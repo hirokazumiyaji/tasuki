@@ -28,6 +28,7 @@ func Run(t *testing.T, newBackend Factory) {
 	t.Run("DoubleCompleteSuperseded", func(t *testing.T) { testDoubleComplete(t, newBackend) })
 	t.Run("TerminateIgnoresLateComplete", func(t *testing.T) { testTerminateLateComplete(t, newBackend) })
 	t.Run("FireTimerWakesWorkflow", func(t *testing.T) { testFireTimer(t, newBackend) })
+	RunConcurrent(t, newBackend)
 }
 
 func testMigrate(t *testing.T, newBackend Factory) {
