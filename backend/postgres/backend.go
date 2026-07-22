@@ -158,6 +158,13 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 			_ = json.Unmarshal(payload, &p)
 			t.Name = p.Name
 			t.Input = p.Input
+			t.MaxAttempts = p.Retry.MaxAttempts
+			t.Retry = backend.RetryPolicy{
+				InitialInterval:    time.Duration(p.Retry.InitialIntervalMs) * time.Millisecond,
+				BackoffCoefficient: p.Retry.BackoffCoefficient,
+				MaxInterval:        time.Duration(p.Retry.MaxIntervalMs) * time.Millisecond,
+				MaxAttempts:        p.Retry.MaxAttempts,
+			}
 		}
 		out = append(out, t)
 	}
@@ -311,7 +318,16 @@ func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement
 		}
 	}
 	for _, at := range adv.ActivityTasks {
-		payload, _ := json.Marshal(activityPayload{Name: at.Name, Input: at.Input})
+		payload, _ := json.Marshal(activityPayload{
+			Name:  at.Name,
+			Input: at.Input,
+			Retry: retryJSON{
+				InitialIntervalMs:  at.Retry.InitialInterval.Milliseconds(),
+				BackoffCoefficient: at.Retry.BackoffCoefficient,
+				MaxIntervalMs:      at.Retry.MaxInterval.Milliseconds(),
+				MaxAttempts:        at.MaxAttempts,
+			},
+		})
 		_, err = tx.Exec(ctx, `
 			INSERT INTO wf_tasks (kind, queue, instance_id, ref_seq, payload, max_attempts, visible_at)
 			VALUES ('activity', $1, $2, $3, $4::jsonb, NULLIF($5, 0), now())`,
@@ -491,6 +507,14 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 type activityPayload struct {
 	Name  string          `json:"name"`
 	Input json.RawMessage `json:"input"`
+	Retry retryJSON       `json:"retry"`
+}
+
+type retryJSON struct {
+	InitialIntervalMs  int64   `json:"initial_interval_ms"`
+	BackoffCoefficient float64 `json:"backoff_coefficient"`
+	MaxIntervalMs      int64   `json:"max_interval_ms"`
+	MaxAttempts        int     `json:"max_attempts"`
 }
 
 func jsonbOrNull(b []byte) any {

@@ -202,13 +202,29 @@ func (w *Worker) attachEffects(adv *backend.Advancement, queue string, cmds []jo
 	for _, cmd := range cmds {
 		switch cmd.Type {
 		case journal.TypeActivityScheduled:
+			input := append([]byte(nil), cmd.Payload...)
+			retry := backend.RetryPolicy{}
+			var sched workflow.ActivitySchedule
+			if err := json.Unmarshal(cmd.Payload, &sched); err == nil && len(sched.Input) > 0 {
+				input = append([]byte(nil), sched.Input...)
+				if sched.Retry != nil {
+					retry = backend.RetryPolicy{
+						InitialInterval:    time.Duration(sched.Retry.InitialIntervalMs) * time.Millisecond,
+						BackoffCoefficient: sched.Retry.BackoffCoefficient,
+						MaxInterval:        time.Duration(sched.Retry.MaxIntervalMs) * time.Millisecond,
+						MaxAttempts:        sched.Retry.MaxAttempts,
+					}
+				}
+			}
 			adv.ActivityTasks = append(adv.ActivityTasks, backend.NewTask{
-				Kind:       "activity",
-				Queue:      queue,
-				InstanceID: adv.InstanceID,
-				Name:       cmd.Name,
-				Seq:        cmd.Seq,
-				Input:      append([]byte(nil), cmd.Payload...),
+				Kind:        "activity",
+				Queue:       queue,
+				InstanceID:  adv.InstanceID,
+				Name:        cmd.Name,
+				Seq:         cmd.Seq,
+				Input:       input,
+				MaxAttempts: retry.MaxAttempts,
+				Retry:       retry,
 			})
 		case journal.TypeTimerCreated:
 			var p struct {
@@ -223,25 +239,63 @@ func (w *Worker) attachEffects(adv *backend.Advancement, queue string, cmds []jo
 func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	act, err := w.reg.activity(t.Name)
 	if err != nil {
-		payload, _ := json.Marshal(err.Error())
-		return w.backend.CompleteActivity(ctx, t.ID, journal.Event{
-			Type:    journal.TypeActivityFailed,
-			RefSeq:  t.Seq,
-			Payload: payload,
-		})
+		return w.failActivity(ctx, t, err)
 	}
+
+	done := make(chan struct{})
+	defer close(done)
+	go w.extendLeaseLoop(ctx, t.ID, done)
+
 	out, err := act.fn(ctx, t.Input)
 	if err != nil {
-		payload, _ := json.Marshal(err.Error())
-		return w.backend.CompleteActivity(ctx, t.ID, journal.Event{
-			Type:    journal.TypeActivityFailed,
-			RefSeq:  t.Seq,
-			Payload: payload,
-		})
+		if IsNonRetryable(err) || (t.MaxAttempts > 0 && t.Attempt >= t.MaxAttempts) {
+			return w.failActivity(ctx, t, err)
+		}
+		delay := workflow.RetryPolicy{
+			InitialInterval:    t.Retry.InitialInterval,
+			BackoffCoefficient: t.Retry.BackoffCoefficient,
+			MaxInterval:        t.Retry.MaxInterval,
+			MaxAttempts:        t.Retry.MaxAttempts,
+		}.Backoff(t.Attempt)
+		var now time.Time
+		if st, loadErr := w.backend.LoadWorkflow(ctx, t.InstanceID); loadErr == nil {
+			now = st.Now
+		} else {
+			now = time.Now().UTC()
+		}
+		return w.backend.RetryActivity(ctx, t.ID, now.Add(delay))
 	}
 	return w.backend.CompleteActivity(ctx, t.ID, journal.Event{
 		Type:    journal.TypeActivityCompleted,
 		RefSeq:  t.Seq,
 		Payload: out,
 	})
+}
+
+func (w *Worker) failActivity(ctx context.Context, t backend.Task, err error) error {
+	payload, _ := json.Marshal(err.Error())
+	return w.backend.CompleteActivity(ctx, t.ID, journal.Event{
+		Type:    journal.TypeActivityFailed,
+		RefSeq:  t.Seq,
+		Payload: payload,
+	})
+}
+
+func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan struct{}) {
+	d := w.opts.LeaseDuration / 2
+	if d <= 0 {
+		return
+	}
+	ticker := time.NewTicker(d)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = w.backend.ExtendLease(ctx, taskID, w.opts.LeaseDuration)
+		}
+	}
 }
