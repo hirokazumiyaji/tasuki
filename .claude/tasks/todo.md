@@ -1,50 +1,25 @@
-# tasuki（旧名 durable-workflow）設計書・開発プラン作成
+# tasuki M0 実行モデル検証
 
 ## ゴール
 
-Temporal のような durable workflow engine を、サーバー群を立てずにライブラリとしてアプリケーションへ組み込める形で Go により実装する。
-そのための設計書と開発プランを作成する。
+ジャーナル再実行方式の中核を実装し、M0 受入条件を自動テストでグリーンにする。
 
 ## タスク
 
-- [x] プロジェクト状態の確認（空リポジトリであることを確認）
-- [x] 実行モデルの選択肢を比較し、採用案を決める（02-architecture.md に比較表として記載）
-- [x] docs/01-overview.md（背景、要求、非目標、既存プロダクト比較、用語）
-- [x] docs/02-architecture.md（実行モデル、状態遷移プロトコル、データモデル、信頼性）
-- [x] docs/03-api.md（公開 API、コード例、決定性ルール、テスト支援）
-- [x] docs/04-plan.md（マイルストーン、テスト戦略、リスク）
-- [x] README.md（プロジェクト概要と docs への導線）
-- [x] セルフレビュー（括弧の不一致 4 件、タイポ 1 件、import 漏れ、API 表の漏れを修正）
-- [x] git commit
-- [ ] ユーザーへレビュー依頼（承認後に writing-plans で M0 実装プランへ進む）
+- [x] M0 実装プラン作成（docs/superpowers/plans/2026-07-23-m0-execution-model.md）
+- [x] Task 1: journal event types
+- [x] Task 2: command matching
+- [x] Task 3: Context + Goexit suspend
+- [x] Task 4: determinism stuck
+- [x] Task 5: codec + Sleep fire_at
+- [x] Task 6: memory backend
+- [x] Task 7: worker replay
+- [x] Task 8: wftest virtual clock
+- [x] Task 9: example + README
 
-## レビュー
+## 受入条件
 
-### 主要な設計判断
-
-- 実行モデルは「ジャーナル再実行方式」（C案）を採用。常駐ゴルーチン方式（DBOS 型）と完全イベントソーシング方式（Temporal 型）は比較表つきで棄却理由を記載。
-- exactly-once の状態遷移は、inbox パターンでジャーナルの書き手を一本化し、`next_seq` の楽観ロック（フェンシング兼用）と単一トランザクションで実現。
-- サスペンドは panic センチネルではなく `runtime.Goexit`（ユーザーの recover に捕捉されないため）。
-- リースは専用カラムではなく `visible_at` の先送りで表現し、reaper を不要にした。
-- 起こし損ね競合は PostgreSQL の `ON CONFLICT` の待機セマンティクスで解消されることを分析し、バックエンド適合テストの必須ケースに昇格。
-
-### 追記（2026-07-22 バックエンド差し替え対応の改訂）
-
-ユーザー要望（datastore を interface で組み替え可能に。RDBMS のほか Spanner / TiDB / DynamoDB / Firestore へ対応したい）を受けて改訂した。
-
-- exactly-once プロトコルの要件を「五つの保証 + 不変条件 I1」としてストア非依存の実装契約に一般化し、PostgreSQL の SQL は参照実装へ格下げした。
-- タスク獲得を「ロック方式（SKIP LOCKED）」と「条件付き更新方式（楽観 CAS）」の二戦略として定義した。
-- 書き込み件数上限（DynamoDB 100 項目、Firestore 500 書き込み）へ対応する `Capabilities` をバックエンドインターフェースに追加した。
-- 権威時計のないストア向けに、時計ずれは効率にのみ影響し正しさは CAS が守るという整理を明文化した。
-- バックエンドは独立 Go モジュールに分離し、本体がクラウド SDK に依存しない方針を追加した。
-- 04-plan に M4「バックエンドの拡充」（MySQL/MariaDB → TiDB → Spanner → DynamoDB → Firestore）を新設し、旧 M4 を M5 に繰り下げた。
-
-### 追記（2026-07-23 プロジェクト名を tasuki に決定）
-
-候補（tasuki、reprise、daruma、perdura）から、ユーザーが tasuki（駅伝の襷。ワーカー間で実行を引き継いで完走する）を選択した。
-モジュールパスは `github.com/hirokazumiyaji/tasuki`、ルートパッケージ名は `tasuki`。
-ローカルディレクトリ名の変更と GitHub リポジトリ作成はユーザーの操作として残っている。
-
-### 残課題
-
-- ユーザーによる設計レビュー待ち。承認後、M0（実行モデル検証）の実装プランを writing-plans で作成する。
+- [x] 複数ステップのリプレイ再開
+- [x] 決定性違反 → stuck
+- [x] defer / recover がサスペンドを壊さない
+- [x] 7 日スリープが仮想時計で完走
