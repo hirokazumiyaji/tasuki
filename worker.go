@@ -43,6 +43,11 @@ func (w *Worker) Start(parent context.Context) {
 	go w.loop(ctx)
 }
 
+// PollOnce runs one worker tick (timers, workflow tasks, activity tasks).
+func (w *Worker) PollOnce(ctx context.Context) {
+	w.tick(ctx)
+}
+
 func (w *Worker) Shutdown(ctx context.Context) error {
 	w.mu.Lock()
 	cancel := w.cancel

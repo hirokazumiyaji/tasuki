@@ -367,6 +367,33 @@ func (b *Backend) FireDueTimers(_ context.Context, limit int) (int, error) {
 	return n, nil
 }
 
+func (b *Backend) NextTimerFireAt() (time.Time, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var (
+		found bool
+		earliest time.Time
+	)
+	for _, tm := range b.timers {
+		if !found || tm.fireAt.Before(earliest) {
+			earliest = tm.fireAt
+			found = true
+		}
+	}
+	return earliest, found
+}
+
+func (b *Backend) HasRunnableTasks() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, t := range b.tasks {
+		if !t.visibleAt.After(b.now) {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *Backend) enqueueWorkflowTaskLocked(instanceID, queue string) {
 	for _, t := range b.tasks {
 		if t.kind == "workflow" && t.instanceID == instanceID {
