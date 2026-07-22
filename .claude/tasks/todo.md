@@ -28,6 +28,17 @@ Temporal のような durable workflow engine を、サーバー群を立てず�
 - リースは専用カラムではなく `visible_at` の先送りで表現し、reaper を不要にした。
 - 起こし損ね競合は PostgreSQL の `ON CONFLICT` の待機セマンティクスで解消されることを分析し、バックエンド適合テストの必須ケースに昇格。
 
+### 追記（2026-07-22 バックエンド差し替え対応の改訂）
+
+ユーザー要望（datastore を interface で組み替え可能に。RDBMS のほか Spanner / TiDB / DynamoDB / Firestore へ対応したい）を受けて改訂した。
+
+- exactly-once プロトコルの要件を「五つの保証 + 不変条件 I1」としてストア非依存の実装契約に一般化し、PostgreSQL の SQL は参照実装へ格下げした。
+- タスク獲得を「ロック方式（SKIP LOCKED）」と「条件付き更新方式（楽観 CAS）」の二戦略として定義した。
+- 書き込み件数上限（DynamoDB 100 項目、Firestore 500 書き込み）へ対応する `Capabilities` をバックエンドインターフェースに追加した。
+- 権威時計のないストア向けに、時計ずれは効率にのみ影響し正しさは CAS が守るという整理を明文化した。
+- バックエンドは独立 Go モジュールに分離し、本体がクラウド SDK に依存しない方針を追加した。
+- 04-plan に M4「バックエンドの拡充」（MySQL/MariaDB → TiDB → Spanner → DynamoDB → Firestore）を新設し、旧 M4 を M5 に繰り下げた。
+
 ### 残課題
 
 - ユーザーによる設計レビュー待ち。承認後、M0（実行モデル検証）の実装プランを writing-plans で作成する。

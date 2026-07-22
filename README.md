@@ -3,7 +3,8 @@
 Go アプリケーションに組み込んで使う durable workflow engine。
 
 Temporal のような「リトライ、タイマー、状態永続化を自分で書かず、ワークフローをコードとして書く」体験を、専用サーバーなしで提供する。
-エンジンはライブラリとしてアプリケーションプロセス内で動き、永続化はアプリケーションが持つリレーショナルデータベース（参照実装は PostgreSQL）に相乗りする。
+エンジンはライブラリとしてアプリケーションプロセス内で動き、永続化はアプリケーションが持つデータストアに相乗りする。
+バックエンドはインターフェースで差し替え可能で、参照実装は PostgreSQL、対応対象に MySQL / MariaDB、SQLite、Spanner、TiDB、DynamoDB、Firestore を含む。
 
 ```go
 func OrderWorkflow(ctx *workflow.Context, in OrderInput) (OrderResult, error) {
