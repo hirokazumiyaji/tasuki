@@ -44,16 +44,26 @@ type InboxEvent struct {
 }
 
 type Task struct {
-	ID         int64
-	Kind       string
-	Queue      string
-	InstanceID string
-	Name       string
-	Seq        int64
-	Input      []byte
-	Attempt    int
-	VisibleAt  time.Time
-	WorkerID   string
+	ID          int64
+	Kind        string
+	Queue       string
+	InstanceID  string
+	Name        string
+	Seq         int64
+	Input       []byte
+	Attempt     int
+	MaxAttempts int
+	Retry       RetryPolicy
+	VisibleAt   time.Time
+	WorkerID    string
+}
+
+// RetryPolicy is stored on activity tasks for worker-side backoff.
+type RetryPolicy struct {
+	InitialInterval    time.Duration
+	BackoffCoefficient float64
+	MaxInterval        time.Duration
+	MaxAttempts        int
 }
 
 type ClaimRequest struct {
@@ -72,6 +82,7 @@ type NewTask struct {
 	Seq         int64
 	Input       []byte
 	MaxAttempts int // 0 = unlimited
+	Retry       RetryPolicy
 }
 
 type NewTimer struct {

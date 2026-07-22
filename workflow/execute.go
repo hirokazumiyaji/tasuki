@@ -7,11 +7,41 @@ import (
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
+// ActivitySchedule is the journal payload for activity_scheduled.
+type ActivitySchedule struct {
+	Input json.RawMessage `json:"input"`
+	Retry *RetryPolicyJSON `json:"retry,omitempty"`
+}
+
+type RetryPolicyJSON struct {
+	InitialIntervalMs  int64   `json:"initial_interval_ms"`
+	BackoffCoefficient float64 `json:"backoff_coefficient"`
+	MaxIntervalMs      int64   `json:"max_interval_ms"`
+	MaxAttempts        int     `json:"max_attempts"`
+}
+
 // Execute schedules an activity by name and waits for its completion event.
-// If the completion is not yet in the journal, the workflow goroutine suspends.
-func Execute[I, O any](ctx *Context, activityName string, in I) (O, error) {
+func Execute[I, O any](ctx *Context, activityName string, in I, opts ...ExecuteOption) (O, error) {
 	var zero O
-	payload, err := json.Marshal(in)
+	var eo executeOptions
+	for _, opt := range opts {
+		opt(&eo)
+	}
+	input, err := json.Marshal(in)
+	if err != nil {
+		return zero, err
+	}
+	sched := ActivitySchedule{Input: input}
+	if eo.retry != (RetryPolicy{}) {
+		r := eo.retry.withDefaults()
+		sched.Retry = &RetryPolicyJSON{
+			InitialIntervalMs:  r.InitialInterval.Milliseconds(),
+			BackoffCoefficient: r.BackoffCoefficient,
+			MaxIntervalMs:      r.MaxInterval.Milliseconds(),
+			MaxAttempts:        r.MaxAttempts,
+		}
+	}
+	payload, err := json.Marshal(sched)
 	if err != nil {
 		return zero, err
 	}

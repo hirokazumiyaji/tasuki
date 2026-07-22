@@ -45,6 +45,7 @@ type task struct {
 	input       []byte
 	attempt     int
 	maxAttempts int
+	retry       backend.RetryPolicy
 	visibleAt   time.Time
 	workerID    string
 }
@@ -347,6 +348,7 @@ func (b *Backend) CommitAdvancement(_ context.Context, adv backend.Advancement) 
 			seq:         at.Seq,
 			input:       append([]byte(nil), at.Input...),
 			maxAttempts: at.MaxAttempts,
+			retry:       at.Retry,
 			visibleAt:   b.now,
 		}
 	}
@@ -490,15 +492,17 @@ func (b *Backend) enqueueWorkflowTaskLocked(instanceID, queue string) {
 
 func toTask(t *task) backend.Task {
 	return backend.Task{
-		ID:         t.id,
-		Kind:       t.kind,
-		Queue:      t.queue,
-		InstanceID: t.instanceID,
-		Name:       t.name,
-		Seq:        t.seq,
-		Input:      append([]byte(nil), t.input...),
-		Attempt:    t.attempt,
-		VisibleAt:  t.visibleAt,
-		WorkerID:   t.workerID,
+		ID:          t.id,
+		Kind:        t.kind,
+		Queue:       t.queue,
+		InstanceID:  t.instanceID,
+		Name:        t.name,
+		Seq:         t.seq,
+		Input:       append([]byte(nil), t.input...),
+		Attempt:     t.attempt,
+		MaxAttempts: t.maxAttempts,
+		Retry:       t.retry,
+		VisibleAt:   t.visibleAt,
+		WorkerID:    t.workerID,
 	}
 }
