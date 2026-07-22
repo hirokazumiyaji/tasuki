@@ -7,28 +7,27 @@ Temporal のような「リトライ、タイマー、状態永続化を自分�
 エンジンはライブラリとしてアプリケーションプロセス内で動き、永続化はアプリケーションが持つデータストアに相乗りする。
 バックエンドはインターフェースで差し替え可能で、参照実装は PostgreSQL、対応対象に MySQL / MariaDB、SQLite、Spanner、TiDB、DynamoDB、Firestore を含む。
 
-```go
-func OrderWorkflow(ctx *workflow.Context, in OrderInput) (OrderResult, error) {
-    charge, err := workflow.Execute(ctx, ChargePayment, ChargeInput{OrderID: in.OrderID})
-    if err != nil {
-        return OrderResult{}, err
-    }
-    if err := workflow.Sleep(ctx, 7*24*time.Hour); err != nil { // プロセスが再起動しても継続する
-        return OrderResult{}, err
-    }
-    _, err = workflow.Execute(ctx, SendFollowUpMail, MailInput{To: charge.CustomerEmail})
-    return OrderResult{InvoiceID: charge.InvoiceID}, err
-}
-```
-
 ## ステータス
 
-M0（実行モデルの検証）完了。ジャーナル再実行、`runtime.Goexit` によるサスペンド、インメモリバックエンド、仮想時計（`wftest`）が動く。
-次は M1（PostgreSQL バックエンドと実用最小）へ進む。
+M1（PostgreSQL バックエンドと実用最小）完了。適合テスト、カオステスト、クイックスタートが動く。
+次は M2（表現力: シグナル、子ワークフロー、Await など）へ進む。
+
+## クイックスタート
+
+```bash
+docker compose up -d
+export TASUKI_POSTGRES_DSN='postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable'
+go run ./examples/m1-postgres/
+```
+
+期待出力: `inv-123`
+
+テスト:
 
 ```bash
 go test ./... -race
-go run ./examples/m0-hello/
+cd backend/postgres && go test ./...   # 要 TASUKI_POSTGRES_DSN
+go test ./chaos/ -timeout 2m          # 要 TASUKI_POSTGRES_DSN
 ```
 
 ## 設計ドキュメント
@@ -40,3 +39,4 @@ go run ./examples/m0-hello/
 | [docs/03-api.md](docs/03-api.md) | 公開 API、コード例、決定性の制約、テスト支援 |
 | [docs/04-plan.md](docs/04-plan.md) | マイルストーン、テスト戦略、リスク |
 | [docs/superpowers/plans/2026-07-23-m0-execution-model.md](docs/superpowers/plans/2026-07-23-m0-execution-model.md) | M0 実装プラン |
+| [docs/superpowers/plans/2026-07-23-m1-postgres-backend.md](docs/superpowers/plans/2026-07-23-m1-postgres-backend.md) | M1 実装プラン |
