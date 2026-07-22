@@ -1,0 +1,510 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/hirokazumiyaji/tasuki/backend"
+	"github.com/hirokazumiyaji/tasuki/journal"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilities{} }
+
+// Reset truncates all workflow tables (test helper).
+func (b *Backend) Reset(ctx context.Context) error {
+	_, err := b.pool.Exec(ctx, `
+		TRUNCATE wf_timers, wf_tasks, wf_inbox, wf_journal, wf_instances RESTART IDENTITY CASCADE`)
+	return err
+}
+
+func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
+	queue := inst.Queue
+	if queue == "" {
+		queue = "default"
+	}
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO wf_instances (id, name, queue, status, input, next_seq)
+		VALUES ($1, $2, $3, 'running', $4::jsonb, 2)`,
+		inst.ID, inst.Name, queue, jsonbOrNull(inst.Input))
+	if err != nil {
+		if isUniqueViolation(err) {
+			return backend.ErrAlreadyExists
+		}
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO wf_journal (instance_id, seq, type, name, payload)
+		VALUES ($1, 1, $2, $3, $4::jsonb)`,
+		inst.ID, string(journal.TypeWorkflowStarted), inst.Name, jsonbOrNull(inst.Input))
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO wf_tasks (kind, queue, instance_id, visible_at)
+		VALUES ('workflow', $1, $2, now())`, queue, inst.ID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance, error) {
+	row := b.pool.QueryRow(ctx, `
+		SELECT id, name, queue, status, input, result, failure, next_seq
+		FROM wf_instances WHERE id = $1`, id)
+	var inst backend.Instance
+	var input, result, failure []byte
+	if err := row.Scan(&inst.ID, &inst.Name, &inst.Queue, &inst.Status, &input, &result, &failure, &inst.NextSeq); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, backend.ErrNotFound
+		}
+		return nil, err
+	}
+	inst.Input, inst.Result, inst.Failure = input, result, failure
+	return &inst, nil
+}
+
+func (b *Backend) GetJournal(ctx context.Context, id string, afterSeq int64) ([]journal.Event, error) {
+	rows, err := b.pool.Query(ctx, `
+		SELECT seq, type, name, COALESCE(ref_seq, 0), payload
+		FROM wf_journal WHERE instance_id = $1 AND seq > $2 ORDER BY seq`, id, afterSeq)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []journal.Event
+	for rows.Next() {
+		var e journal.Event
+		var typ string
+		var payload []byte
+		if err := rows.Scan(&e.Seq, &typ, &e.Name, &e.RefSeq, &payload); err != nil {
+			return nil, err
+		}
+		e.Type = journal.Type(typ)
+		e.Payload = payload
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `
+		UPDATE wf_instances SET status = 'terminated', updated_at = now(), completed_at = now()
+		WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return backend.ErrNotFound
+	}
+	_, _ = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE instance_id = $1`, id)
+	_, _ = tx.Exec(ctx, `DELETE FROM wf_timers WHERE instance_id = $1`, id)
+	return tx.Commit(ctx)
+}
+
+func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
+	if req.Limit <= 0 {
+		req.Limit = 1
+	}
+	rows, err := b.pool.Query(ctx, `
+		WITH picked AS (
+			SELECT id FROM wf_tasks
+			WHERE kind = $1 AND queue = ANY($2) AND visible_at <= now()
+			ORDER BY visible_at
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE wf_tasks t
+		SET visible_at = now() + $4::interval,
+		    attempt = t.attempt + 1,
+		    worker_id = $5
+		FROM picked
+		WHERE t.id = picked.id
+		RETURNING t.id, t.kind, t.queue, t.instance_id, t.ref_seq, t.payload, t.attempt, t.visible_at, t.worker_id`,
+		req.Kind, req.Queues, req.Limit, interval(req.Lease), req.WorkerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []backend.Task
+	for rows.Next() {
+		var t backend.Task
+		var refSeq *int64
+		var payload []byte
+		if err := rows.Scan(&t.ID, &t.Kind, &t.Queue, &t.InstanceID, &refSeq, &payload, &t.Attempt, &t.VisibleAt, &t.WorkerID); err != nil {
+			return nil, err
+		}
+		if refSeq != nil {
+			t.Seq = *refSeq
+		}
+		if t.Kind == "activity" {
+			var p activityPayload
+			_ = json.Unmarshal(payload, &p)
+			t.Name = p.Name
+			t.Input = p.Input
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+	tag, err := b.pool.Exec(ctx, `
+		UPDATE wf_tasks SET visible_at = now() + $2::interval WHERE id = $1`, taskID, interval(d))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return backend.ErrNotFound
+	}
+	return nil
+}
+
+func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
+	tag, err := b.pool.Exec(ctx, `
+		UPDATE wf_tasks SET visible_at = now(), worker_id = NULL WHERE id = $1`, taskID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return backend.ErrNotFound
+	}
+	return nil
+}
+
+func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var st backend.WorkflowState
+	var input, result, failure []byte
+	var now time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT id, name, queue, status, input, result, failure, next_seq, now()
+		FROM wf_instances WHERE id = $1`, instanceID).Scan(
+		&st.Instance.ID, &st.Instance.Name, &st.Instance.Queue, &st.Instance.Status,
+		&input, &result, &failure, &st.NextSeq, &now)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, backend.ErrNotFound
+		}
+		return nil, err
+	}
+	st.Instance.Input, st.Instance.Result, st.Instance.Failure = input, result, failure
+	st.Instance.NextSeq = st.NextSeq
+	st.Now = now
+
+	jrows, err := tx.Query(ctx, `
+		SELECT seq, type, name, COALESCE(ref_seq, 0), payload
+		FROM wf_journal WHERE instance_id = $1 ORDER BY seq`, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	for jrows.Next() {
+		var e journal.Event
+		var typ string
+		var payload []byte
+		if err := jrows.Scan(&e.Seq, &typ, &e.Name, &e.RefSeq, &payload); err != nil {
+			jrows.Close()
+			return nil, err
+		}
+		e.Type = journal.Type(typ)
+		e.Payload = payload
+		st.Journal = append(st.Journal, e)
+	}
+	jrows.Close()
+	if err := jrows.Err(); err != nil {
+		return nil, err
+	}
+
+	irows, err := tx.Query(ctx, `
+		SELECT id, type, COALESCE(ref_seq, 0), payload FROM wf_inbox
+		WHERE instance_id = $1 ORDER BY id`, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	for irows.Next() {
+		var item backend.InboxEvent
+		var typ string
+		var payload []byte
+		if err := irows.Scan(&item.ID, &typ, &item.Event.RefSeq, &payload); err != nil {
+			irows.Close()
+			return nil, err
+		}
+		item.Event.Type = journal.Type(typ)
+		item.Event.Payload = payload
+		st.Inbox = append(st.Inbox, item)
+	}
+	irows.Close()
+	if err := irows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	newSeq := adv.ExpectedSeq
+	for _, ev := range adv.NewEvents {
+		if ev.Seq+1 > newSeq {
+			newSeq = ev.Seq + 1
+		}
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE wf_instances SET next_seq = $2, updated_at = now()
+		WHERE id = $1 AND next_seq = $3`, adv.InstanceID, newSeq, adv.ExpectedSeq)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return backend.ErrConflict
+	}
+
+	// Verify own task exists
+	var kind string
+	err = tx.QueryRow(ctx, `SELECT kind FROM wf_tasks WHERE id = $1 AND instance_id = $2`,
+		adv.TaskID, adv.InstanceID).Scan(&kind)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return backend.ErrConflict
+		}
+		return err
+	}
+	if kind != "workflow" {
+		return backend.ErrConflict
+	}
+
+	for _, ev := range adv.NewEvents {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO wf_journal (instance_id, seq, type, name, ref_seq, payload)
+			VALUES ($1, $2, $3, $4, NULLIF($5, 0), $6::jsonb)`,
+			adv.InstanceID, ev.Seq, string(ev.Type), ev.Name, ev.RefSeq, jsonbOrNull(ev.Payload))
+		if err != nil {
+			return err
+		}
+	}
+	for _, at := range adv.ActivityTasks {
+		payload, _ := json.Marshal(activityPayload{Name: at.Name, Input: at.Input})
+		_, err = tx.Exec(ctx, `
+			INSERT INTO wf_tasks (kind, queue, instance_id, ref_seq, payload, max_attempts, visible_at)
+			VALUES ('activity', $1, $2, $3, $4::jsonb, NULLIF($5, 0), now())`,
+			at.Queue, at.InstanceID, at.Seq, payload, at.MaxAttempts)
+		if err != nil {
+			return err
+		}
+	}
+	for _, tm := range adv.Timers {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO wf_timers (instance_id, seq, fire_at) VALUES ($1, $2, $3)`,
+			adv.InstanceID, tm.Seq, tm.FireAt.UTC())
+		if err != nil {
+			return err
+		}
+	}
+	if adv.Terminal != nil {
+		_, err = tx.Exec(ctx, `
+			UPDATE wf_instances
+			SET status = $2, result = $3::jsonb, failure = $4::jsonb,
+			    updated_at = now(), completed_at = now()
+			WHERE id = $1`,
+			adv.InstanceID, adv.Terminal.Status,
+			jsonbOrNull(adv.Terminal.Result), jsonbOrNull(adv.Terminal.Failure))
+		if err != nil {
+			return err
+		}
+	}
+	if len(adv.DrainedInbox) > 0 {
+		_, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE id = ANY($1)`, adv.DrainedInbox)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE id = $1`, adv.TaskID)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO wf_tasks (kind, instance_id, queue)
+		SELECT 'workflow', $1, i.queue
+		FROM wf_instances i
+		WHERE i.id = $1 AND i.status = 'running'
+		  AND EXISTS (SELECT 1 FROM wf_inbox WHERE instance_id = $1)
+		ON CONFLICT (instance_id) WHERE kind = 'workflow' DO NOTHING`, adv.InstanceID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var instanceID string
+	var refSeq int64
+	err = tx.QueryRow(ctx, `
+		DELETE FROM wf_tasks WHERE id = $1 AND kind = 'activity'
+		RETURNING instance_id, COALESCE(ref_seq, 0)`, taskID).Scan(&instanceID, &refSeq)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return backend.ErrSuperseded
+		}
+		return err
+	}
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM wf_instances WHERE id = $1`, instanceID).Scan(&status); err != nil {
+		return err
+	}
+	if status != "running" {
+		return tx.Commit(ctx)
+	}
+	if ev.RefSeq == 0 {
+		ev.RefSeq = refSeq
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO wf_inbox (instance_id, type, ref_seq, payload)
+		VALUES ($1, $2, $3, $4::jsonb)`,
+		instanceID, string(ev.Type), ev.RefSeq, jsonbOrNull(ev.Payload))
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO wf_tasks (kind, instance_id, queue)
+		SELECT 'workflow', $1, queue FROM wf_instances WHERE id = $1 AND status = 'running'
+		ON CONFLICT (instance_id) WHERE kind = 'workflow' DO NOTHING`, instanceID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (b *Backend) RetryActivity(ctx context.Context, taskID int64, visibleAt time.Time) error {
+	tag, err := b.pool.Exec(ctx, `
+		UPDATE wf_tasks SET visible_at = $2, worker_id = NULL
+		WHERE id = $1 AND kind = 'activity'`, taskID, visibleAt.UTC())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return backend.ErrNotFound
+	}
+	return nil
+}
+
+func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
+		SELECT instance_id, seq FROM wf_timers
+		WHERE fire_at <= now()
+		ORDER BY fire_at
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED`, limit)
+	if err != nil {
+		return 0, err
+	}
+	type due struct {
+		instanceID string
+		seq        int64
+	}
+	var dues []due
+	for rows.Next() {
+		var d due
+		if err := rows.Scan(&d.instanceID, &d.seq); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		dues = append(dues, d)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	n := 0
+	for _, d := range dues {
+		tag, err := tx.Exec(ctx, `DELETE FROM wf_timers WHERE instance_id = $1 AND seq = $2`, d.instanceID, d.seq)
+		if err != nil {
+			return 0, err
+		}
+		if tag.RowsAffected() == 0 {
+			continue
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO wf_inbox (instance_id, type, ref_seq) VALUES ($1, $2, $3)`,
+			d.instanceID, string(journal.TypeTimerFired), d.seq)
+		if err != nil {
+			return 0, err
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO wf_tasks (kind, instance_id, queue)
+			SELECT 'workflow', $1, queue FROM wf_instances WHERE id = $1 AND status = 'running'
+			ON CONFLICT (instance_id) WHERE kind = 'workflow' DO NOTHING`, d.instanceID)
+		if err != nil {
+			return 0, err
+		}
+		n++
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+type activityPayload struct {
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
+}
+
+func jsonbOrNull(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
+}
+
+func interval(d time.Duration) string {
+	return fmt.Sprintf("%f seconds", d.Seconds())
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
