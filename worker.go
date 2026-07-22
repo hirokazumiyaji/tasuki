@@ -17,17 +17,19 @@ type Worker struct {
 	opts    WorkerOptions
 	reg     *registry
 
-	mu     sync.Mutex
-	cancel context.CancelFunc
-	done   chan struct{}
+	mu       sync.Mutex
+	cancel   context.CancelFunc
+	done     chan struct{}
+	inFlight map[int64]struct{}
 }
 
 func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 	opts = opts.withDefaults()
 	return &Worker{
-		backend: b,
-		opts:    opts,
-		reg:     newRegistry(opts.Codec),
+		backend:  b,
+		opts:     opts,
+		reg:      newRegistry(opts.Codec),
+		inFlight: map[int64]struct{}{},
 	}
 }
 
@@ -58,11 +60,38 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	cancel()
+	var waitErr error
 	select {
 	case <-done:
-		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		waitErr = ctx.Err()
+	}
+	w.releaseInFlight(context.Background())
+	return waitErr
+}
+
+func (w *Worker) track(taskID int64) {
+	w.mu.Lock()
+	w.inFlight[taskID] = struct{}{}
+	w.mu.Unlock()
+}
+
+func (w *Worker) untrack(taskID int64) {
+	w.mu.Lock()
+	delete(w.inFlight, taskID)
+	w.mu.Unlock()
+}
+
+func (w *Worker) releaseInFlight(ctx context.Context) {
+	w.mu.Lock()
+	ids := make([]int64, 0, len(w.inFlight))
+	for id := range w.inFlight {
+		ids = append(ids, id)
+	}
+	w.inFlight = map[int64]struct{}{}
+	w.mu.Unlock()
+	for _, id := range ids {
+		_ = w.backend.ReleaseLease(ctx, id)
 	}
 }
 
@@ -89,7 +118,9 @@ func (w *Worker) tick(ctx context.Context) {
 	})
 	if err == nil {
 		for _, t := range wtasks {
+			w.track(t.ID)
 			_ = w.handleWorkflow(ctx, t)
+			w.untrack(t.ID)
 		}
 	}
 
@@ -99,7 +130,9 @@ func (w *Worker) tick(ctx context.Context) {
 	})
 	if err == nil {
 		for _, t := range atasks {
+			w.track(t.ID)
 			_ = w.handleActivity(ctx, t)
+			w.untrack(t.ID)
 		}
 	}
 }
