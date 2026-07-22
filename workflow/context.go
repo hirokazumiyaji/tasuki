@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"encoding/json"
 	"runtime"
 	"time"
 
@@ -108,11 +109,18 @@ func Sleep(ctx *Context, d time.Duration) error {
 	if ctx.canceled {
 		return ErrCanceled
 	}
-	_ = d // fire_at payload is added in Task 5
-	ev := ctx.recordOrReplay(journal.Command{Type: journal.TypeTimerCreated}, nil)
+	payload, err := json.Marshal(timerPayload{FireAt: ctx.now.Add(d)})
+	if err != nil {
+		return err
+	}
+	ev := ctx.recordOrReplay(journal.Command{Type: journal.TypeTimerCreated}, payload)
 	if _, ok := ctx.awaitCompletion(ev.Seq); !ok {
 		ctx.suspend()
 		return nil // unreachable after Goexit
 	}
 	return nil
+}
+
+type timerPayload struct {
+	FireAt time.Time `json:"fire_at"`
 }
