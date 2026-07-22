@@ -1,25 +1,27 @@
 # 概要と要求
 
-本書は durable-workflow プロジェクトの目的、要求、非目標を定める。
+本書は tasuki プロジェクトの目的、要求、非目標を定める。
 アーキテクチャは [02-architecture.md](02-architecture.md)、公開 API は [03-api.md](03-api.md)、開発プランは [04-plan.md](04-plan.md) に定める。
 
 ## 目的
 
-durable-workflow は、Go アプリケーションに組み込んで使う **durable workflow engine**（プロセスの停止をまたいで実行を継続できるワークフロー実行基盤）である。
+tasuki は、Go アプリケーションに組み込んで使う **durable workflow engine**（プロセスの停止をまたいで実行を継続できるワークフロー実行基盤）である。
+名前は駅伝の襷に由来する。
+走者から走者へ襷を引き継いで長い距離を走り切るように、ワーカーからワーカーへ実行を引き継いでワークフローを完走させる。
 Temporal が提供する体験、すなわち「リトライ、タイマー、状態永続化を自分で書かず、ビジネスロジックをコードとして書く」体験を、専用サーバーなしで提供する。
 
 Temporal は強力だが、動かすには frontend、history、matching、worker の各サービスと、その背後のデータベース、必要に応じて可視化用の Elasticsearch まで運用する必要がある。
 小規模なチームやサービスにとって、この構築の手間とインフラ費用は、ワークフローエンジンの利益に見合わないことが多い。
 
-durable-workflow は逆の配置を取る。
+tasuki は逆の配置を取る。
 エンジンをライブラリとしてアプリケーションプロセスの中で動かし、永続化はアプリケーションがすでに持っているデータストアに相乗りする。
 追加で必要になるインフラはゼロである。
 
 ```go
 // 追加インフラなしで動く最小構成のイメージ
-w := durable.NewWorker(postgres.NewBackend(pool), durable.WorkerOptions{})
-durable.RegisterWorkflow(w, OrderWorkflow)
-durable.RegisterActivity(w, ChargePayment)
+w := tasuki.NewWorker(postgres.NewBackend(pool), tasuki.WorkerOptions{})
+tasuki.RegisterWorkflow(w, OrderWorkflow)
+tasuki.RegisterActivity(w, ChargePayment)
 w.Start(ctx)
 ```
 

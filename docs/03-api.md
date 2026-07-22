@@ -1,7 +1,7 @@
 # 公開 API 設計
 
 本書はライブラリ利用者から見た API を定める。
-モジュールパスは `github.com/hirokazumiyaji/durable-workflow`、ルートパッケージ名は `durable` とする。
+モジュールパスは `github.com/hirokazumiyaji/tasuki`、ルートパッケージ名は `tasuki` とする。
 
 ## 設計方針
 
@@ -19,10 +19,10 @@ import (
     "context"
     "time"
 
-    durable "github.com/hirokazumiyaji/durable-workflow"
-    "github.com/hirokazumiyaji/durable-workflow/activity"
-    "github.com/hirokazumiyaji/durable-workflow/backend/postgres"
-    "github.com/hirokazumiyaji/durable-workflow/workflow"
+    "github.com/hirokazumiyaji/tasuki"
+    "github.com/hirokazumiyaji/tasuki/activity"
+    "github.com/hirokazumiyaji/tasuki/backend/postgres"
+    "github.com/hirokazumiyaji/tasuki/workflow"
     "github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -67,19 +67,19 @@ func main() {
     ctx := context.Background()
     pool, _ := pgxpool.New(ctx, "postgres://...")
 
-    w := durable.NewWorker(postgres.NewBackend(pool), durable.WorkerOptions{})
-    durable.RegisterWorkflow(w, OrderWorkflow)
-    durable.RegisterActivity(w, ChargePayment)
-    durable.RegisterActivity(w, ShipOrder)
-    durable.RegisterActivity(w, SendReceiptMail)
-    durable.RegisterActivity(w, SendFollowUpMail)
+    w := tasuki.NewWorker(postgres.NewBackend(pool), tasuki.WorkerOptions{})
+    tasuki.RegisterWorkflow(w, OrderWorkflow)
+    tasuki.RegisterActivity(w, ChargePayment)
+    tasuki.RegisterActivity(w, ShipOrder)
+    tasuki.RegisterActivity(w, SendReceiptMail)
+    tasuki.RegisterActivity(w, SendFollowUpMail)
     w.Start(ctx)
     defer w.Shutdown(ctx)
 
     // 開始はどのプロセスからでもよい（Client はワーカーなしでも作れる）
-    c := durable.NewClient(postgres.NewBackend(pool))
-    h, _ := durable.Start(ctx, c, OrderWorkflow, OrderInput{OrderID: "order-123"},
-        durable.WithID("order-123"))
+    c := tasuki.NewClient(postgres.NewBackend(pool))
+    h, _ := tasuki.Start(ctx, c, OrderWorkflow, OrderInput{OrderID: "order-123"},
+        tasuki.WithID("order-123"))
     res, _ := h.Result(ctx)
     _ = res
 }
@@ -199,7 +199,7 @@ type RetryPolicy struct {
 既定は Temporal と同じく無制限リトライとする。
 一時障害で止まらないことを既定とし、打ち切りたい呼び出しに `MaxAttempts` やタイムアウトを与える設計である。
 
-リトライしても意味のないエラー（バリデーション失敗など）は、アクティビティが `durable.NonRetryable(err)` で包んで返す。
+リトライしても意味のないエラー（バリデーション失敗など）は、アクティビティが `tasuki.NonRetryable(err)` で包んで返す。
 このエラーは即座に恒久的失敗となり、ワークフロー側へそのまま返る。
 `MaxAttempts` 到達時も同様にワークフロー側へエラーが返り、以後の対処（補償、別経路、失敗として終端）はワークフローコードが決める。
 
@@ -230,25 +230,25 @@ type Info struct {
 ## クライアント API
 
 ```go
-c := durable.NewClient(backend)
+c := tasuki.NewClient(backend)
 
-h, err := durable.Start(ctx, c, OrderWorkflow, in, durable.WithID("order-123"))
+h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID("order-123"))
 res, err := h.Result(ctx)                    // 終端までポーリングで待つ
 err = c.Signal(ctx, "order-123", "approve", payload)
 err = c.Cancel(ctx, "order-123")             // 協調的キャンセル
 err = c.Terminate(ctx, "order-123")          // 即時終了
 info, err := c.Get(ctx, "order-123")         // 状態、結果、失敗理由
 events, err := c.GetJournal(ctx, "order-123") // 実行履歴
-list, err := c.List(ctx, durable.InstanceFilter{Status: durable.StatusStuck})
+list, err := c.List(ctx, tasuki.InstanceFilter{Status: tasuki.StatusStuck})
 ```
 
 `Start` は ID で冪等である。
-同じ ID がすでに存在する場合は `durable.ErrAlreadyStarted` を返し、そのとき返るハンドルは既存インスタンスを指す。
+同じ ID がすでに存在する場合は `tasuki.ErrAlreadyStarted` を返し、そのとき返るハンドルは既存インスタンスを指す。
 API ハンドラのリトライで二重開始しない、という組み込み用途で重要な性質のため、エラーではなく正常系の一部として文書化する。
 
 ```go
-h, err := durable.Start(ctx, c, OrderWorkflow, in, durable.WithID(orderID))
-if err != nil && !errors.Is(err, durable.ErrAlreadyStarted) {
+h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID(orderID))
+if err != nil && !errors.Is(err, tasuki.ErrAlreadyStarted) {
     return err
 }
 res, err := h.Result(ctx) // 新規でも既存でも同じに扱える
@@ -264,7 +264,7 @@ res, err := h.Result(ctx) // 新規でも既存でも同じに扱える
 実運用では明示的な名前を推奨する。
 
 ```go
-durable.RegisterWorkflow(w, OrderWorkflow, durable.WithName("order"))
+tasuki.RegisterWorkflow(w, OrderWorkflow, tasuki.WithName("order"))
 ```
 
 ## シリアライゼーション

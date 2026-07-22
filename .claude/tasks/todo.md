@@ -1,4 +1,4 @@
-# durable-workflow 設計書・開発プラン作成
+# tasuki（旧名 durable-workflow）設計書・開発プラン作成
 
 ## ゴール
 
@@ -38,6 +38,12 @@ Temporal のような durable workflow engine を、サーバー群を立てず�
 - 権威時計のないストア向けに、時計ずれは効率にのみ影響し正しさは CAS が守るという整理を明文化した。
 - バックエンドは独立 Go モジュールに分離し、本体がクラウド SDK に依存しない方針を追加した。
 - 04-plan に M4「バックエンドの拡充」（MySQL/MariaDB → TiDB → Spanner → DynamoDB → Firestore）を新設し、旧 M4 を M5 に繰り下げた。
+
+### 追記（2026-07-23 プロジェクト名を tasuki に決定）
+
+候補（tasuki、reprise、daruma、perdura）から、ユーザーが tasuki（駅伝の襷。ワーカー間で実行を引き継いで完走する）を選択した。
+モジュールパスは `github.com/hirokazumiyaji/tasuki`、ルートパッケージ名は `tasuki`。
+ローカルディレクトリ名の変更と GitHub リポジトリ作成はユーザーの操作として残っている。
 
 ### 残課題
 
