@@ -23,7 +23,13 @@ func OrderWorkflow(ctx *workflow.Context, in OrderInput) (OrderResult, error) {
 
 ## ステータス
 
-設計フェーズ。実装はまだない。
+M0（実行モデルの検証）完了。ジャーナル再実行、`runtime.Goexit` によるサスペンド、インメモリバックエンド、仮想時計（`wftest`）が動く。
+次は M1（PostgreSQL バックエンドと実用最小）へ進む。
+
+```bash
+go test ./... -race
+go run ./examples/m0-hello/
+```
 
 ## 設計ドキュメント
 
@@ -33,3 +39,4 @@ func OrderWorkflow(ctx *workflow.Context, in OrderInput) (OrderResult, error) {
 | [docs/02-architecture.md](docs/02-architecture.md) | 実行モデル、exactly-once 状態遷移プロトコル、データモデル |
 | [docs/03-api.md](docs/03-api.md) | 公開 API、コード例、決定性の制約、テスト支援 |
 | [docs/04-plan.md](docs/04-plan.md) | マイルストーン、テスト戦略、リスク |
+| [docs/superpowers/plans/2026-07-23-m0-execution-model.md](docs/superpowers/plans/2026-07-23-m0-execution-model.md) | M0 実装プラン |
