@@ -1,0 +1,242 @@
+package tasuki
+
+import (
+	"context"
+	"encoding/json"
+	"sync"
+	"time"
+
+	"github.com/hirokazumiyaji/tasuki/backend"
+	"github.com/hirokazumiyaji/tasuki/internal/engine"
+	"github.com/hirokazumiyaji/tasuki/journal"
+	"github.com/hirokazumiyaji/tasuki/workflow"
+)
+
+type Worker struct {
+	backend backend.Backend
+	opts    WorkerOptions
+	reg     *registry
+
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
+	opts = opts.withDefaults()
+	return &Worker{
+		backend: b,
+		opts:    opts,
+		reg:     newRegistry(opts.Codec),
+	}
+}
+
+func (w *Worker) Start(parent context.Context) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.cancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(parent)
+	w.cancel = cancel
+	w.done = make(chan struct{})
+	go w.loop(ctx)
+}
+
+func (w *Worker) Shutdown(ctx context.Context) error {
+	w.mu.Lock()
+	cancel := w.cancel
+	done := w.done
+	w.cancel = nil
+	w.mu.Unlock()
+	if cancel == nil {
+		return nil
+	}
+	cancel()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (w *Worker) loop(ctx context.Context) {
+	defer close(w.done)
+	ticker := time.NewTicker(w.opts.PollInterval)
+	defer ticker.Stop()
+	for {
+		w.tick(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (w *Worker) tick(ctx context.Context) {
+	_, _ = w.backend.FireDueTimers(ctx, 100)
+
+	wtasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: w.opts.Queues, Limit: 10,
+		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
+	})
+	if err == nil {
+		for _, t := range wtasks {
+			_ = w.handleWorkflow(ctx, t)
+		}
+	}
+
+	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "activity", Queues: w.opts.Queues, Limit: 10,
+		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
+	})
+	if err == nil {
+		for _, t := range atasks {
+			_ = w.handleActivity(ctx, t)
+		}
+	}
+}
+
+func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
+	state, err := w.backend.LoadWorkflow(ctx, t.InstanceID)
+	if err != nil {
+		return err
+	}
+	if state.Instance.Status != "running" {
+		// Drop the task by committing empty? Just leave it — for M0 ignore.
+		return nil
+	}
+	wf, err := w.reg.workflow(state.Instance.Name)
+	if err != nil {
+		return err
+	}
+
+	next := state.NextSeq
+	drained := make([]int64, 0, len(state.Inbox))
+	ingested := make([]journal.Event, 0, len(state.Inbox))
+	for _, item := range state.Inbox {
+		ev := item.Event
+		ev.Seq = next
+		next++
+		ingested = append(ingested, ev)
+		drained = append(drained, item.ID)
+	}
+	events := append(append([]journal.Event{}, state.Journal...), ingested...)
+
+	res := engine.RunAt(events, state.Now, func(wctx *workflow.Context) (any, error) {
+		out, err := wf.fn(wctx, state.Instance.Input)
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	})
+
+	adv := backend.Advancement{
+		InstanceID:   t.InstanceID,
+		TaskID:       t.ID,
+		ExpectedSeq:  state.NextSeq,
+		DrainedInbox: drained,
+		NewEvents:    append([]journal.Event{}, ingested...),
+	}
+
+	if res.Stuck {
+		adv.NewEvents = append(adv.NewEvents, res.NewCommands...)
+		adv.Terminal = &backend.TerminalUpdate{
+			Status:  "stuck",
+			Failure: []byte(res.Err.Error()),
+		}
+		return w.backend.CommitAdvancement(ctx, adv)
+	}
+
+	if res.Suspended {
+		adv.NewEvents = append(adv.NewEvents, res.NewCommands...)
+		w.attachEffects(&adv, state.Instance.Queue, res.NewCommands)
+		return w.backend.CommitAdvancement(ctx, adv)
+	}
+
+	// Completed (normal return or error return)
+	adv.NewEvents = append(adv.NewEvents, res.NewCommands...)
+	w.attachEffects(&adv, state.Instance.Queue, res.NewCommands)
+
+	termSeq := state.NextSeq + int64(len(adv.NewEvents))
+	if res.Err != nil {
+		failPayload, _ := json.Marshal(res.Err.Error())
+		adv.NewEvents = append(adv.NewEvents, journal.Event{
+			Seq:     termSeq,
+			Type:    journal.TypeWorkflowFailed,
+			Payload: failPayload,
+		})
+		adv.Terminal = &backend.TerminalUpdate{
+			Status:  "failed",
+			Failure: failPayload,
+		}
+	} else {
+		var resultBytes []byte
+		switch v := res.Result.(type) {
+		case []byte:
+			resultBytes = v
+		default:
+			resultBytes, _ = json.Marshal(v)
+		}
+		adv.NewEvents = append(adv.NewEvents, journal.Event{
+			Seq:     termSeq,
+			Type:    journal.TypeWorkflowCompleted,
+			Payload: resultBytes,
+		})
+		adv.Terminal = &backend.TerminalUpdate{
+			Status: "completed",
+			Result: resultBytes,
+		}
+	}
+	return w.backend.CommitAdvancement(ctx, adv)
+}
+
+func (w *Worker) attachEffects(adv *backend.Advancement, queue string, cmds []journal.Event) {
+	for _, cmd := range cmds {
+		switch cmd.Type {
+		case journal.TypeActivityScheduled:
+			adv.ActivityTasks = append(adv.ActivityTasks, backend.NewTask{
+				Kind:       "activity",
+				Queue:      queue,
+				InstanceID: adv.InstanceID,
+				Name:       cmd.Name,
+				Seq:        cmd.Seq,
+				Input:      append([]byte(nil), cmd.Payload...),
+			})
+		case journal.TypeTimerCreated:
+			var p struct {
+				FireAt time.Time `json:"fire_at"`
+			}
+			_ = json.Unmarshal(cmd.Payload, &p)
+			adv.Timers = append(adv.Timers, backend.NewTimer{Seq: cmd.Seq, FireAt: p.FireAt})
+		}
+	}
+}
+
+func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
+	act, err := w.reg.activity(t.Name)
+	if err != nil {
+		payload, _ := json.Marshal(err.Error())
+		return w.backend.CompleteActivity(ctx, t.ID, journal.Event{
+			Type:    journal.TypeActivityFailed,
+			RefSeq:  t.Seq,
+			Payload: payload,
+		})
+	}
+	out, err := act.fn(ctx, t.Input)
+	if err != nil {
+		payload, _ := json.Marshal(err.Error())
+		return w.backend.CompleteActivity(ctx, t.ID, journal.Event{
+			Type:    journal.TypeActivityFailed,
+			RefSeq:  t.Seq,
+			Payload: payload,
+		})
+	}
+	return w.backend.CompleteActivity(ctx, t.ID, journal.Event{
+		Type:    journal.TypeActivityCompleted,
+		RefSeq:  t.Seq,
+		Payload: out,
+	})
+}
