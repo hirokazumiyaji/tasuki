@@ -5,26 +5,37 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"time"
 
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/codec"
 )
 
-var ErrAlreadyStarted = errors.New("workflow already started")
+var (
+	ErrAlreadyStarted = errors.New("workflow already started")
+	ErrTerminated     = errors.New("workflow terminated")
+	ErrFailed         = errors.New("workflow failed")
+	ErrStuck          = errors.New("workflow stuck")
+	ErrCanceled       = errors.New("workflow canceled")
+)
 
 type Client struct {
-	backend backend.Backend
-	codec   codec.Codec
+	backend      backend.Backend
+	codec        codec.Codec
+	pollInterval time.Duration
 }
 
 func NewClient(b backend.Backend) *Client {
-	return &Client{backend: b, codec: codec.JSON()}
+	return &Client{backend: b, codec: codec.JSON(), pollInterval: 200 * time.Millisecond}
 }
 
 type Handle struct {
 	client *Client
 	id     string
 }
+
+func (h *Handle) ID() string { return h.id }
 
 func Start[I any](ctx context.Context, c *Client, workflowName string, input I, opts ...StartOption) (*Handle, error) {
 	o := startOptions{queue: "default"}
@@ -56,6 +67,44 @@ func Start[I any](ctx context.Context, c *Client, workflowName string, input I, 
 
 func (c *Client) Get(ctx context.Context, id string) (*backend.Instance, error) {
 	return c.backend.GetInstance(ctx, id)
+}
+
+func (c *Client) Terminate(ctx context.Context, id string) error {
+	return c.backend.TerminateInstance(ctx, id)
+}
+
+// Result polls until the workflow reaches a terminal status and returns the typed output.
+func Result[O any](ctx context.Context, h *Handle) (O, error) {
+	var zero O
+	ticker := time.NewTicker(h.client.pollInterval)
+	defer ticker.Stop()
+	for {
+		inst, err := h.client.backend.GetInstance(ctx, h.id)
+		if err != nil {
+			return zero, err
+		}
+		switch inst.Status {
+		case "completed":
+			var out O
+			if err := h.client.codec.Unmarshal(inst.Result, &out); err != nil {
+				return zero, err
+			}
+			return out, nil
+		case "failed":
+			return zero, fmt.Errorf("%w: %s", ErrFailed, string(inst.Failure))
+		case "terminated":
+			return zero, ErrTerminated
+		case "canceled":
+			return zero, ErrCanceled
+		case "stuck":
+			return zero, fmt.Errorf("%w: %s", ErrStuck, string(inst.Failure))
+		}
+		select {
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func newID() string {
