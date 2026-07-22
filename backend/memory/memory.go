@@ -36,16 +36,17 @@ type instance struct {
 }
 
 type task struct {
-	id         int64
-	kind       string
-	queue      string
-	instanceID string
-	name       string
-	seq        int64
-	input      []byte
-	attempt    int
-	visibleAt  time.Time
-	workerID   string
+	id          int64
+	kind        string
+	queue       string
+	instanceID  string
+	name        string
+	seq         int64
+	input       []byte
+	attempt     int
+	maxAttempts int
+	visibleAt   time.Time
+	workerID    string
 }
 
 type timerKey struct {
@@ -73,6 +74,8 @@ func New() *Backend {
 		inbox:     map[string][]*inboxItem{},
 	}
 }
+
+func (b *Backend) Migrate(context.Context) error { return nil }
 
 func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{}
@@ -136,6 +139,78 @@ func (b *Backend) GetInstance(_ context.Context, id string) (*backend.Instance, 
 		Failure: append([]byte(nil), inst.failure...),
 		NextSeq: inst.nextSeq,
 	}, nil
+}
+
+func (b *Backend) GetJournal(_ context.Context, id string, afterSeq int64) ([]journal.Event, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	inst, ok := b.instances[id]
+	if !ok {
+		return nil, backend.ErrNotFound
+	}
+	out := make([]journal.Event, 0)
+	for _, e := range inst.journal {
+		if e.Seq > afterSeq {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (b *Backend) TerminateInstance(_ context.Context, id string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	inst, ok := b.instances[id]
+	if !ok {
+		return backend.ErrNotFound
+	}
+	inst.status = "terminated"
+	for tid, t := range b.tasks {
+		if t.instanceID == id {
+			delete(b.tasks, tid)
+		}
+	}
+	for k := range b.timers {
+		if k.instanceID == id {
+			delete(b.timers, k)
+		}
+	}
+	return nil
+}
+
+func (b *Backend) ExtendLease(_ context.Context, taskID int64, d time.Duration) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t, ok := b.tasks[taskID]
+	if !ok {
+		return backend.ErrNotFound
+	}
+	t.visibleAt = b.now.Add(d)
+	return nil
+}
+
+func (b *Backend) ReleaseLease(_ context.Context, taskID int64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t, ok := b.tasks[taskID]
+	if !ok {
+		return backend.ErrNotFound
+	}
+	t.visibleAt = b.now
+	t.workerID = ""
+	return nil
+}
+
+func (b *Backend) RetryActivity(_ context.Context, taskID int64, visibleAt time.Time) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t, ok := b.tasks[taskID]
+	if !ok || t.kind != "activity" {
+		return backend.ErrNotFound
+	}
+	t.visibleAt = visibleAt.UTC()
+	t.workerID = ""
+	return nil
 }
 
 func (b *Backend) LoadWorkflow(_ context.Context, instanceID string) (*backend.WorkflowState, error) {
@@ -264,14 +339,15 @@ func (b *Backend) CommitAdvancement(_ context.Context, adv backend.Advancement) 
 	for _, at := range adv.ActivityTasks {
 		b.nextTask++
 		b.tasks[b.nextTask] = &task{
-			id:         b.nextTask,
-			kind:       "activity",
-			queue:      at.Queue,
-			instanceID: at.InstanceID,
-			name:       at.Name,
-			seq:        at.Seq,
-			input:      append([]byte(nil), at.Input...),
-			visibleAt:  b.now,
+			id:          b.nextTask,
+			kind:        "activity",
+			queue:       at.Queue,
+			instanceID:  at.InstanceID,
+			name:        at.Name,
+			seq:         at.Seq,
+			input:       append([]byte(nil), at.Input...),
+			maxAttempts: at.MaxAttempts,
+			visibleAt:   b.now,
 		}
 	}
 	for _, tm := range adv.Timers {
@@ -308,12 +384,14 @@ func (b *Backend) CompleteActivity(_ context.Context, taskID int64, ev journal.E
 		return backend.ErrNotFound
 	}
 	delete(b.tasks, taskID)
+	if inst.status != "running" {
+		// Terminated/completed instances ignore late completions.
+		return nil
+	}
 	ev.RefSeq = t.seq
 	b.nextInbox++
 	b.inbox[t.instanceID] = append(b.inbox[t.instanceID], &inboxItem{id: b.nextInbox, event: ev})
-	if inst.status == "running" {
-		b.enqueueWorkflowTaskLocked(t.instanceID, inst.queue)
-	}
+	b.enqueueWorkflowTaskLocked(t.instanceID, inst.queue)
 	return nil
 }
 

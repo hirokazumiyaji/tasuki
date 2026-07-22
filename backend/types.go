@@ -65,12 +65,13 @@ type ClaimRequest struct {
 }
 
 type NewTask struct {
-	Kind       string
-	Queue      string
-	InstanceID string
-	Name       string
-	Seq        int64
-	Input      []byte
+	Kind        string
+	Queue       string
+	InstanceID  string
+	Name        string
+	Seq         int64
+	Input       []byte
+	MaxAttempts int // 0 = unlimited
 }
 
 type NewTimer struct {
