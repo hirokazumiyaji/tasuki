@@ -45,9 +45,6 @@ func SleepAsync(ctx *Context, d time.Duration) *Future[struct{}] {
 
 // Await returns the index of the first ready future, or suspends if none are ready.
 func Await(ctx *Context, futures ...Awaitable) (int, error) {
-	if ctx.canceled {
-		return -1, ErrCanceled
-	}
 	if len(futures) == 0 {
 		return -1, nil
 	}
@@ -56,17 +53,20 @@ func Await(ctx *Context, futures ...Awaitable) (int, error) {
 			return i, nil
 		}
 	}
+	if ctx.canceled {
+		return -1, ErrCanceled
+	}
 	ctx.suspend()
 	return -1, nil
 }
 
 // AwaitAll waits until all futures are ready, then returns the first Get error.
 func AwaitAll(ctx *Context, futures ...Awaitable) error {
-	if ctx.canceled {
-		return ErrCanceled
-	}
 	for _, f := range futures {
 		if !f.ready(ctx) {
+			if ctx.canceled {
+				return ErrCanceled
+			}
 			ctx.suspend()
 			return nil
 		}

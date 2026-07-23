@@ -36,11 +36,11 @@ func (f *Future[O]) errCanceled(ctx *Context) error {
 // Get blocks (via journal replay / suspend) until the future completes.
 func (f *Future[O]) Get(ctx *Context) (O, error) {
 	var zero O
-	if ctx.canceled {
-		return zero, ErrCanceled
-	}
 	comp, ok := ctx.awaitCompletion(f.seq)
 	if !ok {
+		if ctx.canceled {
+			return zero, ErrCanceled
+		}
 		ctx.suspend()
 		return zero, nil
 	}

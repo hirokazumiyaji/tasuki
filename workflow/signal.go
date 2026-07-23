@@ -8,11 +8,11 @@ import (
 // ReceiveSignal waits for the next unmatched signal with the given name.
 func ReceiveSignal[T any](ctx *Context, name string) (T, error) {
 	var zero T
-	if ctx.canceled {
-		return zero, ErrCanceled
-	}
 	ev, ok := ctx.takeSignal(name)
 	if !ok {
+		if ctx.canceled {
+			return zero, ErrCanceled
+		}
 		ctx.suspend()
 		return zero, nil
 	}

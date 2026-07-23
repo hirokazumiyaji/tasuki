@@ -122,6 +122,18 @@ func AsDeterminismPanic(r any) (error, bool) {
 // Sleep schedules a durable timer. If the timer has not fired in the journal, the
 // workflow goroutine suspends via runtime.Goexit.
 func Sleep(ctx *Context, d time.Duration) error {
+	// Replay an already-recorded timer before applying cancel, so command matching stays aligned.
+	if rec, ok := ctx.peekCommand(); ok && rec.Type == journal.TypeTimerCreated {
+		ev := ctx.recordOrReplay(journal.Command{Type: journal.TypeTimerCreated}, rec.Payload)
+		if _, done := ctx.awaitCompletion(ev.Seq); done {
+			return nil
+		}
+		if ctx.canceled {
+			return ErrCanceled
+		}
+		ctx.suspend()
+		return nil
+	}
 	if ctx.canceled {
 		return ErrCanceled
 	}
