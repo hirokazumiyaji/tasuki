@@ -17,6 +17,7 @@ type Context struct {
 	completions map[int64]journal.Event
 	canceled    bool
 	suspended   bool
+	info        WorkflowInfo
 }
 
 func NewContext(events []journal.Event, now time.Time) *Context {
@@ -25,6 +26,12 @@ func NewContext(events []journal.Event, now time.Time) *Context {
 		now:         now,
 		completions: map[int64]journal.Event{},
 		nextSeq:     1,
+	}
+	for _, e := range events {
+		if e.Type == journal.TypeWorkflowStarted {
+			ctx.info.Name = e.Name
+			break
+		}
 	}
 	for _, e := range events {
 		if e.Seq >= ctx.nextSeq {
@@ -41,6 +48,8 @@ func NewContext(events []journal.Event, now time.Time) *Context {
 }
 
 func (c *Context) NewCommands() []journal.Event { return c.commands }
+
+func (c *Context) SetInfo(info WorkflowInfo) { c.info = info }
 
 func WasSuspended(c *Context) bool { return c.suspended }
 
