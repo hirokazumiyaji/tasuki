@@ -1,23 +1,18 @@
-# tasuki M4 MySQL / MariaDB
+# tasuki M4 TiDB
 
 ## ゴール
 
-MySQL 8（および MariaDB）バックエンドを適合テストとカオスでグリーンにする。
+`backend/mysql` を TiDB 上で適合・カオスし、流用可否を確定する。
 
 ## タスク
 
-- [x] M4 MySQL 実装プラン
-- [x] Task 2: Scaffold + migrate
-- [x] Task 3–5: Backend + conformance
-- [x] Task 6: Chaos + example + README
+- [ ] M4 TiDB プラン
+- [ ] Task 2: docker-compose TiDB + migrate
+- [ ] Task 3: Conformance on TiDB
+- [ ] Task 4: Conditional-update fallback（必要な場合のみ）
+- [ ] Task 5: Chaos + README
 
 ## 注記
 
-- コミットとマージコミットの両方に `[skip ci]` を付ける
-- TiDB / Spanner / DynamoDB / Firestore は後続フェーズ
-
-## 受入条件
-
-- [x] MySQL が `backendtest.Run` を通過
-- [x] カオステストが MySQL 上でグリーン
-- [x] クイックスタート例が動く
+- コミットとマージコミットに `[skip ci]`
+- 新規モジュールは原則作らない（mysql 実装を共有）
