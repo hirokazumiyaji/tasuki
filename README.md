@@ -58,3 +58,4 @@ go test ./chaos/ -timeout 2m          # 要 TASUKI_POSTGRES_DSN
 | [docs/superpowers/plans/2026-07-23-m1-postgres-backend.md](docs/superpowers/plans/2026-07-23-m1-postgres-backend.md) | M1 実装プラン |
 | [docs/superpowers/plans/2026-07-23-m2-expressiveness.md](docs/superpowers/plans/2026-07-23-m2-expressiveness.md) | M2 実装プラン |
 | [docs/superpowers/plans/2026-07-23-m3-operability.md](docs/superpowers/plans/2026-07-23-m3-operability.md) | M3 実装プラン |
+| [docs/superpowers/plans/2026-07-23-m4-mysql-backend.md](docs/superpowers/plans/2026-07-23-m4-mysql-backend.md) | M4 MySQL 実装プラン |
