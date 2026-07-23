@@ -20,14 +20,16 @@ type NewInstance struct {
 }
 
 type Instance struct {
-	ID     string
-	Name   string
-	Queue  string
-	Status string
-	Input  []byte
-	Result []byte
-	Failure []byte
-	NextSeq int64
+	ID        string
+	Name      string
+	Queue     string
+	Status    string
+	Input     []byte
+	Result    []byte
+	Failure   []byte
+	NextSeq   int64
+	ParentID  string
+	ParentSeq int64
 }
 
 type WorkflowState struct {

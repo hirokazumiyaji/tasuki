@@ -190,13 +190,15 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 			Status:  "stuck",
 			Failure: []byte(res.Err.Error()),
 		}
-		return w.backend.CommitAdvancement(ctx, adv)
+		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
+	return w.backend.CommitAdvancement(ctx, adv)
 	}
 
 	if res.Suspended {
 		adv.NewEvents = append(adv.NewEvents, res.NewCommands...)
 		w.attachEffects(&adv, state.Instance.Queue, res.NewCommands)
-		return w.backend.CommitAdvancement(ctx, adv)
+		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
+	return w.backend.CommitAdvancement(ctx, adv)
 	}
 
 	// Completed (normal return or error return)
@@ -239,7 +241,25 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 			Result: resultBytes,
 		}
 	}
+	w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
+	w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
 	return w.backend.CommitAdvancement(ctx, adv)
+}
+
+func (w *Worker) withParentNotify(adv *backend.Advancement, parentID string, parentSeq int64) {
+	if parentID == "" || adv.Terminal == nil {
+		return
+	}
+	switch adv.Terminal.Status {
+	case "completed":
+		adv.ParentNotify = &journal.Event{Type: journal.TypeChildCompleted, RefSeq: parentSeq, Payload: adv.Terminal.Result}
+	case "failed", "canceled", "terminated", "stuck":
+		payload := adv.Terminal.Failure
+		if len(payload) == 0 {
+			payload, _ = json.Marshal(adv.Terminal.Status)
+		}
+		adv.ParentNotify = &journal.Event{Type: journal.TypeChildFailed, RefSeq: parentSeq, Payload: payload}
+	}
 }
 
 func (w *Worker) attachEffects(adv *backend.Advancement, queue string, cmds []journal.Event) {
@@ -276,6 +296,17 @@ func (w *Worker) attachEffects(adv *backend.Advancement, queue string, cmds []jo
 			}
 			_ = json.Unmarshal(cmd.Payload, &p)
 			adv.Timers = append(adv.Timers, backend.NewTimer{Seq: cmd.Seq, FireAt: p.FireAt})
+		case journal.TypeChildScheduled:
+			var p struct {
+				ChildID string          `json:"child_id"`
+				Name    string          `json:"name"`
+				Input   json.RawMessage `json:"input"`
+			}
+			_ = json.Unmarshal(cmd.Payload, &p)
+			adv.Children = append(adv.Children, backend.NewInstance{
+				ID: p.ChildID, Name: p.Name, Queue: queue, Input: p.Input,
+				ParentID: adv.InstanceID, ParentSeq: cmd.Seq,
+			})
 		}
 	}
 }
