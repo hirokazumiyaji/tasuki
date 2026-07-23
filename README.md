@@ -9,8 +9,8 @@ Temporal のような「リトライ、タイマー、状態永続化を自分�
 
 ## ステータス
 
-M4（MySQL / MariaDB + TiDB 検証）完了。`backend/mysql` を TiDB（unistore）でも適合・カオス済み。専用 TiDB モジュールは不要。
-次のストア候補は Spanner → DynamoDB → Firestore。
+M4（MySQL / MariaDB + TiDB + Spanner）完了。Spanner は条件付き更新方式の最初の実装（Emulator で適合・カオス済み）。
+次のストア候補は DynamoDB → Firestore。
 
 ## クイックスタート
 
@@ -40,6 +40,15 @@ export TASUKI_MYSQL_DSN="$TASUKI_TIDB_DSN"
 go run ./examples/m4-mysql/
 ```
 
+Spanner（Emulator）:
+
+```bash
+docker compose up -d spanner
+export SPANNER_EMULATOR_HOST=localhost:9010
+export TASUKI_SPANNER_DSN=projects/tasuki/instances/tasuki/databases/tasuki
+go run ./examples/m4-spanner/
+```
+
 SQLite（追加インフラ不要）:
 
 ```bash
@@ -58,8 +67,9 @@ go run ./analyzers/determinism/cmd/determinism -- ./...
 go test ./... -race
 cd backend/postgres && go test ./...   # 要 TASUKI_POSTGRES_DSN
 cd backend/mysql && go test ./...      # 要 TASUKI_MYSQL_DSN / TASUKI_TIDB_DSN
+cd backend/spanner && go test ./...    # 要 SPANNER_EMULATOR_HOST + TASUKI_SPANNER_DSN
 cd backend/sqlite && go test ./...
-go test ./chaos/ -timeout 2m          # postgres / mysql / tidb の DSN
+go test ./chaos/ -timeout 3m          # postgres / mysql / tidb / spanner の DSN
 ```
 
 観測性: [docs/05-observability.md](docs/05-observability.md)
