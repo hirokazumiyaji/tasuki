@@ -51,3 +51,10 @@ services:
     command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
     ports:
       - "8000:8000"
+
+  # Firestore emulator (gcloud).
+  firestore:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+    command: ["gcloud", "beta", "emulators", "firestore", "start", "--host-port=0.0.0.0:8086"]
+    ports:
+      - "8086:8086"

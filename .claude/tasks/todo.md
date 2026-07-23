@@ -7,7 +7,7 @@
 ## タスク
 
 - [x] Task 1: Spec + Plan
-- [ ] Task 2: Compose emulator + scaffold
+- [x] Task 2: Compose emulator + scaffold
 - [ ] Task 3: Backend core + Capabilities
 - [ ] Task 4: Inbox / schedules / List
 - [ ] Task 5: Conformance
@@ -16,6 +16,6 @@
 ## 注記
 
 - コミットとマージコミットに `[skip ci]`
+- FIRESTORE_EMULATOR_HOST=localhost:8086
 - Spec: `docs/superpowers/specs/2026-07-23-m4-firestore-design.md`
 - Plan: `docs/superpowers/plans/2026-07-23-m4-firestore.md`
-- 次: M5 候補（通知化・バッチ・スティッキー等）
