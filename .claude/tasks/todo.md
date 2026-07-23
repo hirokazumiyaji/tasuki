@@ -1,21 +1,21 @@
-# tasuki M4 Spanner
+# tasuki M4 DynamoDB
 
 ## ゴール
 
-`backend/spanner` を Emulator 上で適合・カオスし、条件付き更新方式の最初の実装を完了する。
+`backend/dynamodb` を Local 上で適合・カオスし、TransactWriteItems 上限を Capabilities で宣言する最初の実装を完了する。
 
 ## タスク
 
 - [x] Task 1: Spec + Plan
-- [x] Task 2: Compose emulator + scaffold + migrate
-- [x] Task 3: Backend core
-- [x] Task 4: Inbox / schedules / List
-- [x] Task 5: Conformance
-- [x] Task 6: Chaos + example + README
+- [ ] Task 2: Compose Local + scaffold + migrate
+- [ ] Task 3: Capabilities clamp + Backend core
+- [ ] Task 4: Inbox / schedules / List
+- [ ] Task 5: Conformance
+- [ ] Task 6: Chaos + example + README
 
 ## 注記
 
 - コミットとマージコミットに `[skip ci]`
-- Spec: `docs/superpowers/specs/2026-07-23-m4-spanner-design.md`
-- Plan: `docs/superpowers/plans/2026-07-23-m4-spanner.md`
-- 次マイルストーン候補: DynamoDB
+- Spec: `docs/superpowers/specs/2026-07-23-m4-dynamodb-design.md`
+- Plan: `docs/superpowers/plans/2026-07-23-m4-dynamodb.md`
+- 次マイルストーン候補: Firestore
