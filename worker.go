@@ -113,6 +113,7 @@ func (w *Worker) loop(ctx context.Context) {
 
 func (w *Worker) tick(ctx context.Context) {
 	_, _ = w.backend.FireDueTimers(ctx, 100)
+	_, _ = w.backend.ClaimDueSchedules(ctx, 100)
 
 	wtasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
 		Kind: "workflow", Queues: w.opts.Queues, Limit: 10,

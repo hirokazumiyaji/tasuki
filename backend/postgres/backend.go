@@ -18,7 +18,7 @@ func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilit
 // Reset truncates all workflow tables (test helper).
 func (b *Backend) Reset(ctx context.Context) error {
 	_, err := b.pool.Exec(ctx, `
-		TRUNCATE wf_timers, wf_tasks, wf_inbox, wf_journal, wf_instances RESTART IDENTITY CASCADE`)
+		TRUNCATE wf_schedules, wf_timers, wf_tasks, wf_inbox, wf_journal, wf_instances RESTART IDENTITY CASCADE`)
 	return err
 }
 

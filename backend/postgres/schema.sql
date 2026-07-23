@@ -60,3 +60,17 @@ CREATE TABLE IF NOT EXISTS wf_timers (
     PRIMARY KEY (instance_id, seq)
 );
 CREATE INDEX IF NOT EXISTS wf_timers_fire_idx ON wf_timers (fire_at);
+
+CREATE TABLE IF NOT EXISTS wf_schedules (
+    id          text PRIMARY KEY,
+    cron        text NOT NULL,
+    workflow    text NOT NULL,
+    queue       text NOT NULL DEFAULT 'default',
+    input       jsonb,
+    next_run_at timestamptz NOT NULL,
+    paused      boolean NOT NULL DEFAULT false,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS wf_schedules_due_idx ON wf_schedules (next_run_at) WHERE NOT paused;
+
