@@ -11,9 +11,10 @@
 - [x] Task 3: Backend core + Capabilities
 - [x] Task 4: Inbox / schedules / List
 - [x] Task 5: Conformance
-- [ ] Task 6: Chaos + example + README（M4 完了）
+- [x] Task 6: Chaos + example + README（M4 完了）
 
 ## 注記
 
 - FIRESTORE_EMULATOR_HOST=localhost:8086
 - MaxAdvancementEffects: 400
+- M4 全ストア完了 → 次は M5
