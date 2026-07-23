@@ -9,7 +9,7 @@
 - [x] M4 TiDB プラン
 - [x] Task 2: docker-compose TiDB + migrate
 - [x] Task 3: Conformance on TiDB (+ I1 post-commit ensure)
-- [ ] Task 4: Conditional-update fallback（不要・docs）
+- [x] Task 4: Conditional-update fallback（不要・docs）
 - [ ] Task 5: Chaos + README
 
 ## 注記
