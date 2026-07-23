@@ -114,6 +114,18 @@ func (c *Client) Terminate(ctx context.Context, id string) error {
 	return c.backend.TerminateInstance(ctx, id)
 }
 
+func (c *Client) UpsertSchedule(ctx context.Context, s backend.NewSchedule) error {
+	return c.backend.UpsertSchedule(ctx, s)
+}
+
+func (c *Client) GetSchedule(ctx context.Context, id string) (*backend.Schedule, error) {
+	return c.backend.GetSchedule(ctx, id)
+}
+
+func (c *Client) PauseSchedule(ctx context.Context, id string, paused bool) error {
+	return c.backend.PauseSchedule(ctx, id, paused)
+}
+
 // Result polls until the workflow reaches a terminal status and returns the typed output.
 func Result[O any](ctx context.Context, h *Handle) (O, error) {
 	var zero O
