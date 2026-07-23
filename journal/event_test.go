@@ -31,3 +31,15 @@ func TestIsCommand(t *testing.T) {
 		t.Fatal("activity_completed should not be command")
 	}
 }
+
+func TestChildEventClassification(t *testing.T) {
+	if !journal.TypeChildScheduled.IsCommand() {
+		t.Fatal("child_scheduled should be command")
+	}
+	if !journal.TypeChildCompleted.IsCompletion() {
+		t.Fatal("child_completed should be completion")
+	}
+	if !journal.TypeChildFailed.IsCompletion() {
+		t.Fatal("child_failed should be completion")
+	}
+}

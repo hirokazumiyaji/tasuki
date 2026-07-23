@@ -6,12 +6,15 @@ const (
 	TypeWorkflowStarted   Type = "workflow_started"
 	TypeActivityScheduled Type = "activity_scheduled"
 	TypeTimerCreated      Type = "timer_created"
+	TypeChildScheduled    Type = "child_scheduled"
 	TypeSideEffect        Type = "side_effect"
 	TypeNowRecorded       Type = "now_recorded"
 	TypeVersionMarker     Type = "version_marker"
 	TypeActivityCompleted Type = "activity_completed"
 	TypeActivityFailed    Type = "activity_failed"
 	TypeTimerFired        Type = "timer_fired"
+	TypeChildCompleted    Type = "child_completed"
+	TypeChildFailed       Type = "child_failed"
 	TypeSignalReceived    Type = "signal_received"
 	TypeCancelRequested   Type = "cancel_requested"
 	TypeWorkflowCompleted Type = "workflow_completed"
@@ -30,7 +33,7 @@ type Event struct {
 
 func (t Type) IsCommand() bool {
 	switch t {
-	case TypeActivityScheduled, TypeTimerCreated, TypeSideEffect, TypeNowRecorded, TypeVersionMarker:
+	case TypeActivityScheduled, TypeTimerCreated, TypeChildScheduled, TypeSideEffect, TypeNowRecorded, TypeVersionMarker:
 		return true
 	default:
 		return false
@@ -39,7 +42,7 @@ func (t Type) IsCommand() bool {
 
 func (t Type) IsCompletion() bool {
 	switch t {
-	case TypeActivityCompleted, TypeActivityFailed, TypeTimerFired, TypeSignalReceived, TypeCancelRequested:
+	case TypeActivityCompleted, TypeActivityFailed, TypeTimerFired, TypeChildCompleted, TypeChildFailed, TypeSignalReceived, TypeCancelRequested:
 		return true
 	default:
 		return false
