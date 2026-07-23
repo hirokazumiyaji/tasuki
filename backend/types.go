@@ -119,3 +119,32 @@ type Advancement struct {
 	Terminal      *TerminalUpdate
 	EnsureWorkflowTask bool // if true, enqueue workflow task after commit when inbox remains or always for M0 helpers
 }
+
+// NewSchedule is the input for UpsertSchedule.
+type NewSchedule struct {
+	ID       string
+	Cron     string
+	Workflow string
+	Queue    string
+	Input    []byte
+	Paused   bool
+}
+
+// Schedule is a persisted cron trigger.
+type Schedule struct {
+	ID        string
+	Cron      string
+	Workflow  string
+	Queue     string
+	Input     []byte
+	NextRunAt time.Time
+	Paused    bool
+}
+
+// DueSchedule is a claimed schedule fire that started (or deduped) an instance.
+type DueSchedule struct {
+	Schedule
+	InstanceID  string
+	ScheduledAt time.Time
+	Created     bool // false if instance already existed (dedup)
+}
