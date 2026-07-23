@@ -9,8 +9,8 @@ Temporal のような「リトライ、タイマー、状態永続化を自分�
 
 ## ステータス
 
-M4（MySQL / MariaDB）完了。適合テストとカオステストが MySQL 8 で動く。
-次のストア候補は TiDB → Spanner → DynamoDB → Firestore。
+M4（MySQL / MariaDB + TiDB 検証）完了。`backend/mysql` を TiDB（unistore）でも適合・カオス済み。専用 TiDB モジュールは不要。
+次のストア候補は Spanner → DynamoDB → Firestore。
 
 ## クイックスタート
 
@@ -27,6 +27,16 @@ MySQL:
 ```bash
 docker compose up -d mysql
 export TASUKI_MYSQL_DSN='tasuki:tasuki@tcp(localhost:3306)/tasuki?parseTime=true&loc=UTC'
+go run ./examples/m4-mysql/
+```
+
+TiDB（`backend/mysql` を流用）:
+
+```bash
+docker compose up -d tidb
+export TASUKI_TIDB_DSN='root@tcp(127.0.0.1:4000)/tasuki?parseTime=true&loc=UTC'
+# 例: MySQL 向け example と同じコードパス（DSN だけ差し替え）
+export TASUKI_MYSQL_DSN="$TASUKI_TIDB_DSN"
 go run ./examples/m4-mysql/
 ```
 
@@ -47,9 +57,9 @@ go run ./analyzers/determinism/cmd/determinism -- ./...
 ```bash
 go test ./... -race
 cd backend/postgres && go test ./...   # 要 TASUKI_POSTGRES_DSN
-cd backend/mysql && go test ./...      # 要 TASUKI_MYSQL_DSN
+cd backend/mysql && go test ./...      # 要 TASUKI_MYSQL_DSN / TASUKI_TIDB_DSN
 cd backend/sqlite && go test ./...
-go test ./chaos/ -timeout 2m          # postgres / mysql の DSN
+go test ./chaos/ -timeout 2m          # postgres / mysql / tidb の DSN
 ```
 
 観測性: [docs/05-observability.md](docs/05-observability.md)
