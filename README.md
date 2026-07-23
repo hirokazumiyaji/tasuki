@@ -91,3 +91,5 @@ go test ./chaos/ -timeout 3m          # postgres / mysql / tidb / spanner の DS
 | [docs/superpowers/plans/2026-07-23-m4-tidb.md](docs/superpowers/plans/2026-07-23-m4-tidb.md) | M4 TiDB 検証プラン |
 | [docs/superpowers/specs/2026-07-23-m4-spanner-design.md](docs/superpowers/specs/2026-07-23-m4-spanner-design.md) | M4 Spanner 設計 |
 | [docs/superpowers/plans/2026-07-23-m4-spanner.md](docs/superpowers/plans/2026-07-23-m4-spanner.md) | M4 Spanner 実装プラン |
+| [docs/superpowers/specs/2026-07-23-m4-dynamodb-design.md](docs/superpowers/specs/2026-07-23-m4-dynamodb-design.md) | M4 DynamoDB 設計 |
+| [docs/superpowers/plans/2026-07-23-m4-dynamodb.md](docs/superpowers/plans/2026-07-23-m4-dynamodb.md) | M4 DynamoDB 実装プラン |
