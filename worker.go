@@ -162,7 +162,26 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 	next := state.NextSeq
 	drained := make([]int64, 0, len(state.Inbox))
 	ingested := make([]journal.Event, 0, len(state.Inbox))
-	for _, item := range state.Inbox {
+	inboxLimit := len(state.Inbox)
+	if caps := w.backend.Capabilities(); caps.MaxAdvancementEffects > 0 {
+		// Each drained inbox item costs ~2 TransactWrite actions (journal put + inbox delete).
+		// Reserve headroom for instance CAS, task delete, ensure, timers/activities/children.
+		budget := caps.MaxAdvancementEffects - 20
+		if budget < 2 {
+			budget = 2
+		}
+		inboxLimit = budget / 2
+		if inboxLimit < 1 {
+			inboxLimit = 1
+		}
+		if inboxLimit > len(state.Inbox) {
+			inboxLimit = len(state.Inbox)
+		}
+	}
+	for i, item := range state.Inbox {
+		if i >= inboxLimit {
+			break
+		}
 		ev := item.Event
 		ev.Seq = next
 		next++
