@@ -79,3 +79,5 @@ go test ./chaos/ -timeout 2m          # postgres / mysql / tidb の DSN
 | [docs/superpowers/plans/2026-07-23-m3-operability.md](docs/superpowers/plans/2026-07-23-m3-operability.md) | M3 実装プラン |
 | [docs/superpowers/plans/2026-07-23-m4-mysql-backend.md](docs/superpowers/plans/2026-07-23-m4-mysql-backend.md) | M4 MySQL 実装プラン |
 | [docs/superpowers/plans/2026-07-23-m4-tidb.md](docs/superpowers/plans/2026-07-23-m4-tidb.md) | M4 TiDB 検証プラン |
+| [docs/superpowers/specs/2026-07-23-m4-spanner-design.md](docs/superpowers/specs/2026-07-23-m4-spanner-design.md) | M4 Spanner 設計 |
+| [docs/superpowers/plans/2026-07-23-m4-spanner.md](docs/superpowers/plans/2026-07-23-m4-spanner.md) | M4 Spanner 実装プラン |
