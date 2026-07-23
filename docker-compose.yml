@@ -12,3 +12,18 @@ services:
       interval: 2s
       timeout: 5s
       retries: 15
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_USER: tasuki
+      MYSQL_PASSWORD: tasuki
+      MYSQL_DATABASE: tasuki
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-utasuki", "-ptasuki"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
