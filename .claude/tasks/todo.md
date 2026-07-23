@@ -11,7 +11,7 @@
 - [x] Task 3: Capabilities clamp + Backend core
 - [x] Task 4: Inbox / schedules / List
 - [x] Task 5: Conformance
-- [ ] Task 6: Chaos + example + README
+- [x] Task 6: Chaos + example + README
 
 ## 注記
 
@@ -19,4 +19,3 @@
 - Spec: `docs/superpowers/specs/2026-07-23-m4-dynamodb-design.md`
 - Plan: `docs/superpowers/plans/2026-07-23-m4-dynamodb.md`
 - 次マイルストーン候補: Firestore
-- MaxAdvancementEffects: 80（worker inbox clamp）
