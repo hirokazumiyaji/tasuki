@@ -27,3 +27,13 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
+
+  # Single-node TiDB with unistore (local verification; MySQL protocol on :4000).
+  tidb:
+    image: pingcap/tidb:v8.5.1
+    command:
+      - --store=unistore
+      - --path=/tmp/tidb
+      - --advertise-address=127.0.0.1
+    ports:
+      - "4000:4000"
