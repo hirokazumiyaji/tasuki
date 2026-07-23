@@ -355,8 +355,17 @@ func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend
 }
 
 func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {
-	return withTx(ctx, b.db, func(conn *sql.Conn) error {
+	err := withTx(ctx, b.db, func(conn *sql.Conn) error {
 		return b.commitAdvancementConn(ctx, conn, adv)
+	})
+	if err != nil {
+		return err
+	}
+	// Second pass: under snapshot isolation (e.g. TiDB optimistic), a concurrent
+	// SendToInbox may commit an inbox row that this txn's ensure did not see after
+	// deleting the workflow task (I1). Re-check in a fresh snapshot.
+	return withTx(ctx, b.db, func(conn *sql.Conn) error {
+		return ensureWorkflowTaskIfInbox(ctx, conn, adv.InstanceID)
 	})
 }
 
