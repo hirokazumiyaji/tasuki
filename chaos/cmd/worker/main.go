@@ -10,6 +10,7 @@ import (
 	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/backend/dynamodb"
+	"github.com/hirokazumiyaji/tasuki/backend/firestore"
 	"github.com/hirokazumiyaji/tasuki/backend/mysql"
 	"github.com/hirokazumiyaji/tasuki/backend/postgres"
 	"github.com/hirokazumiyaji/tasuki/backend/spanner"
@@ -62,6 +63,12 @@ func openBackend(ctx context.Context) (backend.Backend, func()) {
 	case "dynamodb":
 		ep := os.Getenv("TASUKI_DYNAMODB_ENDPOINT")
 		b, err := dynamodb.New(ctx, dynamodb.Config{Endpoint: ep})
+		if err != nil {
+			panic(err)
+		}
+		return b, func() { _ = b.Close() }
+	case "firestore":
+		b, err := firestore.New(ctx, os.Getenv("TASUKI_FIRESTORE_PROJECT"))
 		if err != nil {
 			panic(err)
 		}

@@ -9,8 +9,8 @@ Temporal のような「リトライ、タイマー、状態永続化を自分�
 
 ## ステータス
 
-M4（MySQL / MariaDB + TiDB + Spanner + DynamoDB）完了。DynamoDB は TransactWriteItems 上限を `Capabilities.MaxAdvancementEffects` で宣言する最初の実装（Local で適合・カオス済み）。
-次のストア候補は Firestore。
+M4（バックエンド拡充）完了。PostgreSQL / SQLite / MySQL·MariaDB·TiDB / Spanner / DynamoDB / Firestore が適合・カオス可能な状態。
+次は M5（性能と拡張：通知化、バッチ、スティッキーキャッシュなど）。
 
 ## クイックスタート
 
@@ -35,7 +35,6 @@ TiDB（`backend/mysql` を流用）:
 ```bash
 docker compose up -d tidb
 export TASUKI_TIDB_DSN='root@tcp(127.0.0.1:4000)/tasuki?parseTime=true&loc=UTC'
-# 例: MySQL 向け example と同じコードパス（DSN だけ差し替え）
 export TASUKI_MYSQL_DSN="$TASUKI_TIDB_DSN"
 go run ./examples/m4-mysql/
 ```
@@ -58,6 +57,15 @@ export AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local AWS_REGION=us-east-1
 go run ./examples/m4-dynamodb/
 ```
 
+Firestore（Emulator）:
+
+```bash
+docker compose up -d firestore
+export FIRESTORE_EMULATOR_HOST=localhost:8086
+export TASUKI_FIRESTORE_PROJECT=tasuki
+go run ./examples/m4-firestore/
+```
+
 SQLite（追加インフラ不要）:
 
 ```bash
@@ -74,12 +82,13 @@ go run ./analyzers/determinism/cmd/determinism -- ./...
 
 ```bash
 go test ./... -race
-cd backend/postgres && go test ./...   # 要 TASUKI_POSTGRES_DSN
-cd backend/mysql && go test ./...      # 要 TASUKI_MYSQL_DSN / TASUKI_TIDB_DSN
-cd backend/spanner && go test ./...    # 要 SPANNER_EMULATOR_HOST + TASUKI_SPANNER_DSN
-cd backend/dynamodb && go test ./...   # 要 TASUKI_DYNAMODB_ENDPOINT
+cd backend/postgres && go test ./...
+cd backend/mysql && go test ./...
+cd backend/spanner && go test ./...
+cd backend/dynamodb && go test ./...
+cd backend/firestore && go test ./...
 cd backend/sqlite && go test ./...
-go test ./chaos/ -timeout 3m          # 各ストアの DSN / endpoint
+go test ./chaos/ -timeout 5m
 ```
 
 観測性: [docs/05-observability.md](docs/05-observability.md)
