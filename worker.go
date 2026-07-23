@@ -121,6 +121,8 @@ func (w *Worker) tick(ctx context.Context) {
 	})
 	if err == nil {
 		for _, t := range wtasks {
+			w.opts.Metrics.AddWorkflowTask(ctx, 1)
+			w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
 			w.track(t.ID)
 			_ = w.handleWorkflow(ctx, t)
 			w.untrack(t.ID)
@@ -133,6 +135,9 @@ func (w *Worker) tick(ctx context.Context) {
 	})
 	if err == nil {
 		for _, t := range atasks {
+			w.opts.Metrics.AddActivityTask(ctx, 1)
+			w.opts.Logger.Debug("activity task",
+				"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
 			w.track(t.ID)
 			_ = w.handleActivity(ctx, t)
 			w.untrack(t.ID)
@@ -193,7 +198,9 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 			Failure: []byte(res.Err.Error()),
 		}
 		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
-	return w.backend.CommitAdvancement(ctx, adv)
+		w.opts.Logger.Warn("workflow stuck", "instance_id", t.InstanceID, "error", res.Err)
+		w.opts.Metrics.AddTerminal(ctx, "stuck")
+		return w.backend.CommitAdvancement(ctx, adv)
 	}
 
 	if res.Suspended {
@@ -260,6 +267,10 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 		}
 	}
 	w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
+	if adv.Terminal != nil {
+		w.opts.Logger.Info("workflow terminal", "instance_id", t.InstanceID, "status", adv.Terminal.Status)
+		w.opts.Metrics.AddTerminal(ctx, adv.Terminal.Status)
+	}
 	return w.backend.CommitAdvancement(ctx, adv)
 }
 
@@ -355,6 +366,9 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		} else {
 			now = time.Now().UTC()
 		}
+		w.opts.Logger.Info("activity retry",
+			"instance_id", t.InstanceID, "activity", t.Name, "attempt", t.Attempt, "delay", delay)
+		w.opts.Metrics.AddActivityRetry(ctx, 1)
 		return w.backend.RetryActivity(ctx, t.ID, now.Add(delay))
 	}
 	return w.backend.CompleteActivity(ctx, t.ID, journal.Event{
@@ -365,6 +379,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 }
 
 func (w *Worker) failActivity(ctx context.Context, t backend.Task, err error) error {
+	w.opts.Logger.Warn("activity failed", "instance_id", t.InstanceID, "activity", t.Name, "error", err)
 	payload, _ := json.Marshal(err.Error())
 	return w.backend.CompleteActivity(ctx, t.ID, journal.Event{
 		Type:    journal.TypeActivityFailed,

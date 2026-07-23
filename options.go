@@ -1,17 +1,21 @@
 package tasuki
 
 import (
+	"log/slog"
 	"time"
 
 	"github.com/hirokazumiyaji/tasuki/codec"
+	"github.com/hirokazumiyaji/tasuki/observability"
 )
 
 type WorkerOptions struct {
-	Queues       []string
-	PollInterval time.Duration
+	Queues        []string
+	PollInterval  time.Duration
 	LeaseDuration time.Duration
-	WorkerID     string
-	Codec        codec.Codec
+	WorkerID      string
+	Codec         codec.Codec
+	Logger        *slog.Logger
+	Metrics       *observability.Metrics
 }
 
 func (o WorkerOptions) withDefaults() WorkerOptions {
@@ -29,6 +33,9 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 	}
 	if o.Codec == nil {
 		o.Codec = codec.JSON()
+	}
+	if o.Logger == nil {
+		o.Logger = slog.Default()
 	}
 	return o
 }
