@@ -6,12 +6,10 @@ MySQL 8（および MariaDB）バックエンドを適合テストとカオス�
 
 ## タスク
 
-- [ ] M4 MySQL 実装プラン
-- [ ] Task 2: Scaffold + migrate
-- [ ] Task 3: Backend core
-- [ ] Task 4: Inbox / schedules / List
-- [ ] Task 5: Conformance
-- [ ] Task 6: Chaos + example + README
+- [x] M4 MySQL 実装プラン
+- [x] Task 2: Scaffold + migrate
+- [x] Task 3–5: Backend + conformance
+- [x] Task 6: Chaos + example + README
 
 ## 注記
 
@@ -20,6 +18,6 @@ MySQL 8（および MariaDB）バックエンドを適合テストとカオス�
 
 ## 受入条件
 
-- [ ] MySQL が `backendtest.Run` を通過
-- [ ] カオステストが MySQL 上でグリーン
-- [ ] クイックスタート例が動く
+- [x] MySQL が `backendtest.Run` を通過
+- [x] カオステストが MySQL 上でグリーン
+- [x] クイックスタート例が動く

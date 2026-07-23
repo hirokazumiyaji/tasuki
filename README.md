@@ -9,17 +9,25 @@ Temporal のような「リトライ、タイマー、状態永続化を自分�
 
 ## ステータス
 
-M3（運用性）完了。SQLite、cron スケジュール、List/GetJournal、観測性（slog/OTel）、決定性解析器が揃う。
-次は M4（MySQL / Spanner などバックエンド拡充）へ進む。
+M4（MySQL / MariaDB）完了。適合テストとカオステストが MySQL 8 で動く。
+次のストア候補は TiDB → Spanner → DynamoDB → Firestore。
 
 ## クイックスタート
 
 PostgreSQL:
 
 ```bash
-docker compose up -d
+docker compose up -d postgres
 export TASUKI_POSTGRES_DSN='postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable'
 go run ./examples/m1-postgres/
+```
+
+MySQL:
+
+```bash
+docker compose up -d mysql
+export TASUKI_MYSQL_DSN='tasuki:tasuki@tcp(localhost:3306)/tasuki?parseTime=true&loc=UTC'
+go run ./examples/m4-mysql/
 ```
 
 SQLite（追加インフラ不要）:
@@ -39,8 +47,9 @@ go run ./analyzers/determinism/cmd/determinism -- ./...
 ```bash
 go test ./... -race
 cd backend/postgres && go test ./...   # 要 TASUKI_POSTGRES_DSN
+cd backend/mysql && go test ./...      # 要 TASUKI_MYSQL_DSN
 cd backend/sqlite && go test ./...
-go test ./chaos/ -timeout 2m          # 要 TASUKI_POSTGRES_DSN
+go test ./chaos/ -timeout 2m          # postgres / mysql の DSN
 ```
 
 観測性: [docs/05-observability.md](docs/05-observability.md)

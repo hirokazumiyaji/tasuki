@@ -8,23 +8,18 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/tasuki"
+	"github.com/hirokazumiyaji/tasuki/backend"
+	"github.com/hirokazumiyaji/tasuki/backend/mysql"
 	"github.com/hirokazumiyaji/tasuki/backend/postgres"
 	"github.com/hirokazumiyaji/tasuki/workflow"
 )
 
 func main() {
-	dsn := os.Getenv("TASUKI_POSTGRES_DSN")
-	if dsn == "" {
-		panic("TASUKI_POSTGRES_DSN required")
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	b, err := postgres.New(ctx, dsn)
-	if err != nil {
-		panic(err)
-	}
-	defer b.Close()
+	b, closer := openBackend(ctx)
+	defer closer()
 
 	w := tasuki.NewWorker(b, tasuki.WorkerOptions{
 		PollInterval:  20 * time.Millisecond,
@@ -40,6 +35,31 @@ func main() {
 	_ = w.Shutdown(shutdownCtx)
 }
 
+func openBackend(ctx context.Context) (backend.Backend, func()) {
+	switch os.Getenv("TASUKI_BACKEND") {
+	case "mysql":
+		dsn := os.Getenv("TASUKI_MYSQL_DSN")
+		if dsn == "" {
+			panic("TASUKI_MYSQL_DSN required")
+		}
+		b, err := mysql.New(ctx, dsn)
+		if err != nil {
+			panic(err)
+		}
+		return b, func() { _ = b.Close() }
+	default:
+		dsn := os.Getenv("TASUKI_POSTGRES_DSN")
+		if dsn == "" {
+			panic("TASUKI_POSTGRES_DSN required")
+		}
+		b, err := postgres.New(ctx, dsn)
+		if err != nil {
+			panic(err)
+		}
+		return b, b.Close
+	}
+}
+
 func chaosWF(ctx *workflow.Context, n int) (int, error) {
 	a, err := workflow.Execute[int, int](ctx, "step", n)
 	if err != nil {
@@ -53,6 +73,5 @@ func chaosWF(ctx *workflow.Context, n int) (int, error) {
 }
 
 func step(ctx context.Context, n int) (int, error) {
-	time.Sleep(5 * time.Millisecond)
 	return n + 1, nil
 }
