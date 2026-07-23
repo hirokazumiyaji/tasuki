@@ -156,3 +156,23 @@ func TestMemory_MigrateNoop(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestMemory_ListInstances(t *testing.T) {
+	ctx := context.Background()
+	b := memory.New()
+	_ = b.CreateInstance(ctx, backend.NewInstance{ID: "a", Name: "WF", Queue: "default"})
+	_ = b.CreateInstance(ctx, backend.NewInstance{ID: "b", Name: "Other", Queue: "default"})
+	_ = b.TerminateInstance(ctx, "b")
+	all, err := b.ListInstances(ctx, backend.InstanceFilter{})
+	if err != nil || len(all) != 2 {
+		t.Fatalf("all: %v %#v", err, all)
+	}
+	term, err := b.ListInstances(ctx, backend.InstanceFilter{Status: "terminated"})
+	if err != nil || len(term) != 1 || term[0].ID != "b" {
+		t.Fatalf("terminated: %v %#v", err, term)
+	}
+	named, err := b.ListInstances(ctx, backend.InstanceFilter{Name: "WF"})
+	if err != nil || len(named) != 1 || named[0].ID != "a" {
+		t.Fatalf("name: %v %#v", err, named)
+	}
+}

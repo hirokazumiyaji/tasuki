@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -152,6 +153,44 @@ func (b *Backend) GetJournal(_ context.Context, id string, afterSeq int64) ([]jo
 		if e.Seq > afterSeq {
 			out = append(out, e)
 		}
+	}
+	return out, nil
+}
+
+func (b *Backend) ListInstances(_ context.Context, f backend.InstanceFilter) ([]backend.Instance, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	ids := make([]string, 0, len(b.instances))
+	for id, inst := range b.instances {
+		if f.Status != "" && inst.status != f.Status {
+			continue
+		}
+		if f.Name != "" && inst.name != f.Name {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if f.Offset >= len(ids) {
+		return nil, nil
+	}
+	ids = ids[f.Offset:]
+	if len(ids) > limit {
+		ids = ids[:limit]
+	}
+	out := make([]backend.Instance, 0, len(ids))
+	for _, id := range ids {
+		inst := b.instances[id]
+		out = append(out, backend.Instance{
+			ID: inst.id, Name: inst.name, Queue: inst.queue, Status: inst.status,
+			Input: append([]byte(nil), inst.input...), Result: append([]byte(nil), inst.result...),
+			Failure: append([]byte(nil), inst.failure...), NextSeq: inst.nextSeq,
+			ParentID: inst.parentID, ParentSeq: inst.parentSeq,
+		})
 	}
 	return out, nil
 }

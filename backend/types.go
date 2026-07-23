@@ -10,6 +10,14 @@ type Capabilities struct {
 	MaxAdvancementEffects int // 0 = unlimited
 }
 
+// InstanceFilter selects instances for ListInstances.
+type InstanceFilter struct {
+	Status string // empty = any
+	Name   string // empty = any
+	Limit  int    // 0 = default 100
+	Offset int
+}
+
 type NewInstance struct {
 	ID       string
 	Name     string
