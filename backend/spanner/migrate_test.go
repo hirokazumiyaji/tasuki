@@ -23,7 +23,7 @@ func dsnOrSkip(t *testing.T) string {
 func TestMigrateIdempotent(t *testing.T) {
 	dsn := dsnOrSkip(t)
 	ctx := context.Background()
-	if err := spanner.EnsureDatabase(ctx, dsn); err != nil {
+	if err := spanner.RecreateDatabase(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
 	b, err := spanner.New(ctx, dsn)

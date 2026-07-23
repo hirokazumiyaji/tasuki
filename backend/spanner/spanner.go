@@ -61,6 +61,28 @@ func EnsureDatabase(ctx context.Context, dsn string) error {
 	return ensureDatabase(ctx, project, inst, dbName)
 }
 
+// RecreateDatabase drops and recreates the database (emulator-friendly schema resets).
+func RecreateDatabase(ctx context.Context, dsn string) error {
+	project, inst, dbName, err := parseDSN(dsn)
+	if err != nil {
+		return err
+	}
+	if err := ensureInstance(ctx, project, inst); err != nil {
+		return err
+	}
+	admin, err := database.NewDatabaseAdminClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer admin.Close()
+	name := fmt.Sprintf("projects/%s/instances/%s/databases/%s", project, inst, dbName)
+	err = admin.DropDatabase(ctx, &databasepb.DropDatabaseRequest{Database: name})
+	if err != nil && status.Code(err) != codes.NotFound {
+		return fmt.Errorf("spanner drop database: %w", err)
+	}
+	return ensureDatabase(ctx, project, inst, dbName)
+}
+
 func parseDSN(dsn string) (project, instanceID, databaseID string, err error) {
 	m := dsnRE.FindStringSubmatch(dsn)
 	if m == nil {
