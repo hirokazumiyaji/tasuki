@@ -164,6 +164,10 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 	events := append(append([]journal.Event{}, state.Journal...), ingested...)
 
 	res := engine.RunAt(events, state.Now, func(wctx *workflow.Context) (any, error) {
+		wctx.SetInfo(workflow.WorkflowInfo{
+			InstanceID: state.Instance.ID,
+			Name:       state.Instance.Name,
+		})
 		out, err := wf.fn(wctx, state.Instance.Input)
 		if err != nil {
 			return nil, err
