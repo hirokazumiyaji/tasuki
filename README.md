@@ -9,8 +9,9 @@ Temporal のような「リトライ、タイマー、状態永続化を自分�
 
 ## ステータス
 
-M1（PostgreSQL バックエンドと実用最小）完了。適合テスト、カオステスト、クイックスタートが動く。
-次は M2（表現力: シグナル、子ワークフロー、Await など）へ進む。
+M2（表現力）完了。Async/Await、シグナル、子ワークフロー、SideEffect、GetVersion、Cancel、ContinueAsNew が使える。
+適合テスト（memory / postgres）、カオステスト、ドキュメント例テストが動く。
+次は M3（運用性: SQLite、cron、OTel、静的解析など）へ進む。
 
 ## クイックスタート
 
