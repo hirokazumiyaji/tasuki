@@ -98,6 +98,37 @@ func (b *Backend) GetJournal(ctx context.Context, id string, afterSeq int64) ([]
 	return out, rows.Err()
 }
 
+func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) ([]backend.Instance, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := b.pool.Query(ctx, `
+		SELECT id, name, queue, status, input, result, failure, next_seq,
+		       COALESCE(parent_id, ''), COALESCE(parent_seq, 0)
+		FROM wf_instances
+		WHERE ($1 = '' OR status = $1)
+		  AND ($2 = '' OR name = $2)
+		ORDER BY created_at, id
+		LIMIT $3 OFFSET $4`, f.Status, f.Name, limit, f.Offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []backend.Instance
+	for rows.Next() {
+		var inst backend.Instance
+		var input, result, failure []byte
+		if err := rows.Scan(&inst.ID, &inst.Name, &inst.Queue, &inst.Status, &input, &result, &failure,
+			&inst.NextSeq, &inst.ParentID, &inst.ParentSeq); err != nil {
+			return nil, err
+		}
+		inst.Input, inst.Result, inst.Failure = input, result, failure
+		out = append(out, inst)
+	}
+	return out, rows.Err()
+}
+
 func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {

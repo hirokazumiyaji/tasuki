@@ -15,6 +15,7 @@ type Backend interface {
 	CreateInstance(ctx context.Context, inst NewInstance) error
 	GetInstance(ctx context.Context, id string) (*Instance, error)
 	GetJournal(ctx context.Context, id string, afterSeq int64) ([]journal.Event, error)
+	ListInstances(ctx context.Context, f InstanceFilter) ([]Instance, error)
 	TerminateInstance(ctx context.Context, id string) error
 	SendToInbox(ctx context.Context, instanceID string, ev journal.Event) error
 

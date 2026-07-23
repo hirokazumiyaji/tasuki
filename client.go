@@ -70,6 +70,27 @@ func (c *Client) Get(ctx context.Context, id string) (*backend.Instance, error) 
 	return c.backend.GetInstance(ctx, id)
 }
 
+// GetJournal returns the full journal for an instance (seq > 0).
+func (c *Client) GetJournal(ctx context.Context, id string) ([]journal.Event, error) {
+	return c.backend.GetJournal(ctx, id, 0)
+}
+
+// InstanceFilter is re-exported for Client.List callers.
+type InstanceFilter = backend.InstanceFilter
+
+const (
+	StatusRunning    = "running"
+	StatusCompleted  = "completed"
+	StatusFailed     = "failed"
+	StatusTerminated = "terminated"
+	StatusCanceled   = "canceled"
+	StatusStuck      = "stuck"
+	StatusContinued  = "continued"
+)
+
+func (c *Client) List(ctx context.Context, f InstanceFilter) ([]backend.Instance, error) {
+	return c.backend.ListInstances(ctx, f)
+}
 
 func (c *Client) Signal(ctx context.Context, id, name string, payload any) error {
 	body, err := c.codec.Marshal(payload)
