@@ -9,11 +9,12 @@ Temporal のような「リトライ、タイマー、状態永続化を自分�
 
 ## ステータス
 
-M2（表現力）完了。Async/Await、シグナル、子ワークフロー、SideEffect、GetVersion、Cancel、ContinueAsNew が使える。
-適合テスト（memory / postgres）、カオステスト、ドキュメント例テストが動く。
-次は M3（運用性: SQLite、cron、OTel、静的解析など）へ進む。
+M3（運用性）完了。SQLite、cron スケジュール、List/GetJournal、観測性（slog/OTel）、決定性解析器が揃う。
+次は M4（MySQL / Spanner などバックエンド拡充）へ進む。
 
 ## クイックスタート
+
+PostgreSQL:
 
 ```bash
 docker compose up -d
@@ -21,15 +22,28 @@ export TASUKI_POSTGRES_DSN='postgres://tasuki:tasuki@localhost:5432/tasuki?sslmo
 go run ./examples/m1-postgres/
 ```
 
-期待出力: `inv-123`
+SQLite（追加インフラ不要）:
+
+```bash
+go run ./examples/m3-sqlite/
+```
+
+決定性解析:
+
+```bash
+go run ./analyzers/determinism/cmd/determinism -- ./...
+```
 
 テスト:
 
 ```bash
 go test ./... -race
 cd backend/postgres && go test ./...   # 要 TASUKI_POSTGRES_DSN
+cd backend/sqlite && go test ./...
 go test ./chaos/ -timeout 2m          # 要 TASUKI_POSTGRES_DSN
 ```
+
+観測性: [docs/05-observability.md](docs/05-observability.md)
 
 ## 設計ドキュメント
 
