@@ -7,7 +7,7 @@
 ## タスク
 
 - [x] Task 1: Spec + Plan
-- [ ] Task 2: Compose Local + scaffold + migrate
+- [x] Task 2: Compose Local + scaffold + migrate
 - [ ] Task 3: Capabilities clamp + Backend core
 - [ ] Task 4: Inbox / schedules / List
 - [ ] Task 5: Conformance

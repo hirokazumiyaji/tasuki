@@ -2,6 +2,7 @@ go 1.26.4
 
 use (
 	.
+	./backend/dynamodb
 	./backend/mysql
 	./backend/postgres
 	./backend/spanner

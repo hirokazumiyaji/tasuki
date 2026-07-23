@@ -44,3 +44,10 @@ services:
     ports:
       - "9010:9010"
       - "9020:9020"
+
+  # DynamoDB Local (in-memory shared DB on :8000).
+  dynamodb:
+    image: amazon/dynamodb-local:2.5.2
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "8000:8000"
