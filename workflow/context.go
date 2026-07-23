@@ -57,8 +57,13 @@ func WasSuspended(c *Context) bool { return c.suspended }
 
 func (c *Context) recordOrReplay(cmd journal.Command, payload []byte) journal.Event {
 	recordedCmds := c.recordedCommands()
-	if c.cmdIndex < len(recordedCmds) {
+	for c.cmdIndex < len(recordedCmds) {
 		rec := recordedCmds[c.cmdIndex]
+		// Old code skips version markers it does not understand.
+		if cmd.Type != journal.TypeVersionMarker && rec.Type == journal.TypeVersionMarker {
+			c.cmdIndex++
+			continue
+		}
 		c.cmdIndex++
 		if err := journal.MatchCommand(rec, cmd); err != nil {
 			raiseDeterminism(err)
@@ -161,4 +166,17 @@ func (c *Context) peekSignal(name string) (journal.Event, bool) {
 		return e, true
 	}
 	return journal.Event{}, false
+}
+
+func (c *Context) peekCommand() (journal.Event, bool) {
+	cmds := c.recordedCommands()
+	// skip already-handled index; also surface markers
+	if c.cmdIndex >= len(cmds) {
+		return journal.Event{}, false
+	}
+	return cmds[c.cmdIndex], true
+}
+
+func (c *Context) skipCommand() {
+	c.cmdIndex++
 }
