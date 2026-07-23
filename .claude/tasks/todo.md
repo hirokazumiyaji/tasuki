@@ -6,8 +6,8 @@
 
 ## タスク
 
-- [ ] Task 1: Spec + Plan
-- [ ] Task 2: Compose emulator + scaffold + migrate
+- [x] Task 1: Spec + Plan
+- [x] Task 2: Compose emulator + scaffold + migrate
 - [ ] Task 3: Backend core
 - [ ] Task 4: Inbox / schedules / List
 - [ ] Task 5: Conformance
@@ -19,3 +19,4 @@
 - Spec: `docs/superpowers/specs/2026-07-23-m4-spanner-design.md`
 - Plan: `docs/superpowers/plans/2026-07-23-m4-spanner.md`
 - 次マイルストーン候補: DynamoDB
+- Task/inbox IDs: client-assigned INT64（SEQUENCE は後で再検討可）

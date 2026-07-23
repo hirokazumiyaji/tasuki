@@ -4,5 +4,6 @@ use (
 	.
 	./backend/mysql
 	./backend/postgres
+	./backend/spanner
 	./backend/sqlite
 )

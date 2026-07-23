@@ -37,3 +37,10 @@ services:
       - --advertise-address=127.0.0.1
     ports:
       - "4000:4000"
+
+  # Cloud Spanner emulator (gRPC :9010, REST :9020).
+  spanner:
+    image: gcr.io/cloud-spanner-emulator/emulator:1.5.41
+    ports:
+      - "9010:9010"
+      - "9020:9020"
