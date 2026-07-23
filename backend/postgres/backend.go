@@ -397,6 +397,13 @@ func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement
 			return err
 		}
 		if parentID != "" {
+			// Serialize with concurrent parent CommitAdvancement / SendToInbox (I1).
+			var parentStatus string
+			err = tx.QueryRow(ctx, `SELECT status FROM wf_instances WHERE id = $1 FOR UPDATE`, parentID).
+				Scan(&parentStatus)
+			if err != nil {
+				return err
+			}
 			ev := *adv.ParentNotify
 			if ev.RefSeq == 0 {
 				ev.RefSeq = parentSeq
@@ -408,12 +415,14 @@ func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement
 			if err != nil {
 				return err
 			}
-			_, err = tx.Exec(ctx, `
-				INSERT INTO wf_tasks (kind, instance_id, queue)
-				SELECT 'workflow', $1, queue FROM wf_instances WHERE id = $1 AND status = 'running'
-				ON CONFLICT (instance_id) WHERE kind = 'workflow' DO NOTHING`, parentID)
-			if err != nil {
-				return err
+			if parentStatus == "running" {
+				_, err = tx.Exec(ctx, `
+					INSERT INTO wf_tasks (kind, instance_id, queue)
+					SELECT 'workflow', $1, queue FROM wf_instances WHERE id = $1 AND status = 'running'
+					ON CONFLICT (instance_id) WHERE kind = 'workflow' DO NOTHING`, parentID)
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -566,8 +575,10 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 		return err
 	}
 	defer tx.Rollback(ctx)
+	// Lock the instance row so this serialize with CommitAdvancement's next_seq CAS
+	// and cannot DO NOTHING against a task that the commit is about to delete (I1).
 	var status string
-	if err := tx.QueryRow(ctx, `SELECT status FROM wf_instances WHERE id = $1`, instanceID).Scan(&status); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT status FROM wf_instances WHERE id = $1 FOR UPDATE`, instanceID).Scan(&status); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return backend.ErrNotFound
 		}
