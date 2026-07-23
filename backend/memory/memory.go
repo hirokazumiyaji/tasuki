@@ -24,15 +24,17 @@ type Backend struct {
 }
 
 type instance struct {
-	id       string
-	name     string
-	queue    string
-	status   string
-	input    []byte
-	result   []byte
-	failure  []byte
-	nextSeq  int64
-	journal  []journal.Event
+	id        string
+	name      string
+	queue     string
+	status    string
+	input     []byte
+	result    []byte
+	failure   []byte
+	nextSeq   int64
+	journal   []journal.Event
+	parentID  string
+	parentSeq int64
 }
 
 type task struct {
@@ -111,13 +113,9 @@ func (b *Backend) CreateInstance(_ context.Context, inst backend.NewInstance) er
 		Payload: inst.Input,
 	}
 	b.instances[inst.ID] = &instance{
-		id:      inst.ID,
-		name:    inst.Name,
-		queue:   queue,
-		status:  "running",
-		input:   inst.Input,
-		nextSeq: 2,
-		journal: []journal.Event{ev},
+		id: inst.ID, name: inst.Name, queue: queue, status: "running",
+		input: inst.Input, nextSeq: 2, journal: []journal.Event{ev},
+		parentID: inst.ParentID, parentSeq: inst.ParentSeq,
 	}
 	b.enqueueWorkflowTaskLocked(inst.ID, queue)
 	return nil
@@ -138,7 +136,7 @@ func (b *Backend) GetInstance(_ context.Context, id string) (*backend.Instance, 
 		Input:   append([]byte(nil), inst.input...),
 		Result:  append([]byte(nil), inst.result...),
 		Failure: append([]byte(nil), inst.failure...),
-		NextSeq: inst.nextSeq,
+		NextSeq: inst.nextSeq, ParentID: inst.parentID, ParentSeq: inst.parentSeq,
 	}, nil
 }
 
@@ -235,7 +233,7 @@ func (b *Backend) LoadWorkflow(_ context.Context, instanceID string) (*backend.W
 			Input:   append([]byte(nil), inst.input...),
 			Result:  append([]byte(nil), inst.result...),
 			Failure: append([]byte(nil), inst.failure...),
-			NextSeq: inst.nextSeq,
+			NextSeq: inst.nextSeq, ParentID: inst.parentID, ParentSeq: inst.parentSeq,
 		},
 		Journal: journalCopy,
 		Inbox:   inbox,
@@ -363,6 +361,18 @@ func (b *Backend) CommitAdvancement(_ context.Context, adv backend.Advancement) 
 		inst.status = adv.Terminal.Status
 		inst.result = append([]byte(nil), adv.Terminal.Result...)
 		inst.failure = append([]byte(nil), adv.Terminal.Failure...)
+	}
+	for _, ch := range adv.Children {
+		if err := b.createInstanceLocked(ch); err != nil {
+			return err
+		}
+	}
+	if adv.ParentNotify != nil && inst.parentID != "" {
+		b.nextInbox++
+		b.inbox[inst.parentID] = append(b.inbox[inst.parentID], &inboxItem{id: b.nextInbox, event: *adv.ParentNotify})
+		if p, ok := b.instances[inst.parentID]; ok && p.status == "running" {
+			b.enqueueWorkflowTaskLocked(inst.parentID, p.queue)
+		}
 	}
 
 	delete(b.tasks, adv.TaskID)
@@ -519,5 +529,23 @@ func (b *Backend) SendToInbox(_ context.Context, instanceID string, ev journal.E
 	if inst.status == "running" {
 		b.enqueueWorkflowTaskLocked(instanceID, inst.queue)
 	}
+	return nil
+}
+
+func (b *Backend) createInstanceLocked(inst backend.NewInstance) error {
+	if _, ok := b.instances[inst.ID]; ok {
+		return backend.ErrAlreadyExists
+	}
+	queue := inst.Queue
+	if queue == "" {
+		queue = "default"
+	}
+	ev := journal.Event{Seq: 1, Type: journal.TypeWorkflowStarted, Name: inst.Name, Payload: inst.Input}
+	b.instances[inst.ID] = &instance{
+		id: inst.ID, name: inst.Name, queue: queue, status: "running",
+		input: inst.Input, nextSeq: 2, journal: []journal.Event{ev},
+		parentID: inst.ParentID, parentSeq: inst.ParentSeq,
+	}
+	b.enqueueWorkflowTaskLocked(inst.ID, queue)
 	return nil
 }

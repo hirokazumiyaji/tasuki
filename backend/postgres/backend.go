@@ -34,9 +34,9 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 	defer tx.Rollback(ctx)
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO wf_instances (id, name, queue, status, input, next_seq)
-		VALUES ($1, $2, $3, 'running', $4::jsonb, 2)`,
-		inst.ID, inst.Name, queue, jsonbOrNull(inst.Input))
+		INSERT INTO wf_instances (id, name, queue, status, input, next_seq, parent_id, parent_seq)
+		VALUES ($1, $2, $3, 'running', $4::jsonb, 2, NULLIF($5, ''), NULLIF($6, 0))`,
+		inst.ID, inst.Name, queue, jsonbOrNull(inst.Input), inst.ParentID, inst.ParentSeq)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return backend.ErrAlreadyExists
@@ -61,11 +61,11 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 
 func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance, error) {
 	row := b.pool.QueryRow(ctx, `
-		SELECT id, name, queue, status, input, result, failure, next_seq
+		SELECT id, name, queue, status, input, result, failure, next_seq, COALESCE(parent_id, ''), COALESCE(parent_seq, 0)
 		FROM wf_instances WHERE id = $1`, id)
 	var inst backend.Instance
 	var input, result, failure []byte
-	if err := row.Scan(&inst.ID, &inst.Name, &inst.Queue, &inst.Status, &input, &result, &failure, &inst.NextSeq); err != nil {
+	if err := row.Scan(&inst.ID, &inst.Name, &inst.Queue, &inst.Status, &input, &result, &failure, &inst.NextSeq, &inst.ParentID, &inst.ParentSeq); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, backend.ErrNotFound
 		}
@@ -206,10 +206,10 @@ func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend
 	var input, result, failure []byte
 	var now time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT id, name, queue, status, input, result, failure, next_seq, now()
+		SELECT id, name, queue, status, input, result, failure, next_seq, COALESCE(parent_id, ''), COALESCE(parent_seq, 0), now()
 		FROM wf_instances WHERE id = $1`, instanceID).Scan(
 		&st.Instance.ID, &st.Instance.Name, &st.Instance.Queue, &st.Instance.Status,
-		&input, &result, &failure, &st.NextSeq, &now)
+		&input, &result, &failure, &st.NextSeq, &st.Instance.ParentID, &st.Instance.ParentSeq, &now)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, backend.ErrNotFound
@@ -360,6 +360,61 @@ func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement
 		_, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE id = ANY($1)`, adv.DrainedInbox)
 		if err != nil {
 			return err
+		}
+	}
+	for _, ch := range adv.Children {
+		q := ch.Queue
+		if q == "" {
+			q = "default"
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO wf_instances (id, name, queue, status, input, next_seq, parent_id, parent_seq)
+			VALUES ($1, $2, $3, 'running', $4::jsonb, 2, $5, $6)`,
+			ch.ID, ch.Name, q, jsonbOrNull(ch.Input), ch.ParentID, ch.ParentSeq)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO wf_journal (instance_id, seq, type, name, payload)
+			VALUES ($1, 1, $2, $3, $4::jsonb)`,
+			ch.ID, string(journal.TypeWorkflowStarted), ch.Name, jsonbOrNull(ch.Input))
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO wf_tasks (kind, queue, instance_id, visible_at)
+			VALUES ('workflow', $1, $2, now())`, q, ch.ID)
+		if err != nil {
+			return err
+		}
+	}
+	if adv.ParentNotify != nil {
+		var parentID string
+		var parentSeq int64
+		err = tx.QueryRow(ctx, `SELECT COALESCE(parent_id,''), COALESCE(parent_seq,0) FROM wf_instances WHERE id = $1`, adv.InstanceID).
+			Scan(&parentID, &parentSeq)
+		if err != nil {
+			return err
+		}
+		if parentID != "" {
+			ev := *adv.ParentNotify
+			if ev.RefSeq == 0 {
+				ev.RefSeq = parentSeq
+			}
+			_, err = tx.Exec(ctx, `
+				INSERT INTO wf_inbox (instance_id, type, ref_seq, payload)
+				VALUES ($1, $2, $3, $4::jsonb)`,
+				parentID, string(ev.Type), ev.RefSeq, jsonbOrNull(ev.Payload))
+			if err != nil {
+				return err
+			}
+			_, err = tx.Exec(ctx, `
+				INSERT INTO wf_tasks (kind, instance_id, queue)
+				SELECT 'workflow', $1, queue FROM wf_instances WHERE id = $1 AND status = 'running'
+				ON CONFLICT (instance_id) WHERE kind = 'workflow' DO NOTHING`, parentID)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	_, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE id = $1`, adv.TaskID)
