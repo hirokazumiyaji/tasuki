@@ -1,26 +1,28 @@
-# tasuki M2 表現力
+# tasuki M3 運用性
 
 ## ゴール
 
-03-api.md の表現力 API（Async/Await、シグナル、子ワークフロー、SideEffect、GetVersion、Cancel、ContinueAsNew）を完成させ、適合テストとドキュメント例でグリーンにする。
+SQLite、cron スケジュール、観測性、決定性解析器、状態閲覧を揃え、M3 受入条件を自動テストでグリーンにする。
 
 ## タスク
 
-- [x] M2 実装プラン
-- [x] Task 1: Future + child event types
-- [x] Task 2: ExecuteAsync / Await
-- [x] Task 3: SideEffect / Now / Info
-- [x] Task 4: SendToInbox + Signal / Cancel
-- [x] Task 5: ReceiveSignal
-- [x] Task 6: GetVersion
-- [x] Task 7: Cancel compensation
-- [x] Task 8: Child workflows
-- [x] Task 9: ContinueAsNew
-- [x] Task 10: Conform + doctest
+- [ ] M3 実装プラン
+- [ ] Task 2: Client GetJournal + List
+- [ ] Task 3: Schedule types + memory
+- [ ] Task 4: Postgres schedules + worker poller
+- [ ] Task 5: SQLite scaffold
+- [ ] Task 6: SQLite backend + conform
+- [ ] Task 7: Observability
+- [ ] Task 8: Determinism analyzer
+- [ ] Task 9: Example + README
+
+## 注記
+
+- 全コミットに `[skip ci]` を付ける（Actions 枠不足のため）
 
 ## 受入条件
 
-- [x] ExecuteAsync / SleepAsync / Await / AwaitAll
-- [x] Signals / Child workflows / SideEffect / GetVersion / Cancel / ContinueAsNew
-- [x] 適合テスト（signal race、child notify、cancel compensation）が memory / postgres で通過
-- [x] 03-api OrderWorkflow スタイルのドキュメントテストがコンパイル・実行される
+- [ ] SQLite が適合テストを通過
+- [ ] スケジュール二重発火が ID 重複排除で無効化される
+- [ ] 解析器が time.Now / go / rand を検出
+- [ ] List / GetJournal / OTel 文書 / example
