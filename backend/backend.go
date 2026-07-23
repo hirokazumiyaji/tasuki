@@ -16,6 +16,7 @@ type Backend interface {
 	GetInstance(ctx context.Context, id string) (*Instance, error)
 	GetJournal(ctx context.Context, id string, afterSeq int64) ([]journal.Event, error)
 	TerminateInstance(ctx context.Context, id string) error
+	SendToInbox(ctx context.Context, instanceID string, ev journal.Event) error
 
 	ClaimTasks(ctx context.Context, req ClaimRequest) ([]Task, error)
 	ExtendLease(ctx context.Context, taskID int64, d time.Duration) error

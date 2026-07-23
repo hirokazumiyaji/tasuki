@@ -506,3 +506,18 @@ func toTask(t *task) backend.Task {
 		WorkerID:    t.workerID,
 	}
 }
+
+func (b *Backend) SendToInbox(_ context.Context, instanceID string, ev journal.Event) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	inst, ok := b.instances[instanceID]
+	if !ok {
+		return backend.ErrNotFound
+	}
+	b.nextInbox++
+	b.inbox[instanceID] = append(b.inbox[instanceID], &inboxItem{id: b.nextInbox, event: ev})
+	if inst.status == "running" {
+		b.enqueueWorkflowTaskLocked(instanceID, inst.queue)
+	}
+	return nil
+}
