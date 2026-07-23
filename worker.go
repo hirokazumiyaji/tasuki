@@ -3,6 +3,7 @@ package tasuki
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"time"
 
@@ -203,7 +204,13 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 	w.attachEffects(&adv, state.Instance.Queue, res.NewCommands)
 
 	termSeq := state.NextSeq + int64(len(adv.NewEvents))
-	if res.Err != nil {
+	if res.Err != nil && errors.Is(res.Err, workflow.ErrCanceled) {
+		adv.NewEvents = append(adv.NewEvents, journal.Event{
+			Seq:  termSeq,
+			Type: journal.TypeWorkflowCanceled,
+		})
+		adv.Terminal = &backend.TerminalUpdate{Status: "canceled"}
+	} else if res.Err != nil {
 		failPayload, _ := json.Marshal(res.Err.Error())
 		adv.NewEvents = append(adv.NewEvents, journal.Event{
 			Seq:     termSeq,
