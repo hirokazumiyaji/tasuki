@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -206,6 +207,22 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 	w.attachEffects(&adv, state.Instance.Queue, res.NewCommands)
 
 	termSeq := state.NextSeq + int64(len(adv.NewEvents))
+	if input, ok := workflow.AsContinueAsNew(res.Err); ok {
+		adv.NewEvents = append(adv.NewEvents, journal.Event{
+			Seq:     termSeq,
+			Type:    journal.TypeContinuedAsNew,
+			Payload: input,
+		})
+		adv.Terminal = &backend.TerminalUpdate{Status: "continued", Result: input}
+		adv.Children = append(adv.Children, backend.NewInstance{
+			ID:    fmt.Sprintf("%s~%d", state.Instance.ID, termSeq),
+			Name:  state.Instance.Name,
+			Queue: state.Instance.Queue,
+			Input: input,
+		})
+		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
+		return w.backend.CommitAdvancement(ctx, adv)
+	}
 	if res.Err != nil && errors.Is(res.Err, workflow.ErrCanceled) {
 		adv.NewEvents = append(adv.NewEvents, journal.Event{
 			Seq:  termSeq,
@@ -241,7 +258,6 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 			Result: resultBytes,
 		}
 	}
-	w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
 	w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
 	return w.backend.CommitAdvancement(ctx, adv)
 }
