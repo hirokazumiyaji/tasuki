@@ -258,7 +258,7 @@ func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend
 			return nil, err
 		}
 		item.Event.Type = journal.Type(typ)
-		item.Event.Payload = payload
+		item.Event.Name, item.Event.Payload = unwrapInboxPayload(payload)
 		st.Inbox = append(st.Inbox, item)
 	}
 	irows.Close()
@@ -504,6 +504,40 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	return n, nil
 }
 
+
+func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event) error {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM wf_instances WHERE id = $1`, instanceID).Scan(&status); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return backend.ErrNotFound
+		}
+		return err
+	}
+	payload := inboxPayload(ev)
+	_, err = tx.Exec(ctx, `
+		INSERT INTO wf_inbox (instance_id, type, ref_seq, payload)
+		VALUES ($1, $2, NULLIF($3, 0), $4::jsonb)`,
+		instanceID, string(ev.Type), ev.RefSeq, jsonbOrNull(payload))
+	if err != nil {
+		return err
+	}
+	if status == "running" {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO wf_tasks (kind, instance_id, queue)
+			SELECT 'workflow', $1, queue FROM wf_instances WHERE id = $1 AND status = 'running'
+			ON CONFLICT (instance_id) WHERE kind = 'workflow' DO NOTHING`, instanceID)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
 type activityPayload struct {
 	Name  string          `json:"name"`
 	Input json.RawMessage `json:"input"`
@@ -515,6 +549,28 @@ type retryJSON struct {
 	BackoffCoefficient float64 `json:"backoff_coefficient"`
 	MaxIntervalMs      int64   `json:"max_interval_ms"`
 	MaxAttempts        int     `json:"max_attempts"`
+}
+
+
+type inboxEnv struct {
+	Name string          `json:"_name,omitempty"`
+	Body json.RawMessage `json:"_body,omitempty"`
+}
+
+func inboxPayload(ev journal.Event) []byte {
+	if ev.Name == "" {
+		return ev.Payload
+	}
+	b, _ := json.Marshal(inboxEnv{Name: ev.Name, Body: ev.Payload})
+	return b
+}
+
+func unwrapInboxPayload(payload []byte) (string, []byte) {
+	var env inboxEnv
+	if err := json.Unmarshal(payload, &env); err == nil && env.Name != "" {
+		return env.Name, []byte(env.Body)
+	}
+	return "", payload
 }
 
 func jsonbOrNull(b []byte) any {

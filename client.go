@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/tasuki/backend"
+	"github.com/hirokazumiyaji/tasuki/journal"
 	"github.com/hirokazumiyaji/tasuki/codec"
 )
 
@@ -67,6 +68,25 @@ func Start[I any](ctx context.Context, c *Client, workflowName string, input I, 
 
 func (c *Client) Get(ctx context.Context, id string) (*backend.Instance, error) {
 	return c.backend.GetInstance(ctx, id)
+}
+
+
+func (c *Client) Signal(ctx context.Context, id, name string, payload any) error {
+	body, err := c.codec.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return c.backend.SendToInbox(ctx, id, journal.Event{
+		Type:    journal.TypeSignalReceived,
+		Name:    name,
+		Payload: body,
+	})
+}
+
+func (c *Client) Cancel(ctx context.Context, id string) error {
+	return c.backend.SendToInbox(ctx, id, journal.Event{
+		Type: journal.TypeCancelRequested,
+	})
 }
 
 func (c *Client) Terminate(ctx context.Context, id string) error {
