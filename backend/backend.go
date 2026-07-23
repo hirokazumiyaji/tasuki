@@ -27,4 +27,9 @@ type Backend interface {
 	CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error
 	RetryActivity(ctx context.Context, taskID int64, visibleAt time.Time) error
 	FireDueTimers(ctx context.Context, limit int) (int, error)
+
+	UpsertSchedule(ctx context.Context, s NewSchedule) error
+	GetSchedule(ctx context.Context, id string) (*Schedule, error)
+	PauseSchedule(ctx context.Context, id string, paused bool) error
+	ClaimDueSchedules(ctx context.Context, limit int) ([]DueSchedule, error)
 }

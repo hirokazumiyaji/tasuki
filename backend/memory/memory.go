@@ -22,6 +22,7 @@ type Backend struct {
 	tasks     map[int64]*task
 	timers    map[timerKey]*timer
 	inbox     map[string][]*inboxItem // instanceID → ordered
+	schedules map[string]*schedule
 }
 
 type instance struct {
@@ -76,6 +77,7 @@ func New() *Backend {
 		tasks:     map[int64]*task{},
 		timers:    map[timerKey]*timer{},
 		inbox:     map[string][]*inboxItem{},
+		schedules: map[string]*schedule{},
 	}
 }
 
