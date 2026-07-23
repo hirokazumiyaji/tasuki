@@ -80,3 +80,10 @@ func Run[I, O any](env *Env, fn func(*workflow.Context, I) (O, error), input I) 
 	}
 	return zero, fmt.Errorf("wftest timeout")
 }
+
+func (e *Env) Signal(name string, payload any) {
+	e.t.Helper()
+	if err := e.client.Signal(context.Background(), "wftest-"+e.t.Name(), name, payload); err != nil {
+		e.t.Fatal(err)
+	}
+}

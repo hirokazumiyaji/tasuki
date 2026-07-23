@@ -17,15 +17,17 @@ type Context struct {
 	completions map[int64]journal.Event
 	canceled    bool
 	suspended   bool
-	info        WorkflowInfo
+	info            WorkflowInfo
+	consumedSignals map[int64]bool
 }
 
 func NewContext(events []journal.Event, now time.Time) *Context {
 	ctx := &Context{
 		events:      events,
 		now:         now,
-		completions: map[int64]journal.Event{},
-		nextSeq:     1,
+		completions:     map[int64]journal.Event{},
+		nextSeq:         1,
+		consumedSignals: map[int64]bool{},
 	}
 	for _, e := range events {
 		if e.Type == journal.TypeWorkflowStarted {
@@ -132,4 +134,31 @@ func Sleep(ctx *Context, d time.Duration) error {
 
 type timerPayload struct {
 	FireAt time.Time `json:"fire_at"`
+}
+
+func (c *Context) takeSignal(name string) (journal.Event, bool) {
+	for _, e := range c.events {
+		if e.Type != journal.TypeSignalReceived || e.Name != name {
+			continue
+		}
+		if c.consumedSignals[e.Seq] {
+			continue
+		}
+		c.consumedSignals[e.Seq] = true
+		return e, true
+	}
+	return journal.Event{}, false
+}
+
+func (c *Context) peekSignal(name string) (journal.Event, bool) {
+	for _, e := range c.events {
+		if e.Type != journal.TypeSignalReceived || e.Name != name {
+			continue
+		}
+		if c.consumedSignals[e.Seq] {
+			continue
+		}
+		return e, true
+	}
+	return journal.Event{}, false
 }
