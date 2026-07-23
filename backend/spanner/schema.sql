@@ -9,8 +9,8 @@ CREATE TABLE wf_instances (
   parent_id STRING(255),
   parent_seq INT64,
   next_seq INT64 NOT NULL DEFAULT (1),
-  created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
-  updated_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+  created_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP NOT NULL,
   completed_at TIMESTAMP
 ) PRIMARY KEY (id);
 
@@ -23,7 +23,7 @@ CREATE TABLE wf_journal (
   name STRING(255) NOT NULL DEFAULT (''),
   ref_seq INT64,
   payload JSON,
-  recorded_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true)
+  recorded_at TIMESTAMP NOT NULL
 ) PRIMARY KEY (instance_id, seq);
 
 CREATE TABLE wf_inbox (
@@ -32,7 +32,7 @@ CREATE TABLE wf_inbox (
   type STRING(64) NOT NULL,
   ref_seq INT64,
   payload JSON,
-  created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true)
+  created_at TIMESTAMP NOT NULL
 ) PRIMARY KEY (id);
 
 CREATE INDEX wf_inbox_instance_idx ON wf_inbox(instance_id, id);
@@ -48,7 +48,7 @@ CREATE TABLE wf_tasks (
   max_attempts INT64,
   visible_at TIMESTAMP NOT NULL,
   worker_id STRING(255),
-  created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+  created_at TIMESTAMP NOT NULL,
   wf_singleton STRING(255) AS (IF(kind = 'workflow', instance_id, NULL)) STORED
 ) PRIMARY KEY (id);
 
@@ -72,8 +72,8 @@ CREATE TABLE wf_schedules (
   input JSON,
   next_run_at TIMESTAMP NOT NULL,
   paused BOOL NOT NULL DEFAULT (FALSE),
-  created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
-  updated_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true)
+  created_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP NOT NULL
 ) PRIMARY KEY (id);
 
 CREATE INDEX wf_schedules_due_idx ON wf_schedules(next_run_at, paused);

@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	cloud.google.com/go/spanner v1.93.0
+	github.com/hirokazumiyaji/tasuki v0.0.0
 	google.golang.org/api v0.290.0
 	google.golang.org/grpc v1.82.1
 )
@@ -32,6 +33,7 @@ require (
 	github.com/googleapis/enterprise-certificate-proxy v0.3.18 // indirect
 	github.com/googleapis/gax-go/v2 v2.23.0 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
+	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/spiffe/go-spiffe/v2 v2.6.0 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
@@ -55,3 +57,5 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
+
+replace github.com/hirokazumiyaji/tasuki => ../..
