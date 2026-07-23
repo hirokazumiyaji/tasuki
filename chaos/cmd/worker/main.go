@@ -11,6 +11,7 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/backend/mysql"
 	"github.com/hirokazumiyaji/tasuki/backend/postgres"
+	"github.com/hirokazumiyaji/tasuki/backend/spanner"
 	"github.com/hirokazumiyaji/tasuki/workflow"
 )
 
@@ -43,6 +44,16 @@ func openBackend(ctx context.Context) (backend.Backend, func()) {
 			panic("TASUKI_MYSQL_DSN required")
 		}
 		b, err := mysql.New(ctx, dsn)
+		if err != nil {
+			panic(err)
+		}
+		return b, func() { _ = b.Close() }
+	case "spanner":
+		dsn := os.Getenv("TASUKI_SPANNER_DSN")
+		if dsn == "" {
+			panic("TASUKI_SPANNER_DSN required")
+		}
+		b, err := spanner.New(ctx, dsn)
 		if err != nil {
 			panic(err)
 		}
