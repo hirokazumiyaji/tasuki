@@ -1,0 +1,551 @@
+package firestore
+
+import (
+	"context"
+	"encoding/json"
+	"sort"
+	"time"
+
+	gcf "cloud.google.com/go/firestore"
+	"github.com/hirokazumiyaji/tasuki/backend"
+	"github.com/hirokazumiyaji/tasuki/journal"
+	"google.golang.org/api/iterator"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+func (b *Backend) Capabilities() backend.Capabilities {
+	return backend.Capabilities{MaxAdvancementEffects: 400}
+}
+func (b *Backend) col(name string) *gcf.CollectionRef  { return b.client.Collection(name) }
+func (b *Backend) ref(col, id string) *gcf.DocumentRef { return b.col(col).Doc(id) }
+
+func instanceDoc(inst backend.NewInstance, queue string, now time.Time) map[string]any {
+	m := map[string]any{"id": inst.ID, "name": inst.Name, "queue": queue, "status": "running", "input": jsonString(inst.Input), "next_seq": int64(2), "created_at": now, "updated_at": now}
+	if inst.ParentID != "" {
+		m["parent_id"] = inst.ParentID
+	}
+	if inst.ParentSeq != 0 {
+		m["parent_seq"] = inst.ParentSeq
+	}
+	return m
+}
+func workflowTaskDoc(id, queue string, taskID int64, now time.Time) map[string]any {
+	return map[string]any{"id": taskID, "kind": "workflow", "queue": queue, "instance_id": id, "attempt": int64(0), "visible_at": now, "created_at": now}
+}
+func journalDoc(id string, seq int64, ev journal.Event, now time.Time) map[string]any {
+	return map[string]any{"instance_id": id, "seq": seq, "type": string(ev.Type), "name": ev.Name, "ref_seq": ev.RefSeq, "payload": jsonString(ev.Payload), "recorded_at": now}
+}
+func activityTaskDoc(t backend.NewTask, id int64, now time.Time) map[string]any {
+	q := t.Queue
+	if q == "" {
+		q = "default"
+	}
+	p, _ := json.Marshal(activityPayload{Name: t.Name, Input: t.Input, Retry: retryJSON{InitialIntervalMs: t.Retry.InitialInterval.Milliseconds(), BackoffCoefficient: t.Retry.BackoffCoefficient, MaxIntervalMs: t.Retry.MaxInterval.Milliseconds(), MaxAttempts: t.MaxAttempts}})
+	return map[string]any{"id": id, "kind": "activity", "queue": q, "instance_id": t.InstanceID, "ref_seq": t.Seq, "payload": string(p), "attempt": int64(0), "max_attempts": int64(t.MaxAttempts), "visible_at": now, "created_at": now}
+}
+func inboxDoc(instanceID string, id int64, ev journal.Event, now time.Time) map[string]any {
+	return map[string]any{"instance_id": instanceID, "id": id, "type": string(ev.Type), "ref_seq": ev.RefSeq, "payload": inboxPayload(ev), "created_at": now}
+}
+
+func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
+	q := inst.Queue
+	if q == "" {
+		q = "default"
+	}
+	now := nowUTC()
+	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		r := b.ref("wf_instances", inst.ID)
+		s, err := tx.Get(r)
+		if err != nil && !isNotFound(err) {
+			return err
+		}
+		if err == nil && s.Exists() {
+			return backend.ErrAlreadyExists
+		}
+		if err := tx.Create(r, instanceDoc(inst, q, now)); err != nil {
+			return err
+		}
+		if err := tx.Create(b.ref("wf_journal", journalID(inst.ID, 1)), journalDoc(inst.ID, 1, journal.Event{Type: journal.TypeWorkflowStarted, Name: inst.Name, Payload: inst.Input}, now)); err != nil {
+			return err
+		}
+		return tx.Create(b.ref("wf_tasks", wfTaskID(inst.ID)), workflowTaskDoc(inst.ID, q, newID(), now))
+	})
+}
+func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance, error) {
+	s, err := b.ref("wf_instances", id).Get(ctx)
+	if isNotFound(err) {
+		return nil, backend.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !s.Exists() {
+		return nil, backend.ErrNotFound
+	}
+	return decodeInstance(s.Data()), nil
+}
+func (b *Backend) GetJournal(ctx context.Context, id string, after int64) ([]journal.Event, error) {
+	it := b.col("wf_journal").Where("instance_id", "==", id).Where("seq", ">", after).OrderBy("seq", gcf.Asc).Documents(ctx)
+	defer it.Stop()
+	var out []journal.Event
+	for {
+		s, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		m := s.Data()
+		out = append(out, journal.Event{Seq: i64(m, "seq"), Type: journal.Type(str(m, "type")), Name: str(m, "name"), RefSeq: i64(m, "ref_seq"), Payload: bytes(m, "payload")})
+	}
+	return out, nil
+}
+func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) ([]backend.Instance, error) {
+	it := b.col("wf_instances").Documents(ctx)
+	defer it.Stop()
+	var all []backend.Instance
+	for {
+		s, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		x := decodeInstance(s.Data())
+		if (f.Status == "" || x.Status == f.Status) && (f.Name == "" || x.Name == f.Name) {
+			all = append(all, *x)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
+	if f.Offset >= len(all) {
+		return nil, nil
+	}
+	all = all[f.Offset:]
+	n := f.Limit
+	if n <= 0 {
+		n = 100
+	}
+	if len(all) > n {
+		all = all[:n]
+	}
+	return all, nil
+}
+func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
+	now := nowUTC()
+	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		s, err := tx.Get(b.ref("wf_instances", id))
+		if isNotFound(err) {
+			return backend.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if !s.Exists() {
+			return backend.ErrNotFound
+		}
+		if err = tx.Update(b.ref("wf_instances", id), []gcf.Update{{Path: "status", Value: "terminated"}, {Path: "updated_at", Value: now}, {Path: "completed_at", Value: now}}); err != nil {
+			return err
+		}
+		for _, col := range []string{"wf_tasks", "wf_timers"} {
+			it := b.col(col).Where("instance_id", "==", id).Documents(ctx)
+			for {
+				d, e := it.Next()
+				if e == iterator.Done {
+					break
+				}
+				if e != nil {
+					it.Stop()
+					return e
+				}
+				if e = tx.Delete(d.Ref); e != nil {
+					it.Stop()
+					return e
+				}
+			}
+			it.Stop()
+		}
+		return nil
+	})
+}
+
+func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
+	if req.Limit <= 0 {
+		req.Limit = 1
+	}
+	if len(req.Queues) == 0 {
+		return nil, nil
+	}
+	now := nowUTC()
+	var out []backend.Task
+	for _, q := range req.Queues {
+		if len(out) >= req.Limit {
+			break
+		}
+		it := b.col("wf_tasks").Where("kind", "==", req.Kind).Where("queue", "==", q).Where("visible_at", "<=", now).OrderBy("visible_at", gcf.Asc).Limit(req.Limit - len(out)).Documents(ctx)
+		for {
+			d, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				it.Stop()
+				return nil, err
+			}
+			old := timestamp(d.Data(), "visible_at")
+			var claimed backend.Task
+			err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+				s, e := tx.Get(d.Ref)
+				if isNotFound(e) {
+					return backend.ErrConflict
+				}
+				if e != nil {
+					return e
+				}
+				if !s.Exists() || !timestamp(s.Data(), "visible_at").Equal(old) {
+					return backend.ErrConflict
+				}
+				m := s.Data()
+				claimed = decodeTask(m)
+				claimed.Attempt++
+				claimed.VisibleAt = now.Add(req.Lease)
+				claimed.WorkerID = req.WorkerID
+				return tx.Update(d.Ref, []gcf.Update{{Path: "visible_at", Value: claimed.VisibleAt}, {Path: "worker_id", Value: req.WorkerID}, {Path: "attempt", Value: int64(claimed.Attempt)}})
+			})
+			if err == backend.ErrConflict {
+				continue
+			}
+			if err != nil {
+				it.Stop()
+				return nil, err
+			}
+			out = append(out, claimed)
+		}
+		it.Stop()
+	}
+	return out, nil
+}
+func (b *Backend) updateTask(ctx context.Context, id int64, activity bool, fields []gcf.Update) error {
+	r := b.ref("wf_tasks", actTaskID(id))
+	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		s, e := tx.Get(r)
+		if isNotFound(e) {
+			return backend.ErrNotFound
+		}
+		if e != nil {
+			return e
+		}
+		if !s.Exists() || (activity && str(s.Data(), "kind") != "activity") {
+			return backend.ErrNotFound
+		}
+		return tx.Update(r, fields)
+	})
+}
+func (b *Backend) ExtendLease(ctx context.Context, id int64, d time.Duration) error {
+	return b.updateTask(ctx, id, false, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
+}
+func (b *Backend) ReleaseLease(ctx context.Context, id int64) error {
+	return b.updateTask(ctx, id, false, []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}})
+}
+func (b *Backend) RetryActivity(ctx context.Context, id int64, at time.Time) error {
+	return b.updateTask(ctx, id, true, []gcf.Update{{Path: "visible_at", Value: at.UTC()}, {Path: "worker_id", Value: gcf.Delete}})
+}
+func (b *Backend) LoadWorkflow(ctx context.Context, id string) (*backend.WorkflowState, error) {
+	inst, err := b.GetInstance(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	j, err := b.GetJournal(ctx, id, 0)
+	if err != nil {
+		return nil, err
+	}
+	st := &backend.WorkflowState{Instance: *inst, Journal: j, NextSeq: inst.NextSeq, Now: nowUTC()}
+	it := b.col("wf_inbox").Where("instance_id", "==", id).OrderBy("id", gcf.Asc).Documents(ctx)
+	defer it.Stop()
+	for {
+		d, e := it.Next()
+		if e == iterator.Done {
+			break
+		}
+		if e != nil {
+			return nil, e
+		}
+		m := d.Data()
+		name, p := unwrapInboxPayload(bytes(m, "payload"))
+		st.Inbox = append(st.Inbox, backend.InboxEvent{ID: i64(m, "id"), Event: journal.Event{Type: journal.Type(str(m, "type")), Name: name, RefSeq: i64(m, "ref_seq"), Payload: p}})
+	}
+	return st, nil
+}
+
+func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {
+	now := nowUTC()
+	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		instSnap, err := tx.Get(b.ref("wf_instances", adv.InstanceID))
+		if isNotFound(err) {
+			return backend.ErrConflict
+		}
+		if err != nil {
+			return err
+		}
+		if !instSnap.Exists() || i64(instSnap.Data(), "next_seq") != adv.ExpectedSeq {
+			return backend.ErrConflict
+		}
+		taskRef := b.ref("wf_tasks", wfTaskID(adv.InstanceID))
+		taskSnap, err := tx.Get(taskRef)
+		if isNotFound(err) {
+			return backend.ErrConflict
+		}
+		if err != nil {
+			return err
+		}
+		if !taskSnap.Exists() || i64(taskSnap.Data(), "id") != adv.TaskID {
+			return backend.ErrConflict
+		}
+		inst := decodeInstance(instSnap.Data())
+		drained := make(map[int64]struct{}, len(adv.DrainedInbox))
+		for _, id := range adv.DrainedInbox {
+			drained[id] = struct{}{}
+		}
+		hasInbox := false
+		inboxIter := tx.Documents(b.col("wf_inbox").Where("instance_id", "==", adv.InstanceID))
+		for {
+			inbox, nextErr := inboxIter.Next()
+			if nextErr == iterator.Done {
+				break
+			}
+			if nextErr != nil {
+				inboxIter.Stop()
+				return nextErr
+			}
+			if _, ok := drained[i64(inbox.Data(), "id")]; !ok {
+				hasInbox = true
+			}
+		}
+		inboxIter.Stop()
+		next := adv.ExpectedSeq
+		for _, e := range adv.NewEvents {
+			if e.Seq >= next {
+				next = e.Seq + 1
+			}
+		}
+		updates := []gcf.Update{{Path: "next_seq", Value: next}, {Path: "updated_at", Value: now}}
+		if adv.Terminal != nil {
+			updates = append(updates, gcf.Update{Path: "status", Value: adv.Terminal.Status}, gcf.Update{Path: "result", Value: jsonString(adv.Terminal.Result)}, gcf.Update{Path: "failure", Value: jsonString(adv.Terminal.Failure)}, gcf.Update{Path: "completed_at", Value: now})
+		}
+		if err = tx.Update(instSnap.Ref, updates); err != nil {
+			return err
+		}
+		for _, e := range adv.NewEvents {
+			if err = tx.Create(b.ref("wf_journal", journalID(adv.InstanceID, e.Seq)), journalDoc(adv.InstanceID, e.Seq, e, now)); err != nil {
+				return err
+			}
+		}
+		for _, at := range adv.ActivityTasks {
+			id := newID()
+			if err = tx.Create(b.ref("wf_tasks", actTaskID(id)), activityTaskDoc(at, id, now)); err != nil {
+				return err
+			}
+		}
+		for _, tm := range adv.Timers {
+			if err = tx.Create(b.ref("wf_timers", journalID(adv.InstanceID, tm.Seq)), map[string]any{"instance_id": adv.InstanceID, "seq": tm.Seq, "fire_at": tm.FireAt.UTC(), "created_at": now}); err != nil {
+				return err
+			}
+		}
+		for _, id := range adv.DrainedInbox {
+			if err = tx.Delete(b.ref("wf_inbox", inboxID(adv.InstanceID, id))); err != nil {
+				return err
+			}
+		}
+		for _, ch := range adv.Children {
+			q := ch.Queue
+			if q == "" {
+				q = "default"
+			}
+			if err = tx.Create(b.ref("wf_instances", ch.ID), instanceDoc(ch, q, now)); err != nil {
+				return err
+			}
+			if err = tx.Create(b.ref("wf_journal", journalID(ch.ID, 1)), journalDoc(ch.ID, 1, journal.Event{Type: journal.TypeWorkflowStarted, Name: ch.Name, Payload: ch.Input}, now)); err != nil {
+				return err
+			}
+			if err = tx.Create(b.ref("wf_tasks", wfTaskID(ch.ID)), workflowTaskDoc(ch.ID, q, newID(), now)); err != nil {
+				return err
+			}
+		}
+		if adv.ParentNotify != nil && inst.ParentID != "" {
+			ev := *adv.ParentNotify
+			if ev.RefSeq == 0 {
+				ev.RefSeq = inst.ParentSeq
+			}
+			id := newID()
+			if err = tx.Create(b.ref("wf_inbox", inboxID(inst.ParentID, id)), inboxDoc(inst.ParentID, id, ev, now)); err != nil {
+				return err
+			}
+		}
+		if hasInbox && adv.Terminal == nil {
+			return tx.Set(taskRef, workflowTaskDoc(adv.InstanceID, inst.Queue, newID(), now))
+		}
+		return tx.Delete(taskRef)
+	})
+	if err != nil {
+		if err == backend.ErrConflict {
+			return err
+		}
+		return err
+	}
+	if adv.ParentNotify != nil {
+		inst, _ := b.GetInstance(ctx, adv.InstanceID)
+		if inst != nil && inst.ParentID != "" {
+			if err := b.ensureWorkflowTask(ctx, inst.ParentID); err != nil {
+				return err
+			}
+		}
+	}
+	return b.ensureWorkflowTask(ctx, adv.InstanceID)
+}
+
+func (b *Backend) ensureWorkflowTask(ctx context.Context, instanceID string) error {
+	inst, err := b.GetInstance(ctx, instanceID)
+	if err == backend.ErrNotFound || inst.Status != "running" {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	it := b.col("wf_inbox").Where("instance_id", "==", instanceID).Limit(1).Documents(ctx)
+	_, err = it.Next()
+	it.Stop()
+	if err == iterator.Done {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, err = b.ref("wf_tasks", wfTaskID(instanceID)).Create(ctx, workflowTaskDoc(instanceID, inst.Queue, newID(), nowUTC()))
+	if status.Code(err) == codes.AlreadyExists {
+		return nil
+	}
+	return err
+}
+
+func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+	now := nowUTC()
+	var instanceID string
+	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		r := b.ref("wf_tasks", actTaskID(taskID))
+		task, err := tx.Get(r)
+		if isNotFound(err) {
+			return backend.ErrSuperseded
+		}
+		if err != nil {
+			return err
+		}
+		if !task.Exists() || str(task.Data(), "kind") != "activity" {
+			return backend.ErrSuperseded
+		}
+		m := task.Data()
+		instanceID = str(m, "instance_id")
+		inst, err := tx.Get(b.ref("wf_instances", instanceID))
+		if isNotFound(err) {
+			return backend.ErrSuperseded
+		}
+		if err != nil {
+			return err
+		}
+		if !inst.Exists() {
+			return backend.ErrSuperseded
+		}
+		if err = tx.Delete(r); err != nil {
+			return err
+		}
+		if str(inst.Data(), "status") != "running" {
+			return nil
+		}
+		if ev.RefSeq == 0 {
+			ev.RefSeq = i64(m, "ref_seq")
+		}
+		id := newID()
+		return tx.Create(b.ref("wf_inbox", inboxID(instanceID, id)), inboxDoc(instanceID, id, ev, now))
+	})
+	if err != nil {
+		return err
+	}
+	return b.ensureWorkflowTask(ctx, instanceID)
+}
+func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event) error {
+	inst, err := b.GetInstance(ctx, instanceID)
+	if err != nil {
+		return err
+	}
+	id := newID()
+	if _, err = b.ref("wf_inbox", inboxID(instanceID, id)).Create(ctx, inboxDoc(instanceID, id, ev, nowUTC())); err != nil {
+		return err
+	}
+	if inst.Status == "running" {
+		return b.ensureWorkflowTask(ctx, instanceID)
+	}
+	return nil
+}
+func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	it := b.col("wf_timers").Where("fire_at", "<=", nowUTC()).OrderBy("fire_at", gcf.Asc).Limit(limit).Documents(ctx)
+	defer it.Stop()
+	n := 0
+	for {
+		d, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return n, err
+		}
+		m := d.Data()
+		id := str(m, "instance_id")
+		seq := i64(m, "seq")
+		claimed := false
+		err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+			s, e := tx.Get(d.Ref)
+			if isNotFound(e) {
+				return backend.ErrConflict
+			}
+			if e != nil {
+				return e
+			}
+			if !s.Exists() {
+				return backend.ErrConflict
+			}
+			inst, e := tx.Get(b.ref("wf_instances", id))
+			if isNotFound(e) {
+				return tx.Delete(d.Ref)
+			}
+			if e != nil {
+				return e
+			}
+			if e = tx.Delete(d.Ref); e != nil {
+				return e
+			}
+			if inst.Exists() && str(inst.Data(), "status") == "running" {
+				inbox := newID()
+				return tx.Create(b.ref("wf_inbox", inboxID(id, inbox)), inboxDoc(id, inbox, journal.Event{Type: journal.TypeTimerFired, RefSeq: seq}, nowUTC()))
+			}
+			return nil
+		})
+		if err == backend.ErrConflict {
+			continue
+		}
+		if err != nil {
+			return n, err
+		}
+		claimed = true
+		if claimed {
+			n++
+			if err = b.ensureWorkflowTask(ctx, id); err != nil {
+				return n, err
+			}
+		}
+	}
+	return n, nil
+}
