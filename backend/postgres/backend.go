@@ -302,12 +302,39 @@ func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend
 }
 
 func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {
+	return b.CommitAdvancements(ctx, []backend.Advancement{adv})
+}
+
+func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
+	if len(advs) == 0 {
+		return nil
+	}
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 
+	var terminals []string
+	for _, adv := range advs {
+		if err := b.applyAdvancement(ctx, tx, adv); err != nil {
+			return err
+		}
+		if adv.Terminal != nil {
+			terminals = append(terminals, adv.InstanceID)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	b.notifyTasks(ctx)
+	for _, id := range terminals {
+		b.notifyTerminal(ctx, id)
+	}
+	return nil
+}
+
+func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.Advancement) error {
 	newSeq := adv.ExpectedSeq
 	for _, ev := range adv.NewEvents {
 		if ev.Seq+1 > newSeq {
@@ -469,13 +496,6 @@ func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement
 		ON CONFLICT (instance_id) WHERE kind = 'workflow' DO NOTHING`, adv.InstanceID)
 	if err != nil {
 		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	b.notifyTasks(ctx)
-	if adv.Terminal != nil {
-		b.notifyTerminal(ctx, adv.InstanceID)
 	}
 	return nil
 }

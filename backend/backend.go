@@ -35,3 +35,9 @@ type Backend interface {
 	PauseSchedule(ctx context.Context, id string, paused bool) error
 	ClaimDueSchedules(ctx context.Context, limit int) ([]DueSchedule, error)
 }
+
+// AdvancementBatcher optionally commits many workflow advancements in one round-trip.
+// When unimplemented, workers fall back to looping CommitAdvancement.
+type AdvancementBatcher interface {
+	CommitAdvancements(ctx context.Context, advs []Advancement) error
+}
