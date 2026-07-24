@@ -1,11 +1,10 @@
-# tasuki M5 Contrib UI CLI sqlite+mysql
+# tasuki M5 Contrib UI CLI cloud backends
 
 ## タスク
 
-- [x] Task 1: Spec + Plan
-- [x] Task 2: openBackend + tests + README
+- [ ] Task 1: Spec + Plan
+- [ ] Task 2: Implement spanner/dynamodb/firestore
 
 ## 注記
 
-- Spec: docs/superpowers/specs/2026-07-25-m5-contrib-ui-cli-sqlite-mysql-design.md
-- Plan: docs/superpowers/plans/2026-07-25-m5-contrib-ui-cli-sqlite-mysql.md
+- Spec: docs/superpowers/specs/2026-07-25-m5-contrib-ui-cli-cloud-design.md
