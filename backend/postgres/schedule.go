@@ -166,5 +166,11 @@ func (b *Backend) ClaimDueSchedules(ctx context.Context, limit int) ([]backend.D
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	for _, d := range out {
+		if d.Created {
+			b.notifyTasks(ctx)
+			break
+		}
+	}
 	return out, nil
 }
