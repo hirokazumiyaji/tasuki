@@ -9,14 +9,15 @@ import (
 )
 
 type WorkerOptions struct {
-	Queues        []string
-	PollInterval  time.Duration
-	LeaseDuration time.Duration
-	ClaimLimit    int
-	WorkerID      string
-	Codec         codec.Codec
-	Logger        *slog.Logger
-	Metrics       *observability.Metrics
+	Queues               []string
+	PollInterval         time.Duration
+	LeaseDuration        time.Duration
+	ClaimLimit           int
+	ActivityConcurrency  int
+	WorkerID             string
+	Codec                codec.Codec
+	Logger               *slog.Logger
+	Metrics              *observability.Metrics
 }
 
 func (o WorkerOptions) withDefaults() WorkerOptions {
@@ -31,6 +32,9 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 	}
 	if o.ClaimLimit <= 0 {
 		o.ClaimLimit = 10
+	}
+	if o.ActivityConcurrency <= 0 {
+		o.ActivityConcurrency = 1
 	}
 	if o.WorkerID == "" {
 		o.WorkerID = "worker"
