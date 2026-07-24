@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} — instances</title>
+<style>
+:root { --fg:#1a1a1a; --muted:#555; --line:#ddd; --bg:#fafafa; --accent:#0b5fff; }
+* { box-sizing: border-box; }
+body { margin:0; font-family: ui-sans-serif, system-ui, sans-serif; color:var(--fg); background:var(--bg); line-height:1.45; }
+header { padding:1.25rem 1.5rem; border-bottom:1px solid var(--line); background:#fff; }
+header a { color:inherit; text-decoration:none; font-weight:700; font-size:1.35rem; letter-spacing:-0.02em; }
+main { padding:1.5rem; max-width:1100px; margin:0 auto; }
+h1 { font-size:1.1rem; font-weight:600; margin:0 0 1rem; }
+table { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); }
+th, td { text-align:left; padding:0.55rem 0.75rem; border-bottom:1px solid var(--line); font-size:0.92rem; }
+th { color:var(--muted); font-weight:600; }
+a.row { color:var(--accent); }
+form.filter { display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:1rem; align-items:end; }
+label { display:flex; flex-direction:column; gap:0.2rem; font-size:0.8rem; color:var(--muted); }
+input { padding:0.4rem 0.5rem; border:1px solid var(--line); border-radius:4px; min-width:10rem; }
+button { padding:0.45rem 0.8rem; border:1px solid var(--line); background:#fff; border-radius:4px; cursor:pointer; }
+.error { color:#a40000; margin-bottom:1rem; }
+.empty { color:var(--muted); }
+</style>
+</head>
+<body>
+<header><a href="/">tasuki</a></header>
+<main>
+<h1>Instances</h1>
+{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+<form class="filter" method="get" action="/">
+  <label>status <input name="status" value="{{.Status}}" placeholder="running"></label>
+  <label>name <input name="name" value="{{.Name}}" placeholder="workflow name"></label>
+  <button type="submit">Filter</button>
+</form>
+{{if .Rows}}
+<table>
+<thead><tr><th>ID</th><th>Name</th><th>Queue</th><th>Status</th></tr></thead>
+<tbody>
+{{range .Rows}}
+<tr>
+  <td><a class="row" href="/instances/{{.ID}}">{{.ID}}</a></td>
+  <td>{{.Name}}</td>
+  <td>{{.Queue}}</td>
+  <td>{{.Status}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p class="empty">No instances.</p>
+{{end}}
+</main>
+</body>
+</html>
