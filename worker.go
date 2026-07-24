@@ -101,12 +101,32 @@ func (w *Worker) loop(ctx context.Context) {
 	defer close(w.done)
 	ticker := time.NewTicker(w.opts.PollInterval)
 	defer ticker.Stop()
+
+	var wake <-chan struct{}
+	if n, ok := w.backend.(backend.TaskNotifier); ok {
+		ch, err := n.Subscribe(ctx)
+		if err != nil {
+			w.opts.Logger.Warn("task notify subscribe failed", "err", err)
+		} else {
+			wake = ch
+		}
+	}
+
 	for {
 		w.tick(ctx)
+		if wake == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		case <-wake:
 		}
 	}
 }
