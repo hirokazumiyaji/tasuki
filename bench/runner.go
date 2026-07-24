@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,6 +53,7 @@ func Run(ctx context.Context, b backend.Backend, backendName string, cfg Config)
 			PollInterval:  cfg.Poll,
 			LeaseDuration: cfg.Lease,
 			WorkerID:      fmt.Sprintf("bench-w-%d", i),
+			Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 		})
 		Register(w)
 		w.Start(ctx)
