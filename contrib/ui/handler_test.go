@@ -13,6 +13,7 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
 	"github.com/hirokazumiyaji/tasuki/contrib/ui"
+	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
 func TestHandler_ListAndDetail(t *testing.T) {
@@ -119,6 +120,74 @@ func TestHandler_Terminate(t *testing.T) {
 	if strings.Contains(dr2.Body.String(), "Terminate") {
 		t.Fatal("form should be hidden after terminate")
 	}
+}
+
+func TestHandler_Signal(t *testing.T) {
+	b := memory.New()
+	c := tasuki.NewClient(b)
+	ctx := context.Background()
+	if err := b.CreateInstance(ctx, backend.NewInstance{
+		ID: "sig-ui", Name: "demo", Queue: "default", Input: []byte(`{}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := ui.NewHandler(c)
+
+	dr := httptest.NewRecorder()
+	h.ServeHTTP(dr, httptest.NewRequest(http.MethodGet, "/instances/sig-ui", nil))
+	body := dr.Body.String()
+	if !strings.Contains(body, `action="/instances/sig-ui/signal"`) {
+		t.Fatalf("missing signal form: %s", body)
+	}
+	csrf := extractInputValue(t, body, "csrf")
+
+	bad := formPost("/instances/sig-ui/signal", "csrf=bad&name=ping&payload={}")
+	br := httptest.NewRecorder()
+	h.ServeHTTP(br, bad)
+	if br.Code != http.StatusForbidden {
+		t.Fatalf("want 403 got %d", br.Code)
+	}
+
+	emptyName := formPost("/instances/sig-ui/signal", "csrf="+url.QueryEscape(csrf)+"&name=&payload={}")
+	er := httptest.NewRecorder()
+	h.ServeHTTP(er, emptyName)
+	if er.Code != http.StatusBadRequest {
+		t.Fatalf("empty name want 400 got %d", er.Code)
+	}
+
+	badJSON := formPost("/instances/sig-ui/signal", "csrf="+url.QueryEscape(csrf)+"&name=ping&payload={")
+	jr := httptest.NewRecorder()
+	h.ServeHTTP(jr, badJSON)
+	if jr.Code != http.StatusBadRequest {
+		t.Fatalf("bad json want 400 got %d", jr.Code)
+	}
+
+	ok := formPost("/instances/sig-ui/signal", "csrf="+url.QueryEscape(csrf)+"&name=ping&payload="+url.QueryEscape(`{"ok":true}`))
+	or := httptest.NewRecorder()
+	h.ServeHTTP(or, ok)
+	if or.Code != http.StatusSeeOther {
+		t.Fatalf("want 303 got %d body=%s", or.Code, or.Body.String())
+	}
+	head, err := b.LoadWorkflowHead(ctx, "sig-ui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, in := range head.Inbox {
+		if in.Event.Type == journal.TypeSignalReceived && in.Event.Name == "ping" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("inbox missing signal: %+v", head.Inbox)
+	}
+}
+
+func formPost(path, body string) *http.Request {
+	r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return r
 }
 
 var inputValueRe = regexp.MustCompile(`name="([^"]+)" value="([^"]*)"`)

@@ -23,6 +23,11 @@ nav.back a { color:var(--accent); }
 form.terminate { margin:0 0 1.25rem; padding:0.85rem 1rem; background:#fff; border:1px solid var(--line); display:flex; flex-wrap:wrap; gap:0.75rem 1rem; align-items:center; }
 form.terminate button { background:#fff; color:#a40000; border:1px solid #a40000; padding:0.35rem 0.75rem; font:inherit; cursor:pointer; }
 form.terminate button:hover { background:#fff5f5; }
+form.signal { margin:0 0 1.25rem; padding:0.85rem 1rem; background:#fff; border:1px solid var(--line); display:flex; flex-direction:column; gap:0.65rem; max-width:36rem; }
+form.signal label { display:flex; flex-direction:column; gap:0.25rem; font-size:0.9rem; color:var(--muted); }
+form.signal input, form.signal textarea { font:inherit; color:var(--fg); border:1px solid var(--line); padding:0.4rem 0.5rem; }
+form.signal button { align-self:flex-start; background:#fff; color:var(--accent); border:1px solid var(--accent); padding:0.35rem 0.75rem; font:inherit; cursor:pointer; }
+form.signal button:hover { background:#f0f5ff; }
 </style>
 </head>
 <body>
@@ -41,6 +46,14 @@ form.terminate button:hover { background:#fff5f5; }
   <input type="hidden" name="csrf" value="{{.CSRFToken}}">
   <label><input type="checkbox" name="confirm" value="1" required> I understand this cannot be undone</label>
   <button type="submit">Terminate</button>
+</form>
+{{end}}
+{{if .CanSignal}}
+<form method="post" action="/instances/{{.ID}}/signal" class="signal">
+  <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+  <label>Name <input name="name" required></label>
+  <label>Payload (JSON) <textarea name="payload" rows="3" placeholder="{}"></textarea></label>
+  <button type="submit">Signal</button>
 </form>
 {{end}}
 {{if .Events}}
