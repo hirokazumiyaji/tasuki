@@ -2,8 +2,8 @@
 
 ## タスク
 
-- [ ] Task 1: Spec + Plan
-- [ ] Task 2: openBackend + tests + README
+- [x] Task 1: Spec + Plan
+- [x] Task 2: openBackend + tests + README
 
 ## 注記
 
