@@ -56,7 +56,11 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 	if err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	b.notifyTasks(ctx)
+	return nil
 }
 
 func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance, error) {
