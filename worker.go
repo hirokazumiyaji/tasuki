@@ -150,6 +150,8 @@ func (w *Worker) tick(ctx context.Context) {
 	if err == nil && len(wtasks) > 0 {
 		sem := make(chan struct{}, w.opts.WorkflowConcurrency)
 		var wg sync.WaitGroup
+		var pendingMu sync.Mutex
+		var pending []pendingWorkflowCommit
 		for _, t := range wtasks {
 			wg.Add(1)
 			go func(t backend.Task) {
@@ -162,11 +164,21 @@ func (w *Worker) tick(ctx context.Context) {
 				w.opts.Metrics.AddWorkflowTask(ctx, 1)
 				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
 				w.track(t.ID)
-				_ = w.handleWorkflow(ctx, t)
+				p, err := w.handleWorkflow(ctx, t)
 				w.untrack(t.ID)
+				if err != nil {
+					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", err)
+					return
+				}
+				if p != nil {
+					pendingMu.Lock()
+					pending = append(pending, *p)
+					pendingMu.Unlock()
+				}
 			}(t)
 		}
 		wg.Wait()
+		w.flushWorkflowCommits(ctx, pending)
 	}
 
 	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
@@ -194,18 +206,18 @@ func (w *Worker) tick(ctx context.Context) {
 	}
 }
 
-func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
+func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWorkflowCommit, error) {
 	state, err := w.loadWorkflowState(ctx, t.InstanceID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if state.Instance.Status != "running" {
 		// Drop the task by committing empty? Just leave it — for M0 ignore.
-		return nil
+		return nil, nil
 	}
 	wf, err := w.reg.workflow(state.Instance.Name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	next := state.NextSeq
@@ -260,6 +272,14 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 		NewEvents:    append([]journal.Event{}, ingested...),
 	}
 
+	pending := func() *pendingWorkflowCommit {
+		return &pendingWorkflowCommit{
+			instanceID:  t.InstanceID,
+			baseJournal: state.Journal,
+			adv:         adv,
+		}
+	}
+
 	if res.Stuck {
 		adv.NewEvents = append(adv.NewEvents, res.NewCommands...)
 		adv.Terminal = &backend.TerminalUpdate{
@@ -269,14 +289,18 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
 		w.opts.Logger.Warn("workflow stuck", "instance_id", t.InstanceID, "error", res.Err)
 		w.opts.Metrics.AddTerminal(ctx, "stuck")
-		return w.commitWorkflow(ctx, t.InstanceID, state.Journal, adv)
+		p := pending()
+		p.adv = adv
+		return p, nil
 	}
 
 	if res.Suspended {
 		adv.NewEvents = append(adv.NewEvents, res.NewCommands...)
 		w.attachEffects(&adv, state.Instance.Queue, res.NewCommands)
 		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
-		return w.commitWorkflow(ctx, t.InstanceID, state.Journal, adv)
+		p := pending()
+		p.adv = adv
+		return p, nil
 	}
 
 	// Completed (normal return or error return)
@@ -298,7 +322,9 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 			Input: input,
 		})
 		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
-		return w.commitWorkflow(ctx, t.InstanceID, state.Journal, adv)
+		p := pending()
+		p.adv = adv
+		return p, nil
 	}
 	if res.Err != nil && errors.Is(res.Err, workflow.ErrCanceled) {
 		adv.NewEvents = append(adv.NewEvents, journal.Event{
@@ -340,7 +366,9 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 		w.opts.Logger.Info("workflow terminal", "instance_id", t.InstanceID, "status", adv.Terminal.Status)
 		w.opts.Metrics.AddTerminal(ctx, adv.Terminal.Status)
 	}
-	return w.commitWorkflow(ctx, t.InstanceID, state.Journal, adv)
+	p := pending()
+	p.adv = adv
+	return p, nil
 }
 
 func (w *Worker) withParentNotify(adv *backend.Advancement, parentID string, parentSeq int64) {
