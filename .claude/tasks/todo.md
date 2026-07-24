@@ -1,17 +1,18 @@
-# tasuki M5 Claim Limit
+# tasuki M5 Sticky Journal Cache
 
 ## ゴール
 
-`WorkerOptions.ClaimLimit` で 1 tick の Claim 件数を設定可能にする（実行は逐次）。bench `-claim-limit` 対応。
+Worker 内 sticky ジャーナルキャッシュ + `LoadWorkflowHead` でフル journal 再読を削減する。
 
 ## タスク
 
-- [x] Task 1: Spec + Plan
-- [x] Task 2: WorkerOptions + tick
-- [x] Task 3: Bench flag + README
+- [ ] Task 1: Spec + Plan
+- [ ] Task 2: LoadWorkflowHead (memory + postgres)
+- [ ] Task 3: 残ストアの LoadWorkflowHead
+- [ ] Task 4: Worker sticky
+- [ ] Task 5: README
 
 ## 注記
 
-- Spec: docs/superpowers/specs/2026-07-24-m5-claim-limit-design.md
-- Plan: docs/superpowers/plans/2026-07-24-m5-claim-limit.md
-- Default ClaimLimit = 10
+- Spec: docs/superpowers/specs/2026-07-24-m5-sticky-cache-design.md
+- Plan: docs/superpowers/plans/2026-07-24-m5-sticky-cache.md
