@@ -2,6 +2,6 @@
 
 ## タスク
 
-- [ ] Task 1: Specs (memory batch + idle locks)
-- [ ] Task 2: memory CommitAdvancements
-- [ ] Task 3: idle instance lock eviction
+- [x] Task 1: Specs (memory batch + idle locks)
+- [x] Task 2: memory CommitAdvancements
+- [x] Task 3: idle instance lock eviction

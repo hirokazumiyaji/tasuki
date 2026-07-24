@@ -28,7 +28,7 @@ type Worker struct {
 	sticky   map[string]stickyEntry
 
 	instMu   sync.Mutex
-	instLock map[string]*sync.Mutex
+	instLock map[string]*instanceLock
 }
 
 func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
@@ -39,7 +39,7 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		reg:      newRegistry(opts.Codec),
 		inFlight: map[int64]struct{}{},
 		sticky:   map[string]stickyEntry{},
-		instLock: map[string]*sync.Mutex{},
+		instLock: map[string]*instanceLock{},
 	}
 }
 
@@ -179,6 +179,7 @@ func (w *Worker) tick(ctx context.Context) {
 		}
 		wg.Wait()
 		w.flushWorkflowCommits(ctx, pending)
+		w.evictIdleInstanceLocks(time.Now())
 	}
 
 	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
