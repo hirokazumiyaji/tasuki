@@ -1,20 +1,18 @@
-# tasuki M4 Firestore
+# tasuki M5 Benchmark Foundation
 
 ## ゴール
 
-`backend/firestore` を Emulator 上で適合・カオスし、M4 を完了する。
+E2E スループット測定 CLI（memory + postgres、同一プロセス Worker）を追加する。
 
 ## タスク
 
-- [x] Task 1: Spec + Plan
-- [x] Task 2: Compose emulator + scaffold
-- [x] Task 3: Backend core + Capabilities
-- [x] Task 4: Inbox / schedules / List
-- [x] Task 5: Conformance
-- [x] Task 6: Chaos + example + README（M4 完了）
+- [ ] Task 1: Spec + Plan
+- [ ] Task 2: `bench` package (memory test)
+- [ ] Task 3: `cmd/bench` CLI
+- [ ] Task 4: Postgres path + README
 
 ## 注記
 
-- FIRESTORE_EMULATOR_HOST=localhost:8086
-- MaxAdvancementEffects: 400
-- M4 全ストア完了 → 次は M5
+- Spec: docs/superpowers/specs/2026-07-24-m5-bench-design.md
+- Plan: docs/superpowers/plans/2026-07-24-m5-bench.md
+- Primary metric: completed / wall_seconds
