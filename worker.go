@@ -136,7 +136,7 @@ func (w *Worker) tick(ctx context.Context) {
 	_, _ = w.backend.ClaimDueSchedules(ctx, 100)
 
 	wtasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
-		Kind: "workflow", Queues: w.opts.Queues, Limit: 10,
+		Kind: "workflow", Queues: w.opts.Queues, Limit: w.opts.ClaimLimit,
 		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
 	})
 	if err == nil {
@@ -150,7 +150,7 @@ func (w *Worker) tick(ctx context.Context) {
 	}
 
 	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
-		Kind: "activity", Queues: w.opts.Queues, Limit: 10,
+		Kind: "activity", Queues: w.opts.Queues, Limit: w.opts.ClaimLimit,
 		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
 	})
 	if err == nil {
