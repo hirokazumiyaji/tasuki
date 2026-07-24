@@ -1,16 +1,16 @@
-# tasuki M5 Result Terminal Notify
+# tasuki M5 Contrib Web UI
 
 ## ゴール
 
-PostgreSQL `tasuki_terminal` NOTIFY で Client `Result` を起床（ticker フォールバック）。
+読み取り専用のインスタンス一覧・ジャーナル閲覧 UI（`contrib/ui` + CLI）。
 
 ## タスク
 
-- [x] Task 1: Spec + Plan
-- [x] Task 2: TerminalNotifier + postgres
-- [x] Task 3: Client.Result + README
+- [ ] Task 1: Spec + Plan
+- [ ] Task 2: Handler + templates + httptest
+- [ ] Task 3: CLI + README
 
 ## 注記
 
-- Spec: docs/superpowers/specs/2026-07-24-m5-result-notify-design.md
-- Plan: docs/superpowers/plans/2026-07-24-m5-result-notify.md
+- Spec: docs/superpowers/specs/2026-07-24-m5-contrib-ui-design.md
+- Plan: docs/superpowers/plans/2026-07-24-m5-contrib-ui.md
