@@ -48,3 +48,46 @@ func TestSubscribe_WakesOnCreateInstance(t *testing.T) {
 		t.Fatal("expected notify after CreateInstance")
 	}
 }
+
+func TestSubscribeTerminal_WakesOnTerminate(t *testing.T) {
+	dsn := dsnOrSkip(t)
+	ctx := context.Background()
+	b, err := postgres.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch, err := b.SubscribeTerminal(subCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	const id = "notify-term-1"
+	if err := b.CreateInstance(ctx, backend.NewInstance{
+		ID: id, Name: "wf", Queue: "default", Input: []byte(`0`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.TerminateInstance(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-ch:
+		if got != id {
+			t.Fatalf("payload=%q want %q", got, id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected terminal notify after TerminateInstance")
+	}
+}

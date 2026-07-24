@@ -9,3 +9,10 @@ type TaskNotifier interface {
 	// The returned error is only for subscribe/setup failure.
 	Subscribe(ctx context.Context) (<-chan struct{}, error)
 }
+
+// TerminalNotifier is an optional Backend capability for Result wake hints.
+type TerminalNotifier interface {
+	// SubscribeTerminal delivers instance IDs that may have become terminal.
+	// Cancelling ctx ends the subscription.
+	SubscribeTerminal(ctx context.Context) (<-chan string, error)
+}

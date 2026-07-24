@@ -150,7 +150,11 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	}
 	_, _ = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE instance_id = $1`, id)
 	_, _ = tx.Exec(ctx, `DELETE FROM wf_timers WHERE instance_id = $1`, id)
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	b.notifyTerminal(ctx, id)
+	return nil
 }
 
 func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
@@ -470,6 +474,9 @@ func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement
 		return err
 	}
 	b.notifyTasks(ctx)
+	if adv.Terminal != nil {
+		b.notifyTerminal(ctx, adv.InstanceID)
+	}
 	return nil
 }
 
