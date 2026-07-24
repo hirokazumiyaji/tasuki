@@ -12,6 +12,7 @@ type WorkerOptions struct {
 	Queues        []string
 	PollInterval  time.Duration
 	LeaseDuration time.Duration
+	ClaimLimit    int
 	WorkerID      string
 	Codec         codec.Codec
 	Logger        *slog.Logger
@@ -27,6 +28,9 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 	}
 	if o.LeaseDuration == 0 {
 		o.LeaseDuration = 30 * time.Second
+	}
+	if o.ClaimLimit <= 0 {
+		o.ClaimLimit = 10
 	}
 	if o.WorkerID == "" {
 		o.WorkerID = "worker"
