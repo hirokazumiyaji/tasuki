@@ -157,15 +157,24 @@ func (w *Worker) tick(ctx context.Context) {
 		Kind: "activity", Queues: w.opts.Queues, Limit: w.opts.ClaimLimit,
 		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
 	})
-	if err == nil {
+	if err == nil && len(atasks) > 0 {
+		sem := make(chan struct{}, w.opts.ActivityConcurrency)
+		var wg sync.WaitGroup
 		for _, t := range atasks {
-			w.opts.Metrics.AddActivityTask(ctx, 1)
-			w.opts.Logger.Debug("activity task",
-				"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
-			w.track(t.ID)
-			_ = w.handleActivity(ctx, t)
-			w.untrack(t.ID)
+			wg.Add(1)
+			go func(t backend.Task) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				w.opts.Metrics.AddActivityTask(ctx, 1)
+				w.opts.Logger.Debug("activity task",
+					"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
+				w.track(t.ID)
+				_ = w.handleActivity(ctx, t)
+				w.untrack(t.ID)
+			}(t)
 		}
+		wg.Wait()
 	}
 }
 
