@@ -120,6 +120,8 @@ go run ./cmd/bench -backend=memory -instances=200 -workers=4 -claim-limit=50 -ac
 docker compose up -d postgres
 export TASUKI_POSTGRES_DSN='postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable'
 go run ./cmd/bench -backend=postgres -instances=200 -workers=4
+export TASUKI_SQLITE_PATH=./bench.db
+go run ./cmd/bench -backend=sqlite -instances=200 -workers=4
 ```
 
 `WorkerOptions.ClaimLimit`（デフォルト 10）で 1 tick あたりの Claim 件数を変えられる。bench では `-claim-limit`。
