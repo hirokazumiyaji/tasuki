@@ -10,7 +10,7 @@ Temporal のような「リトライ、タイマー、状態永続化を自分�
 ## ステータス
 
 M4（バックエンド拡充）完了。PostgreSQL / SQLite / MySQL·MariaDB·TiDB / Spanner / DynamoDB / Firestore が適合・カオス可能な状態。
-次は M5（性能と拡張：通知化、バッチ、スティッキーキャッシュなど）。
+M5 着手中（性能と拡張）。ベンチマーク基盤: `go run ./cmd/bench`（memory / postgres）。
 
 ## クイックスタート
 
@@ -77,6 +77,19 @@ go run ./examples/m3-sqlite/
 ```bash
 go run ./analyzers/determinism/cmd/determinism -- ./...
 ```
+
+## ベンチマーク
+
+E2E スループット（完走インスタンス数 / 秒）を測る:
+
+```bash
+go run ./cmd/bench -backend=memory -instances=200 -workers=4
+docker compose up -d postgres
+export TASUKI_POSTGRES_DSN='postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable'
+go run ./cmd/bench -backend=postgres -instances=200 -workers=4
+```
+
+詳細は [docs/superpowers/specs/2026-07-24-m5-bench-design.md](docs/superpowers/specs/2026-07-24-m5-bench-design.md)。
 
 テスト:
 
