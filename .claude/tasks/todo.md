@@ -1,16 +1,16 @@
-# tasuki M5 Workflow Parallelism
+# tasuki M5 Result Terminal Notify
 
 ## ゴール
 
-`WorkflowConcurrency` で Claim 済み workflow を tick 内並列実行（同一 instance は mutex、デフォルト 1）。
+PostgreSQL `tasuki_terminal` NOTIFY で Client `Result` を起床（ticker フォールバック）。
 
 ## タスク
 
-- [x] Task 1: Spec + Plan
-- [x] Task 2: WorkerOptions + tick + instance mutex
-- [x] Task 3: Bench flag + README
+- [ ] Task 1: Spec + Plan
+- [ ] Task 2: TerminalNotifier + postgres
+- [ ] Task 3: Client.Result + README
 
 ## 注記
 
-- Spec: docs/superpowers/specs/2026-07-24-m5-workflow-parallel-design.md
-- Plan: docs/superpowers/plans/2026-07-24-m5-workflow-parallel.md
+- Spec: docs/superpowers/specs/2026-07-24-m5-result-notify-design.md
+- Plan: docs/superpowers/plans/2026-07-24-m5-result-notify.md
