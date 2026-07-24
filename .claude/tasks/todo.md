@@ -1,7 +1,6 @@
-# tasuki M5 Memory Batch + Idle Locks
+# tasuki M5 Contrib UI Auth
 
 ## タスク
 
-- [x] Task 1: Specs (memory batch + idle locks)
-- [x] Task 2: memory CommitAdvancements
-- [x] Task 3: idle instance lock eviction
+- [ ] Task 1: Spec
+- [ ] Task 2: WithToken + CLI + tests + README
