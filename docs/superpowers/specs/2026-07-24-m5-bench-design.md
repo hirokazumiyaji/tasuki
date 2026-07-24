@@ -1,7 +1,7 @@
 # M5 Benchmark Foundation Design
 
 **Date:** 2026-07-24  
-**Status:** Approved (conversation); pending file review  
+**Status:** Approved  
 **Parent:** [docs/04-plan.md](../../04-plan.md) M5（性能と拡張）  
 **Decisions:** Primary metric = E2E throughput (completed instances/s); stores = memory + postgres; harness = `cmd/bench` CLI; workers = in-process (Approach A).
 
