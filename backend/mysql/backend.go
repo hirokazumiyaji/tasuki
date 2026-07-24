@@ -345,8 +345,20 @@ func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend
 }
 
 func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {
+	return b.CommitAdvancements(ctx, []backend.Advancement{adv})
+}
+
+func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
+	if len(advs) == 0 {
+		return nil
+	}
 	err := withTx(ctx, b.db, func(conn *sql.Conn) error {
-		return b.commitAdvancementConn(ctx, conn, adv)
+		for _, adv := range advs {
+			if err := b.commitAdvancementConn(ctx, conn, adv); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return err
@@ -354,9 +366,14 @@ func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement
 	// Second pass: under snapshot isolation (e.g. TiDB optimistic), a concurrent
 	// SendToInbox may commit an inbox row that this txn's ensure did not see after
 	// deleting the workflow task (I1). Re-check in a fresh snapshot.
-	return withTx(ctx, b.db, func(conn *sql.Conn) error {
-		return ensureWorkflowTaskIfInbox(ctx, conn, adv.InstanceID)
-	})
+	for _, adv := range advs {
+		if err := withTx(ctx, b.db, func(conn *sql.Conn) error {
+			return ensureWorkflowTaskIfInbox(ctx, conn, adv.InstanceID)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv backend.Advancement) error {

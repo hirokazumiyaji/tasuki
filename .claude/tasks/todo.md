@@ -2,5 +2,5 @@
 
 ## タスク
 
-- [ ] Task 1: Spec
-- [ ] Task 2: sqlite + mysql impl + tests
+- [x] Task 1: Spec
+- [x] Task 2: sqlite + mysql impl + tests
