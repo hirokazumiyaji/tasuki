@@ -23,6 +23,9 @@ type Worker struct {
 	cancel   context.CancelFunc
 	done     chan struct{}
 	inFlight map[int64]struct{}
+
+	stickyMu sync.Mutex
+	sticky   map[string]stickyEntry
 }
 
 func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
@@ -32,6 +35,7 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		opts:     opts,
 		reg:      newRegistry(opts.Codec),
 		inFlight: map[int64]struct{}{},
+		sticky:   map[string]stickyEntry{},
 	}
 }
 
@@ -166,7 +170,7 @@ func (w *Worker) tick(ctx context.Context) {
 }
 
 func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
-	state, err := w.backend.LoadWorkflow(ctx, t.InstanceID)
+	state, err := w.loadWorkflowState(ctx, t.InstanceID)
 	if err != nil {
 		return err
 	}
@@ -239,14 +243,14 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
 		w.opts.Logger.Warn("workflow stuck", "instance_id", t.InstanceID, "error", res.Err)
 		w.opts.Metrics.AddTerminal(ctx, "stuck")
-		return w.backend.CommitAdvancement(ctx, adv)
+		return w.commitWorkflow(ctx, t.InstanceID, state.Journal, adv)
 	}
 
 	if res.Suspended {
 		adv.NewEvents = append(adv.NewEvents, res.NewCommands...)
 		w.attachEffects(&adv, state.Instance.Queue, res.NewCommands)
 		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
-	return w.backend.CommitAdvancement(ctx, adv)
+		return w.commitWorkflow(ctx, t.InstanceID, state.Journal, adv)
 	}
 
 	// Completed (normal return or error return)
@@ -268,7 +272,7 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 			Input: input,
 		})
 		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
-		return w.backend.CommitAdvancement(ctx, adv)
+		return w.commitWorkflow(ctx, t.InstanceID, state.Journal, adv)
 	}
 	if res.Err != nil && errors.Is(res.Err, workflow.ErrCanceled) {
 		adv.NewEvents = append(adv.NewEvents, journal.Event{
@@ -310,7 +314,7 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 		w.opts.Logger.Info("workflow terminal", "instance_id", t.InstanceID, "status", adv.Terminal.Status)
 		w.opts.Metrics.AddTerminal(ctx, adv.Terminal.Status)
 	}
-	return w.backend.CommitAdvancement(ctx, adv)
+	return w.commitWorkflow(ctx, t.InstanceID, state.Journal, adv)
 }
 
 func (w *Worker) withParentNotify(adv *backend.Advancement, parentID string, parentSeq int64) {
