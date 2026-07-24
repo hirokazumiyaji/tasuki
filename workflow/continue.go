@@ -1,7 +1,6 @@
 package workflow
 
 import (
-	"encoding/json"
 	"errors"
 )
 
@@ -17,7 +16,7 @@ func (e *continueAsNewError) Unwrap() error { return ErrContinueAsNew }
 
 // ContinueAsNew ends the current run and starts a new one with the given input.
 func ContinueAsNew[I any](ctx *Context, in I) error {
-	payload, err := json.Marshal(in)
+	payload, err := ctx.codec.Marshal(in)
 	if err != nil {
 		return err
 	}

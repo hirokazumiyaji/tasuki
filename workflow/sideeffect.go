@@ -25,13 +25,13 @@ func SideEffect[T any](ctx *Context, fn func() T) (T, error) {
 	if ctx.cmdIndex < len(recorded) {
 		ev := ctx.recordOrReplay(journal.Command{Type: journal.TypeSideEffect}, nil)
 		var out T
-		if err := json.Unmarshal(ev.Payload, &out); err != nil {
+		if err := ctx.codec.Unmarshal(ev.Payload, &out); err != nil {
 			return zero, err
 		}
 		return out, nil
 	}
 	val := fn()
-	payload, err := json.Marshal(val)
+	payload, err := ctx.codec.Marshal(val)
 	if err != nil {
 		return zero, err
 	}

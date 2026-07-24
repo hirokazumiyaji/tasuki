@@ -27,7 +27,7 @@ func Execute[I, O any](ctx *Context, activityName string, in I, opts ...ExecuteO
 	for _, opt := range opts {
 		opt(&eo)
 	}
-	input, err := json.Marshal(in)
+	input, err := ctx.codec.Marshal(in)
 	if err != nil {
 		return zero, err
 	}
@@ -64,7 +64,7 @@ func Execute[I, O any](ctx *Context, activityName string, in I, opts ...ExecuteO
 		return zero, fmt.Errorf("%s", msg)
 	}
 	var out O
-	if err := json.Unmarshal(comp.Payload, &out); err != nil {
+	if err := ctx.codec.Unmarshal(comp.Payload, &out); err != nil {
 		return zero, err
 	}
 	return out, nil

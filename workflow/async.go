@@ -13,7 +13,7 @@ func ExecuteAsync[I, O any](ctx *Context, activityName string, in I, opts ...Exe
 	for _, opt := range opts {
 		opt(&eo)
 	}
-	input, err := json.Marshal(in)
+	input, err := ctx.codec.Marshal(in)
 	if err != nil {
 		// Schedule still needs a command for determinism; use empty input on marshal failure.
 		input = []byte("null")
