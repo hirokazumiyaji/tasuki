@@ -19,9 +19,7 @@ type server struct {
 
 // NewHandler returns a read-only HTTP handler for instance list and journal detail.
 func NewHandler(c *tasuki.Client) http.Handler {
-	tmpl := template.Must(template.New("").Funcs(template.FuncMap{
-		"trunc": truncStr,
-	}).ParseFS(templateFS, "templates/*.html"))
+	tmpl := template.Must(template.New("").ParseFS(templateFS, "templates/*.html"))
 	s := &server{client: c, tmpl: tmpl}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleList)
