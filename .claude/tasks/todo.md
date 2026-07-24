@@ -2,5 +2,5 @@
 
 ## タスク
 
-- [ ] Task 1: Spec
-- [ ] Task 2: internal/backendopen + wire UI/bench
+- [x] Task 1: Spec
+- [x] Task 2: internal/backendopen + wire UI/bench
