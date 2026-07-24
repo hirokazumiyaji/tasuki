@@ -22,7 +22,7 @@ type server struct {
 	secret []byte
 }
 
-// NewHandler returns an HTTP handler for instance list, journal detail, terminate, and signal.
+// NewHandler returns an HTTP handler for instance list, journal detail, terminate, signal, and cancel.
 func NewHandler(c *tasuki.Client) http.Handler {
 	tmpl := template.Must(template.New("").ParseFS(templateFS, "templates/*.html"))
 	secret := make([]byte, 32)
@@ -35,6 +35,7 @@ func NewHandler(c *tasuki.Client) http.Handler {
 	mux.HandleFunc("GET /instances/{id}", s.handleDetail)
 	mux.HandleFunc("POST /instances/{id}/terminate", s.handleTerminate)
 	mux.HandleFunc("POST /instances/{id}/signal", s.handleSignal)
+	mux.HandleFunc("POST /instances/{id}/cancel", s.handleCancel)
 	return mux
 }
 
@@ -65,6 +66,7 @@ type detailPage struct {
 	NotFound     bool
 	CanTerminate bool
 	CanSignal    bool
+	CanCancel    bool
 	CSRFToken    string
 }
 
@@ -175,6 +177,35 @@ func (s *server) handleSignal(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/instances/"+id, http.StatusSeeOther)
 }
 
+func (s *server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	if !verifyCSRF(s.secret, id, r.Form.Get("csrf"), time.Now()) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if r.Form.Get("confirm") == "" {
+		http.Error(w, "confirm required", http.StatusBadRequest)
+		return
+	}
+	if err := s.client.Cancel(r.Context(), id); err != nil {
+		page, code := s.buildDetail(r, id, err.Error())
+		if page.NotFound {
+			s.render(w, "detail.html", page, http.StatusNotFound)
+			return
+		}
+		if code == http.StatusOK {
+			code = http.StatusInternalServerError
+		}
+		s.render(w, "detail.html", page, code)
+		return
+	}
+	http.Redirect(w, r, "/instances/"+id, http.StatusSeeOther)
+}
+
 func (s *server) buildDetail(r *http.Request, id, errMsg string) (detailPage, int) {
 	page := detailPage{Title: "tasuki", ID: id, Error: errMsg}
 	inst, err := s.client.Get(r.Context(), id)
@@ -192,6 +223,7 @@ func (s *server) buildDetail(r *http.Request, id, errMsg string) (detailPage, in
 	if inst.Status == tasuki.StatusRunning {
 		page.CanTerminate = true
 		page.CanSignal = true
+		page.CanCancel = true
 		page.CSRFToken = issueCSRF(s.secret, id, time.Now())
 	}
 	events, err := s.client.GetJournal(r.Context(), id)

@@ -184,6 +184,65 @@ func TestHandler_Signal(t *testing.T) {
 	}
 }
 
+func TestHandler_Cancel(t *testing.T) {
+	b := memory.New()
+	c := tasuki.NewClient(b)
+	ctx := context.Background()
+	if err := b.CreateInstance(ctx, backend.NewInstance{
+		ID: "cancel-ui", Name: "demo", Queue: "default", Input: []byte(`{}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := ui.NewHandler(c)
+
+	dr := httptest.NewRecorder()
+	h.ServeHTTP(dr, httptest.NewRequest(http.MethodGet, "/instances/cancel-ui", nil))
+	body := dr.Body.String()
+	if !strings.Contains(body, `action="/instances/cancel-ui/cancel"`) {
+		t.Fatalf("missing cancel form: %s", body)
+	}
+	csrf := extractInputValue(t, body, "csrf")
+
+	bad := formPost("/instances/cancel-ui/cancel", "csrf=bad&confirm=1")
+	br := httptest.NewRecorder()
+	h.ServeHTTP(br, bad)
+	if br.Code != http.StatusForbidden {
+		t.Fatalf("want 403 got %d", br.Code)
+	}
+
+	nc := formPost("/instances/cancel-ui/cancel", "csrf="+url.QueryEscape(csrf))
+	nr := httptest.NewRecorder()
+	h.ServeHTTP(nr, nc)
+	if nr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 got %d", nr.Code)
+	}
+
+	ok := formPost("/instances/cancel-ui/cancel", "csrf="+url.QueryEscape(csrf)+"&confirm=1")
+	or := httptest.NewRecorder()
+	h.ServeHTTP(or, ok)
+	if or.Code != http.StatusSeeOther {
+		t.Fatalf("want 303 got %d body=%s", or.Code, or.Body.String())
+	}
+	head, err := b.LoadWorkflowHead(ctx, "cancel-ui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, in := range head.Inbox {
+		if in.Event.Type == journal.TypeCancelRequested {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("inbox missing cancel: %+v", head.Inbox)
+	}
+	inst, err := c.Get(ctx, "cancel-ui")
+	if err != nil || inst.Status != tasuki.StatusRunning {
+		t.Fatalf("still running want; status=%v err=%v", inst, err)
+	}
+}
+
 func formPost(path, body string) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
