@@ -268,15 +268,12 @@ func condSuffix(s string) string {
 	return " AND " + s
 }
 
-func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
+func (b *Backend) LoadWorkflowHead(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil {
 		return nil, err
 	}
 	st := &backend.WorkflowState{Instance: *inst, NextSeq: inst.NextSeq, Now: nowUTC()}
-	if st.Journal, err = b.GetJournal(ctx, instanceID, 0); err != nil {
-		return nil, err
-	}
 	out, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_inbox")), KeyConditionExpression: aws.String("instance_id = :id"), ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(instanceID)}, ScanIndexForward: aws.Bool(true)})
 	if err != nil {
 		return nil, err
@@ -284,6 +281,17 @@ func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend
 	for _, m := range out.Items {
 		name, payload := unwrapInboxPayload(fromJSON(m["payload"]))
 		st.Inbox = append(st.Inbox, backend.InboxEvent{ID: fromN(m["id"]), Event: journal.Event{Type: journal.Type(fromS(m["type"])), Name: name, RefSeq: fromN(m["ref_seq"]), Payload: payload}})
+	}
+	return st, nil
+}
+
+func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
+	st, err := b.LoadWorkflowHead(ctx, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	if st.Journal, err = b.GetJournal(ctx, instanceID, 0); err != nil {
+		return nil, err
 	}
 	return st, nil
 }

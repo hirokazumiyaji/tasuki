@@ -366,7 +366,7 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	return err
 }
 
-func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
+func (b *Backend) LoadWorkflowHead(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil {
 		return nil, err
@@ -376,11 +376,6 @@ func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend
 		NextSeq:  inst.NextSeq,
 		Now:      nowUTC(),
 	}
-	events, err := b.GetJournal(ctx, instanceID, 0)
-	if err != nil {
-		return nil, err
-	}
-	st.Journal = events
 
 	iter := b.client.Single().Query(ctx, spanner.Statement{
 		SQL:    `SELECT id, type, ref_seq, payload FROM wf_inbox WHERE instance_id = @id ORDER BY id`,
@@ -409,6 +404,19 @@ func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend
 		item.Event.Name, item.Event.Payload = unwrapInboxPayload(jsonBytes(payload))
 		st.Inbox = append(st.Inbox, item)
 	}
+	return st, nil
+}
+
+func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
+	st, err := b.LoadWorkflowHead(ctx, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	events, err := b.GetJournal(ctx, instanceID, 0)
+	if err != nil {
+		return nil, err
+	}
+	st.Journal = events
 	return st, nil
 }
 

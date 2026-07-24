@@ -6,9 +6,9 @@ Worker 内 sticky ジャーナルキャッシュ + `LoadWorkflowHead` でフル 
 
 ## タスク
 
-- [ ] Task 1: Spec + Plan
-- [ ] Task 2: LoadWorkflowHead (memory + postgres)
-- [ ] Task 3: 残ストアの LoadWorkflowHead
+- [x] Task 1: Spec + Plan
+- [x] Task 2: LoadWorkflowHead (memory + postgres)
+- [x] Task 3: 残ストアの LoadWorkflowHead
 - [ ] Task 4: Worker sticky
 - [ ] Task 5: README
 
