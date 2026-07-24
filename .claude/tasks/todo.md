@@ -1,6 +1,7 @@
-# tasuki M5 Shared Backend Opener
+# tasuki M5 Memory Batch + Idle Locks
 
 ## タスク
 
-- [x] Task 1: Spec
-- [x] Task 2: internal/backendopen + wire UI/bench
+- [ ] Task 1: Specs (memory batch + idle locks)
+- [ ] Task 2: memory CommitAdvancements
+- [ ] Task 3: idle instance lock eviction
