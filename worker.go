@@ -26,6 +26,9 @@ type Worker struct {
 
 	stickyMu sync.Mutex
 	sticky   map[string]stickyEntry
+
+	instMu   sync.Mutex
+	instLock map[string]*sync.Mutex
 }
 
 func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
@@ -36,6 +39,7 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		reg:      newRegistry(opts.Codec),
 		inFlight: map[int64]struct{}{},
 		sticky:   map[string]stickyEntry{},
+		instLock: map[string]*sync.Mutex{},
 	}
 }
 
@@ -143,14 +147,26 @@ func (w *Worker) tick(ctx context.Context) {
 		Kind: "workflow", Queues: w.opts.Queues, Limit: w.opts.ClaimLimit,
 		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
 	})
-	if err == nil {
+	if err == nil && len(wtasks) > 0 {
+		sem := make(chan struct{}, w.opts.WorkflowConcurrency)
+		var wg sync.WaitGroup
 		for _, t := range wtasks {
-			w.opts.Metrics.AddWorkflowTask(ctx, 1)
-			w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
-			w.track(t.ID)
-			_ = w.handleWorkflow(ctx, t)
-			w.untrack(t.ID)
+			wg.Add(1)
+			go func(t backend.Task) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				mu := w.instanceMutex(t.InstanceID)
+				mu.Lock()
+				defer mu.Unlock()
+				w.opts.Metrics.AddWorkflowTask(ctx, 1)
+				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
+				w.track(t.ID)
+				_ = w.handleWorkflow(ctx, t)
+				w.untrack(t.ID)
+			}(t)
 		}
+		wg.Wait()
 	}
 
 	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{

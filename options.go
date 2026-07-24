@@ -14,6 +14,7 @@ type WorkerOptions struct {
 	LeaseDuration        time.Duration
 	ClaimLimit           int
 	ActivityConcurrency  int
+	WorkflowConcurrency  int
 	WorkerID             string
 	Codec                codec.Codec
 	Logger               *slog.Logger
@@ -35,6 +36,9 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 	}
 	if o.ActivityConcurrency <= 0 {
 		o.ActivityConcurrency = 1
+	}
+	if o.WorkflowConcurrency <= 0 {
+		o.WorkflowConcurrency = 1
 	}
 	if o.WorkerID == "" {
 		o.WorkerID = "worker"
