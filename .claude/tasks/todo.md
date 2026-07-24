@@ -1,15 +1,11 @@
-# tasuki M5 Contrib UI Cancel
-
-## ゴール
-
-詳細ページから running インスタンスへ協調 Cancel（confirm + HMAC CSRF）。
+# tasuki M5 Contrib UI CLI sqlite+mysql
 
 ## タスク
 
-- [x] Task 1: Spec + Plan
-- [x] Task 2: Cancel route + form + tests + README
+- [ ] Task 1: Spec + Plan
+- [ ] Task 2: openBackend + tests + README
 
 ## 注記
 
-- Spec: docs/superpowers/specs/2026-07-25-m5-contrib-ui-cancel-design.md
-- Plan: docs/superpowers/plans/2026-07-25-m5-contrib-ui-cancel.md
+- Spec: docs/superpowers/specs/2026-07-25-m5-contrib-ui-cli-sqlite-mysql-design.md
+- Plan: docs/superpowers/plans/2026-07-25-m5-contrib-ui-cli-sqlite-mysql.md
