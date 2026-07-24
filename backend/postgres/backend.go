@@ -227,6 +227,7 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	if tag.RowsAffected() == 0 {
 		return backend.ErrNotFound
 	}
+	b.notifyTasks(ctx)
 	return nil
 }
 
@@ -475,7 +476,11 @@ func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement
 	if err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	b.notifyTasks(ctx)
+	return nil
 }
 
 func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
@@ -520,7 +525,11 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	if err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	b.notifyTasks(ctx)
+	return nil
 }
 
 func (b *Backend) RetryActivity(ctx context.Context, taskID int64, visibleAt time.Time) error {
@@ -600,6 +609,9 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
+	if n > 0 {
+		b.notifyTasks(ctx)
+	}
 	return n, nil
 }
 
@@ -636,7 +648,13 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if status == "running" {
+		b.notifyTasks(ctx)
+	}
+	return nil
 }
 
 type activityPayload struct {
