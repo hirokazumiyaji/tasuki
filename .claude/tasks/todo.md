@@ -6,8 +6,8 @@ E2E スループット測定 CLI（memory + postgres、同一プロセス Worker
 
 ## タスク
 
-- [ ] Task 1: Spec + Plan
-- [ ] Task 2: `bench` package (memory test)
+- [x] Task 1: Spec + Plan
+- [x] Task 2: `bench` package (memory test)
 - [ ] Task 3: `cmd/bench` CLI
 - [ ] Task 4: Postgres path + README
 
