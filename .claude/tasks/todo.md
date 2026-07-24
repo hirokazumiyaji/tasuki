@@ -9,10 +9,11 @@ E2E スループット測定 CLI（memory + postgres、同一プロセス Worker
 - [x] Task 1: Spec + Plan
 - [x] Task 2: `bench` package (memory test)
 - [x] Task 3: `cmd/bench` CLI
-- [ ] Task 4: Postgres path + README
+- [x] Task 4: Postgres path + README
 
 ## 注記
 
 - Spec: docs/superpowers/specs/2026-07-24-m5-bench-design.md
 - Plan: docs/superpowers/plans/2026-07-24-m5-bench.md
 - Primary metric: completed / wall_seconds
+- `go run ./cmd/bench -backend=memory|postgres`

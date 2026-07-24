@@ -9,6 +9,7 @@ import (
 
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
+	"github.com/hirokazumiyaji/tasuki/backend/postgres"
 	"github.com/hirokazumiyaji/tasuki/bench"
 )
 
@@ -23,21 +24,9 @@ func main() {
 	flag.Parse()
 
 	ctx := context.Background()
-	var (
-		b      backend.Backend
-		closer func()
-		name   string
-	)
-	switch *backendFlag {
-	case "memory":
-		b = memory.New()
-		closer = func() {}
-		name = "memory"
-	case "postgres":
-		fmt.Fprintln(os.Stderr, "postgres backend not wired yet; use a later build or wait for Task 4")
-		os.Exit(2)
-	default:
-		fmt.Fprintf(os.Stderr, "unknown -backend=%q (want memory|postgres)\n", *backendFlag)
+	b, closer, name, err := openBackend(ctx, *backendFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
 	defer closer()
@@ -51,23 +40,48 @@ func main() {
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		if *jsonOut {
-			if raw, jerr := res.FormatJSON(); jerr == nil {
-				fmt.Println(string(raw))
-			}
-		} else {
-			fmt.Print(res.FormatHuman())
-		}
+		printResult(res, *jsonOut)
 		os.Exit(1)
 	}
-	if *jsonOut {
+	printResult(res, *jsonOut)
+}
+
+func printResult(res bench.Result, jsonOut bool) {
+	if jsonOut {
 		raw, jerr := res.FormatJSON()
 		if jerr != nil {
 			fmt.Fprintln(os.Stderr, jerr)
 			os.Exit(1)
 		}
 		fmt.Println(string(raw))
-	} else {
-		fmt.Print(res.FormatHuman())
+		return
+	}
+	fmt.Print(res.FormatHuman())
+}
+
+func openBackend(ctx context.Context, name string) (backend.Backend, func(), string, error) {
+	switch name {
+	case "memory":
+		return memory.New(), func() {}, "memory", nil
+	case "postgres":
+		dsn := os.Getenv("TASUKI_POSTGRES_DSN")
+		if dsn == "" {
+			return nil, nil, "", fmt.Errorf("TASUKI_POSTGRES_DSN required")
+		}
+		pb, err := postgres.New(ctx, dsn)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		if err := pb.Migrate(ctx); err != nil {
+			pb.Close()
+			return nil, nil, "", err
+		}
+		if err := pb.Reset(ctx); err != nil {
+			pb.Close()
+			return nil, nil, "", err
+		}
+		return pb, pb.Close, "postgres", nil
+	default:
+		return nil, nil, "", fmt.Errorf("unknown -backend=%q (want memory|postgres)", name)
 	}
 }
