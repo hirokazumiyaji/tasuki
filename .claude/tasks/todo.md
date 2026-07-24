@@ -1,10 +1,12 @@
-# tasuki M5 Contrib UI CLI cloud backends
+# tasuki M5 Commit Batching
 
 ## タスク
 
-- [x] Task 1: Spec + Plan
-- [x] Task 2: Implement spanner/dynamodb/firestore
+- [ ] Task 1: Spec + Plan
+- [ ] Task 2: Interface + postgres CommitAdvancements
+- [ ] Task 3: Worker collect-then-flush
+- [ ] Task 4: README
 
 ## 注記
 
-- Spec: docs/superpowers/specs/2026-07-25-m5-contrib-ui-cli-cloud-design.md
+- Spec: docs/superpowers/specs/2026-07-25-m5-commit-batch-design.md
