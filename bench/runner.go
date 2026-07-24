@@ -16,12 +16,13 @@ import (
 
 // Config controls a benchmark run. Zero values use defaults.
 type Config struct {
-	Workers   int
-	Instances int
-	Steps     int
-	Poll      time.Duration
-	Duration  time.Duration
-	Lease     time.Duration
+	Workers    int
+	Instances  int
+	Steps      int
+	Poll       time.Duration
+	Duration   time.Duration
+	Lease      time.Duration
+	ClaimLimit int // 0 = Worker default (10)
 }
 
 func (c Config) withDefaults() Config {
@@ -52,6 +53,7 @@ func Run(ctx context.Context, b backend.Backend, backendName string, cfg Config)
 		w := tasuki.NewWorker(b, tasuki.WorkerOptions{
 			PollInterval:  cfg.Poll,
 			LeaseDuration: cfg.Lease,
+			ClaimLimit:    cfg.ClaimLimit,
 			WorkerID:      fmt.Sprintf("bench-w-%d", i),
 			Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 		})
