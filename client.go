@@ -135,6 +135,15 @@ func Result[O any](ctx context.Context, h *Handle) (O, error) {
 	var zero O
 	ticker := time.NewTicker(h.client.pollInterval)
 	defer ticker.Stop()
+
+	var wake <-chan string
+	if n, ok := h.client.backend.(backend.TerminalNotifier); ok {
+		ch, err := n.SubscribeTerminal(ctx)
+		if err == nil {
+			wake = ch
+		}
+	}
+
 	for {
 		inst, err := h.client.backend.GetInstance(ctx, h.id)
 		if err != nil {
@@ -156,10 +165,22 @@ func Result[O any](ctx context.Context, h *Handle) (O, error) {
 		case "stuck":
 			return zero, fmt.Errorf("%w: %s", ErrStuck, string(inst.Failure))
 		}
+		if wake == nil {
+			select {
+			case <-ctx.Done():
+				return zero, ctx.Err()
+			case <-ticker.C:
+			}
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return zero, ctx.Err()
 		case <-ticker.C:
+		case id := <-wake:
+			if id != "" && id != h.id {
+				continue
+			}
 		}
 	}
 }

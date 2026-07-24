@@ -6,9 +6,9 @@ PostgreSQL `tasuki_terminal` NOTIFY で Client `Result` を起床（ticker フ�
 
 ## タスク
 
-- [ ] Task 1: Spec + Plan
-- [ ] Task 2: TerminalNotifier + postgres
-- [ ] Task 3: Client.Result + README
+- [x] Task 1: Spec + Plan
+- [x] Task 2: TerminalNotifier + postgres
+- [x] Task 3: Client.Result + README
 
 ## 注記
 
