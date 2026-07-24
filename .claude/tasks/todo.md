@@ -6,8 +6,8 @@ PostgreSQL LISTEN/NOTIFY で Worker を起床し、PollInterval 待ちを減ら�
 
 ## タスク
 
-- [ ] Task 1: Spec + Plan
-- [ ] Task 2: TaskNotifier + Subscribe + CreateInstance notify
+- [x] Task 1: Spec + Plan
+- [x] Task 2: TaskNotifier + Subscribe + CreateInstance notify
 - [ ] Task 3: 残りの notify 発火点
 - [ ] Task 4: Worker loop 統合
 - [ ] Task 5: Conform / chaos / README
