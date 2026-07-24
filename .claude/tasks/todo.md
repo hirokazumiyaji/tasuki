@@ -6,10 +6,10 @@
 
 ## タスク
 
-- [ ] Task 1: Spec + Plan
-- [ ] Task 2: codec.Encrypted + Keyring（単体テスト）
-- [ ] Task 3: Client WithCodec + E2E（memory / postgres jsonb）
-- [ ] Task 4: ドキュメント（03-api、README）
+- [x] Task 1: Spec + Plan
+- [x] Task 2: codec.Encrypted + Keyring（単体テスト）
+- [x] Task 3: Client WithCodec + E2E（memory / postgres jsonb）。workflow パッケージが encoding/json 直書きで Codec を素通ししていた設計ギャップを検出し、Context への codec 注入で解消
+- [x] Task 4: ドキュメント（03-api、README）
 
 ## 注記
 

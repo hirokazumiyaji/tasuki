@@ -13,6 +13,7 @@ M4（バックエンド拡充）完了。PostgreSQL / SQLite / MySQL·MariaDB·T
 M5 着手中（性能と拡張）。ベンチマーク基盤: `go run ./cmd/bench`（memory / postgres）。
 PostgreSQL Worker は `LISTEN`/`NOTIFY`（チャネル `tasuki_tasks`）で起床し、`PollInterval` はフォールバックおよびタイマー／スケジュール用。
 Worker はインスタンスごとの sticky ジャーナルキャッシュ（`next_seq` 照合、差分は `GetJournal`）でフル履歴の再読を減らす。
+ペイロードの at-rest 暗号化は `codec.Encrypted`（AES-256-GCM、鍵ローテーション対応。Worker の `Codec` と Client の `WithCodec` に設定）。
 
 ## クイックスタート
 
