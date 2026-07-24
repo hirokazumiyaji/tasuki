@@ -1,18 +1,17 @@
-# tasuki M5 Sticky Journal Cache
+# tasuki M5 Encrypted Codec
 
 ## ゴール
 
-Worker 内 sticky ジャーナルキャッシュ + `LoadWorkflowHead` でフル journal 再読を削減する。
+保存ペイロードの at-rest 暗号化。AES-256-GCM の JSON 封筒コーデック、ローテーション対応 Keyring、Client の codec 差し替えオプション。
 
 ## タスク
 
-- [x] Task 1: Spec + Plan
-- [x] Task 2: LoadWorkflowHead (memory + postgres)
-- [x] Task 3: 残ストアの LoadWorkflowHead
-- [x] Task 4: Worker sticky
-- [x] Task 5: README
+- [ ] Task 1: Spec + Plan
+- [ ] Task 2: codec.Encrypted + Keyring（単体テスト）
+- [ ] Task 3: Client WithCodec + E2E（memory / postgres jsonb）
+- [ ] Task 4: ドキュメント（03-api、README）
 
 ## 注記
 
-- Spec: docs/superpowers/specs/2026-07-24-m5-sticky-cache-design.md
-- Plan: docs/superpowers/plans/2026-07-24-m5-sticky-cache.md
+- Spec: docs/superpowers/specs/2026-07-24-m5-encrypted-codec-design.md
+- Plan: docs/superpowers/plans/2026-07-24-m5-encrypted-codec.md
