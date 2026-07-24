@@ -84,10 +84,14 @@ go run ./analyzers/determinism/cmd/determinism -- ./...
 
 ## 閲覧 UI（contrib）
 
-インスタンス一覧・ジャーナルビューア。詳細ページでは running インスタンスを Cancel / Terminate / Signal できる（Cancel・Terminate は確認チェック、Signal は name + JSON。いずれも CSRF。Cancel は協調キャンセル、Terminate は即時終了。認証なし）:
+インスタンス一覧・ジャーナルビューア。詳細ページでは running インスタンスを Cancel / Terminate / Signal できる（Cancel・Terminate は確認チェック、Signal は name + JSON。いずれも CSRF。Cancel は協調キャンセル、Terminate は即時終了）。
+
+共有デプロイでは `TASUKI_UI_TOKEN` または `-token` で共有シークレットを設定する（Bearer / HTTP Basic。未設定なら認証なし）:
 
 ```bash
 go run ./contrib/ui/cmd/tasuki-ui -backend=memory -addr=:8080
+export TASUKI_UI_TOKEN='change-me'
+go run ./contrib/ui/cmd/tasuki-ui -backend=memory -addr=:8080 -token="$TASUKI_UI_TOKEN"
 # open http://localhost:8080
 docker compose up -d postgres
 export TASUKI_POSTGRES_DSN='postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable'

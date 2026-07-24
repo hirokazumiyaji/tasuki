@@ -23,7 +23,11 @@ type server struct {
 }
 
 // NewHandler returns an HTTP handler for instance list, journal detail, terminate, signal, and cancel.
-func NewHandler(c *tasuki.Client) http.Handler {
+func NewHandler(c *tasuki.Client, opts ...Option) http.Handler {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
 	tmpl := template.Must(template.New("").ParseFS(templateFS, "templates/*.html"))
 	secret := make([]byte, 32)
 	if _, err := rand.Read(secret); err != nil {
@@ -36,7 +40,7 @@ func NewHandler(c *tasuki.Client) http.Handler {
 	mux.HandleFunc("POST /instances/{id}/terminate", s.handleTerminate)
 	mux.HandleFunc("POST /instances/{id}/signal", s.handleSignal)
 	mux.HandleFunc("POST /instances/{id}/cancel", s.handleCancel)
-	return mux
+	return withAuth(mux, o.token)
 }
 
 type listPage struct {
