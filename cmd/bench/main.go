@@ -22,6 +22,7 @@ func main() {
 	poll := flag.Duration("poll", 20*time.Millisecond, "worker poll interval")
 	claimLimit := flag.Int("claim-limit", 0, "tasks per claim (0 = worker default 10)")
 	activityConc := flag.Int("activity-concurrency", 0, "parallel activities (0 = worker default 1)")
+	workflowConc := flag.Int("workflow-concurrency", 0, "parallel workflows (0 = worker default 1)")
 	jsonOut := flag.Bool("json", false, "emit JSON result")
 	flag.Parse()
 
@@ -41,6 +42,7 @@ func main() {
 		Poll:                *poll,
 		ClaimLimit:          *claimLimit,
 		ActivityConcurrency: *activityConc,
+		WorkflowConcurrency: *workflowConc,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
