@@ -87,13 +87,14 @@ E2E スループット（完走インスタンス数 / 秒）を測る:
 
 ```bash
 go run ./cmd/bench -backend=memory -instances=200 -workers=4
-go run ./cmd/bench -backend=memory -instances=200 -workers=4 -claim-limit=50
+go run ./cmd/bench -backend=memory -instances=200 -workers=4 -claim-limit=50 -activity-concurrency=8
 docker compose up -d postgres
 export TASUKI_POSTGRES_DSN='postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable'
 go run ./cmd/bench -backend=postgres -instances=200 -workers=4
 ```
 
 `WorkerOptions.ClaimLimit`（デフォルト 10）で 1 tick あたりの Claim 件数を変えられる。bench では `-claim-limit`。
+`WorkerOptions.ActivityConcurrency`（デフォルト 1）で Claim 済み activity の並列度を変えられる。bench では `-activity-concurrency`。
 
 詳細は [docs/superpowers/specs/2026-07-24-m5-bench-design.md](docs/superpowers/specs/2026-07-24-m5-bench-design.md)。
 

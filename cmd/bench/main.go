@@ -21,6 +21,7 @@ func main() {
 	duration := flag.Duration("duration", 0, "max wait (0 = wait for all)")
 	poll := flag.Duration("poll", 20*time.Millisecond, "worker poll interval")
 	claimLimit := flag.Int("claim-limit", 0, "tasks per claim (0 = worker default 10)")
+	activityConc := flag.Int("activity-concurrency", 0, "parallel activities (0 = worker default 1)")
 	jsonOut := flag.Bool("json", false, "emit JSON result")
 	flag.Parse()
 
@@ -33,12 +34,13 @@ func main() {
 	defer closer()
 
 	res, err := bench.Run(ctx, b, name, bench.Config{
-		Workers:    *workers,
-		Instances:  *instances,
-		Steps:      *steps,
-		Duration:   *duration,
-		Poll:       *poll,
-		ClaimLimit: *claimLimit,
+		Workers:             *workers,
+		Instances:           *instances,
+		Steps:               *steps,
+		Duration:            *duration,
+		Poll:                *poll,
+		ClaimLimit:          *claimLimit,
+		ActivityConcurrency: *activityConc,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
