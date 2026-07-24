@@ -421,15 +421,32 @@ func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend
 }
 
 func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {
+	return b.CommitAdvancements(ctx, []backend.Advancement{adv})
+}
+
+func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
+	if len(advs) == 0 {
+		return nil
+	}
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		return b.commitAdvancementTxn(ctx, txn, adv)
+		for _, adv := range advs {
+			if err := b.commitAdvancementTxn(ctx, txn, adv); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return err
 	}
-	return b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		return ensureWorkflowTaskIfInbox(ctx, txn, adv.InstanceID)
-	})
+	for _, adv := range advs {
+		if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			return ensureWorkflowTaskIfInbox(ctx, txn, adv.InstanceID)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *Backend) withRW(ctx context.Context, fn func(context.Context, *spanner.ReadWriteTransaction) error) error {
