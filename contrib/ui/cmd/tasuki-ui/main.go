@@ -11,12 +11,14 @@ import (
 	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
+	"github.com/hirokazumiyaji/tasuki/backend/mysql"
 	"github.com/hirokazumiyaji/tasuki/backend/postgres"
+	"github.com/hirokazumiyaji/tasuki/backend/sqlite"
 	"github.com/hirokazumiyaji/tasuki/contrib/ui"
 )
 
 func main() {
-	backendFlag := flag.String("backend", "memory", "memory|postgres")
+	backendFlag := flag.String("backend", "memory", "memory|postgres|sqlite|mysql")
 	addr := flag.String("addr", ":8080", "listen address")
 	flag.Parse()
 
@@ -54,7 +56,35 @@ func openBackend(ctx context.Context, name string) (backend.Backend, func(), err
 			return nil, nil, err
 		}
 		return pb, pb.Close, nil
+	case "sqlite":
+		path := os.Getenv("TASUKI_SQLITE_PATH")
+		if path == "" {
+			return nil, nil, fmt.Errorf("TASUKI_SQLITE_PATH required")
+		}
+		sb, err := sqlite.New(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := sb.Migrate(ctx); err != nil {
+			_ = sb.Close()
+			return nil, nil, err
+		}
+		return sb, func() { _ = sb.Close() }, nil
+	case "mysql":
+		dsn := os.Getenv("TASUKI_MYSQL_DSN")
+		if dsn == "" {
+			return nil, nil, fmt.Errorf("TASUKI_MYSQL_DSN required")
+		}
+		mb, err := mysql.New(ctx, dsn)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := mb.Migrate(ctx); err != nil {
+			_ = mb.Close()
+			return nil, nil, err
+		}
+		return mb, func() { _ = mb.Close() }, nil
 	default:
-		return nil, nil, fmt.Errorf("unknown -backend=%q (want memory|postgres)", name)
+		return nil, nil, fmt.Errorf("unknown -backend=%q (want memory|postgres|sqlite|mysql)", name)
 	}
 }

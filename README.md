@@ -92,6 +92,12 @@ go run ./contrib/ui/cmd/tasuki-ui -backend=memory -addr=:8080
 docker compose up -d postgres
 export TASUKI_POSTGRES_DSN='postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable'
 go run ./contrib/ui/cmd/tasuki-ui -backend=postgres -addr=:8080
+
+export TASUKI_SQLITE_PATH=./tasuki.db
+go run ./contrib/ui/cmd/tasuki-ui -backend=sqlite -addr=:8080
+
+export TASUKI_MYSQL_DSN='tasuki:tasuki@tcp(localhost:3306)/tasuki?parseTime=true'
+go run ./contrib/ui/cmd/tasuki-ui -backend=mysql -addr=:8080
 ```
 
 ## ベンチマーク
