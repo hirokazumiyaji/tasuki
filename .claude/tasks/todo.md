@@ -2,10 +2,10 @@
 
 ## タスク
 
-- [ ] Task 1: Spec + Plan
-- [ ] Task 2: Interface + postgres CommitAdvancements
-- [ ] Task 3: Worker collect-then-flush
-- [ ] Task 4: README
+- [x] Task 1: Spec + Plan
+- [x] Task 2: Interface + postgres CommitAdvancements
+- [x] Task 3: Worker collect-then-flush
+- [x] Task 4: README
 
 ## 注記
 

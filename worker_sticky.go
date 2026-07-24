@@ -109,9 +109,48 @@ func (w *Worker) commitWorkflow(ctx context.Context, instanceID string, baseJour
 		}
 		return err
 	}
+	w.applyStickyAfterCommit(instanceID, baseJournal, adv)
+	return nil
+}
+
+type pendingWorkflowCommit struct {
+	instanceID  string
+	baseJournal []journal.Event
+	adv         backend.Advancement
+}
+
+func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWorkflowCommit) {
+	if len(pending) == 0 {
+		return
+	}
+	if batcher, ok := w.backend.(backend.AdvancementBatcher); ok && len(pending) > 1 {
+		advs := make([]backend.Advancement, len(pending))
+		for i, p := range pending {
+			advs[i] = p.adv
+		}
+		if err := batcher.CommitAdvancements(ctx, advs); err != nil {
+			for _, p := range pending {
+				w.dropSticky(p.instanceID)
+			}
+			w.opts.Logger.Debug("workflow batch commit failed", "err", err, "n", len(pending))
+			return
+		}
+		for _, p := range pending {
+			w.applyStickyAfterCommit(p.instanceID, p.baseJournal, p.adv)
+		}
+		return
+	}
+	for _, p := range pending {
+		if err := w.commitWorkflow(ctx, p.instanceID, p.baseJournal, p.adv); err != nil {
+			w.opts.Logger.Debug("workflow commit failed", "instance_id", p.instanceID, "err", err)
+		}
+	}
+}
+
+func (w *Worker) applyStickyAfterCommit(instanceID string, baseJournal []journal.Event, adv backend.Advancement) {
 	if adv.Terminal != nil {
 		w.dropSticky(instanceID)
-		return nil
+		return
 	}
 	newNext := adv.ExpectedSeq
 	for _, e := range adv.NewEvents {
@@ -121,5 +160,4 @@ func (w *Worker) commitWorkflow(ctx context.Context, instanceID string, baseJour
 	}
 	updated := append(append([]journal.Event{}, baseJournal...), adv.NewEvents...)
 	w.setSticky(instanceID, updated, newNext)
-	return nil
 }
