@@ -126,7 +126,7 @@ go run ./cmd/bench -backend=sqlite -instances=200 -workers=4
 
 `WorkerOptions.ClaimLimit`（デフォルト 10）で 1 tick あたりの Claim 件数を変えられる。bench では `-claim-limit`。
 
-PostgreSQL / SQLite / MySQL では 1 tick 内の複数ワークフロー前進を `CommitAdvancements` でまとめてコミットできる（未対応ストアは従来どおり 1 件ずつ）。
+PostgreSQL / SQLite / MySQL / メモリ では 1 tick 内の複数ワークフロー前進を `CommitAdvancements` でまとめてコミットできる（未対応ストアは従来どおり 1 件ずつ）。
 `WorkerOptions.ActivityConcurrency`（デフォルト 1）で Claim 済み activity の並列度を変えられる。bench では `-activity-concurrency`。
 `WorkerOptions.WorkflowConcurrency`（デフォルト 1）で Claim 済み workflow の並列度を変えられる（同一 instance はプロセス内で直列）。bench では `-workflow-concurrency`。
 

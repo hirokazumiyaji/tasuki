@@ -345,9 +345,45 @@ func (b *Backend) ClaimTasks(_ context.Context, req backend.ClaimRequest) ([]bac
 	return out, nil
 }
 
-func (b *Backend) CommitAdvancement(_ context.Context, adv backend.Advancement) error {
+func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {
+	return b.CommitAdvancements(ctx, []backend.Advancement{adv})
+}
+
+func (b *Backend) CommitAdvancements(_ context.Context, advs []backend.Advancement) error {
+	if len(advs) == 0 {
+		return nil
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	for _, adv := range advs {
+		if err := b.preflightAdvancementLocked(adv); err != nil {
+			return err
+		}
+	}
+	for _, adv := range advs {
+		if err := b.commitAdvancementLocked(adv); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *Backend) preflightAdvancementLocked(adv backend.Advancement) error {
+	inst, ok := b.instances[adv.InstanceID]
+	if !ok {
+		return backend.ErrNotFound
+	}
+	if inst.nextSeq != adv.ExpectedSeq {
+		return backend.ErrConflict
+	}
+	own, ok := b.tasks[adv.TaskID]
+	if !ok || own.instanceID != adv.InstanceID || own.kind != "workflow" {
+		return backend.ErrConflict
+	}
+	return nil
+}
+
+func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 	inst, ok := b.instances[adv.InstanceID]
 	if !ok {
 		return backend.ErrNotFound
