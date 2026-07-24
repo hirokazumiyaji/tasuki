@@ -82,6 +82,18 @@ go run ./examples/m3-sqlite/
 go run ./analyzers/determinism/cmd/determinism -- ./...
 ```
 
+## 閲覧 UI（contrib）
+
+読み取り専用のインスタンス一覧・ジャーナルビューア:
+
+```bash
+go run ./contrib/ui/cmd/tasuki-ui -backend=memory -addr=:8080
+# open http://localhost:8080
+docker compose up -d postgres
+export TASUKI_POSTGRES_DSN='postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable'
+go run ./contrib/ui/cmd/tasuki-ui -backend=postgres -addr=:8080
+```
+
 ## ベンチマーク
 
 E2E スループット（完走インスタンス数 / 秒）を測る:
