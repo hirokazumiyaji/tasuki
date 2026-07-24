@@ -11,6 +11,7 @@ Temporal のような「リトライ、タイマー、状態永続化を自分�
 
 M4（バックエンド拡充）完了。PostgreSQL / SQLite / MySQL·MariaDB·TiDB / Spanner / DynamoDB / Firestore が適合・カオス可能な状態。
 M5 着手中（性能と拡張）。ベンチマーク基盤: `go run ./cmd/bench`（memory / postgres）。
+PostgreSQL Worker は `LISTEN`/`NOTIFY`（チャネル `tasuki_tasks`）で起床し、`PollInterval` はフォールバックおよびタイマー／スケジュール用。
 
 ## クイックスタート
 

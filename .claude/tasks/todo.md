@@ -10,10 +10,11 @@ PostgreSQL LISTEN/NOTIFY で Worker を起床し、PollInterval 待ちを減ら�
 - [x] Task 2: TaskNotifier + Subscribe + CreateInstance notify
 - [x] Task 3: 残りの notify 発火点
 - [x] Task 4: Worker loop 統合
-- [ ] Task 5: Conform / chaos / README
+- [x] Task 5: Conform / chaos / README
 
 ## 注記
 
 - Spec: docs/superpowers/specs/2026-07-24-m5-postgres-notify-design.md
 - Plan: docs/superpowers/plans/2026-07-24-m5-postgres-notify.md
 - Channel: `tasuki_tasks`
+- `go run ./cmd/bench -backend=postgres -poll=1s` で効果を確認しやすい
