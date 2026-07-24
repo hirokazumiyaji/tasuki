@@ -20,6 +20,9 @@ th { color:var(--muted); font-weight:600; }
 pre.payload { margin:0; white-space:pre-wrap; word-break:break-all; font-size:0.8rem; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
 nav.back { margin-bottom:1rem; }
 nav.back a { color:var(--accent); }
+form.terminate { margin:0 0 1.25rem; padding:0.85rem 1rem; background:#fff; border:1px solid var(--line); display:flex; flex-wrap:wrap; gap:0.75rem 1rem; align-items:center; }
+form.terminate button { background:#fff; color:#a40000; border:1px solid #a40000; padding:0.35rem 0.75rem; font:inherit; cursor:pointer; }
+form.terminate button:hover { background:#fff5f5; }
 </style>
 </head>
 <body>
@@ -33,6 +36,13 @@ nav.back a { color:var(--accent); }
 <h1>{{.ID}}</h1>
 <p class="meta">{{.Name}} · {{.Queue}} · {{.Status}} · next_seq={{.NextSeq}}</p>
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+{{if .CanTerminate}}
+<form method="post" action="/instances/{{.ID}}/terminate" class="terminate">
+  <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+  <label><input type="checkbox" name="confirm" value="1" required> I understand this cannot be undone</label>
+  <button type="submit">Terminate</button>
+</form>
+{{end}}
 {{if .Events}}
 <table>
 <thead><tr><th>Seq</th><th>Type</th><th>Name</th><th>Ref</th><th>Payload</th></tr></thead>

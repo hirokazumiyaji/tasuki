@@ -6,8 +6,8 @@
 
 ## タスク
 
-- [ ] Task 1: Spec + Plan
-- [ ] Task 2: CSRF + POST terminate + tests + README
+- [x] Task 1: Spec + Plan
+- [x] Task 2: CSRF + POST terminate + tests + README
 
 ## 注記
 

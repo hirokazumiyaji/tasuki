@@ -84,7 +84,7 @@ go run ./analyzers/determinism/cmd/determinism -- ./...
 
 ## 閲覧 UI（contrib）
 
-読み取り専用のインスタンス一覧・ジャーナルビューア:
+インスタンス一覧・ジャーナルビューア。詳細ページでは running インスタンスを Terminate できる（確認チェック + CSRF。認証なし）:
 
 ```bash
 go run ./contrib/ui/cmd/tasuki-ui -backend=memory -addr=:8080
