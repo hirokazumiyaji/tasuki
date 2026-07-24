@@ -10,15 +10,18 @@ import (
 
 	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend"
+	"github.com/hirokazumiyaji/tasuki/backend/dynamodb"
+	"github.com/hirokazumiyaji/tasuki/backend/firestore"
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
 	"github.com/hirokazumiyaji/tasuki/backend/mysql"
 	"github.com/hirokazumiyaji/tasuki/backend/postgres"
+	"github.com/hirokazumiyaji/tasuki/backend/spanner"
 	"github.com/hirokazumiyaji/tasuki/backend/sqlite"
 	"github.com/hirokazumiyaji/tasuki/contrib/ui"
 )
 
 func main() {
-	backendFlag := flag.String("backend", "memory", "memory|postgres|sqlite|mysql")
+	backendFlag := flag.String("backend", "memory", "memory|postgres|sqlite|mysql|spanner|dynamodb|firestore")
 	addr := flag.String("addr", ":8080", "listen address")
 	flag.Parse()
 
@@ -84,7 +87,43 @@ func openBackend(ctx context.Context, name string) (backend.Backend, func(), err
 			return nil, nil, err
 		}
 		return mb, func() { _ = mb.Close() }, nil
+	case "spanner":
+		dsn := os.Getenv("TASUKI_SPANNER_DSN")
+		if dsn == "" {
+			return nil, nil, fmt.Errorf("TASUKI_SPANNER_DSN required")
+		}
+		sp, err := spanner.New(ctx, dsn)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := sp.Migrate(ctx); err != nil {
+			_ = sp.Close()
+			return nil, nil, err
+		}
+		return sp, func() { _ = sp.Close() }, nil
+	case "dynamodb":
+		db, err := dynamodb.New(ctx, dynamodb.Config{
+			Endpoint: os.Getenv("TASUKI_DYNAMODB_ENDPOINT"),
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := db.Migrate(ctx); err != nil {
+			_ = db.Close()
+			return nil, nil, err
+		}
+		return db, func() { _ = db.Close() }, nil
+	case "firestore":
+		fb, err := firestore.New(ctx, os.Getenv("TASUKI_FIRESTORE_PROJECT"))
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := fb.Migrate(ctx); err != nil {
+			_ = fb.Close()
+			return nil, nil, err
+		}
+		return fb, func() { _ = fb.Close() }, nil
 	default:
-		return nil, nil, fmt.Errorf("unknown -backend=%q (want memory|postgres|sqlite|mysql)", name)
+		return nil, nil, fmt.Errorf("unknown -backend=%q (want memory|postgres|sqlite|mysql|spanner|dynamodb|firestore)", name)
 	}
 }

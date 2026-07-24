@@ -47,3 +47,11 @@ func TestOpenBackend_MySQLMissingEnv(t *testing.T) {
 		t.Fatalf("want dsn required, got %v", err)
 	}
 }
+
+func TestOpenBackend_SpannerMissingEnv(t *testing.T) {
+	t.Setenv("TASUKI_SPANNER_DSN", "")
+	_, _, err := openBackend(context.Background(), "spanner")
+	if err == nil || !strings.Contains(err.Error(), "TASUKI_SPANNER_DSN") {
+		t.Fatalf("want dsn required, got %v", err)
+	}
+}
