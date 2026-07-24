@@ -2,8 +2,8 @@
 
 ## タスク
 
-- [ ] Task 1: Spec + Plan
-- [ ] Task 2: Implement spanner/dynamodb/firestore
+- [x] Task 1: Spec + Plan
+- [x] Task 2: Implement spanner/dynamodb/firestore
 
 ## 注記
 

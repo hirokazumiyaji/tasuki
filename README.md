@@ -98,6 +98,16 @@ go run ./contrib/ui/cmd/tasuki-ui -backend=sqlite -addr=:8080
 
 export TASUKI_MYSQL_DSN='tasuki:tasuki@tcp(localhost:3306)/tasuki?parseTime=true'
 go run ./contrib/ui/cmd/tasuki-ui -backend=mysql -addr=:8080
+
+export TASUKI_SPANNER_DSN='projects/p/instances/i/databases/d'
+go run ./contrib/ui/cmd/tasuki-ui -backend=spanner -addr=:8080
+
+export TASUKI_DYNAMODB_ENDPOINT=http://localhost:8000
+go run ./contrib/ui/cmd/tasuki-ui -backend=dynamodb -addr=:8080
+
+export FIRESTORE_EMULATOR_HOST=localhost:8081
+export TASUKI_FIRESTORE_PROJECT=tasuki
+go run ./contrib/ui/cmd/tasuki-ui -backend=firestore -addr=:8080
 ```
 
 ## ベンチマーク
