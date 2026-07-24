@@ -23,6 +23,8 @@ type Backend interface {
 	ExtendLease(ctx context.Context, taskID int64, d time.Duration) error
 	ReleaseLease(ctx context.Context, taskID int64) error
 	LoadWorkflow(ctx context.Context, instanceID string) (*WorkflowState, error)
+	// LoadWorkflowHead returns instance metadata, inbox, next_seq, and store Now without journal.
+	LoadWorkflowHead(ctx context.Context, instanceID string) (*WorkflowState, error)
 	CommitAdvancement(ctx context.Context, adv Advancement) error
 	CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error
 	RetryActivity(ctx context.Context, taskID int64, visibleAt time.Time) error

@@ -253,9 +253,13 @@ func (b *Backend) RetryActivity(_ context.Context, taskID int64, visibleAt time.
 	return nil
 }
 
-func (b *Backend) LoadWorkflow(_ context.Context, instanceID string) (*backend.WorkflowState, error) {
+func (b *Backend) LoadWorkflowHead(_ context.Context, instanceID string) (*backend.WorkflowState, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.loadWorkflowHeadLocked(instanceID)
+}
+
+func (b *Backend) loadWorkflowHeadLocked(instanceID string) (*backend.WorkflowState, error) {
 	inst, ok := b.instances[instanceID]
 	if !ok {
 		return nil, backend.ErrNotFound
@@ -264,7 +268,6 @@ func (b *Backend) LoadWorkflow(_ context.Context, instanceID string) (*backend.W
 	for _, item := range b.inbox[instanceID] {
 		inbox = append(inbox, backend.InboxEvent{ID: item.id, Event: item.event})
 	}
-	journalCopy := append([]journal.Event(nil), inst.journal...)
 	return &backend.WorkflowState{
 		Instance: backend.Instance{
 			ID:      inst.id,
@@ -276,11 +279,21 @@ func (b *Backend) LoadWorkflow(_ context.Context, instanceID string) (*backend.W
 			Failure: append([]byte(nil), inst.failure...),
 			NextSeq: inst.nextSeq, ParentID: inst.parentID, ParentSeq: inst.parentSeq,
 		},
-		Journal: journalCopy,
 		Inbox:   inbox,
 		NextSeq: inst.nextSeq,
 		Now:     b.now,
 	}, nil
+}
+
+func (b *Backend) LoadWorkflow(_ context.Context, instanceID string) (*backend.WorkflowState, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	st, err := b.loadWorkflowHeadLocked(instanceID)
+	if err != nil {
+		return nil, err
+	}
+	st.Journal = append([]journal.Event(nil), b.instances[instanceID].journal...)
+	return st, nil
 }
 
 func (b *Backend) ClaimTasks(_ context.Context, req backend.ClaimRequest) ([]backend.Task, error) {

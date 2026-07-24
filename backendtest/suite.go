@@ -24,6 +24,7 @@ func Run(t *testing.T, newBackend Factory) {
 	t.Helper()
 	t.Run("MigrateIdempotent", func(t *testing.T) { testMigrate(t, newBackend) })
 	t.Run("CreateDuplicate", func(t *testing.T) { testCreateDuplicate(t, newBackend) })
+	t.Run("LoadWorkflowHead", func(t *testing.T) { testLoadWorkflowHead(t, newBackend) })
 	t.Run("CommitAdvancementConflict", func(t *testing.T) { testCommitConflict(t, newBackend) })
 	t.Run("DoubleCompleteSuperseded", func(t *testing.T) { testDoubleComplete(t, newBackend) })
 	t.Run("TerminateIgnoresLateComplete", func(t *testing.T) { testTerminateLateComplete(t, newBackend) })
@@ -31,6 +32,34 @@ func Run(t *testing.T, newBackend Factory) {
 	RunConcurrent(t, newBackend)
 	RunM2(t, newBackend)
 	RunM3(t, newBackend)
+}
+
+func testLoadWorkflowHead(t *testing.T, newBackend Factory) {
+	ctx := context.Background()
+	b := newBackend(t)
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: "head-1", Name: "wf", Queue: "default", Input: []byte(`1`)}); err != nil {
+		t.Fatal(err)
+	}
+	full, err := b.LoadWorkflow(ctx, "head-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := b.LoadWorkflowHead(ctx, "head-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(head.Journal) != 0 {
+		t.Fatalf("head journal want empty, got %d", len(head.Journal))
+	}
+	if head.NextSeq != full.NextSeq || head.Instance.ID != full.Instance.ID || head.Instance.Status != full.Instance.Status {
+		t.Fatalf("head meta mismatch: %+v vs %+v", head, full)
+	}
+	if len(head.Inbox) != len(full.Inbox) {
+		t.Fatalf("inbox len %d vs %d", len(head.Inbox), len(full.Inbox))
+	}
+	if head.Now.IsZero() {
+		t.Fatal("head Now is zero")
+	}
 }
 
 func testMigrate(t *testing.T, newBackend Factory) {

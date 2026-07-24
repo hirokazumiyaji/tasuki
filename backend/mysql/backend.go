@@ -279,7 +279,7 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	return nil
 }
 
-func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
+func (b *Backend) LoadWorkflowHead(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
 	conn, err := b.db.Conn(ctx)
 	if err != nil {
 		return nil, err
@@ -306,29 +306,6 @@ func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend
 	st.Instance.NextSeq = st.NextSeq
 	st.Now = nowUTC()
 
-	jrows, err := conn.QueryContext(ctx, `
-		SELECT seq, type, name, COALESCE(ref_seq, 0), payload
-		FROM wf_journal WHERE instance_id = ? ORDER BY seq`, instanceID)
-	if err != nil {
-		return nil, err
-	}
-	for jrows.Next() {
-		var e journal.Event
-		var typ string
-		var payload sql.NullString
-		if err := jrows.Scan(&e.Seq, &typ, &e.Name, &e.RefSeq, &payload); err != nil {
-			jrows.Close()
-			return nil, err
-		}
-		e.Type = journal.Type(typ)
-		e.Payload = scanJSONNullString(payload)
-		st.Journal = append(st.Journal, e)
-	}
-	jrows.Close()
-	if err := jrows.Err(); err != nil {
-		return nil, err
-	}
-
 	irows, err := conn.QueryContext(ctx, `
 		SELECT id, type, COALESCE(ref_seq, 0), payload FROM wf_inbox
 		WHERE instance_id = ? ORDER BY id`, instanceID)
@@ -352,6 +329,19 @@ func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend
 		return nil, err
 	}
 	return &st, nil
+}
+
+func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
+	st, err := b.LoadWorkflowHead(ctx, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	events, err := b.GetJournal(ctx, instanceID, 0)
+	if err != nil {
+		return nil, err
+	}
+	st.Journal = events
+	return st, nil
 }
 
 func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {

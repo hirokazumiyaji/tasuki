@@ -252,16 +252,12 @@ func (b *Backend) ReleaseLease(ctx context.Context, id int64) error {
 func (b *Backend) RetryActivity(ctx context.Context, id int64, at time.Time) error {
 	return b.updateTask(ctx, id, true, []gcf.Update{{Path: "visible_at", Value: at.UTC()}, {Path: "worker_id", Value: gcf.Delete}})
 }
-func (b *Backend) LoadWorkflow(ctx context.Context, id string) (*backend.WorkflowState, error) {
+func (b *Backend) LoadWorkflowHead(ctx context.Context, id string) (*backend.WorkflowState, error) {
 	inst, err := b.GetInstance(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	j, err := b.GetJournal(ctx, id, 0)
-	if err != nil {
-		return nil, err
-	}
-	st := &backend.WorkflowState{Instance: *inst, Journal: j, NextSeq: inst.NextSeq, Now: nowUTC()}
+	st := &backend.WorkflowState{Instance: *inst, NextSeq: inst.NextSeq, Now: nowUTC()}
 	it := b.col("wf_inbox").Where("instance_id", "==", id).OrderBy("id", gcf.Asc).Documents(ctx)
 	defer it.Stop()
 	for {
@@ -276,6 +272,19 @@ func (b *Backend) LoadWorkflow(ctx context.Context, id string) (*backend.Workflo
 		name, p := unwrapInboxPayload(bytes(m, "payload"))
 		st.Inbox = append(st.Inbox, backend.InboxEvent{ID: i64(m, "id"), Event: journal.Event{Type: journal.Type(str(m, "type")), Name: name, RefSeq: i64(m, "ref_seq"), Payload: p}})
 	}
+	return st, nil
+}
+
+func (b *Backend) LoadWorkflow(ctx context.Context, id string) (*backend.WorkflowState, error) {
+	st, err := b.LoadWorkflowHead(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	j, err := b.GetJournal(ctx, id, 0)
+	if err != nil {
+		return nil, err
+	}
+	st.Journal = j
 	return st, nil
 }
 
