@@ -284,6 +284,29 @@ type Codec interface {
 - 構造体の進化はフィールド追加までを互換とする。実行中インスタンスが残る間のフィールド削除、リネーム、型変更は避ける。
 - ペイロードは小さく保つ。大きなデータは本体を渡さず、オブジェクトストレージのキーなど参照を渡す。
 
+### 暗号化
+
+保存されるユーザーペイロード（入力、結果、アクティビティ入出力、シグナル、SideEffect、子ワークフロー入力）を AES-256-GCM で暗号化する `Encrypted` コーデックを同梱する。
+出力は鍵 ID とノンスを含む JSON 封筒であり、jsonb カラムにもそのまま保存できる。
+
+```go
+keys, err := codec.StaticKeys("2026-07", map[string][]byte{
+    "2026-07": currentKey, // 32 バイト
+    "2026-01": oldKey,     // ローテーション済みの鍵も復号用に残す
+})
+enc := codec.Encrypted(codec.JSON(), keys)
+
+w := tasuki.NewWorker(b, tasuki.WorkerOptions{Codec: enc})
+c := tasuki.NewClient(b, tasuki.WithCodec(enc))
+```
+
+運用規則を四つ定める。
+
+- Worker と Client に同じコーデックを設定する。
+- ローテーションは primary の切り替えで行い、旧鍵は該当ペイロードが残る間 `Lookup` に残す（再暗号化は不要）。
+- 封筒マーカーのないペイロードは平文として読むため、既存インスタンスが残るストアでも有効化できる。
+- インスタンス ID、ワークフロー名、キュー名、時刻は暗号化されない（メタデータは平文）。
+
 ## テスト支援
 
 `wftest` パッケージで、DB なし、仮想時計のユニットテストを書ける。
