@@ -1,20 +1,17 @@
-# tasuki M5 PostgreSQL Task Notify
+# tasuki M5 Claim Limit
 
 ## ゴール
 
-PostgreSQL LISTEN/NOTIFY で Worker を起床し、PollInterval 待ちを減らす（ヒントのみ、ticker フォールバック）。
+`WorkerOptions.ClaimLimit` で 1 tick の Claim 件数を設定可能にする（実行は逐次）。bench `-claim-limit` 対応。
 
 ## タスク
 
-- [x] Task 1: Spec + Plan
-- [x] Task 2: TaskNotifier + Subscribe + CreateInstance notify
-- [x] Task 3: 残りの notify 発火点
-- [x] Task 4: Worker loop 統合
-- [x] Task 5: Conform / chaos / README
+- [ ] Task 1: Spec + Plan
+- [ ] Task 2: WorkerOptions + tick
+- [ ] Task 3: Bench flag + README
 
 ## 注記
 
-- Spec: docs/superpowers/specs/2026-07-24-m5-postgres-notify-design.md
-- Plan: docs/superpowers/plans/2026-07-24-m5-postgres-notify.md
-- Channel: `tasuki_tasks`
-- `go run ./cmd/bench -backend=postgres -poll=1s` で効果を確認しやすい
+- Spec: docs/superpowers/specs/2026-07-24-m5-claim-limit-design.md
+- Plan: docs/superpowers/plans/2026-07-24-m5-claim-limit.md
+- Default ClaimLimit = 10
