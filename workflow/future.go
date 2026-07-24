@@ -59,7 +59,7 @@ func (f *Future[O]) Get(ctx *Context) (O, error) {
 		if len(comp.Payload) == 0 {
 			return zero, nil
 		}
-		if err := json.Unmarshal(comp.Payload, &out); err != nil {
+		if err := ctx.codec.Unmarshal(comp.Payload, &out); err != nil {
 			return zero, err
 		}
 		return out, nil

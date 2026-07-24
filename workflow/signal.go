@@ -1,7 +1,6 @@
 package workflow
 
 import (
-	"encoding/json"
 	"time"
 )
 
@@ -18,7 +17,7 @@ func ReceiveSignal[T any](ctx *Context, name string) (T, error) {
 	}
 	var out T
 	if len(ev.Payload) > 0 {
-		if err := json.Unmarshal(ev.Payload, &out); err != nil {
+		if err := ctx.codec.Unmarshal(ev.Payload, &out); err != nil {
 			return zero, err
 		}
 	}

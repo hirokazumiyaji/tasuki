@@ -27,8 +27,12 @@ type Client struct {
 	pollInterval time.Duration
 }
 
-func NewClient(b backend.Backend) *Client {
-	return &Client{backend: b, codec: codec.JSON(), pollInterval: 200 * time.Millisecond}
+func NewClient(b backend.Backend, opts ...ClientOption) *Client {
+	c := &Client{backend: b, codec: codec.JSON(), pollInterval: 200 * time.Millisecond}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 type Handle struct {

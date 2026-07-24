@@ -219,6 +219,7 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) error {
 			InstanceID: state.Instance.ID,
 			Name:       state.Instance.Name,
 		})
+		wctx.SetCodec(w.reg.codec)
 		out, err := wf.fn(wctx, state.Instance.Input)
 		if err != nil {
 			return nil, err

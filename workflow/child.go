@@ -20,7 +20,7 @@ func ExecuteChild[I, O any](ctx *Context, workflowName string, in I) (O, error) 
 
 // ExecuteChildAsync starts a child workflow and returns a Future.
 func ExecuteChildAsync[I, O any](ctx *Context, workflowName string, in I) *Future[O] {
-	input, _ := json.Marshal(in)
+	input, _ := ctx.codec.Marshal(in)
 	childID := fmt.Sprintf("%s:%d", ctx.info.InstanceID, ctx.nextSeq)
 	payload, _ := json.Marshal(childPayload{ChildID: childID, Name: workflowName, Input: input})
 	ev := ctx.recordOrReplay(journal.Command{

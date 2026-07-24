@@ -54,6 +54,14 @@ func WithName(name string) RegisterOption {
 	return func(o *registerOptions) { o.name = name }
 }
 
+type ClientOption func(*Client)
+
+// WithCodec sets the codec used for inputs, signals, and results.
+// It must match the codec configured on the workers.
+func WithCodec(c codec.Codec) ClientOption {
+	return func(cl *Client) { cl.codec = c }
+}
+
 type startOptions struct {
 	id    string
 	queue string

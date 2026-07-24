@@ -8,6 +8,19 @@ import (
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
+// Codec serializes user payloads (activity inputs and results, signals,
+// side effects, child inputs). It mirrors codec.Codec so the worker can
+// inject its configured codec without an import cycle.
+type Codec interface {
+	Marshal(v any) ([]byte, error)
+	Unmarshal(data []byte, v any) error
+}
+
+type jsonCodec struct{}
+
+func (jsonCodec) Marshal(v any) ([]byte, error)      { return json.Marshal(v) }
+func (jsonCodec) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
+
 type Context struct {
 	events      []journal.Event
 	cmdIndex    int
@@ -19,6 +32,7 @@ type Context struct {
 	suspended   bool
 	info            WorkflowInfo
 	consumedSignals map[int64]bool
+	codec           Codec
 }
 
 func NewContext(events []journal.Event, now time.Time) *Context {
@@ -28,6 +42,7 @@ func NewContext(events []journal.Event, now time.Time) *Context {
 		completions:     map[int64]journal.Event{},
 		nextSeq:         1,
 		consumedSignals: map[int64]bool{},
+		codec:           jsonCodec{},
 	}
 	for _, e := range events {
 		if e.Type == journal.TypeWorkflowStarted {
@@ -52,6 +67,9 @@ func NewContext(events []journal.Event, now time.Time) *Context {
 func (c *Context) NewCommands() []journal.Event { return c.commands }
 
 func (c *Context) SetInfo(info WorkflowInfo) { c.info = info }
+
+// SetCodec injects the worker's payload codec. Unset, the context uses plain JSON.
+func (c *Context) SetCodec(m Codec) { c.codec = m }
 
 func WasSuspended(c *Context) bool { return c.suspended }
 
