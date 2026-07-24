@@ -23,6 +23,10 @@ nav.back a { color:var(--accent); }
 form.terminate { margin:0 0 1.25rem; padding:0.85rem 1rem; background:#fff; border:1px solid var(--line); display:flex; flex-wrap:wrap; gap:0.75rem 1rem; align-items:center; }
 form.terminate button { background:#fff; color:#a40000; border:1px solid #a40000; padding:0.35rem 0.75rem; font:inherit; cursor:pointer; }
 form.terminate button:hover { background:#fff5f5; }
+form.cancel { margin:0 0 1.25rem; padding:0.85rem 1rem; background:#fff; border:1px solid var(--line); display:flex; flex-wrap:wrap; gap:0.75rem 1rem; align-items:center; }
+form.cancel .hint { flex:1 1 100%; margin:0; color:var(--muted); font-size:0.85rem; }
+form.cancel button { background:#fff; color:#5a4a00; border:1px solid #b89b2a; padding:0.35rem 0.75rem; font:inherit; cursor:pointer; }
+form.cancel button:hover { background:#fffbeb; }
 form.signal { margin:0 0 1.25rem; padding:0.85rem 1rem; background:#fff; border:1px solid var(--line); display:flex; flex-direction:column; gap:0.65rem; max-width:36rem; }
 form.signal label { display:flex; flex-direction:column; gap:0.25rem; font-size:0.9rem; color:var(--muted); }
 form.signal input, form.signal textarea { font:inherit; color:var(--fg); border:1px solid var(--line); padding:0.4rem 0.5rem; }
@@ -46,6 +50,14 @@ form.signal button:hover { background:#f0f5ff; }
   <input type="hidden" name="csrf" value="{{.CSRFToken}}">
   <label><input type="checkbox" name="confirm" value="1" required> I understand this cannot be undone</label>
   <button type="submit">Terminate</button>
+</form>
+{{end}}
+{{if .CanCancel}}
+<form method="post" action="/instances/{{.ID}}/cancel" class="cancel">
+  <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+  <p class="hint">Cooperative cancel — the workflow keeps running until it handles cancel. Use Terminate for an immediate stop.</p>
+  <label><input type="checkbox" name="confirm" value="1" required> Request cooperative cancel</label>
+  <button type="submit">Cancel</button>
 </form>
 {{end}}
 {{if .CanSignal}}
