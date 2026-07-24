@@ -15,6 +15,7 @@ type WorkerOptions struct {
 	ClaimLimit           int
 	ActivityConcurrency  int
 	WorkflowConcurrency  int
+	IdleInstanceLockTTL  time.Duration // evict unused per-instance locks; <=0 → 10m
 	WorkerID             string
 	Codec                codec.Codec
 	Logger               *slog.Logger
@@ -39,6 +40,9 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 	}
 	if o.WorkflowConcurrency <= 0 {
 		o.WorkflowConcurrency = 1
+	}
+	if o.IdleInstanceLockTTL <= 0 {
+		o.IdleInstanceLockTTL = 10 * time.Minute
 	}
 	if o.WorkerID == "" {
 		o.WorkerID = "worker"
