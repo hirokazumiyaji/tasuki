@@ -19,7 +19,7 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 	if queue == "" {
 		queue = "default"
 	}
-	return withTx(ctx, b.db, func(conn *sql.Conn) error {
+	err := withTx(ctx, b.db, func(conn *sql.Conn) error {
 		now := nowUTC()
 		_, err := conn.ExecContext(ctx, `
 		INSERT INTO wf_instances (id, name, queue, status, input, next_seq, parent_id, parent_seq, created_at, updated_at)
@@ -43,6 +43,11 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 		VALUES ('workflow', ?, ?, ?, ?)`, queue, inst.ID, now, now)
 		return err
 	})
+	if err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
 }
 
 func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance, error) {
@@ -144,7 +149,11 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	}
 	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE instance_id = ?`, id)
 	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_timers WHERE instance_id = ?`, id)
-	return commitConn(ctx, conn)
+	if err := commitConn(ctx, conn); err != nil {
+		return err
+	}
+	b.notifyTerminal(id)
+	return nil
 }
 
 func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
