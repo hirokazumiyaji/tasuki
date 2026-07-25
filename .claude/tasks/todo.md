@@ -4,4 +4,4 @@
 
 - [x] Task 1: Spec + Plan
 - [x] Task 2: Subscribe + CreateInstance / Terminate wake
-- [ ] Task 3: Remaining emit sites + README
+- [x] Task 3: Remaining emit sites + README
