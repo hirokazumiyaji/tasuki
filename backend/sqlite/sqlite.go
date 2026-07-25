@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
-	"sync"
 
+	"github.com/hirokazumiyaji/tasuki/backend/hub"
 	_ "modernc.org/sqlite"
 )
 
@@ -15,11 +15,8 @@ var schemaFS embed.FS
 
 // Backend is the SQLite implementation of backend.Backend.
 type Backend struct {
-	db *sql.DB
-
-	notifyMu     sync.Mutex
-	taskSubs     []*taskSub
-	terminalSubs []*terminalSub
+	db  *sql.DB
+	hub *hub.Hub
 }
 
 // New opens a SQLite database at path (use ":memory:" for ephemeral).
@@ -39,7 +36,7 @@ func New(path string) (*Backend, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite: ping: %w", err)
 	}
-	return &Backend{db: db}, nil
+	return &Backend{db: db, hub: hub.New()}, nil
 }
 
 func (b *Backend) Close() error {
