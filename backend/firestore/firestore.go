@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sync"
 
 	"cloud.google.com/go/firestore"
+	"github.com/hirokazumiyaji/tasuki/backend/hub"
 	"google.golang.org/api/iterator"
 )
 
@@ -14,10 +14,7 @@ import (
 type Backend struct {
 	client  *firestore.Client
 	project string
-
-	notifyMu     sync.Mutex
-	taskSubs     []*taskSub
-	terminalSubs []*terminalSub
+	hub     *hub.Hub
 }
 
 // New opens a Firestore client. Set FIRESTORE_EMULATOR_HOST for the emulator.
@@ -32,7 +29,7 @@ func New(ctx context.Context, projectID string) (*Backend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("firestore: open: %w", err)
 	}
-	return &Backend{client: client, project: projectID}, nil
+	return &Backend{client: client, project: projectID, hub: hub.New()}, nil
 }
 
 func (b *Backend) Close() error {

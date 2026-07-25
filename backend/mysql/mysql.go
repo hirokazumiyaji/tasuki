@@ -6,8 +6,8 @@ import (
 	"embed"
 	"fmt"
 	"strings"
-	"sync"
 
+	"github.com/hirokazumiyaji/tasuki/backend/hub"
 	_ "github.com/go-sql-driver/mysql"
 )
 
@@ -16,11 +16,8 @@ var schemaFS embed.FS
 
 // Backend is the MySQL / MariaDB implementation of backend.Backend.
 type Backend struct {
-	db *sql.DB
-
-	notifyMu     sync.Mutex
-	taskSubs     []*taskSub
-	terminalSubs []*terminalSub
+	db  *sql.DB
+	hub *hub.Hub
 }
 
 // New opens a connection pool. dsn example:
@@ -35,7 +32,7 @@ func New(ctx context.Context, dsn string) (*Backend, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("mysql: ping: %w", err)
 	}
-	return &Backend{db: db}, nil
+	return &Backend{db: db, hub: hub.New()}, nil
 }
 
 func (b *Backend) Close() error {

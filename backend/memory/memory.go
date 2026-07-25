@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/tasuki/backend"
+	"github.com/hirokazumiyaji/tasuki/backend/hub"
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
@@ -24,9 +25,7 @@ type Backend struct {
 	inbox     map[string][]*inboxItem // instanceID → ordered
 	schedules map[string]*schedule
 
-	notifyMu     sync.Mutex
-	taskSubs     []*taskSub
-	terminalSubs []*terminalSub
+	hub *hub.Hub
 }
 
 type instance struct {
@@ -82,6 +81,7 @@ func New() *Backend {
 		timers:    map[timerKey]*timer{},
 		inbox:     map[string][]*inboxItem{},
 		schedules: map[string]*schedule{},
+		hub:       hub.New(),
 	}
 }
 

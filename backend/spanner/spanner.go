@@ -7,9 +7,9 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"sync"
 
 	"cloud.google.com/go/spanner"
+	"github.com/hirokazumiyaji/tasuki/backend/hub"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	instance "cloud.google.com/go/spanner/admin/instance/apiv1"
@@ -28,10 +28,7 @@ var dsnRE = regexp.MustCompile(`^projects/([^/]+)/instances/([^/]+)/databases/([
 type Backend struct {
 	client *spanner.Client
 	dsn    string
-
-	notifyMu     sync.Mutex
-	taskSubs     []*taskSub
-	terminalSubs []*terminalSub
+	hub    *hub.Hub
 }
 
 // New opens a Spanner client. Set SPANNER_EMULATOR_HOST for the emulator.
@@ -41,7 +38,7 @@ func New(ctx context.Context, dsn string) (*Backend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("spanner: open: %w", err)
 	}
-	return &Backend{client: client, dsn: dsn}, nil
+	return &Backend{client: client, dsn: dsn, hub: hub.New()}, nil
 }
 
 func (b *Backend) Close() error {

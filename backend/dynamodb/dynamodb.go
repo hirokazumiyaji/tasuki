@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -13,16 +12,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/hirokazumiyaji/tasuki/backend/hub"
 )
 
 // Backend is the DynamoDB implementation of backend.Backend.
 type Backend struct {
 	client *dynamodb.Client
 	prefix string
-
-	notifyMu     sync.Mutex
-	taskSubs     []*taskSub
-	terminalSubs []*terminalSub
+	hub    *hub.Hub
 }
 
 // Config holds connection options.
@@ -71,7 +68,7 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 	}
 
 	client := dynamodb.NewFromConfig(awsCfg, clientOpts...)
-	return &Backend{client: client, prefix: cfg.Prefix}, nil
+	return &Backend{client: client, prefix: cfg.Prefix, hub: hub.New()}, nil
 }
 
 func (b *Backend) Close() error { return nil }

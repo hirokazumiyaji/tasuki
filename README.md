@@ -11,7 +11,7 @@ Temporal のような「リトライ、タイマー、状態永続化を自分�
 
 M4（バックエンド拡充）完了。PostgreSQL / SQLite / MySQL·MariaDB·TiDB / Spanner / DynamoDB / Firestore が適合・カオス可能な状態。
 M5 着手中（性能と拡張）。ベンチマーク基盤: `go run ./cmd/bench`（memory / postgres）。
-PostgreSQL Worker は `LISTEN`/`NOTIFY`（チャネル `tasuki_tasks`）で起床し、`PollInterval` はフォールバックおよびタイマー／スケジュール用。他ストア（memory / sqlite / mysql / spanner / dynamodb / firestore）は同一 `Backend` インスタンス内の `TaskNotifier` で同様に起床する。
+PostgreSQL Worker は `LISTEN`/`NOTIFY`（チャネル `tasuki_tasks`）で起床し、`PollInterval` はフォールバックおよびタイマー／スケジュール用。他ストアは同一 `Backend` 内のプロセス内 wakeup（`backend/hub`）で同様に起床する。
 Client の `Result` は postgres（`tasuki_terminal`）および他ストア（プロセス内）で終端時に起床できる。
 Worker はインスタンスごとの sticky ジャーナルキャッシュ（`next_seq` 照合、差分は `GetJournal`）でフル履歴の再読を減らす。
 ペイロードの at-rest 暗号化は `codec.Encrypted`（AES-256-GCM、鍵ローテーション対応。Worker の `Codec` と Client の `WithCodec` に設定）。
