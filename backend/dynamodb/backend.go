@@ -33,7 +33,11 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 	if conditional(err) {
 		return backend.ErrAlreadyExists
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
 }
 
 func instanceItem(inst backend.NewInstance, queue string, now time.Time) map[string]types.AttributeValue {
@@ -158,7 +162,11 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	if err := b.deleteTasksForInstance(ctx, id); err != nil {
 		return err
 	}
-	return b.deleteTimersForInstance(ctx, id)
+	if err := b.deleteTimersForInstance(ctx, id); err != nil {
+		return err
+	}
+	b.notifyTerminal(id)
+	return nil
 }
 
 func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
@@ -246,7 +254,11 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 	return b.updateTask(ctx, taskID, "SET visible_at = :v", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(d)))}, "")
 }
 func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
-	return b.updateTask(ctx, taskID, "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC()))}, "")
+	if err := b.updateTask(ctx, taskID, "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC()))}, ""); err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
 }
 func (b *Backend) RetryActivity(ctx context.Context, taskID int64, at time.Time) error {
 	return b.updateTask(ctx, taskID, "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(at))}, "kind = :kind")
@@ -297,7 +309,7 @@ func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend
 }
 
 func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {
-	return b.commitAdvancementOnce(ctx, adv)
+	return b.CommitAdvancements(ctx, []backend.Advancement{adv})
 }
 
 func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
@@ -305,7 +317,11 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		return nil
 	}
 	if len(advs) == 1 {
-		return b.commitAdvancementOnce(ctx, advs[0])
+		if err := b.commitAdvancementOnce(ctx, advs[0]); err != nil {
+			return err
+		}
+		b.notifyAfterAdvancements(advs)
+		return nil
 	}
 	var all []types.TransactWriteItem
 	var ensures []string
@@ -321,6 +337,7 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 					return err
 				}
 			}
+			b.notifyAfterAdvancements(advs)
 			return nil
 		}
 		all = append(all, items...)
@@ -346,7 +363,17 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			return err
 		}
 	}
+	b.notifyAfterAdvancements(advs)
 	return nil
+}
+
+func (b *Backend) notifyAfterAdvancements(advs []backend.Advancement) {
+	b.notifyTasks()
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			b.notifyTerminal(adv.InstanceID)
+		}
+	}
 }
 
 func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advancement) error {
@@ -500,7 +527,10 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 		return err
 	}
 	if inst.Status == "running" {
-		return b.ensureWorkflowTask(ctx, inst.ID)
+		if err := b.ensureWorkflowTask(ctx, inst.ID); err != nil {
+			return err
+		}
+		b.notifyTasks()
 	}
 	return nil
 }
@@ -539,6 +569,9 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			}
 		}
 	}
+	if count > 0 {
+		b.notifyTasks()
+	}
 	return count, nil
 }
 
@@ -553,8 +586,11 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 		return err
 	}
 	if inst.Status == "running" {
-		return b.ensureWorkflowTask(ctx, instanceID)
+		if err := b.ensureWorkflowTask(ctx, instanceID); err != nil {
+			return err
+		}
 	}
+	b.notifyTasks()
 	return nil
 }
 
