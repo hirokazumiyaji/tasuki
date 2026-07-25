@@ -3,5 +3,5 @@
 ## タスク
 
 - [x] Task 1: Spec + Plan
-- [ ] Task 2: DynamoDB notify (full)
+- [x] Task 2: DynamoDB notify (full)
 - [ ] Task 3: Firestore notify (full) + README

@@ -128,5 +128,8 @@ func (b *Backend) ClaimDueSchedules(ctx context.Context, limit int) ([]backend.D
 		}
 		return result, err
 	}
+	if len(result) > 0 {
+		b.notifyTasks()
+	}
 	return result, nil
 }

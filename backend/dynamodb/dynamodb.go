@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -18,6 +19,10 @@ import (
 type Backend struct {
 	client *dynamodb.Client
 	prefix string
+
+	notifyMu     sync.Mutex
+	taskSubs     []*taskSub
+	terminalSubs []*terminalSub
 }
 
 // Config holds connection options.
