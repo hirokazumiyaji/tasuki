@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 
 	"cloud.google.com/go/firestore"
 	"google.golang.org/api/iterator"
@@ -13,6 +14,10 @@ import (
 type Backend struct {
 	client  *firestore.Client
 	project string
+
+	notifyMu     sync.Mutex
+	taskSubs     []*taskSub
+	terminalSubs []*terminalSub
 }
 
 // New opens a Firestore client. Set FIRESTORE_EMULATOR_HOST for the emulator.
