@@ -1,7 +1,9 @@
-# tasuki M5 Journal Warn + ContinueAsNew Guidance
+# tasuki M5 Backlog Metrics
 
 ## タスク
 
 - [x] Task 1: Spec + Plan
-- [x] Task 2: Threshold + warn (options, metrics, worker, tests)
-- [x] Task 3: Docs + README
+- [ ] Task 2: Interface + memory + backendtest + metrics + worker
+- [ ] Task 3: SQL + Spanner
+- [ ] Task 4: DynamoDB + Firestore
+- [ ] Task 5: Observability docs
