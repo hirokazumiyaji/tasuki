@@ -23,6 +23,10 @@ type Backend struct {
 	timers    map[timerKey]*timer
 	inbox     map[string][]*inboxItem // instanceID → ordered
 	schedules map[string]*schedule
+
+	notifyMu     sync.Mutex
+	taskSubs     []*taskSub
+	terminalSubs []*terminalSub
 }
 
 type instance struct {
@@ -101,26 +105,12 @@ func (b *Backend) Now() time.Time {
 
 func (b *Backend) CreateInstance(_ context.Context, inst backend.NewInstance) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if _, ok := b.instances[inst.ID]; ok {
-		return backend.ErrAlreadyExists
+	err := b.createInstanceLocked(inst)
+	b.mu.Unlock()
+	if err != nil {
+		return err
 	}
-	queue := inst.Queue
-	if queue == "" {
-		queue = "default"
-	}
-	ev := journal.Event{
-		Seq:     1,
-		Type:    journal.TypeWorkflowStarted,
-		Name:    inst.Name,
-		Payload: inst.Input,
-	}
-	b.instances[inst.ID] = &instance{
-		id: inst.ID, name: inst.Name, queue: queue, status: "running",
-		input: inst.Input, nextSeq: 2, journal: []journal.Event{ev},
-		parentID: inst.ParentID, parentSeq: inst.ParentSeq,
-	}
-	b.enqueueWorkflowTaskLocked(inst.ID, queue)
+	b.notifyTasks()
 	return nil
 }
 
@@ -199,9 +189,9 @@ func (b *Backend) ListInstances(_ context.Context, f backend.InstanceFilter) ([]
 
 func (b *Backend) TerminateInstance(_ context.Context, id string) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	inst, ok := b.instances[id]
 	if !ok {
+		b.mu.Unlock()
 		return backend.ErrNotFound
 	}
 	inst.status = "terminated"
@@ -215,6 +205,8 @@ func (b *Backend) TerminateInstance(_ context.Context, id string) error {
 			delete(b.timers, k)
 		}
 	}
+	b.mu.Unlock()
+	b.notifyTerminal(id)
 	return nil
 }
 
