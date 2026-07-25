@@ -252,6 +252,18 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 	}
 	events := append(append([]journal.Event{}, state.Journal...), ingested...)
 
+	if th := w.opts.JournalWarnThreshold; th > 0 {
+		if n := len(state.Journal); n >= th {
+			w.opts.Logger.Warn("journal size warning",
+				"instance_id", t.InstanceID,
+				"workflow", state.Instance.Name,
+				"journal_events", n,
+				"threshold", th,
+			)
+			w.opts.Metrics.AddJournalWarning(ctx, 1)
+		}
+	}
+
 	res := engine.RunAt(events, state.Now, func(wctx *workflow.Context) (any, error) {
 		wctx.SetInfo(workflow.WorkflowInfo{
 			InstanceID: state.Instance.ID,

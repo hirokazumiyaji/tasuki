@@ -20,6 +20,7 @@ type WorkerOptions struct {
 	Codec                codec.Codec
 	Logger               *slog.Logger
 	Metrics              *observability.Metrics
+	JournalWarnThreshold int // 0 → 10000; <0 disabled
 }
 
 func (o WorkerOptions) withDefaults() WorkerOptions {
@@ -52,6 +53,9 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
+	}
+	if o.JournalWarnThreshold == 0 {
+		o.JournalWarnThreshold = 10000
 	}
 	return o
 }

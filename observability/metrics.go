@@ -12,10 +12,11 @@ const MeterName = "github.com/hirokazumiyaji/tasuki"
 
 // Metrics holds OpenTelemetry instruments for the worker.
 type Metrics struct {
-	WorkflowTasks   metric.Int64Counter
-	ActivityTasks   metric.Int64Counter
-	WorkflowDone    metric.Int64Counter // completed / failed / stuck / canceled
-	ActivityRetries metric.Int64Counter
+	WorkflowTasks    metric.Int64Counter
+	ActivityTasks    metric.Int64Counter
+	WorkflowDone     metric.Int64Counter // completed / failed / stuck / canceled
+	ActivityRetries  metric.Int64Counter
+	JournalWarnings  metric.Int64Counter
 }
 
 // NewMetrics creates counters on the global MeterProvider (noop if unset).
@@ -42,11 +43,17 @@ func NewMetrics() (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	jw, err := m.Int64Counter("tasuki.workflow.journal_warnings",
+		metric.WithDescription("Workflow journal size warnings"))
+	if err != nil {
+		return nil, err
+	}
 	return &Metrics{
 		WorkflowTasks:   wt,
 		ActivityTasks:   at,
 		WorkflowDone:    wd,
 		ActivityRetries: ar,
+		JournalWarnings: jw,
 	}, nil
 }
 
@@ -77,6 +84,13 @@ func (m *Metrics) AddActivityRetry(ctx context.Context, n int64) {
 		return
 	}
 	m.ActivityRetries.Add(ctx, n)
+}
+
+func (m *Metrics) AddJournalWarning(ctx context.Context, n int64) {
+	if m == nil {
+		return
+	}
+	m.JournalWarnings.Add(ctx, n)
 }
 
 // MustNewMetrics panics on instrument creation failure.
