@@ -289,129 +289,168 @@ func (b *Backend) LoadWorkflow(ctx context.Context, id string) (*backend.Workflo
 }
 
 func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {
+	return b.CommitAdvancements(ctx, []backend.Advancement{adv})
+}
+
+type advancementPrep struct {
+	instRef  *gcf.DocumentRef
+	taskRef  *gcf.DocumentRef
+	inst     *backend.Instance
+	hasInbox bool
+}
+
+func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
+	if len(advs) == 0 {
+		return nil
+	}
 	now := nowUTC()
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
-		instSnap, err := tx.Get(b.ref("wf_instances", adv.InstanceID))
-		if isNotFound(err) {
-			return backend.ErrConflict
-		}
-		if err != nil {
-			return err
-		}
-		if !instSnap.Exists() || i64(instSnap.Data(), "next_seq") != adv.ExpectedSeq {
-			return backend.ErrConflict
-		}
-		taskRef := b.ref("wf_tasks", wfTaskID(adv.InstanceID))
-		taskSnap, err := tx.Get(taskRef)
-		if isNotFound(err) {
-			return backend.ErrConflict
-		}
-		if err != nil {
-			return err
-		}
-		if !taskSnap.Exists() || i64(taskSnap.Data(), "id") != adv.TaskID {
-			return backend.ErrConflict
-		}
-		inst := decodeInstance(instSnap.Data())
-		drained := make(map[int64]struct{}, len(adv.DrainedInbox))
-		for _, id := range adv.DrainedInbox {
-			drained[id] = struct{}{}
-		}
-		hasInbox := false
-		inboxIter := tx.Documents(b.col("wf_inbox").Where("instance_id", "==", adv.InstanceID))
-		for {
-			inbox, nextErr := inboxIter.Next()
-			if nextErr == iterator.Done {
-				break
+		// Firestore requires all reads before any writes in a transaction.
+		preps := make([]advancementPrep, len(advs))
+		for i, adv := range advs {
+			prep, err := b.readAdvancementTx(tx, adv)
+			if err != nil {
+				return err
 			}
-			if nextErr != nil {
-				inboxIter.Stop()
-				return nextErr
-			}
-			if _, ok := drained[i64(inbox.Data(), "id")]; !ok {
-				hasInbox = true
-			}
+			preps[i] = prep
 		}
-		inboxIter.Stop()
-		next := adv.ExpectedSeq
-		for _, e := range adv.NewEvents {
-			if e.Seq >= next {
-				next = e.Seq + 1
-			}
-		}
-		updates := []gcf.Update{{Path: "next_seq", Value: next}, {Path: "updated_at", Value: now}}
-		if adv.Terminal != nil {
-			updates = append(updates, gcf.Update{Path: "status", Value: adv.Terminal.Status}, gcf.Update{Path: "result", Value: jsonString(adv.Terminal.Result)}, gcf.Update{Path: "failure", Value: jsonString(adv.Terminal.Failure)}, gcf.Update{Path: "completed_at", Value: now})
-		}
-		if err = tx.Update(instSnap.Ref, updates); err != nil {
-			return err
-		}
-		for _, e := range adv.NewEvents {
-			if err = tx.Create(b.ref("wf_journal", journalID(adv.InstanceID, e.Seq)), journalDoc(adv.InstanceID, e.Seq, e, now)); err != nil {
+		for i, adv := range advs {
+			if err := b.writeAdvancementTx(tx, adv, preps[i], now); err != nil {
 				return err
 			}
 		}
-		for _, at := range adv.ActivityTasks {
-			id := newID()
-			if err = tx.Create(b.ref("wf_tasks", actTaskID(id)), activityTaskDoc(at, id, now)); err != nil {
-				return err
-			}
-		}
-		for _, tm := range adv.Timers {
-			if err = tx.Create(b.ref("wf_timers", journalID(adv.InstanceID, tm.Seq)), map[string]any{"instance_id": adv.InstanceID, "seq": tm.Seq, "fire_at": tm.FireAt.UTC(), "created_at": now}); err != nil {
-				return err
-			}
-		}
-		for _, id := range adv.DrainedInbox {
-			if err = tx.Delete(b.ref("wf_inbox", inboxID(adv.InstanceID, id))); err != nil {
-				return err
-			}
-		}
-		for _, ch := range adv.Children {
-			q := ch.Queue
-			if q == "" {
-				q = "default"
-			}
-			if err = tx.Create(b.ref("wf_instances", ch.ID), instanceDoc(ch, q, now)); err != nil {
-				return err
-			}
-			if err = tx.Create(b.ref("wf_journal", journalID(ch.ID, 1)), journalDoc(ch.ID, 1, journal.Event{Type: journal.TypeWorkflowStarted, Name: ch.Name, Payload: ch.Input}, now)); err != nil {
-				return err
-			}
-			if err = tx.Create(b.ref("wf_tasks", wfTaskID(ch.ID)), workflowTaskDoc(ch.ID, q, newID(), now)); err != nil {
-				return err
-			}
-		}
-		if adv.ParentNotify != nil && inst.ParentID != "" {
-			ev := *adv.ParentNotify
-			if ev.RefSeq == 0 {
-				ev.RefSeq = inst.ParentSeq
-			}
-			id := newID()
-			if err = tx.Create(b.ref("wf_inbox", inboxID(inst.ParentID, id)), inboxDoc(inst.ParentID, id, ev, now)); err != nil {
-				return err
-			}
-		}
-		if hasInbox && adv.Terminal == nil {
-			return tx.Set(taskRef, workflowTaskDoc(adv.InstanceID, inst.Queue, newID(), now))
-		}
-		return tx.Delete(taskRef)
+		return nil
 	})
 	if err != nil {
-		if err == backend.ErrConflict {
-			return err
-		}
 		return err
 	}
-	if adv.ParentNotify != nil {
-		inst, _ := b.GetInstance(ctx, adv.InstanceID)
-		if inst != nil && inst.ParentID != "" {
-			if err := b.ensureWorkflowTask(ctx, inst.ParentID); err != nil {
-				return err
+	for _, adv := range advs {
+		if adv.ParentNotify != nil {
+			inst, _ := b.GetInstance(ctx, adv.InstanceID)
+			if inst != nil && inst.ParentID != "" {
+				if err := b.ensureWorkflowTask(ctx, inst.ParentID); err != nil {
+					return err
+				}
 			}
 		}
+		if err := b.ensureWorkflowTask(ctx, adv.InstanceID); err != nil {
+			return err
+		}
 	}
-	return b.ensureWorkflowTask(ctx, adv.InstanceID)
+	return nil
+}
+
+func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement) (advancementPrep, error) {
+	instSnap, err := tx.Get(b.ref("wf_instances", adv.InstanceID))
+	if isNotFound(err) {
+		return advancementPrep{}, backend.ErrConflict
+	}
+	if err != nil {
+		return advancementPrep{}, err
+	}
+	if !instSnap.Exists() || i64(instSnap.Data(), "next_seq") != adv.ExpectedSeq {
+		return advancementPrep{}, backend.ErrConflict
+	}
+	taskRef := b.ref("wf_tasks", wfTaskID(adv.InstanceID))
+	taskSnap, err := tx.Get(taskRef)
+	if isNotFound(err) {
+		return advancementPrep{}, backend.ErrConflict
+	}
+	if err != nil {
+		return advancementPrep{}, err
+	}
+	if !taskSnap.Exists() || i64(taskSnap.Data(), "id") != adv.TaskID {
+		return advancementPrep{}, backend.ErrConflict
+	}
+	inst := decodeInstance(instSnap.Data())
+	drained := make(map[int64]struct{}, len(adv.DrainedInbox))
+	for _, id := range adv.DrainedInbox {
+		drained[id] = struct{}{}
+	}
+	hasInbox := false
+	inboxIter := tx.Documents(b.col("wf_inbox").Where("instance_id", "==", adv.InstanceID))
+	for {
+		inbox, nextErr := inboxIter.Next()
+		if nextErr == iterator.Done {
+			break
+		}
+		if nextErr != nil {
+			inboxIter.Stop()
+			return advancementPrep{}, nextErr
+		}
+		if _, ok := drained[i64(inbox.Data(), "id")]; !ok {
+			hasInbox = true
+		}
+	}
+	inboxIter.Stop()
+	return advancementPrep{instRef: instSnap.Ref, taskRef: taskRef, inst: inst, hasInbox: hasInbox}, nil
+}
+
+func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancement, prep advancementPrep, now time.Time) error {
+	inst := prep.inst
+	next := adv.ExpectedSeq
+	for _, e := range adv.NewEvents {
+		if e.Seq >= next {
+			next = e.Seq + 1
+		}
+	}
+	updates := []gcf.Update{{Path: "next_seq", Value: next}, {Path: "updated_at", Value: now}}
+	if adv.Terminal != nil {
+		updates = append(updates, gcf.Update{Path: "status", Value: adv.Terminal.Status}, gcf.Update{Path: "result", Value: jsonString(adv.Terminal.Result)}, gcf.Update{Path: "failure", Value: jsonString(adv.Terminal.Failure)}, gcf.Update{Path: "completed_at", Value: now})
+	}
+	if err := tx.Update(prep.instRef, updates); err != nil {
+		return err
+	}
+	for _, e := range adv.NewEvents {
+		if err := tx.Create(b.ref("wf_journal", journalID(adv.InstanceID, e.Seq)), journalDoc(adv.InstanceID, e.Seq, e, now)); err != nil {
+			return err
+		}
+	}
+	for _, at := range adv.ActivityTasks {
+		id := newID()
+		if err := tx.Create(b.ref("wf_tasks", actTaskID(id)), activityTaskDoc(at, id, now)); err != nil {
+			return err
+		}
+	}
+	for _, tm := range adv.Timers {
+		if err := tx.Create(b.ref("wf_timers", journalID(adv.InstanceID, tm.Seq)), map[string]any{"instance_id": adv.InstanceID, "seq": tm.Seq, "fire_at": tm.FireAt.UTC(), "created_at": now}); err != nil {
+			return err
+		}
+	}
+	for _, id := range adv.DrainedInbox {
+		if err := tx.Delete(b.ref("wf_inbox", inboxID(adv.InstanceID, id))); err != nil {
+			return err
+		}
+	}
+	for _, ch := range adv.Children {
+		q := ch.Queue
+		if q == "" {
+			q = "default"
+		}
+		if err := tx.Create(b.ref("wf_instances", ch.ID), instanceDoc(ch, q, now)); err != nil {
+			return err
+		}
+		if err := tx.Create(b.ref("wf_journal", journalID(ch.ID, 1)), journalDoc(ch.ID, 1, journal.Event{Type: journal.TypeWorkflowStarted, Name: ch.Name, Payload: ch.Input}, now)); err != nil {
+			return err
+		}
+		if err := tx.Create(b.ref("wf_tasks", wfTaskID(ch.ID)), workflowTaskDoc(ch.ID, q, newID(), now)); err != nil {
+			return err
+		}
+	}
+	if adv.ParentNotify != nil && inst.ParentID != "" {
+		ev := *adv.ParentNotify
+		if ev.RefSeq == 0 {
+			ev.RefSeq = inst.ParentSeq
+		}
+		id := newID()
+		if err := tx.Create(b.ref("wf_inbox", inboxID(inst.ParentID, id)), inboxDoc(inst.ParentID, id, ev, now)); err != nil {
+			return err
+		}
+	}
+	if prep.hasInbox && adv.Terminal == nil {
+		return tx.Set(prep.taskRef, workflowTaskDoc(adv.InstanceID, inst.Queue, newID(), now))
+	}
+	return tx.Delete(prep.taskRef)
 }
 
 func (b *Backend) ensureWorkflowTask(ctx context.Context, instanceID string) error {
