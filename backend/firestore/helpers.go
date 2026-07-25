@@ -112,7 +112,7 @@ func decodeInstance(m map[string]any) *backend.Instance {
 func decodeTask(m map[string]any) backend.Task {
 	t := backend.Task{ID: i64(m, "id"), Kind: str(m, "kind"), Queue: str(m, "queue"), InstanceID: str(m, "instance_id"),
 		Seq: i64(m, "ref_seq"), Attempt: int(i64(m, "attempt")), MaxAttempts: int(i64(m, "max_attempts")),
-		VisibleAt: timestamp(m, "visible_at"), WorkerID: str(m, "worker_id")}
+		VisibleAt: timestamp(m, "visible_at"), WorkerID: str(m, "worker_id"), HeartbeatDetails: bytes(m, "heartbeat")}
 	if t.Kind == "activity" {
 		var p activityPayload
 		_ = json.Unmarshal(bytes(m, "payload"), &p)
