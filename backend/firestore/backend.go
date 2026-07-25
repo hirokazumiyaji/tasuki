@@ -54,7 +54,7 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 		q = "default"
 	}
 	now := nowUTC()
-	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		r := b.ref("wf_instances", inst.ID)
 		s, err := tx.Get(r)
 		if err != nil && !isNotFound(err) {
@@ -71,6 +71,11 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 		}
 		return tx.Create(b.ref("wf_tasks", wfTaskID(inst.ID)), workflowTaskDoc(inst.ID, q, newID(), now))
 	})
+	if err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
 }
 func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance, error) {
 	s, err := b.ref("wf_instances", id).Get(ctx)
@@ -135,7 +140,7 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 }
 func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	now := nowUTC()
-	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		s, err := tx.Get(b.ref("wf_instances", id))
 		if isNotFound(err) {
 			return backend.ErrNotFound
@@ -169,6 +174,11 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	b.notifyTerminal(id)
+	return nil
 }
 
 func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
@@ -247,7 +257,11 @@ func (b *Backend) ExtendLease(ctx context.Context, id int64, d time.Duration) er
 	return b.updateTask(ctx, id, false, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
 }
 func (b *Backend) ReleaseLease(ctx context.Context, id int64) error {
-	return b.updateTask(ctx, id, false, []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}})
+	if err := b.updateTask(ctx, id, false, []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}}); err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
 }
 func (b *Backend) RetryActivity(ctx context.Context, id int64, at time.Time) error {
 	return b.updateTask(ctx, id, true, []gcf.Update{{Path: "visible_at", Value: at.UTC()}, {Path: "worker_id", Value: gcf.Delete}})
@@ -335,6 +349,12 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		}
 		if err := b.ensureWorkflowTask(ctx, adv.InstanceID); err != nil {
 			return err
+		}
+	}
+	b.notifyTasks()
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			b.notifyTerminal(adv.InstanceID)
 		}
 	}
 	return nil
@@ -519,7 +539,11 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	if err != nil {
 		return err
 	}
-	return b.ensureWorkflowTask(ctx, instanceID)
+	if err := b.ensureWorkflowTask(ctx, instanceID); err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
 }
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event) error {
 	inst, err := b.GetInstance(ctx, instanceID)
@@ -531,8 +555,11 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 		return err
 	}
 	if inst.Status == "running" {
-		return b.ensureWorkflowTask(ctx, instanceID)
+		if err := b.ensureWorkflowTask(ctx, instanceID); err != nil {
+			return err
+		}
 	}
+	b.notifyTasks()
 	return nil
 }
 func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
@@ -594,6 +621,9 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 				return n, err
 			}
 		}
+	}
+	if n > 0 {
+		b.notifyTasks()
 	}
 	return n, nil
 }

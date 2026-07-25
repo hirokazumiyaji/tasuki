@@ -111,5 +111,8 @@ func (b *Backend) ClaimDueSchedules(ctx context.Context, limit int) ([]backend.D
 		}
 		out = append(out, backend.DueSchedule{Schedule: backend.Schedule{ID: s.ID, Cron: s.Cron, Workflow: s.Workflow, Queue: s.Queue, Input: s.Input, NextRunAt: next}, InstanceID: instanceID, ScheduledAt: scheduled, Created: created})
 	}
+	if len(out) > 0 {
+		b.notifyTasks()
+	}
 	return out, nil
 }
