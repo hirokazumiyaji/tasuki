@@ -120,6 +120,30 @@ func TestSubscribeTerminal_WakesOnCommitTerminal(t *testing.T) {
 	}
 }
 
+func TestSubscribe_CrossProcessWake(t *testing.T) {
+	ctx := context.Background()
+	listener := openNotifyBackend(t)
+	writer := openNotifyBackend(t)
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch, err := listener.Subscribe(subCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Let wake poller establish baseline n.
+	time.Sleep(250 * time.Millisecond)
+	if err := writer.CreateInstance(ctx, backend.NewInstance{
+		ID: "notify-xproc-1", Name: "wf", Queue: "default", Input: []byte(`0`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected cross-process notify after CreateInstance")
+	}
+}
+
 func TestSubscribe_CancelStopsDelivery(t *testing.T) {
 	ctx := context.Background()
 	b := openNotifyBackend(t)
