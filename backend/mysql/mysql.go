@@ -6,6 +6,7 @@ import (
 	"embed"
 	"fmt"
 	"strings"
+	"sync"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -16,6 +17,10 @@ var schemaFS embed.FS
 // Backend is the MySQL / MariaDB implementation of backend.Backend.
 type Backend struct {
 	db *sql.DB
+
+	notifyMu     sync.Mutex
+	taskSubs     []*taskSub
+	terminalSubs []*terminalSub
 }
 
 // New opens a connection pool. dsn example:
