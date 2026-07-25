@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS wf_tasks (
     max_attempts int,
     visible_at   timestamptz NOT NULL DEFAULT now(),
     worker_id    text,
+    heartbeat    bytea,
     created_at   timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS wf_tasks_claim_idx ON wf_tasks (kind, queue, visible_at);
@@ -74,3 +75,5 @@ CREATE TABLE IF NOT EXISTS wf_schedules (
 );
 CREATE INDEX IF NOT EXISTS wf_schedules_due_idx ON wf_schedules (next_run_at) WHERE NOT paused;
 
+
+ALTER TABLE wf_tasks ADD COLUMN IF NOT EXISTS heartbeat bytea;
