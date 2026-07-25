@@ -51,6 +51,7 @@ var collections = []string{
 	"wf_tasks",
 	"wf_timers",
 	"wf_schedules",
+	"wf_notify",
 }
 
 // Reset deletes all documents in known collections (test helper).
