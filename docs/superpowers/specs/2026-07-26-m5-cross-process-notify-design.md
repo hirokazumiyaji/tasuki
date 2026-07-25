@@ -44,7 +44,7 @@ Emit sites stay the same (`notifyTasks` / `notifyTerminal`). Each call:
 
 Writes: `UpdateItem` `ADD n :one` (and `SET id = :id` for terminal).
 
-`Subscribe*`: in-process hub fan-in **plus** a DynamoDB Streams poller on `wf_wake` (shard iterators, GetRecords loop). Any record for the matching `pk` coalesces a wake. Stream setup failure → log/debug and rely on hub + PollInterval (Subscribe still succeeds).
+`Subscribe*`: in-process hub fan-in **plus** a consistent `GetItem` poll (~100ms) on the wake item (works with DynamoDB Local). The table enables DynamoDB Streams (`NEW_IMAGE`) so operators can attach Lambda / external consumers; the library itself uses the wake-item poller for Subscribe reliability.
 
 ## Tests
 

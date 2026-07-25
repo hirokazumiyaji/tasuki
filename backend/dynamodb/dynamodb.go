@@ -184,6 +184,16 @@ func (b *Backend) Migrate(ctx context.Context) error {
 				},
 			},
 		},
+		{
+			name: b.table("wf_wake"),
+			attrs: []types.AttributeDefinition{
+				{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			},
+			keys: []types.KeySchemaElement{
+				{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			},
+			stream: true,
+		},
 	}
 	for _, d := range defs {
 		if err := b.ensureTable(ctx, d); err != nil {
@@ -194,17 +204,30 @@ func (b *Backend) Migrate(ctx context.Context) error {
 }
 
 type tableDef struct {
-	name  string
-	attrs []types.AttributeDefinition
-	keys  []types.KeySchemaElement
-	gsi   []types.GlobalSecondaryIndex
+	name   string
+	attrs  []types.AttributeDefinition
+	keys   []types.KeySchemaElement
+	gsi    []types.GlobalSecondaryIndex
+	stream bool
 }
 
 func (b *Backend) ensureTable(ctx context.Context, d tableDef) error {
-	_, err := b.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+	desc, err := b.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
 		TableName: aws.String(d.name),
 	})
 	if err == nil {
+		if d.stream && (desc.Table.StreamSpecification == nil || !aws.ToBool(desc.Table.StreamSpecification.StreamEnabled)) {
+			_, uerr := b.client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+				TableName: aws.String(d.name),
+				StreamSpecification: &types.StreamSpecification{
+					StreamEnabled:  aws.Bool(true),
+					StreamViewType: types.StreamViewTypeNewImage,
+				},
+			})
+			if uerr != nil {
+				return fmt.Errorf("dynamodb enable stream %s: %w", d.name, uerr)
+			}
+		}
 		return nil
 	}
 	var nfe *types.ResourceNotFoundException
@@ -221,6 +244,12 @@ func (b *Backend) ensureTable(ctx context.Context, d tableDef) error {
 	if len(d.gsi) > 0 {
 		in.GlobalSecondaryIndexes = d.gsi
 	}
+	if d.stream {
+		in.StreamSpecification = &types.StreamSpecification{
+			StreamEnabled:  aws.Bool(true),
+			StreamViewType: types.StreamViewTypeNewImage,
+		}
+	}
 	_, err = b.client.CreateTable(ctx, in)
 	if err != nil {
 		var inUse *types.ResourceInUseException
@@ -236,6 +265,7 @@ func (b *Backend) ensureTable(ctx context.Context, d tableDef) error {
 // Reset deletes all items from all tables (test helper).
 func (b *Backend) Reset(ctx context.Context) error {
 	tables := []string{
+		b.table("wf_wake"),
 		b.table("wf_schedules"),
 		b.table("wf_timers"),
 		b.table("wf_tasks"),
@@ -282,6 +312,12 @@ func (b *Backend) clearTable(ctx context.Context, name string) error {
 }
 
 func keyFromItem(table string, item map[string]types.AttributeValue) map[string]types.AttributeValue {
+	if len(table) >= 7 && table[len(table)-7:] == "wf_wake" {
+		if pk, ok := item["pk"]; ok {
+			return map[string]types.AttributeValue{"pk": pk}
+		}
+		return nil
+	}
 	switch {
 	case len(table) >= 8 && table[len(table)-8:] == "wf_tasks":
 		return map[string]types.AttributeValue{"task_pk": item["task_pk"]}
