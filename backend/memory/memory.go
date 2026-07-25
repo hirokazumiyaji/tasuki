@@ -223,13 +223,15 @@ func (b *Backend) ExtendLease(_ context.Context, taskID int64, d time.Duration) 
 
 func (b *Backend) ReleaseLease(_ context.Context, taskID int64) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	t, ok := b.tasks[taskID]
 	if !ok {
+		b.mu.Unlock()
 		return backend.ErrNotFound
 	}
 	t.visibleAt = b.now
 	t.workerID = ""
+	b.mu.Unlock()
+	b.notifyTasks()
 	return nil
 }
 
@@ -346,16 +348,26 @@ func (b *Backend) CommitAdvancements(_ context.Context, advs []backend.Advanceme
 		return nil
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	for _, adv := range advs {
 		if err := b.preflightAdvancementLocked(adv); err != nil {
+			b.mu.Unlock()
 			return err
 		}
 	}
+	var terminals []string
 	for _, adv := range advs {
 		if err := b.commitAdvancementLocked(adv); err != nil {
+			b.mu.Unlock()
 			return err
 		}
+		if adv.Terminal != nil {
+			terminals = append(terminals, adv.InstanceID)
+		}
+	}
+	b.mu.Unlock()
+	b.notifyTasks()
+	for _, id := range terminals {
+		b.notifyTerminal(id)
 	}
 	return nil
 }
@@ -468,30 +480,33 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 
 func (b *Backend) CompleteActivity(_ context.Context, taskID int64, ev journal.Event) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	t, ok := b.tasks[taskID]
 	if !ok || t.kind != "activity" {
+		b.mu.Unlock()
 		return backend.ErrSuperseded
 	}
 	inst, ok := b.instances[t.instanceID]
 	if !ok {
+		b.mu.Unlock()
 		return backend.ErrNotFound
 	}
 	delete(b.tasks, taskID)
 	if inst.status != "running" {
 		// Terminated/completed instances ignore late completions.
+		b.mu.Unlock()
 		return nil
 	}
 	ev.RefSeq = t.seq
 	b.nextInbox++
 	b.inbox[t.instanceID] = append(b.inbox[t.instanceID], &inboxItem{id: b.nextInbox, event: ev})
 	b.enqueueWorkflowTaskLocked(t.instanceID, inst.queue)
+	b.mu.Unlock()
+	b.notifyTasks()
 	return nil
 }
 
 func (b *Backend) FireDueTimers(_ context.Context, limit int) (int, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if limit <= 0 {
 		limit = 1
 	}
@@ -535,6 +550,10 @@ func (b *Backend) FireDueTimers(_ context.Context, limit int) (int, error) {
 			b.enqueueWorkflowTaskLocked(d.tm.instanceID, inst.queue)
 		}
 		n++
+	}
+	b.mu.Unlock()
+	if n > 0 {
+		b.notifyTasks()
 	}
 	return n, nil
 }
@@ -601,15 +620,21 @@ func toTask(t *task) backend.Task {
 
 func (b *Backend) SendToInbox(_ context.Context, instanceID string, ev journal.Event) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	inst, ok := b.instances[instanceID]
 	if !ok {
+		b.mu.Unlock()
 		return backend.ErrNotFound
 	}
 	b.nextInbox++
 	b.inbox[instanceID] = append(b.inbox[instanceID], &inboxItem{id: b.nextInbox, event: ev})
+	wake := false
 	if inst.status == "running" {
 		b.enqueueWorkflowTaskLocked(instanceID, inst.queue)
+		wake = true
+	}
+	b.mu.Unlock()
+	if wake {
+		b.notifyTasks()
 	}
 	return nil
 }

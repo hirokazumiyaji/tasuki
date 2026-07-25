@@ -76,7 +76,6 @@ func (b *Backend) PauseSchedule(_ context.Context, id string, paused bool) error
 
 func (b *Backend) ClaimDueSchedules(_ context.Context, limit int) ([]backend.DueSchedule, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if limit <= 0 {
 		limit = 1
 	}
@@ -88,6 +87,7 @@ func (b *Backend) ClaimDueSchedules(_ context.Context, limit int) ([]backend.Due
 		due = append(due, s)
 	}
 	if len(due) == 0 {
+		b.mu.Unlock()
 		return nil, nil
 	}
 	// Stable order by id
@@ -113,11 +113,13 @@ func (b *Backend) ClaimDueSchedules(_ context.Context, limit int) ([]backend.Due
 			if err == backend.ErrAlreadyExists {
 				created = false
 			} else {
+				b.mu.Unlock()
 				return nil, err
 			}
 		}
 		next, err := backend.NextCronTime(s.cron, scheduledAt)
 		if err != nil {
+			b.mu.Unlock()
 			return nil, err
 		}
 		s.nextRunAt = next
@@ -131,5 +133,7 @@ func (b *Backend) ClaimDueSchedules(_ context.Context, limit int) ([]backend.Due
 			Created:     created,
 		})
 	}
+	b.mu.Unlock()
+	b.notifyTasks()
 	return out, nil
 }
