@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hirokazumiyaji/tasuki/activity"
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/internal/engine"
 	"github.com/hirokazumiyaji/tasuki/journal"
@@ -476,7 +477,26 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	defer close(done)
 	go w.extendLeaseLoop(ctx, t.ID, done)
 
-	out, err := act.fn(ctx, t.Input)
+	attempt := t.Attempt
+	if attempt < 1 {
+		attempt = 1
+	}
+	actCtx := activity.WithEnv(ctx, &activity.Env{
+		Info: activity.Info{
+			InstanceID:     t.InstanceID,
+			ActivityName:   t.Name,
+			Attempt:        attempt,
+			TaskID:         t.ID,
+			IdempotencyKey: fmt.Sprintf("%s/%d", t.InstanceID, t.Seq),
+		},
+		Codec:   w.opts.Codec,
+		Details: append([]byte(nil), t.HeartbeatDetails...),
+		Record: func(ctx context.Context, details []byte) error {
+			return w.backend.RecordHeartbeat(ctx, t.ID, w.opts.LeaseDuration, details)
+		},
+	})
+
+	out, err := act.fn(actCtx, t.Input)
 	if err != nil {
 		if IsNonRetryable(err) || (t.MaxAttempts > 0 && t.Attempt >= t.MaxAttempts) {
 			return w.failActivity(ctx, t, err)

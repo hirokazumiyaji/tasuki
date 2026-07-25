@@ -55,6 +55,7 @@ type task struct {
 	retry       backend.RetryPolicy
 	visibleAt   time.Time
 	workerID    string
+	heartbeat   []byte
 }
 
 type timerKey struct {
@@ -218,6 +219,20 @@ func (b *Backend) ExtendLease(_ context.Context, taskID int64, d time.Duration) 
 		return backend.ErrNotFound
 	}
 	t.visibleAt = b.now.Add(d)
+	return nil
+}
+
+func (b *Backend) RecordHeartbeat(_ context.Context, taskID int64, lease time.Duration, details []byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t, ok := b.tasks[taskID]
+	if !ok {
+		return backend.ErrNotFound
+	}
+	t.visibleAt = b.now.Add(lease)
+	if details != nil {
+		t.heartbeat = append([]byte(nil), details...)
+	}
 	return nil
 }
 
@@ -629,18 +644,19 @@ func (b *Backend) enqueueWorkflowTaskLocked(instanceID, queue string) {
 
 func toTask(t *task) backend.Task {
 	return backend.Task{
-		ID:          t.id,
-		Kind:        t.kind,
-		Queue:       t.queue,
-		InstanceID:  t.instanceID,
-		Name:        t.name,
-		Seq:         t.seq,
-		Input:       append([]byte(nil), t.input...),
-		Attempt:     t.attempt,
-		MaxAttempts: t.maxAttempts,
-		Retry:       t.retry,
-		VisibleAt:   t.visibleAt,
-		WorkerID:    t.workerID,
+		ID:               t.id,
+		Kind:             t.kind,
+		Queue:            t.queue,
+		InstanceID:       t.instanceID,
+		Name:             t.name,
+		Seq:              t.seq,
+		Input:            append([]byte(nil), t.input...),
+		Attempt:          t.attempt,
+		MaxAttempts:      t.maxAttempts,
+		Retry:            t.retry,
+		VisibleAt:        t.visibleAt,
+		WorkerID:         t.workerID,
+		HeartbeatDetails: append([]byte(nil), t.heartbeat...),
 	}
 }
 

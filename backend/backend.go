@@ -24,6 +24,8 @@ type Backend interface {
 	// for kind among queues. Queues with zero may be omitted.
 	CountClaimableTasks(ctx context.Context, kind string, queues []string) (map[string]int64, error)
 	ExtendLease(ctx context.Context, taskID int64, d time.Duration) error
+	// RecordHeartbeat extends the lease and stores details for GetHeartbeatDetails on later attempts.
+	RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error
 	ReleaseLease(ctx context.Context, taskID int64) error
 	LoadWorkflow(ctx context.Context, instanceID string) (*WorkflowState, error)
 	// LoadWorkflowHead returns instance metadata, inbox, next_seq, and store Now without journal.
