@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 
 	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
@@ -27,6 +28,10 @@ var dsnRE = regexp.MustCompile(`^projects/([^/]+)/instances/([^/]+)/databases/([
 type Backend struct {
 	client *spanner.Client
 	dsn    string
+
+	notifyMu     sync.Mutex
+	taskSubs     []*taskSub
+	terminalSubs []*terminalSub
 }
 
 // New opens a Spanner client. Set SPANNER_EMULATOR_HOST for the emulator.

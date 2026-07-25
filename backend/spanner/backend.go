@@ -57,7 +57,11 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 	if isAlreadyExists(err) {
 		return backend.ErrAlreadyExists
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
 }
 
 func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance, error) {
@@ -223,7 +227,11 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		tmIter.Stop()
 		return txn.BufferWrite(muts)
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	b.notifyTerminal(id)
+	return nil
 }
 
 func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
