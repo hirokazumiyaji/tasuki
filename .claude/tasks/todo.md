@@ -1,9 +1,7 @@
-# tasuki M5 Backlog Metrics
+# tasuki M5 Fuzz + Hot-instance docs
 
 ## タスク
 
-- [x] Task 1: Spec + Plan
-- [x] Task 2: Interface + memory + backendtest + metrics + worker
-- [x] Task 3: SQL + Spanner
-- [x] Task 4: DynamoDB + Firestore
-- [x] Task 5: Observability docs
+- [x] Slice 1: Backlog metrics (done)
+- [x] Slice 2: Codec + engine fuzz
+- [ ] Slice 3: Hot-instance docs
