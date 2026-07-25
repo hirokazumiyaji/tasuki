@@ -6,4 +6,4 @@
 - [x] Task 2: Interface + memory + backendtest + metrics + worker
 - [x] Task 3: SQL + Spanner
 - [x] Task 4: DynamoDB + Firestore
-- [ ] Task 5: Observability docs
+- [x] Task 5: Observability docs

@@ -27,6 +27,8 @@ Meter 名: `github.com/hirokazumiyaji/tasuki`
 | `tasuki.workflow.terminal` | Counter | ワークフロー終端回数 |
 | `tasuki.activity.retries` | Counter | スケジュールしたアクティビティリトライ数 |
 | `tasuki.workflow.journal_warnings` | Counter | ジャーナル件数警告の回数 |
+| `tasuki.tasks.backlog` | Gauge | キューごとの claim 可能タスク数（属性 `kind`, `queue`）。Worker がポーリング tick ごとにサンプリング |
 
 `WorkerOptions.Metrics` に `observability.NewMetrics()` の結果を渡す。未設定時は記録しない（noop）。
 グローバル `MeterProvider` が未設定なら OTel 既定の noop 実装が使われる。
+backlog Gauge は `Metrics` 設定時のみ、`CountClaimableTasks` でストア上の claim 可能件数を読む（失敗してもタスク処理は継続）。
