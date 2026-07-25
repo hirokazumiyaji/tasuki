@@ -107,6 +107,8 @@ func main() {
 | `ContinueAsNew[I](ctx, in) error` | 履歴を打ち切り新しい実行へ引き継ぐ（return で使うエラー値） |
 | `Info(ctx) WorkflowInfo` | インスタンス ID、ワークフロー名、開始時刻 |
 
+長寿命・ループするワークフローは、イベント数が数千〜1万付近になったら `ContinueAsNew` で履歴を打ち切ることを推奨する（既定の警告しきい値と揃える）。警告自体は実行を止めない。
+
 `Future[O]` は `Get(ctx) (O, error)` を持つ。
 `Await` に異なる型の Future を混ぜられるよう、すべての Future は型を消した `Awaitable` インターフェースを満たす。
 
@@ -345,7 +347,7 @@ type WorkerOptions struct {
     WorkerID             string        // 既定 ホスト名 + ランダムサフィックス
     Codec                Codec         // 既定 JSON
     Logger               *slog.Logger  // 既定 slog.Default()
-    JournalWarnThreshold int           // 既定 10000 イベント
+    JournalWarnThreshold int           // 0 → 既定 10000。負数で無効。超過時は Warn + メトリクスのみ
 }
 ```
 
