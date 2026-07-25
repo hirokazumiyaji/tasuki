@@ -1,8 +1,9 @@
-# tasuki M5 Cross-Process Notify
+# tasuki M6 Activity Heartbeat
 
 ## タスク
 
 - [x] Task 1: Spec + Plan
-- [x] Task 2: Firestore snapshot wake
-- [x] Task 3: DynamoDB wf_wake + Streams
-- [x] Task 4: README
+- [ ] Task 2: activity package + memory + worker
+- [ ] Task 3: SQL + Spanner
+- [ ] Task 4: DynamoDB + Firestore
+- [ ] Task 5: Docs
