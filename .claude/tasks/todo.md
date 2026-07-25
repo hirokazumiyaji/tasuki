@@ -1,7 +1,8 @@
-# tasuki M5 Leftover A-Track
+# tasuki M5 Cross-Process Notify
 
 ## タスク
 
-- [x] Slice 1: Backlog metrics
-- [x] Slice 2: Codec + engine fuzz
-- [x] Slice 3: Hot-instance docs
+- [x] Task 1: Spec + Plan
+- [ ] Task 2: Firestore snapshot wake
+- [ ] Task 3: DynamoDB wf_wake + Streams
+- [ ] Task 4: README
