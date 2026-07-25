@@ -290,6 +290,11 @@ func decodeTask(m map[string]types.AttributeValue) backend.Task {
 func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
 	return b.updateTask(ctx, taskID, "SET visible_at = :v", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(d)))}, "")
 }
+
+func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+	_ = details
+	return b.ExtendLease(ctx, taskID, lease)
+}
 func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	if err := b.updateTask(ctx, taskID, "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC()))}, ""); err != nil {
 		return err

@@ -54,18 +54,19 @@ type InboxEvent struct {
 }
 
 type Task struct {
-	ID          int64
-	Kind        string
-	Queue       string
-	InstanceID  string
-	Name        string
-	Seq         int64
-	Input       []byte
-	Attempt     int
-	MaxAttempts int
-	Retry       RetryPolicy
-	VisibleAt   time.Time
-	WorkerID    string
+	ID                int64
+	Kind              string
+	Queue             string
+	InstanceID        string
+	Name              string
+	Seq               int64
+	Input             []byte
+	Attempt           int
+	MaxAttempts       int
+	Retry             RetryPolicy
+	VisibleAt         time.Time
+	WorkerID          string
+	HeartbeatDetails  []byte // last RecordHeartbeat payload; may be nil
 }
 
 // RetryPolicy is stored on activity tasks for worker-side backoff.

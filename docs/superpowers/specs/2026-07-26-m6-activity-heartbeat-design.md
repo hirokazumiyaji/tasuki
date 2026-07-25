@@ -26,7 +26,7 @@ type Info struct {
     IdempotencyKey string // "{instanceID}/{seq}"
 }
 
-func Info(ctx context.Context) Info
+func GetInfo(ctx context.Context) Info // docs historically said Info(ctx); Go cannot share the name with the type
 func RecordHeartbeat(ctx context.Context, details any) error
 func GetHeartbeatDetails(ctx context.Context, dest any) error // ErrNoDetails if none
 ```

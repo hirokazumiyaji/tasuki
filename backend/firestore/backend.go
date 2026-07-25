@@ -288,6 +288,11 @@ func (b *Backend) updateTask(ctx context.Context, id int64, activity bool, field
 func (b *Backend) ExtendLease(ctx context.Context, id int64, d time.Duration) error {
 	return b.updateTask(ctx, id, false, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
 }
+
+func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+	_ = details
+	return b.ExtendLease(ctx, taskID, lease)
+}
 func (b *Backend) ReleaseLease(ctx context.Context, id int64) error {
 	if err := b.updateTask(ctx, id, false, []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}}); err != nil {
 		return err

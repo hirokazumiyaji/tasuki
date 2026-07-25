@@ -302,6 +302,11 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 	return nil
 }
 
+func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+	_ = details
+	return b.ExtendLease(ctx, taskID, lease)
+}
+
 func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	res, err := b.db.ExecContext(ctx, `
 		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ?`, nowUTC(), taskID)

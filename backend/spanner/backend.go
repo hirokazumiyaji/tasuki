@@ -388,6 +388,11 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 	return err
 }
 
+func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+	_ = details
+	return b.ExtendLease(ctx, taskID, lease)
+}
+
 func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
