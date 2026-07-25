@@ -297,9 +297,85 @@ func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend
 }
 
 func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {
+	return b.commitAdvancementOnce(ctx, adv)
+}
+
+func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
+	if len(advs) == 0 {
+		return nil
+	}
+	if len(advs) == 1 {
+		return b.commitAdvancementOnce(ctx, advs[0])
+	}
+	var all []types.TransactWriteItem
+	var ensures []string
+	var parentEnsures []string
+	for _, adv := range advs {
+		items, parentID, err := b.buildAdvancementItems(ctx, adv)
+		if err != nil {
+			return err
+		}
+		if len(all)+len(items) > 100 {
+			for _, a := range advs {
+				if err := b.commitAdvancementOnce(ctx, a); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		all = append(all, items...)
+		ensures = append(ensures, adv.InstanceID)
+		if parentID != "" {
+			parentEnsures = append(parentEnsures, parentID)
+		}
+	}
+	_, err := b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: all})
+	if conditional(err) {
+		return backend.ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	for _, id := range parentEnsures {
+		if err := b.ensureWorkflowTask(ctx, id); err != nil {
+			return err
+		}
+	}
+	for _, id := range ensures {
+		if err := b.ensureWorkflowTask(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advancement) error {
+	items, parentID, err := b.buildAdvancementItems(ctx, adv)
+	if err != nil {
+		return err
+	}
+	if len(items) > 100 {
+		return fmt.Errorf("dynamodb: advancement produces %d transaction operations", len(items))
+	}
+	_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+	if conditional(err) {
+		return backend.ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	if parentID != "" {
+		if err := b.ensureWorkflowTask(ctx, parentID); err != nil {
+			return err
+		}
+	}
+	return b.ensureWorkflowTask(ctx, adv.InstanceID)
+}
+
+func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advancement) ([]types.TransactWriteItem, string, error) {
 	inst, err := b.GetInstance(ctx, adv.InstanceID)
 	if err != nil {
-		return backend.ErrConflict
+		return nil, "", backend.ErrConflict
 	}
 	now := nowUTC()
 	newSeq := adv.ExpectedSeq
@@ -336,30 +412,17 @@ func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement
 		}
 		items = append(items, put(b.table("wf_instances"), instanceItem(child, q, now), "attribute_not_exists(id)"), put(b.table("wf_journal"), journalItem(child.ID, 1, journal.Event{Type: journal.TypeWorkflowStarted, Name: child.Name, Payload: child.Input}, now), "attribute_not_exists(instance_id) AND attribute_not_exists(seq)"), put(b.table("wf_tasks"), workflowTaskItem(child.ID, q, newID(), now), "attribute_not_exists(task_pk)"))
 	}
+	parentID := ""
 	if adv.ParentNotify != nil && inst.ParentID != "" {
 		ev := *adv.ParentNotify
 		if ev.RefSeq == 0 {
 			ev.RefSeq = inst.ParentSeq
 		}
 		items = append(items, put(b.table("wf_inbox"), inboxItem(inst.ParentID, newID(), ev, now), "attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
+		parentID = inst.ParentID
 	}
 	items = append(items, delWithValues(b.table("wf_tasks"), map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))}, "id = :taskid AND kind = :workflow", map[string]types.AttributeValue{":taskid": avN(adv.TaskID), ":workflow": avS("workflow")}))
-	if len(items) > 100 {
-		return fmt.Errorf("dynamodb: advancement produces %d transaction operations", len(items))
-	}
-	_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
-	if conditional(err) {
-		return backend.ErrConflict
-	}
-	if err != nil {
-		return err
-	}
-	if adv.ParentNotify != nil && inst.ParentID != "" {
-		if err := b.ensureWorkflowTask(ctx, inst.ParentID); err != nil {
-			return err
-		}
-	}
-	return b.ensureWorkflowTask(ctx, adv.InstanceID)
+	return items, parentID, nil
 }
 
 func instanceAdvanceExpression(t *backend.TerminalUpdate) string {
