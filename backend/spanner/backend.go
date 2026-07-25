@@ -371,7 +371,11 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 		}
 		return nil
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
 }
 
 func (b *Backend) LoadWorkflowHead(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
@@ -452,6 +456,12 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			return ensureWorkflowTaskIfInbox(ctx, txn, adv.InstanceID)
 		}); err != nil {
 			return err
+		}
+	}
+	b.notifyTasks()
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			b.notifyTerminal(adv.InstanceID)
 		}
 	}
 	return nil
@@ -709,7 +719,8 @@ func ensureWorkflowTaskIfInbox(ctx context.Context, txn *spanner.ReadWriteTransa
 
 func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
 	now := nowUTC()
-	return b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+	var wake bool
+	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{taskID},
 			[]string{"instance_id", "ref_seq", "kind"})
 		if err != nil {
@@ -753,8 +764,16 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 		}); err != nil {
 			return err
 		}
+		wake = true
 		return enqueueWorkflowTask(ctx, txn, instanceID, queue, now)
 	})
+	if err != nil {
+		return err
+	}
+	if wake {
+		b.notifyTasks()
+	}
+	return nil
 }
 
 func (b *Backend) RetryActivity(ctx context.Context, taskID int64, visibleAt time.Time) error {
@@ -836,7 +855,13 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 		}
 		return nil
 	})
-	return n, err
+	if err != nil {
+		return n, err
+	}
+	if n > 0 {
+		b.notifyTasks()
+	}
+	return n, nil
 }
 
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event) error {
@@ -870,7 +895,11 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	if err != nil {
 		return err
 	}
-	return b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+	if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		return ensureWorkflowTaskIfInbox(ctx, txn, instanceID)
-	})
+	}); err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
 }
