@@ -285,6 +285,7 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	if n == 0 {
 		return backend.ErrNotFound
 	}
+	b.notifyTasks()
 	return nil
 }
 
@@ -380,6 +381,12 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			return ensureWorkflowTaskIfInbox(ctx, conn, adv.InstanceID)
 		}); err != nil {
 			return err
+		}
+	}
+	b.notifyTasks()
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			b.notifyTerminal(adv.InstanceID)
 		}
 	}
 	return nil
@@ -612,7 +619,11 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	if err := enqueueWorkflowTask(ctx, conn, instanceID); err != nil {
 		return err
 	}
-	return commitConn(ctx, conn)
+	if err := commitConn(ctx, conn); err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
 }
 
 func (b *Backend) RetryActivity(ctx context.Context, taskID int64, visibleAt time.Time) error {
@@ -699,6 +710,9 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	if err := commitConn(ctx, conn); err != nil {
 		return 0, err
 	}
+	if n > 0 {
+		b.notifyTasks()
+	}
 	return n, nil
 }
 
@@ -732,7 +746,11 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	if err != nil {
 		return err
 	}
-	return withTx(ctx, b.db, func(conn *sql.Conn) error {
+	if err := withTx(ctx, b.db, func(conn *sql.Conn) error {
 		return ensureWorkflowTaskIfInbox(ctx, conn, instanceID)
-	})
+	}); err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
 }
