@@ -290,6 +290,32 @@ func (b *Backend) LoadWorkflow(_ context.Context, instanceID string) (*backend.W
 	return st, nil
 }
 
+func (b *Backend) CountClaimableTasks(_ context.Context, kind string, queues []string) (map[string]int64, error) {
+	if len(queues) == 0 {
+		return map[string]int64{}, nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	queueSet := map[string]struct{}{}
+	for _, q := range queues {
+		queueSet[q] = struct{}{}
+	}
+	out := map[string]int64{}
+	for _, t := range b.tasks {
+		if t.kind != kind {
+			continue
+		}
+		if _, ok := queueSet[t.queue]; !ok {
+			continue
+		}
+		if t.visibleAt.After(b.now) {
+			continue
+		}
+		out[t.queue]++
+	}
+	return out, nil
+}
+
 func (b *Backend) ClaimTasks(_ context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

@@ -203,6 +203,43 @@ func (b *Backend) deleteTimersForInstance(ctx context.Context, id string) error 
 	return nil
 }
 
+func (b *Backend) CountClaimableTasks(ctx context.Context, kind string, queues []string) (map[string]int64, error) {
+	if len(queues) == 0 {
+		return map[string]int64{}, nil
+	}
+	now := nowUTC()
+	out := map[string]int64{}
+	for _, queue := range queues {
+		var n int64
+		var startKey map[string]types.AttributeValue
+		for {
+			in := &dynamodb.QueryInput{
+				TableName:              aws.String(b.table("wf_tasks")),
+				IndexName:              aws.String("claim_gsi"),
+				KeyConditionExpression: aws.String("gsi_pk = :g AND visible_at <= :now"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":g": avS(claimGSI(kind, queue)), ":now": avN(timeToN(now)),
+				},
+				Select:            types.SelectCount,
+				ExclusiveStartKey: startKey,
+			}
+			res, err := b.client.Query(ctx, in)
+			if err != nil {
+				return nil, err
+			}
+			n += int64(res.Count)
+			if res.LastEvaluatedKey == nil {
+				break
+			}
+			startKey = res.LastEvaluatedKey
+		}
+		if n > 0 {
+			out[queue] = n
+		}
+	}
+	return out, nil
+}
+
 func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
 	if req.Limit <= 0 {
 		req.Limit = 1

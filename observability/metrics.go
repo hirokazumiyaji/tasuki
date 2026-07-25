@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
 
@@ -17,6 +18,7 @@ type Metrics struct {
 	WorkflowDone     metric.Int64Counter // completed / failed / stuck / canceled
 	ActivityRetries  metric.Int64Counter
 	JournalWarnings  metric.Int64Counter
+	TaskBacklog      metric.Int64Gauge
 }
 
 // NewMetrics creates counters on the global MeterProvider (noop if unset).
@@ -48,12 +50,19 @@ func NewMetrics() (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	tb, err := m.Int64Gauge("tasuki.tasks.backlog",
+		metric.WithDescription("Claimable tasks per queue"),
+		metric.WithUnit("{task}"))
+	if err != nil {
+		return nil, err
+	}
 	return &Metrics{
 		WorkflowTasks:   wt,
 		ActivityTasks:   at,
 		WorkflowDone:    wd,
 		ActivityRetries: ar,
 		JournalWarnings: jw,
+		TaskBacklog:     tb,
 	}, nil
 }
 
@@ -91,6 +100,18 @@ func (m *Metrics) AddJournalWarning(ctx context.Context, n int64) {
 		return
 	}
 	m.JournalWarnings.Add(ctx, n)
+}
+
+func (m *Metrics) RecordBacklog(ctx context.Context, kind, queue string, n int64) {
+	if m == nil {
+		return
+	}
+	m.TaskBacklog.Record(ctx, n,
+		metric.WithAttributes(
+			attribute.String("kind", kind),
+			attribute.String("queue", queue),
+		),
+	)
 }
 
 // MustNewMetrics panics on instrument creation failure.

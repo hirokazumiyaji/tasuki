@@ -29,9 +29,42 @@ func Run(t *testing.T, newBackend Factory) {
 	t.Run("DoubleCompleteSuperseded", func(t *testing.T) { testDoubleComplete(t, newBackend) })
 	t.Run("TerminateIgnoresLateComplete", func(t *testing.T) { testTerminateLateComplete(t, newBackend) })
 	t.Run("FireTimerWakesWorkflow", func(t *testing.T) { testFireTimer(t, newBackend) })
+	t.Run("CountClaimableTasks", func(t *testing.T) { testCountClaimableTasks(t, newBackend) })
 	RunConcurrent(t, newBackend)
 	RunM2(t, newBackend)
 	RunM3(t, newBackend)
+}
+
+func testCountClaimableTasks(t *testing.T, newBackend Factory) {
+	ctx := context.Background()
+	b := newBackend(t)
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: "backlog-1", Name: "wf", Queue: "default", Input: []byte(`1`)}); err != nil {
+		t.Fatal(err)
+	}
+	counts, err := b.CountClaimableTasks(ctx, "workflow", []string{"default", "other"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts["default"] < 1 {
+		t.Fatalf("want default backlog >= 1, got %v", counts)
+	}
+	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 10,
+		Lease: time.Minute, WorkerID: "w1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) < 1 {
+		t.Fatal("expected to claim at least one task")
+	}
+	after, err := b.CountClaimableTasks(ctx, "workflow", []string{"default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after["default"] >= counts["default"] {
+		t.Fatalf("backlog should drop after claim: before=%v after=%v", counts, after)
+	}
 }
 
 func testLoadWorkflowHead(t *testing.T, newBackend Factory) {
