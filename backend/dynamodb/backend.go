@@ -277,7 +277,7 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 }
 
 func decodeTask(m map[string]types.AttributeValue) backend.Task {
-	t := backend.Task{ID: fromN(m["id"]), Kind: fromS(m["kind"]), Queue: fromS(m["queue"]), InstanceID: fromS(m["instance_id"]), Seq: fromN(m["ref_seq"]), Attempt: int(fromN(m["attempt"])), MaxAttempts: int(fromN(m["max_attempts"])), VisibleAt: nToTime(fromN(m["visible_at"])), WorkerID: fromS(m["worker_id"])}
+	t := backend.Task{ID: fromN(m["id"]), Kind: fromS(m["kind"]), Queue: fromS(m["queue"]), InstanceID: fromS(m["instance_id"]), Seq: fromN(m["ref_seq"]), Attempt: int(fromN(m["attempt"])), MaxAttempts: int(fromN(m["max_attempts"])), VisibleAt: nToTime(fromN(m["visible_at"])), WorkerID: fromS(m["worker_id"]), HeartbeatDetails: fromJSON(m["heartbeat"])}
 	if t.Kind == "activity" {
 		var p activityPayload
 		_ = json.Unmarshal(fromJSON(m["payload"]), &p)
@@ -292,8 +292,13 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 }
 
 func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
-	_ = details
-	return b.ExtendLease(ctx, taskID, lease)
+	values := map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(lease)))}
+	update := "SET visible_at = :v"
+	if details != nil {
+		update += ", heartbeat = :h"
+		values[":h"] = avJSON(details)
+	}
+	return b.updateTask(ctx, taskID, update, values, "")
 }
 func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	if err := b.updateTask(ctx, taskID, "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC()))}, ""); err != nil {

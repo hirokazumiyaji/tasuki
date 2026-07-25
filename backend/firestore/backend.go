@@ -290,8 +290,11 @@ func (b *Backend) ExtendLease(ctx context.Context, id int64, d time.Duration) er
 }
 
 func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
-	_ = details
-	return b.ExtendLease(ctx, taskID, lease)
+	fields := []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(lease)}}
+	if details != nil {
+		fields = append(fields, gcf.Update{Path: "heartbeat", Value: string(details)})
+	}
+	return b.updateTask(ctx, taskID, false, fields)
 }
 func (b *Backend) ReleaseLease(ctx context.Context, id int64) error {
 	if err := b.updateTask(ctx, id, false, []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}}); err != nil {
