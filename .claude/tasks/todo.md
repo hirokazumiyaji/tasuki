@@ -4,6 +4,6 @@
 
 - [x] Task 1: Spec + Plan
 - [x] Task 2: activity package + memory + worker
-- [ ] Task 3: SQL + Spanner
-- [ ] Task 4: DynamoDB + Firestore
-- [ ] Task 5: Docs
+- [x] Task 3: SQL + Spanner
+- [x] Task 4: DynamoDB + Firestore
+- [x] Task 5: Docs

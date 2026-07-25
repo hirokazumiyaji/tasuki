@@ -217,16 +217,21 @@ type RetryPolicy struct {
 func ChargePayment(ctx context.Context, in ChargeInput) (ChargeResult, error)
 ```
 
-実行情報は `activity.Info(ctx)` から得る。
+実行情報は `activity.GetInfo(ctx)` から得る。
 
 ```go
 type Info struct {
     InstanceID     string
     ActivityName   string
     Attempt        int    // 1 始まり
+    TaskID         int64
     IdempotencyKey string // InstanceID とスケジュール seq から成る。リトライ間で不変
 }
 ```
+
+長時間アクティビティは `activity.RecordHeartbeat(ctx, details)` でリースを延ばし、進捗を記録できる。
+リトライ時は `activity.GetHeartbeatDetails(ctx, &dest)` で直前の details を取り出せる（未記録なら `activity.ErrNoDetails`）。
+ワーカーはフォールバックとしてリース半減期ごとの自動延長も行う。
 
 アクティビティは at-least-once 実行である（[02-architecture.md](02-architecture.md)）。
 外部システムへの副作用を一度きりにしたい場合は、`IdempotencyKey` を外部 API の冪等キーや一意制約に使う。
