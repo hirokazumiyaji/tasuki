@@ -156,6 +156,36 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	return nil
 }
 
+func (b *Backend) CountClaimableTasks(ctx context.Context, kind string, queues []string) (map[string]int64, error) {
+	if len(queues) == 0 {
+		return map[string]int64{}, nil
+	}
+	args := make([]any, 0, 2+len(queues))
+	args = append(args, kind, nowUTC())
+	for _, q := range queues {
+		args = append(args, q)
+	}
+	query := fmt.Sprintf(`
+		SELECT queue, COUNT(*) FROM wf_tasks
+		WHERE kind = ? AND visible_at <= ? AND queue IN (%s)
+		GROUP BY queue`, inClause(len(queues)))
+	rows, err := b.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var q string
+		var n int64
+		if err := rows.Scan(&q, &n); err != nil {
+			return nil, err
+		}
+		out[q] = n
+	}
+	return out, rows.Err()
+}
+
 func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
 	if req.Limit <= 0 {
 		req.Limit = 1

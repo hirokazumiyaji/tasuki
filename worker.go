@@ -139,9 +139,26 @@ func (w *Worker) loop(ctx context.Context) {
 	}
 }
 
+func (w *Worker) sampleBacklog(ctx context.Context) {
+	if w.opts.Metrics == nil {
+		return
+	}
+	for _, kind := range []string{"workflow", "activity"} {
+		counts, err := w.backend.CountClaimableTasks(ctx, kind, w.opts.Queues)
+		if err != nil {
+			w.opts.Logger.Debug("backlog count failed", "kind", kind, "err", err)
+			continue
+		}
+		for _, q := range w.opts.Queues {
+			w.opts.Metrics.RecordBacklog(ctx, kind, q, counts[q])
+		}
+	}
+}
+
 func (w *Worker) tick(ctx context.Context) {
 	_, _ = w.backend.FireDueTimers(ctx, 100)
 	_, _ = w.backend.ClaimDueSchedules(ctx, 100)
+	w.sampleBacklog(ctx)
 
 	wtasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
 		Kind: "workflow", Queues: w.opts.Queues, Limit: w.opts.ClaimLimit,

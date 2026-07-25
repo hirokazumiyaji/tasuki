@@ -20,6 +20,9 @@ type Backend interface {
 	SendToInbox(ctx context.Context, instanceID string, ev journal.Event) error
 
 	ClaimTasks(ctx context.Context, req ClaimRequest) ([]Task, error)
+	// CountClaimableTasks returns per-queue counts of tasks with visible_at <= store now
+	// for kind among queues. Queues with zero may be omitted.
+	CountClaimableTasks(ctx context.Context, kind string, queues []string) (map[string]int64, error)
 	ExtendLease(ctx context.Context, taskID int64, d time.Duration) error
 	ReleaseLease(ctx context.Context, taskID int64) error
 	LoadWorkflow(ctx context.Context, instanceID string) (*WorkflowState, error)

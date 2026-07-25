@@ -11,7 +11,7 @@ func TestNewMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.WorkflowTasks == nil || m.ActivityTasks == nil || m.JournalWarnings == nil {
-		t.Fatal("counters nil")
+	if m.WorkflowTasks == nil || m.ActivityTasks == nil || m.JournalWarnings == nil || m.TaskBacklog == nil {
+		t.Fatal("instruments nil")
 	}
 }

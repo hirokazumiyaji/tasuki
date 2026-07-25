@@ -181,6 +181,38 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	return nil
 }
 
+func (b *Backend) CountClaimableTasks(ctx context.Context, kind string, queues []string) (map[string]int64, error) {
+	if len(queues) == 0 {
+		return map[string]int64{}, nil
+	}
+	now := nowUTC()
+	out := map[string]int64{}
+	for _, q := range queues {
+		it := b.col("wf_tasks").
+			Where("kind", "==", kind).
+			Where("queue", "==", q).
+			Where("visible_at", "<=", now).
+			Documents(ctx)
+		var n int64
+		for {
+			_, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				it.Stop()
+				return nil, err
+			}
+			n++
+		}
+		it.Stop()
+		if n > 0 {
+			out[q] = n
+		}
+	}
+	return out, nil
+}
+
 func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
 	if req.Limit <= 0 {
 		req.Limit = 1
