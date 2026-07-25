@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -15,6 +16,10 @@ var schemaFS embed.FS
 // Backend is the SQLite implementation of backend.Backend.
 type Backend struct {
 	db *sql.DB
+
+	notifyMu     sync.Mutex
+	taskSubs     []*taskSub
+	terminalSubs []*terminalSub
 }
 
 // New opens a SQLite database at path (use ":memory:" for ephemeral).
