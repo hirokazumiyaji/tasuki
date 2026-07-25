@@ -1,7 +1,7 @@
-# tasuki M5 Fuzz + Hot-instance docs
+# tasuki M5 Leftover A-Track
 
 ## タスク
 
-- [x] Slice 1: Backlog metrics (done)
+- [x] Slice 1: Backlog metrics
 - [x] Slice 2: Codec + engine fuzz
-- [ ] Slice 3: Hot-instance docs
+- [x] Slice 3: Hot-instance docs
