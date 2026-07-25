@@ -3,5 +3,5 @@
 ## タスク
 
 - [x] Task 1: Spec + Plan
-- [ ] Task 2: backend/hub + unit tests
+- [x] Task 2: backend/hub + unit tests
 - [ ] Task 3: Wire six stores + README
