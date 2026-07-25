@@ -51,6 +51,7 @@ func (b *Backend) Migrate(ctx context.Context) error {
 			return fmt.Errorf("mysql migrate: %w\nstmt: %s", err, stmt)
 		}
 	}
+	_, _ = b.db.ExecContext(ctx, `ALTER TABLE wf_tasks ADD COLUMN heartbeat BLOB NULL`)
 	return nil
 }
 

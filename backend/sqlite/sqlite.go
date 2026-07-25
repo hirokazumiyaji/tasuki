@@ -48,8 +48,11 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = b.db.ExecContext(ctx, string(sqlBytes))
-	return err
+	if _, err = b.db.ExecContext(ctx, string(sqlBytes)); err != nil {
+		return err
+	}
+	_, _ = b.db.ExecContext(ctx, `ALTER TABLE wf_tasks ADD COLUMN heartbeat TEXT`)
+	return nil
 }
 
 // Reset truncates all tables (test helper).

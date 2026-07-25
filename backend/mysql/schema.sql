@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS wf_tasks (
     max_attempts INT NULL,
     visible_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     worker_id    VARCHAR(255) NULL,
+    heartbeat    BLOB NULL,
     created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     wf_singleton VARCHAR(255)
         GENERATED ALWAYS AS (CASE WHEN kind = 'workflow' THEN instance_id ELSE NULL END) STORED,

@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS wf_tasks (
     max_attempts INTEGER,
     visible_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     worker_id    TEXT,
+    heartbeat    TEXT,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS wf_tasks_claim_idx ON wf_tasks (kind, queue, visible_at);

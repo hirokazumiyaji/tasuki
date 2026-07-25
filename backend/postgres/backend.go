@@ -199,7 +199,7 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		    worker_id = $5
 		FROM picked
 		WHERE t.id = picked.id
-		RETURNING t.id, t.kind, t.queue, t.instance_id, t.ref_seq, t.payload, t.attempt, t.visible_at, t.worker_id`,
+		RETURNING t.id, t.kind, t.queue, t.instance_id, t.ref_seq, t.payload, t.attempt, t.visible_at, t.worker_id, t.heartbeat`,
 		req.Kind, req.Queues, req.Limit, interval(req.Lease), req.WorkerID)
 	if err != nil {
 		return nil, err
@@ -210,7 +210,7 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		var t backend.Task
 		var refSeq *int64
 		var payload []byte
-		if err := rows.Scan(&t.ID, &t.Kind, &t.Queue, &t.InstanceID, &refSeq, &payload, &t.Attempt, &t.VisibleAt, &t.WorkerID); err != nil {
+		if err := rows.Scan(&t.ID, &t.Kind, &t.Queue, &t.InstanceID, &refSeq, &payload, &t.Attempt, &t.VisibleAt, &t.WorkerID, &t.HeartbeatDetails); err != nil {
 			return nil, err
 		}
 		if refSeq != nil {
@@ -247,8 +247,16 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 }
 
 func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
-	_ = details
-	return b.ExtendLease(ctx, taskID, lease)
+	tag, err := b.pool.Exec(ctx, `
+		UPDATE wf_tasks SET visible_at = now() + $2::interval, heartbeat = $3 WHERE id = $1`,
+		taskID, interval(lease), details)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return backend.ErrNotFound
+	}
+	return nil
 }
 
 func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {

@@ -48,6 +48,7 @@ CREATE TABLE wf_tasks (
   max_attempts INT64,
   visible_at TIMESTAMP NOT NULL,
   worker_id STRING(255),
+  heartbeat BYTES(MAX),
   created_at TIMESTAMP NOT NULL,
   wf_singleton STRING(255) AS (IF(kind = 'workflow', instance_id, NULL)) STORED
 ) PRIMARY KEY (id);

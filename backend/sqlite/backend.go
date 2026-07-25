@@ -251,17 +251,21 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		}
 
 		row := conn.QueryRowContext(ctx, `
-			SELECT id, kind, queue, instance_id, ref_seq, payload, attempt, visible_at, worker_id
+			SELECT id, kind, queue, instance_id, ref_seq, payload, attempt, visible_at, worker_id, heartbeat
 			FROM wf_tasks WHERE id = ?`, id)
 		var t backend.Task
 		var refSeq sql.NullInt64
 		var payload sql.NullString
 		var visStr string
+		var hb sql.NullString
 		if err := row.Scan(&t.ID, &t.Kind, &t.Queue, &t.InstanceID, &refSeq, &payload,
-			&t.Attempt, &visStr, &t.WorkerID); err != nil {
+			&t.Attempt, &visStr, &t.WorkerID, &hb); err != nil {
 			return nil, err
 		}
 		t.Seq = scanNullableInt64(refSeq)
+		if hb.Valid {
+			t.HeartbeatDetails = []byte(hb.String)
+		}
 		t.VisibleAt, err = parseTime(visStr)
 		if err != nil {
 			return nil, err
@@ -305,8 +309,24 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 }
 
 func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
-	_ = details
-	return b.ExtendLease(ctx, taskID, lease)
+	var hb any
+	if details != nil {
+		hb = string(details)
+	}
+	res, err := b.db.ExecContext(ctx, `
+		UPDATE wf_tasks SET visible_at = ?, heartbeat = ? WHERE id = ?`,
+		formatTime(nowUTC().Add(lease)), hb, taskID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return backend.ErrNotFound
+	}
+	return nil
 }
 
 func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {

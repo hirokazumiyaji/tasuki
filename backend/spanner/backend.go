@@ -323,7 +323,7 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				continue
 			}
 			row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{c.id},
-				[]string{"id", "kind", "queue", "instance_id", "ref_seq", "payload", "attempt", "visible_at", "worker_id"})
+				[]string{"id", "kind", "queue", "instance_id", "ref_seq", "payload", "attempt", "visible_at", "worker_id", "heartbeat"})
 			if err != nil {
 				return err
 			}
@@ -343,12 +343,14 @@ func scanTask(row *spanner.Row) (backend.Task, error) {
 	var refSeq spanner.NullInt64
 	var payload spanner.NullJSON
 	var worker spanner.NullString
+	var hb []byte
 	var attempt int64
 	if err := row.Columns(&t.ID, &t.Kind, &t.Queue, &t.InstanceID, &refSeq, &payload,
-		&attempt, &t.VisibleAt, &worker); err != nil {
+		&attempt, &t.VisibleAt, &worker, &hb); err != nil {
 		return t, err
 	}
 	t.Attempt = int(attempt)
+	t.HeartbeatDetails = hb
 	if refSeq.Valid {
 		t.Seq = refSeq.Int64
 	}
@@ -389,8 +391,20 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 }
 
 func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
-	_ = details
-	return b.ExtendLease(ctx, taskID, lease)
+	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		n, err := txn.Update(ctx, spanner.Statement{
+			SQL: `UPDATE wf_tasks SET visible_at = @v, heartbeat = @h WHERE id = @id`,
+			Params: map[string]any{"v": nowUTC().Add(lease), "h": details, "id": taskID},
+		})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return backend.ErrNotFound
+		}
+		return nil
+	})
+	return err
 }
 
 func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
