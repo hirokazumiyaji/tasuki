@@ -59,7 +59,7 @@ func OrderWorkflow(ctx *workflow.Context, in OrderInput) (OrderResult, error) {
 
 // アクティビティ: 副作用はここに置く。at-least-once 実行のため冪等に実装する
 func ChargePayment(ctx context.Context, in ChargeInput) (ChargeResult, error) {
-    key := activity.Info(ctx).IdempotencyKey
+    key := activity.GetInfo(ctx).IdempotencyKey
     return paymentClient.Charge(ctx, in.OrderID, key)
 }
 
