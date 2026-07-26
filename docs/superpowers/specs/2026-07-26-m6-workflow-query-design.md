@@ -61,7 +61,7 @@ Query handlers must be read-only (no `Execute` / `Sleep` / etc. that would need 
 
 ## Acceptance
 
-- [ ] `SetQueryHandler` + queryMode
-- [ ] `engine.RunQuery` / `tasuki.Query`
-- [ ] Tests
-- [ ] Docs
+- [x] `SetQueryHandler` + queryMode
+- [x] `engine.RunQuery` / `tasuki.Query`
+- [x] Tests
+- [x] Docs

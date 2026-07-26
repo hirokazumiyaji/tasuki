@@ -106,6 +106,10 @@ func main() {
 | `GetVersion(ctx, changeID, min, max) int` | 実行中インスタンスと共存するコード変更の分岐 |
 | `ContinueAsNew[I](ctx, in) error` | 履歴を打ち切り新しい実行へ引き継ぐ（return で使うエラー値） |
 | `Info(ctx) WorkflowInfo` | インスタンス ID、ワークフロー名、開始時刻 |
+| `SetQueryHandler[I, O](ctx, name, fn)` | 読み取り専用のクエリハンドラを登録する（ジャーナルには残らない） |
+
+`SetQueryHandler` はリプレイのたびに同じ決定的な位置で呼び出す。
+ハンドラは履歴を進めない（`Execute` や `Sleep` など新しいコマンドを記録してはならない）。
 
 長寿命・ループするワークフローは、イベント数が数千〜1万付近になったら `ContinueAsNew` で履歴を打ち切ることを推奨する（既定の警告しきい値と揃える）。警告自体は実行を止めない。
 
@@ -266,6 +270,19 @@ res, err := h.Result(ctx) // 新規でも既存でも同じに扱える
 
 `Handle[O].Result` はポーリング（既定 200ms 間隔）で待つ。
 通知による即時化は最適化として計画する（[04-plan.md](04-plan.md) M5）。
+
+### クエリ
+
+実行中（または終端）のインスタンスから、シグナルなしで派生状態を読むには `tasuki.Query` を使う。
+ワークフローを登録した同一プロセスの Worker が必要である（レジストリでハンドラ定義を解決するため）。
+
+```go
+out, err := tasuki.Query[struct{}, int](ctx, w, "order-123", "count", struct{}{})
+```
+
+内部では journal と可視な inbox を仮 seq で連結してリプレイし、名前付きハンドラを呼ぶ。
+Claim や Commit は行わないため、`next_seq` とタスクは変わらない。
+未登録の名前は `workflow.ErrUnknownQuery`、未知のインスタンスは `backend.ErrNotFound` を返す。
 
 ## 登録と命名
 
