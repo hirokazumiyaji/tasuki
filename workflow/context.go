@@ -33,6 +33,9 @@ type Context struct {
 	info            WorkflowInfo
 	consumedSignals map[int64]bool
 	codec           Codec
+	queryMode       bool
+	queryInvoking   bool
+	queryHandlers   map[string]queryHandler
 }
 
 func NewContext(events []journal.Event, now time.Time) *Context {
@@ -87,6 +90,13 @@ func (c *Context) recordOrReplay(cmd journal.Command, payload []byte) journal.Ev
 			raiseDeterminism(err)
 		}
 		return rec
+	}
+	if c.queryInvoking {
+		raiseDeterminism(errQuerySideEffect)
+	}
+	if c.queryMode {
+		// Read-only query: do not extend history; stop at the wait point.
+		c.suspend()
 	}
 	ev := journal.Event{
 		Seq:     c.nextSeq,
