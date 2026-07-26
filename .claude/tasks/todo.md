@@ -1,9 +1,8 @@
-# tasuki M6 Activity Heartbeat
+# tasuki M6 Workflow Query
 
 ## タスク
 
 - [x] Task 1: Spec + Plan
-- [x] Task 2: activity package + memory + worker
-- [x] Task 3: SQL + Spanner
-- [x] Task 4: DynamoDB + Firestore
-- [x] Task 5: Docs
+- [ ] Task 2: queryMode + SetQueryHandler + engine.RunQuery
+- [ ] Task 3: tasuki.Query + integration test
+- [ ] Task 4: Docs
