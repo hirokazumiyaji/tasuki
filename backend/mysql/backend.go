@@ -149,6 +149,7 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	}
 	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE instance_id = ?`, id)
 	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_timers WHERE instance_id = ?`, id)
+	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = ?`, id)
 	if err := commitConn(ctx, conn); err != nil {
 		return err
 	}
@@ -533,6 +534,9 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 		if err != nil {
 			return err
 		}
+		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = ?`, adv.InstanceID); err != nil {
+			return err
+		}
 	}
 	if len(adv.DrainedInbox) > 0 {
 		for _, inboxID := range adv.DrainedInbox {
@@ -766,7 +770,7 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 }
 
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
-	_ = dedupeID // Task 3/4: wf_signal_dedupe
+	var skipped bool
 	err := withTx(ctx, b.db, func(conn *sql.Conn) error {
 		var status string
 		err := conn.QueryRowContext(ctx, `SELECT status FROM wf_instances WHERE id = ? FOR UPDATE`, instanceID).
@@ -778,6 +782,22 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 			return err
 		}
 		now := nowUTC()
+		if dedupeID != "" {
+			res, err := conn.ExecContext(ctx, `
+				INSERT IGNORE INTO wf_signal_dedupe (instance_id, dedupe_id, created_at)
+				VALUES (?, ?, ?)`, instanceID, dedupeID, now)
+			if err != nil {
+				return err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				skipped = true
+				return nil
+			}
+		}
 		payload := inboxPayload(ev)
 		_, err = conn.ExecContext(ctx, `
 			INSERT INTO wf_inbox (instance_id, type, ref_seq, payload, created_at)
@@ -795,6 +815,9 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	})
 	if err != nil {
 		return err
+	}
+	if skipped {
+		return nil
 	}
 	if err := withTx(ctx, b.db, func(conn *sql.Conn) error {
 		return ensureWorkflowTaskIfInbox(ctx, conn, instanceID)

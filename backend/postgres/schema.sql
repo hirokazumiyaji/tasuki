@@ -37,6 +37,13 @@ CREATE TABLE IF NOT EXISTS wf_inbox (
 );
 CREATE INDEX IF NOT EXISTS wf_inbox_instance_idx ON wf_inbox (instance_id, id);
 
+CREATE TABLE IF NOT EXISTS wf_signal_dedupe (
+    instance_id text NOT NULL,
+    dedupe_id   text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (instance_id, dedupe_id)
+);
+
 CREATE TABLE IF NOT EXISTS wf_tasks (
     id           bigserial PRIMARY KEY,
     kind         text NOT NULL,

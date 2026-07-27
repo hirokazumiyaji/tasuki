@@ -174,13 +174,31 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if exists {
-		return nil
+	if !exists {
+		stmts, err := loadDDL()
+		if err != nil {
+			return err
+		}
+		if err := b.applyDDL(ctx, stmts); err != nil {
+			return err
+		}
 	}
-	stmts, err := loadDDL()
+	dedupeExists, err := b.tableExists(ctx, "wf_signal_dedupe")
 	if err != nil {
 		return err
 	}
+	if dedupeExists {
+		return nil
+	}
+	return b.applyDDL(ctx, []string{`
+CREATE TABLE wf_signal_dedupe (
+  instance_id STRING(255) NOT NULL,
+  dedupe_id STRING(255) NOT NULL,
+  created_at TIMESTAMP NOT NULL
+) PRIMARY KEY (instance_id, dedupe_id)`})
+}
+
+func (b *Backend) applyDDL(ctx context.Context, stmts []string) error {
 	admin, err := database.NewDatabaseAdminClient(ctx)
 	if err != nil {
 		return err

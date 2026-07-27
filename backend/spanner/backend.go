@@ -225,6 +225,11 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 			muts = append(muts, spanner.Delete("wf_timers", spanner.Key{id, seq}))
 		}
 		tmIter.Stop()
+		dMuts, err := deleteSignalDedupe(ctx, txn, id)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, dMuts...)
 		return txn.BufferWrite(muts)
 	})
 	if err != nil {
@@ -630,6 +635,11 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 			"completed_at": now,
 		}
 		muts = append(muts, spanner.UpdateMap("wf_instances", m))
+		dMuts, err := deleteSignalDedupe(ctx, txn, adv.InstanceID)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, dMuts...)
 	}
 	for _, inboxID := range adv.DrainedInbox {
 		muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{inboxID}))
@@ -915,8 +925,8 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 }
 
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
-	_ = dedupeID // Task 3/4: wf_signal_dedupe
 	now := nowUTC()
+	var skipped bool
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"status", "queue"})
 		if err != nil {
@@ -928,6 +938,23 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 		var status, queue string
 		if err := row.Columns(&status, &queue); err != nil {
 			return err
+		}
+		if dedupeID != "" {
+			_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, dedupeID}, []string{"dedupe_id"})
+			if err == nil {
+				skipped = true
+				return nil
+			}
+			if !isNotFound(err) {
+				return err
+			}
+			if err := txn.BufferWrite([]*spanner.Mutation{
+				spanner.InsertMap("wf_signal_dedupe", map[string]any{
+					"instance_id": instanceID, "dedupe_id": dedupeID, "created_at": now,
+				}),
+			}); err != nil {
+				return err
+			}
 		}
 		payload := inboxPayload(ev)
 		if err := txn.BufferWrite([]*spanner.Mutation{
@@ -946,6 +973,9 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	if err != nil {
 		return err
 	}
+	if skipped {
+		return nil
+	}
 	if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		return ensureWorkflowTaskIfInbox(ctx, txn, instanceID)
 	}); err != nil {
@@ -953,4 +983,28 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	}
 	b.notifyTasks()
 	return nil
+}
+
+func deleteSignalDedupe(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string) ([]*spanner.Mutation, error) {
+	iter := txn.Query(ctx, spanner.Statement{
+		SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id`,
+		Params: map[string]any{"id": instanceID},
+	})
+	defer iter.Stop()
+	var muts []*spanner.Mutation
+	for {
+		r, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		var dedupeID string
+		if err := r.Columns(&dedupeID); err != nil {
+			return nil, err
+		}
+		muts = append(muts, spanner.Delete("wf_signal_dedupe", spanner.Key{instanceID, dedupeID}))
+	}
+	return muts, nil
 }

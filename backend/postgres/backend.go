@@ -18,7 +18,7 @@ func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilit
 // Reset truncates all workflow tables (test helper).
 func (b *Backend) Reset(ctx context.Context) error {
 	_, err := b.pool.Exec(ctx, `
-		TRUNCATE wf_schedules, wf_timers, wf_tasks, wf_inbox, wf_journal, wf_instances RESTART IDENTITY CASCADE`)
+		TRUNCATE wf_schedules, wf_timers, wf_tasks, wf_inbox, wf_signal_dedupe, wf_journal, wf_instances RESTART IDENTITY CASCADE`)
 	return err
 }
 
@@ -150,6 +150,7 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	}
 	_, _ = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE instance_id = $1`, id)
 	_, _ = tx.Exec(ctx, `DELETE FROM wf_timers WHERE instance_id = $1`, id)
+	_, _ = tx.Exec(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = $1`, id)
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
@@ -449,6 +450,9 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 		if err != nil {
 			return err
 		}
+		if _, err = tx.Exec(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = $1`, adv.InstanceID); err != nil {
+			return err
+		}
 	}
 	if len(adv.DrainedInbox) > 0 {
 		_, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE id = ANY($1)`, adv.DrainedInbox)
@@ -671,7 +675,6 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 
 
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
-	_ = dedupeID // Task 3/4: wf_signal_dedupe
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -685,6 +688,18 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 			return backend.ErrNotFound
 		}
 		return err
+	}
+	if dedupeID != "" {
+		var got string
+		err = tx.QueryRow(ctx, `
+			INSERT INTO wf_signal_dedupe (instance_id, dedupe_id) VALUES ($1, $2)
+			ON CONFLICT DO NOTHING RETURNING dedupe_id`, instanceID, dedupeID).Scan(&got)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 	}
 	payload := inboxPayload(ev)
 	_, err = tx.Exec(ctx, `
