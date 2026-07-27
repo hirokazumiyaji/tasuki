@@ -33,9 +33,10 @@ type Context struct {
 	info            WorkflowInfo
 	consumedSignals map[int64]bool
 	codec           Codec
-	queryMode       bool
-	queryInvoking   bool
-	queryHandlers   map[string]queryHandler
+	queryMode        bool
+	queryInvoking    bool
+	queryHandlers    map[string]queryHandler
+	searchAttributes map[string]string
 }
 
 func NewContext(events []journal.Event, now time.Time) *Context {
@@ -62,6 +63,11 @@ func NewContext(events []journal.Event, now time.Time) *Context {
 		}
 		if e.Type == journal.TypeCancelRequested {
 			ctx.canceled = true
+		}
+		if e.Type == journal.TypeSearchAttributesUpdated {
+			var m map[string]string
+			_ = json.Unmarshal(e.Payload, &m)
+			ctx.searchAttributes = cloneSearchAttrs(m)
 		}
 	}
 	return ctx

@@ -291,6 +291,7 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 			Name:       state.Instance.Name,
 		})
 		wctx.SetCodec(w.reg.codec)
+		wctx.SetSearchAttributes(state.Instance.SearchAttributes)
 		out, err := wf.fn(wctx, state.Instance.Input)
 		if err != nil {
 			return nil, err

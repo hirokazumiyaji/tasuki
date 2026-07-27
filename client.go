@@ -55,10 +55,11 @@ func Start[I any](ctx context.Context, c *Client, workflowName string, input I, 
 		return nil, err
 	}
 	err = c.backend.CreateInstance(ctx, backend.NewInstance{
-		ID:    o.id,
-		Name:  workflowName,
-		Queue: o.queue,
-		Input: payload,
+		ID:               o.id,
+		Name:             workflowName,
+		Queue:            o.queue,
+		Input:            payload,
+		SearchAttributes: o.searchAttributes,
 	})
 	h := &Handle{client: c, id: o.id}
 	if errors.Is(err, backend.ErrAlreadyExists) {

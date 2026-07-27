@@ -30,17 +30,18 @@ type Backend struct {
 }
 
 type instance struct {
-	id        string
-	name      string
-	queue     string
-	status    string
-	input     []byte
-	result    []byte
-	failure   []byte
-	nextSeq   int64
-	journal   []journal.Event
-	parentID  string
-	parentSeq int64
+	id               string
+	name             string
+	queue            string
+	status           string
+	input            []byte
+	result           []byte
+	failure          []byte
+	nextSeq          int64
+	journal          []journal.Event
+	parentID         string
+	parentSeq        int64
+	searchAttributes map[string]string
 }
 
 type task struct {
@@ -125,14 +126,17 @@ func (b *Backend) GetInstance(_ context.Context, id string) (*backend.Instance, 
 		return nil, backend.ErrNotFound
 	}
 	return &backend.Instance{
-		ID:      inst.id,
-		Name:    inst.name,
-		Queue:   inst.queue,
-		Status:  inst.status,
-		Input:   append([]byte(nil), inst.input...),
-		Result:  append([]byte(nil), inst.result...),
-		Failure: append([]byte(nil), inst.failure...),
-		NextSeq: inst.nextSeq, ParentID: inst.parentID, ParentSeq: inst.parentSeq,
+		ID:               inst.id,
+		Name:             inst.name,
+		Queue:            inst.queue,
+		Status:           inst.status,
+		Input:            append([]byte(nil), inst.input...),
+		Result:           append([]byte(nil), inst.result...),
+		Failure:          append([]byte(nil), inst.failure...),
+		NextSeq:          inst.nextSeq,
+		ParentID:         inst.parentID,
+		ParentSeq:        inst.parentSeq,
+		SearchAttributes: backend.CloneSearchAttributes(inst.searchAttributes),
 	}, nil
 }
 
@@ -167,6 +171,9 @@ func (b *Backend) ListInstances(_ context.Context, f backend.InstanceFilter) ([]
 		if f.Name != "" && inst.name != f.Name {
 			continue
 		}
+		if !backend.MatchesSearchAttributes(inst.searchAttributes, f.SearchAttributes) {
+			continue
+		}
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
@@ -185,6 +192,7 @@ func (b *Backend) ListInstances(_ context.Context, f backend.InstanceFilter) ([]
 			Input: append([]byte(nil), inst.input...), Result: append([]byte(nil), inst.result...),
 			Failure: append([]byte(nil), inst.failure...), NextSeq: inst.nextSeq,
 			ParentID: inst.parentID, ParentSeq: inst.parentSeq,
+			SearchAttributes: backend.CloneSearchAttributes(inst.searchAttributes),
 		})
 	}
 	return out, nil
@@ -295,14 +303,17 @@ func (b *Backend) loadWorkflowHeadLocked(instanceID string) (*backend.WorkflowSt
 	}
 	return &backend.WorkflowState{
 		Instance: backend.Instance{
-			ID:      inst.id,
-			Name:    inst.name,
-			Queue:   inst.queue,
-			Status:  inst.status,
-			Input:   append([]byte(nil), inst.input...),
-			Result:  append([]byte(nil), inst.result...),
-			Failure: append([]byte(nil), inst.failure...),
-			NextSeq: inst.nextSeq, ParentID: inst.parentID, ParentSeq: inst.parentSeq,
+			ID:               inst.id,
+			Name:             inst.name,
+			Queue:            inst.queue,
+			Status:           inst.status,
+			Input:            append([]byte(nil), inst.input...),
+			Result:           append([]byte(nil), inst.result...),
+			Failure:          append([]byte(nil), inst.failure...),
+			NextSeq:          inst.nextSeq,
+			ParentID:         inst.parentID,
+			ParentSeq:        inst.parentSeq,
+			SearchAttributes: backend.CloneSearchAttributes(inst.searchAttributes),
 		},
 		Inbox:   inbox,
 		NextSeq: inst.nextSeq,
@@ -484,6 +495,9 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 		if last.Seq >= inst.nextSeq {
 			inst.nextSeq = last.Seq + 1
 		}
+	}
+	if updated := backend.LastSearchAttributesUpdate(adv.NewEvents); updated != nil || hasSearchAttributesUpdate(adv.NewEvents) {
+		inst.searchAttributes = updated
 	}
 
 	for _, at := range adv.ActivityTasks {
@@ -723,7 +737,17 @@ func (b *Backend) createInstanceLocked(inst backend.NewInstance) error {
 		id: inst.ID, name: inst.Name, queue: queue, status: "running",
 		input: inst.Input, nextSeq: 2, journal: []journal.Event{ev},
 		parentID: inst.ParentID, parentSeq: inst.ParentSeq,
+		searchAttributes: backend.CloneSearchAttributes(inst.SearchAttributes),
 	}
 	b.enqueueWorkflowTaskLocked(inst.ID, queue)
 	return nil
+}
+
+func hasSearchAttributesUpdate(events []journal.Event) bool {
+	for _, ev := range events {
+		if ev.Type == journal.TypeSearchAttributesUpdated {
+			return true
+		}
+	}
+	return false
 }

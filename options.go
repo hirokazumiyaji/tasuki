@@ -87,8 +87,9 @@ func WithCodec(c codec.Codec) ClientOption {
 }
 
 type startOptions struct {
-	id    string
-	queue string
+	id               string
+	queue            string
+	searchAttributes map[string]string
 }
 
 type StartOption func(*startOptions)
@@ -99,6 +100,23 @@ func WithID(id string) StartOption {
 
 func WithQueue(queue string) StartOption {
 	return func(o *startOptions) { o.queue = queue }
+}
+
+// WithSearchAttributes sets string key/value visibility metadata on Start.
+// Values are exact-match filters for Client.List. Pass a copy; the map is not retained.
+func WithSearchAttributes(attrs map[string]string) StartOption {
+	return func(o *startOptions) {
+		if len(attrs) == 0 {
+			return
+		}
+		o.searchAttributes = make(map[string]string, len(attrs))
+		for k, v := range attrs {
+			if v == "" {
+				continue
+			}
+			o.searchAttributes[k] = v
+		}
+	}
 }
 
 type signalOptions struct {

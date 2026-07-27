@@ -12,32 +12,35 @@ type Capabilities struct {
 
 // InstanceFilter selects instances for ListInstances.
 type InstanceFilter struct {
-	Status string // empty = any
-	Name   string // empty = any
-	Limit  int    // 0 = default 100
-	Offset int
+	Status           string // empty = any
+	Name             string // empty = any
+	SearchAttributes map[string]string // AND exact match; nil/empty = ignore
+	Limit            int    // 0 = default 100
+	Offset           int
 }
 
 type NewInstance struct {
-	ID       string
-	Name     string
-	Queue    string
-	Input    []byte
-	ParentID string
-	ParentSeq int64
+	ID               string
+	Name             string
+	Queue            string
+	Input            []byte
+	ParentID         string
+	ParentSeq        int64
+	SearchAttributes map[string]string
 }
 
 type Instance struct {
-	ID        string
-	Name      string
-	Queue     string
-	Status    string
-	Input     []byte
-	Result    []byte
-	Failure   []byte
-	NextSeq   int64
-	ParentID  string
-	ParentSeq int64
+	ID               string
+	Name             string
+	Queue            string
+	Status           string
+	Input            []byte
+	Result           []byte
+	Failure          []byte
+	NextSeq          int64
+	ParentID         string
+	ParentSeq        int64
+	SearchAttributes map[string]string
 }
 
 type WorkflowState struct {
