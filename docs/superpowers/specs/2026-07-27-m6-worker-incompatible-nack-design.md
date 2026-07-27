@@ -86,8 +86,8 @@ True application determinism bugs are also Nack’d while mixed versions exist. 
 
 ## Acceptance
 
-- [ ] `NackTask` on all backends
-- [ ] Worker incompatible paths (WF / determinism / activity)
-- [ ] `IncompatibleRetryDelay` defaults
-- [ ] Tests
-- [ ] Docs
+- [x] `NackTask` on all backends
+- [x] Worker incompatible paths (WF / determinism / activity)
+- [x] `IncompatibleRetryDelay` defaults
+- [x] Tests
+- [x] Docs

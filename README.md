@@ -18,6 +18,7 @@ Worker はインスタンスごとの sticky ジャーナルキャッシュ（`n
 長時間アクティビティは `activity.RecordHeartbeat` でリース延長と進捗記録ができ、リトライ時に `GetHeartbeatDetails` で取り出せる。
 ワークフローの読み取り専用問い合わせは `workflow.SetQueryHandler` と `tasuki.Query`（Worker 同一プロセス）で行う。
 `Client.Signal` は `WithDedupeID` でインスタンス単位の再送冪等にできる。
+ローリング中に旧 Worker が新履歴を扱えない場合はタスクを Nack し、新 Worker が拾えるようにする（`IncompatibleRetryDelay`）。
 ペイロードの at-rest 暗号化は `codec.Encrypted`（AES-256-GCM、鍵ローテーション対応。Worker の `Codec` と Client の `WithCodec` に設定）。
 
 ## クイックスタート

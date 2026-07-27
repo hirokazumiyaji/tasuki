@@ -167,10 +167,9 @@ if v >= 2 {
 - 記録がない位置のリプレイ（変更前に通過済みの履歴）では `min` を返す。
 - version_marker は照合で特別扱いされ、marker を知らない旧コードは読み飛ばす。分岐の実体が異なれば、次のコマンド照合が違反として検出する。
 
-ローリングデプロイ中は新旧ワーカーが混在するため、新コードが記録した marker 以降を旧ワーカーが処理すると stuck になり得る。
-stuck はタスクの再投入で回復し、最終的に新ワーカーが拾って前進する。
-混在期間を短くするか、大きな変更では新しいワークフロー名（`OrderWorkflowV2`）を切ることを推奨する。
-ワーカーのバージョン管理による構造的な解決は将来候補とする（[04-plan.md](04-plan.md)）。
+ローリングデプロイ中は新旧ワーカーが混在するため、新コードが記録した履歴を旧ワーカーがリプレイすると決定性違反になり得る。
+Worker は決定性違反、および未登録のワークフロー／アクティビティを terminal `stuck` や activity fail にせず、タスクを Nack して再可視にする（`IncompatibleRetryDelay`、既定 5 秒。負数で即時）。
+混在が解消すれば新ワーカーが拾って前進する。大きな変更では新しいワークフロー名（`OrderWorkflowV2`）を切ることも有効。
 
 ## 決定性の制約
 
@@ -378,8 +377,12 @@ type WorkerOptions struct {
     Codec                Codec         // 既定 JSON
     Logger               *slog.Logger  // 既定 slog.Default()
     JournalWarnThreshold int           // 0 → 既定 10000。負数で無効。超過時は Warn + メトリクスのみ
+    IncompatibleRetryDelay time.Duration // 0 → 既定 5s。負数で即時再可視。非互換 Nack 後の hidden 時間
 }
 ```
+
+決定性違反や未登録のワークフロー／アクティビティは terminal にせず Nack する（上記 Delay）。
+メトリクス `tasuki.worker.incompatible_nacks`。
 
 `w.Start(ctx)` は非同期にポーラーを起動して即座に返る。
 `w.Shutdown(ctx)` は新規獲得を止め、実行中タスクの完了を ctx の期限まで待ち、未完了タスクのリースを解放（`visible_at` を現在時刻へ戻す）してから返る。
