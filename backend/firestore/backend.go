@@ -154,7 +154,7 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		if err = tx.Update(b.ref("wf_instances", id), []gcf.Update{{Path: "status", Value: "terminated"}, {Path: "updated_at", Value: now}, {Path: "completed_at", Value: now}}); err != nil {
 			return err
 		}
-		for _, col := range []string{"wf_tasks", "wf_timers"} {
+		for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe"} {
 			it := b.col(col).Where("instance_id", "==", id).Documents(ctx)
 			for {
 				d, e := it.Next()
@@ -461,6 +461,24 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 	if err := tx.Update(prep.instRef, updates); err != nil {
 		return err
 	}
+	if adv.Terminal != nil {
+		it := tx.Documents(b.col("wf_signal_dedupe").Where("instance_id", "==", adv.InstanceID))
+		for {
+			d, e := it.Next()
+			if e == iterator.Done {
+				break
+			}
+			if e != nil {
+				it.Stop()
+				return e
+			}
+			if e = tx.Delete(d.Ref); e != nil {
+				it.Stop()
+				return e
+			}
+		}
+		it.Stop()
+	}
 	for _, e := range adv.NewEvents {
 		if err := tx.Create(b.ref("wf_journal", journalID(adv.InstanceID, e.Seq)), journalDoc(adv.InstanceID, e.Seq, e, now)); err != nil {
 			return err
@@ -586,14 +604,42 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	return nil
 }
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
-	_ = dedupeID // Task 3/4: wf_signal_dedupe
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil {
 		return err
 	}
+	now := nowUTC()
 	id := newID()
-	if _, err = b.ref("wf_inbox", inboxID(instanceID, id)).Create(ctx, inboxDoc(instanceID, id, ev, nowUTC())); err != nil {
+	var skipped bool
+	err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		if dedupeID != "" {
+			dref := b.ref("wf_signal_dedupe", signalDedupeID(instanceID, dedupeID))
+			snap, err := tx.Get(dref)
+			if err != nil && !isNotFound(err) {
+				return err
+			}
+			if err == nil && snap.Exists() {
+				skipped = true
+				return nil
+			}
+			if err := tx.Create(dref, map[string]any{
+				"instance_id": instanceID,
+				"dedupe_id":   dedupeID,
+				"created_at":  now,
+			}); err != nil {
+				return err
+			}
+		}
+		return tx.Create(b.ref("wf_inbox", inboxID(instanceID, id)), inboxDoc(instanceID, id, ev, now))
+	})
+	if err != nil {
+		if status.Code(err) == codes.AlreadyExists && dedupeID != "" {
+			return nil
+		}
 		return err
+	}
+	if skipped {
+		return nil
 	}
 	if inst.Status == "running" {
 		if err := b.ensureWorkflowTask(ctx, instanceID); err != nil {

@@ -120,6 +120,17 @@ func (b *Backend) Migrate(ctx context.Context) error {
 			},
 		},
 		{
+			name: b.table("wf_signal_dedupe"),
+			attrs: []types.AttributeDefinition{
+				{AttributeName: aws.String("instance_id"), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String("dedupe_id"), AttributeType: types.ScalarAttributeTypeS},
+			},
+			keys: []types.KeySchemaElement{
+				{AttributeName: aws.String("instance_id"), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String("dedupe_id"), KeyType: types.KeyTypeRange},
+			},
+		},
+		{
 			name: b.table("wf_tasks"),
 			attrs: []types.AttributeDefinition{
 				{AttributeName: aws.String("task_pk"), AttributeType: types.ScalarAttributeTypeS},
@@ -270,6 +281,7 @@ func (b *Backend) Reset(ctx context.Context) error {
 		b.table("wf_timers"),
 		b.table("wf_tasks"),
 		b.table("wf_inbox"),
+		b.table("wf_signal_dedupe"),
 		b.table("wf_journal"),
 		b.table("wf_instances"),
 	}
@@ -327,6 +339,8 @@ func keyFromItem(table string, item map[string]types.AttributeValue) map[string]
 		return map[string]types.AttributeValue{"instance_id": item["instance_id"], "seq": item["seq"]}
 	case len(table) >= 8 && table[len(table)-8:] == "wf_inbox":
 		return map[string]types.AttributeValue{"instance_id": item["instance_id"], "id": item["id"]}
+	case len(table) >= 16 && table[len(table)-16:] == "wf_signal_dedupe":
+		return map[string]types.AttributeValue{"instance_id": item["instance_id"], "dedupe_id": item["dedupe_id"]}
 	default:
 		// wf_instances, wf_schedules
 		return map[string]types.AttributeValue{"id": item["id"]}
