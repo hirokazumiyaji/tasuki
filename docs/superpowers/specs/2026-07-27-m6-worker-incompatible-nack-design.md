@@ -1,7 +1,7 @@
 # M6 Worker Incompatible-Task Nack Design
 
 **Date:** 2026-07-27  
-**Status:** Proposed  
+**Status:** Approved  
 **Parent:** [docs/04-plan.md](../../04-plan.md) 将来候補「ワーカーのバージョン管理」  
 **Decisions:** Runtime detection after Claim (no build-ID routing); treat determinism violations and unregistered workflow/activity as incompatible; Nack with configurable delay (default short); no Backend schema beyond a kind-agnostic reschedule API.
 
