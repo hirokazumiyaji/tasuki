@@ -914,7 +914,8 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	return n, nil
 }
 
-func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event) error {
+func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
+	_ = dedupeID // Task 3/4: wf_signal_dedupe
 	now := nowUTC()
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"status", "queue"})
