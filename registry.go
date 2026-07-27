@@ -105,7 +105,7 @@ func RegisterActivity[I, O any](w *Worker, fn func(context.Context, I) (O, error
 func (r *registry) workflow(name string) (workflowEntry, error) {
 	e, ok := r.workflows[name]
 	if !ok {
-		return workflowEntry{}, fmt.Errorf("workflow %q not registered", name)
+		return workflowEntry{}, fmt.Errorf("%w: %q", ErrWorkflowNotRegistered, name)
 	}
 	return e, nil
 }
@@ -113,7 +113,7 @@ func (r *registry) workflow(name string) (workflowEntry, error) {
 func (r *registry) activity(name string) (activityEntry, error) {
 	e, ok := r.activities[name]
 	if !ok {
-		return activityEntry{}, fmt.Errorf("activity %q not registered", name)
+		return activityEntry{}, fmt.Errorf("%w: %q", ErrActivityNotRegistered, name)
 	}
 	return e, nil
 }

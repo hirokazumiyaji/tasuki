@@ -2,6 +2,11 @@ package tasuki
 
 import "errors"
 
+var (
+	ErrWorkflowNotRegistered = errors.New("workflow not registered")
+	ErrActivityNotRegistered = errors.New("activity not registered")
+)
+
 type nonRetryable struct{ err error }
 
 func (n nonRetryable) Error() string { return n.err.Error() }
