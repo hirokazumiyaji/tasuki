@@ -1,7 +1,8 @@
 # M6 Search Attributes Design
 
 **Date:** 2026-07-27  
-**Status:** Proposed  
+**Status:** Approved  
+ 
 **Parent:** [docs/04-plan.md](../../04-plan.md) 将来候補「検索属性」  
 **Decisions:** Start-time + in-workflow upsert; string keys/values only; List exact-match AND filters; merge upsert with empty string = delete; store as JSON map on `wf_instances` (approach A).
 
