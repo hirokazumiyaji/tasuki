@@ -48,10 +48,11 @@ In `withDefaults`:
 Add a kind-agnostic reschedule used by both workflow and activity nacks:
 
 ```go
-NackTask(ctx context.Context, taskID int64, visibleAt time.Time) error
+NackTask(ctx context.Context, t Task, visibleAt time.Time) error
 ```
 
-Semantics: task exists → set `visible_at = visibleAt`, clear `worker_id` (same effect as today’s activity retry / lease release, for any kind). Missing task → `ErrNotFound`.
+Semantics: task exists → set `visible_at = visibleAt`, clear `worker_id` (same effect as today’s activity retry / lease release, for any kind). Missing task → `ErrNotFound`.  
+`Task` (not only `taskID`) is required so stores with instance-keyed workflow task PKs (DynamoDB, Firestore) can update the correct row.
 
 `RetryActivity` may delegate to `NackTask` after checking `kind == activity` (optional refactor).
 

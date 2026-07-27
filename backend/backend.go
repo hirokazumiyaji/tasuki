@@ -30,6 +30,9 @@ type Backend interface {
 	// RecordHeartbeat extends the lease and stores details for GetHeartbeatDetails on later attempts.
 	RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error
 	ReleaseLease(ctx context.Context, taskID int64) error
+	// NackTask clears the lease and sets visible_at so the task can be claimed again
+	// (any kind). Used when a Worker cannot process the task (incompatible code/registry).
+	NackTask(ctx context.Context, t Task, visibleAt time.Time) error
 	LoadWorkflow(ctx context.Context, instanceID string) (*WorkflowState, error)
 	// LoadWorkflowHead returns instance metadata, inbox, next_seq, and store Now without journal.
 	LoadWorkflowHead(ctx context.Context, instanceID string) (*WorkflowState, error)
