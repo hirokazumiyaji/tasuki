@@ -1,9 +1,8 @@
-# tasuki M6 Signal Dedupe
+# tasuki M6 Worker Incompatible Nack
 
 ## タスク
 
 - [x] Task 1: Spec + Plan
-- [x] Task 2: Backend API + memory + Client + tests
-- [x] Task 3: SQL + Spanner
-- [x] Task 4: DynamoDB + Firestore
-- [x] Task 5: Docs
+- [ ] Task 2: Backend.NackTask
+- [ ] Task 3: Worker paths + tests
+- [ ] Task 4: Docs
