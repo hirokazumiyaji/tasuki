@@ -1,7 +1,7 @@
 # M6 Signal Dedupe ID Design
 
 **Date:** 2026-07-27  
-**Status:** Proposed  
+**Status:** Approved  
 **Parent:** [docs/04-plan.md](../../04-plan.md) 将来候補「シグナルの重複排除 ID」  
 **Decisions:** Instance-scoped keys `(instance_id, dedupe_id)`; optional `WithDedupeID`; duplicate → `nil` (idempotent); separate `wf_signal_dedupe` table; keys removed when the instance becomes terminal; Cancel / Terminate out of scope.
 
