@@ -520,7 +520,7 @@ type Capabilities struct {
 | アクティビティの実行 | at-least-once（冪等実装が契約） | リースとリトライ |
 | アクティビティ結果の採用 | exactly-once | 完了Txのタスク行 DELETE による排他 |
 | タイマー発火のワークフローへの反映 | exactly-once | inbox 経由の取り込み一本化 |
-| シグナル | 送信側の責務で at-least-once。取り込みは到着分すべて | inbox は重複排除しない（重複送信は重複受信になる） |
+| シグナル | 既定は送信側 at-least-once（到着分すべて取り込み）。`WithDedupeID` 指定時はインスタンス単位で at-most-once | 未指定は inbox 追記のみ。指定時は `wf_signal_dedupe` の一意制約で再送を無効化 |
 | ワークフロー開始 | ID による重複排除で冪等 | 主キー制約 |
 | スケジュール発火 | 実効 exactly-once | 予定時刻由来の ID と開始の重複排除 |
 
