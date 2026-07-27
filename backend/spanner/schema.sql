@@ -37,6 +37,12 @@ CREATE TABLE wf_inbox (
 
 CREATE INDEX wf_inbox_instance_idx ON wf_inbox(instance_id, id);
 
+CREATE TABLE wf_signal_dedupe (
+  instance_id STRING(255) NOT NULL,
+  dedupe_id STRING(255) NOT NULL,
+  created_at TIMESTAMP NOT NULL
+) PRIMARY KEY (instance_id, dedupe_id);
+
 CREATE TABLE wf_tasks (
   id INT64 NOT NULL,
   kind STRING(32) NOT NULL,

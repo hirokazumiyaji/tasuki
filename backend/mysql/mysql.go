@@ -63,6 +63,7 @@ func (b *Backend) Reset(ctx context.Context) error {
 		"TRUNCATE TABLE wf_timers",
 		"TRUNCATE TABLE wf_tasks",
 		"TRUNCATE TABLE wf_inbox",
+		"TRUNCATE TABLE wf_signal_dedupe",
 		"TRUNCATE TABLE wf_journal",
 		"TRUNCATE TABLE wf_instances",
 		"SET FOREIGN_KEY_CHECKS = 1",

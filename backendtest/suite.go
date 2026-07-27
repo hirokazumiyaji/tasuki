@@ -30,6 +30,7 @@ func Run(t *testing.T, newBackend Factory) {
 	t.Run("TerminateIgnoresLateComplete", func(t *testing.T) { testTerminateLateComplete(t, newBackend) })
 	t.Run("FireTimerWakesWorkflow", func(t *testing.T) { testFireTimer(t, newBackend) })
 	t.Run("CountClaimableTasks", func(t *testing.T) { testCountClaimableTasks(t, newBackend) })
+	t.Run("SignalDedupe", func(t *testing.T) { testSignalDedupe(t, newBackend) })
 	RunConcurrent(t, newBackend)
 	RunM2(t, newBackend)
 	RunM3(t, newBackend)

@@ -62,6 +62,7 @@ func (b *Backend) Reset(ctx context.Context) error {
 		DELETE FROM wf_timers;
 		DELETE FROM wf_tasks;
 		DELETE FROM wf_inbox;
+		DELETE FROM wf_signal_dedupe;
 		DELETE FROM wf_journal;
 		DELETE FROM wf_instances;
 		DELETE FROM sqlite_sequence WHERE name IN ('wf_tasks','wf_inbox');

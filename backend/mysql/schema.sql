@@ -37,6 +37,13 @@ CREATE TABLE IF NOT EXISTS wf_inbox (
     INDEX wf_inbox_instance_idx (instance_id, id)
 );
 
+CREATE TABLE IF NOT EXISTS wf_signal_dedupe (
+    instance_id VARCHAR(255) NOT NULL,
+    dedupe_id   VARCHAR(255) NOT NULL,
+    created_at  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (instance_id, dedupe_id)
+);
+
 CREATE TABLE IF NOT EXISTS wf_tasks (
     id           BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     kind         VARCHAR(32) NOT NULL,
