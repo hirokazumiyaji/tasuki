@@ -433,6 +433,27 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	return nil
 }
 
+func (b *Backend) NackTask(ctx context.Context, t backend.Task, visibleAt time.Time) error {
+	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		n, err := txn.Update(ctx, spanner.Statement{
+			SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id`,
+			Params: map[string]any{"v": visibleAt.UTC(), "id": t.ID},
+		})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return backend.ErrNotFound
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
+}
+
 func (b *Backend) LoadWorkflowHead(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil {

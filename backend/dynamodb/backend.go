@@ -310,6 +310,27 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	b.notifyTasks()
 	return nil
 }
+func (b *Backend) NackTask(ctx context.Context, t backend.Task, visibleAt time.Time) error {
+	pk := actTaskPK(t.ID)
+	if t.Kind == "workflow" {
+		pk = wfTaskPK(t.InstanceID)
+	}
+	_, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(b.table("wf_tasks")),
+		Key:       map[string]types.AttributeValue{"task_pk": avS(pk)},
+		UpdateExpression: aws.String("SET visible_at = :v REMOVE worker_id"),
+		ConditionExpression: aws.String("attribute_exists(task_pk)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(visibleAt.UTC()))},
+	})
+	if conditional(err) {
+		return backend.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
+}
 func (b *Backend) RetryActivity(ctx context.Context, taskID int64, at time.Time) error {
 	return b.updateTask(ctx, taskID, "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(at))}, "kind = :kind")
 }

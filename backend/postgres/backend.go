@@ -273,6 +273,19 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	return nil
 }
 
+func (b *Backend) NackTask(ctx context.Context, t backend.Task, visibleAt time.Time) error {
+	tag, err := b.pool.Exec(ctx, `
+		UPDATE wf_tasks SET visible_at = $2, worker_id = NULL WHERE id = $1`, t.ID, visibleAt.UTC())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return backend.ErrNotFound
+	}
+	b.notifyTasks(ctx)
+	return nil
+}
+
 func (b *Backend) LoadWorkflowHead(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {

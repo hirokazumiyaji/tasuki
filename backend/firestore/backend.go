@@ -303,6 +303,30 @@ func (b *Backend) ReleaseLease(ctx context.Context, id int64) error {
 	b.notifyTasks()
 	return nil
 }
+func (b *Backend) NackTask(ctx context.Context, t backend.Task, visibleAt time.Time) error {
+	ref := b.ref("wf_tasks", actTaskID(t.ID))
+	if t.Kind == "workflow" {
+		ref = b.ref("wf_tasks", wfTaskID(t.InstanceID))
+	}
+	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		s, e := tx.Get(ref)
+		if isNotFound(e) {
+			return backend.ErrNotFound
+		}
+		if e != nil {
+			return e
+		}
+		if !s.Exists() {
+			return backend.ErrNotFound
+		}
+		return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: visibleAt.UTC()}, {Path: "worker_id", Value: gcf.Delete}})
+	})
+	if err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
+}
 func (b *Backend) RetryActivity(ctx context.Context, id int64, at time.Time) error {
 	return b.updateTask(ctx, id, true, []gcf.Update{{Path: "visible_at", Value: at.UTC()}, {Path: "worker_id", Value: gcf.Delete}})
 }

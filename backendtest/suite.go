@@ -31,6 +31,7 @@ func Run(t *testing.T, newBackend Factory) {
 	t.Run("FireTimerWakesWorkflow", func(t *testing.T) { testFireTimer(t, newBackend) })
 	t.Run("CountClaimableTasks", func(t *testing.T) { testCountClaimableTasks(t, newBackend) })
 	t.Run("SignalDedupe", func(t *testing.T) { testSignalDedupe(t, newBackend) })
+	t.Run("NackTask", func(t *testing.T) { testNackTask(t, newBackend) })
 	RunConcurrent(t, newBackend)
 	RunM2(t, newBackend)
 	RunM3(t, newBackend)

@@ -253,16 +253,29 @@ func (b *Backend) ReleaseLease(_ context.Context, taskID int64) error {
 	return nil
 }
 
-func (b *Backend) RetryActivity(_ context.Context, taskID int64, visibleAt time.Time) error {
+func (b *Backend) NackTask(_ context.Context, task backend.Task, visibleAt time.Time) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	t, ok := b.tasks[taskID]
-	if !ok || t.kind != "activity" {
+	t, ok := b.tasks[task.ID]
+	if !ok {
+		b.mu.Unlock()
 		return backend.ErrNotFound
 	}
 	t.visibleAt = visibleAt.UTC()
 	t.workerID = ""
+	b.mu.Unlock()
+	b.notifyTasks()
 	return nil
+}
+
+func (b *Backend) RetryActivity(ctx context.Context, taskID int64, visibleAt time.Time) error {
+	b.mu.Lock()
+	t, ok := b.tasks[taskID]
+	if !ok || t.kind != "activity" {
+		b.mu.Unlock()
+		return backend.ErrNotFound
+	}
+	b.mu.Unlock()
+	return b.NackTask(ctx, backend.Task{ID: taskID, Kind: "activity"}, visibleAt)
 }
 
 func (b *Backend) LoadWorkflowHead(_ context.Context, instanceID string) (*backend.WorkflowState, error) {
