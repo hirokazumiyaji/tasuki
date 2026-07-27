@@ -52,7 +52,7 @@ func testSignalCommitRace(t *testing.T, newBackend Factory) {
 				Type:    journal.TypeSignalReceived,
 				Name:    "approve",
 				Payload: []byte(`{}`),
-			})
+			}, "")
 		}()
 		go func() {
 			defer wg.Done()

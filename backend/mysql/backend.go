@@ -765,7 +765,8 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	return n, nil
 }
 
-func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event) error {
+func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
+	_ = dedupeID // Task 3/4: wf_signal_dedupe
 	err := withTx(ctx, b.db, func(conn *sql.Conn) error {
 		var status string
 		err := conn.QueryRowContext(ctx, `SELECT status FROM wf_instances WHERE id = ? FOR UPDATE`, instanceID).

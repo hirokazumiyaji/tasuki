@@ -92,3 +92,16 @@ func WithID(id string) StartOption {
 func WithQueue(queue string) StartOption {
 	return func(o *startOptions) { o.queue = queue }
 }
+
+type signalOptions struct {
+	dedupeID string
+}
+
+// SignalOption configures Client.Signal.
+type SignalOption func(*signalOptions)
+
+// WithDedupeID makes Signal idempotent for this instance: retries with the same
+// ID do not deliver a second copy. Empty ID is ignored (same as omitting the option).
+func WithDedupeID(id string) SignalOption {
+	return func(o *signalOptions) { o.dedupeID = id }
+}

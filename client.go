@@ -96,7 +96,11 @@ func (c *Client) List(ctx context.Context, f InstanceFilter) ([]backend.Instance
 	return c.backend.ListInstances(ctx, f)
 }
 
-func (c *Client) Signal(ctx context.Context, id, name string, payload any) error {
+func (c *Client) Signal(ctx context.Context, id, name string, payload any, opts ...SignalOption) error {
+	o := signalOptions{}
+	for _, opt := range opts {
+		opt(&o)
+	}
 	body, err := c.codec.Marshal(payload)
 	if err != nil {
 		return err
@@ -105,13 +109,13 @@ func (c *Client) Signal(ctx context.Context, id, name string, payload any) error
 		Type:    journal.TypeSignalReceived,
 		Name:    name,
 		Payload: body,
-	})
+	}, o.dedupeID)
 }
 
 func (c *Client) Cancel(ctx context.Context, id string) error {
 	return c.backend.SendToInbox(ctx, id, journal.Event{
 		Type: journal.TypeCancelRequested,
-	})
+	}, "")
 }
 
 func (c *Client) Terminate(ctx context.Context, id string) error {

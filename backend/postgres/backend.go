@@ -670,7 +670,8 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 }
 
 
-func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event) error {
+func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
+	_ = dedupeID // Task 3/4: wf_signal_dedupe
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return err

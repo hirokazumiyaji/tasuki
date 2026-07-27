@@ -585,7 +585,8 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	b.notifyTasks()
 	return nil
 }
-func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event) error {
+func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
+	_ = dedupeID // Task 3/4: wf_signal_dedupe
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil {
 		return err

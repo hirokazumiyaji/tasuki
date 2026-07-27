@@ -19,11 +19,12 @@ type Backend struct {
 	nextTask  int64
 	nextInbox int64
 
-	instances map[string]*instance
-	tasks     map[int64]*task
-	timers    map[timerKey]*timer
-	inbox     map[string][]*inboxItem // instanceID → ordered
-	schedules map[string]*schedule
+	instances    map[string]*instance
+	tasks        map[int64]*task
+	timers       map[timerKey]*timer
+	inbox        map[string][]*inboxItem // instanceID → ordered
+	signalDedupe map[string]map[string]struct{} // instanceID → dedupeID
+	schedules    map[string]*schedule
 
 	hub *hub.Hub
 }
@@ -76,13 +77,14 @@ type inboxItem struct {
 
 func New() *Backend {
 	return &Backend{
-		now:       time.Now().UTC(),
-		instances: map[string]*instance{},
-		tasks:     map[int64]*task{},
-		timers:    map[timerKey]*timer{},
-		inbox:     map[string][]*inboxItem{},
-		schedules: map[string]*schedule{},
-		hub:       hub.New(),
+		now:          time.Now().UTC(),
+		instances:    map[string]*instance{},
+		tasks:        map[int64]*task{},
+		timers:       map[timerKey]*timer{},
+		inbox:        map[string][]*inboxItem{},
+		signalDedupe: map[string]map[string]struct{}{},
+		schedules:    map[string]*schedule{},
+		hub:          hub.New(),
 	}
 }
 
@@ -196,6 +198,7 @@ func (b *Backend) TerminateInstance(_ context.Context, id string) error {
 		return backend.ErrNotFound
 	}
 	inst.status = "terminated"
+	delete(b.signalDedupe, id)
 	for tid, t := range b.tasks {
 		if t.instanceID == id {
 			delete(b.tasks, tid)
@@ -496,6 +499,7 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 		inst.status = adv.Terminal.Status
 		inst.result = append([]byte(nil), adv.Terminal.Result...)
 		inst.failure = append([]byte(nil), adv.Terminal.Failure...)
+		delete(b.signalDedupe, adv.InstanceID)
 	}
 	for _, ch := range adv.Children {
 		if err := b.createInstanceLocked(ch); err != nil {
@@ -660,12 +664,24 @@ func toTask(t *task) backend.Task {
 	}
 }
 
-func (b *Backend) SendToInbox(_ context.Context, instanceID string, ev journal.Event) error {
+func (b *Backend) SendToInbox(_ context.Context, instanceID string, ev journal.Event, dedupeID string) error {
 	b.mu.Lock()
 	inst, ok := b.instances[instanceID]
 	if !ok {
 		b.mu.Unlock()
 		return backend.ErrNotFound
+	}
+	if dedupeID != "" {
+		seen := b.signalDedupe[instanceID]
+		if seen == nil {
+			seen = map[string]struct{}{}
+			b.signalDedupe[instanceID] = seen
+		}
+		if _, dup := seen[dedupeID]; dup {
+			b.mu.Unlock()
+			return nil
+		}
+		seen[dedupeID] = struct{}{}
 	}
 	b.nextInbox++
 	b.inbox[instanceID] = append(b.inbox[instanceID], &inboxItem{id: b.nextInbox, event: ev})

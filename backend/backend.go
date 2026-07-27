@@ -17,7 +17,10 @@ type Backend interface {
 	GetJournal(ctx context.Context, id string, afterSeq int64) ([]journal.Event, error)
 	ListInstances(ctx context.Context, f InstanceFilter) ([]Instance, error)
 	TerminateInstance(ctx context.Context, id string) error
-	SendToInbox(ctx context.Context, instanceID string, ev journal.Event) error
+	// SendToInbox appends an event to the instance inbox.
+	// Non-empty dedupeID makes the send idempotent per (instanceID, dedupeID):
+	// a duplicate returns nil without inserting another inbox row.
+	SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error
 
 	ClaimTasks(ctx context.Context, req ClaimRequest) ([]Task, error)
 	// CountClaimableTasks returns per-queue counts of tasks with visible_at <= store now
