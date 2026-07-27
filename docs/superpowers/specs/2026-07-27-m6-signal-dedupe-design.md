@@ -90,8 +90,8 @@ Architecture doc row for signals updates from “inbox は重複排除しない�
 
 ## Acceptance
 
-- [ ] `WithDedupeID` on `Client.Signal`
-- [ ] `wf_signal_dedupe` + `SendToInbox` dedupe path on all backends
-- [ ] Terminal cleanup
-- [ ] Tests
-- [ ] Docs
+- [x] `WithDedupeID` on `Client.Signal`
+- [x] `wf_signal_dedupe` + `SendToInbox` dedupe path on all backends
+- [x] Terminal cleanup
+- [x] Tests
+- [x] Docs
