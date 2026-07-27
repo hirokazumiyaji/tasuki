@@ -34,6 +34,9 @@ func journalID(instanceID string, seq int64) string {
 func inboxID(instanceID string, id int64) string {
 	return instanceID + ":" + strconv.FormatInt(id, 10)
 }
+func signalDedupeID(instanceID, dedupeID string) string {
+	return instanceID + ":" + dedupeID
+}
 
 type activityPayload struct {
 	Name  string          `json:"name"`

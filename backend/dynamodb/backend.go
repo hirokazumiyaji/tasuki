@@ -165,6 +165,9 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	if err := b.deleteTimersForInstance(ctx, id); err != nil {
 		return err
 	}
+	if err := b.deleteSignalDedupeForInstance(ctx, id); err != nil {
+		return err
+	}
 	b.notifyTerminal(id)
 	return nil
 }
@@ -418,6 +421,7 @@ func (b *Backend) notifyAfterAdvancements(advs []backend.Advancement) {
 	b.notifyTasks()
 	for _, adv := range advs {
 		if adv.Terminal != nil {
+			_ = b.deleteSignalDedupeForInstance(context.Background(), adv.InstanceID)
 			b.notifyTerminal(adv.InstanceID)
 		}
 	}
@@ -623,15 +627,37 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 }
 
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
-	_ = dedupeID // Task 3/4: wf_signal_dedupe
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil {
 		return err
 	}
 	now := nowUTC()
-	_, err = b.client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(b.table("wf_inbox")), Item: inboxItem(instanceID, newID(), ev, now), ConditionExpression: aws.String("attribute_not_exists(instance_id) AND attribute_not_exists(id)")})
-	if err != nil {
-		return err
+	inbox := inboxItem(instanceID, newID(), ev, now)
+	if dedupeID != "" {
+		items := []types.TransactWriteItem{
+			put(b.table("wf_signal_dedupe"), map[string]types.AttributeValue{
+				"instance_id": avS(instanceID),
+				"dedupe_id":   avS(dedupeID),
+				"created_at":  avN(timeToN(now)),
+			}, "attribute_not_exists(instance_id) AND attribute_not_exists(dedupe_id)"),
+			put(b.table("wf_inbox"), inbox, "attribute_not_exists(instance_id) AND attribute_not_exists(id)"),
+		}
+		_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+		if err != nil {
+			if isDedupeConflict(err) {
+				return nil
+			}
+			return err
+		}
+	} else {
+		_, err = b.client.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName:           aws.String(b.table("wf_inbox")),
+			Item:                inbox,
+			ConditionExpression: aws.String("attribute_not_exists(instance_id) AND attribute_not_exists(id)"),
+		})
+		if err != nil {
+			return err
+		}
 	}
 	if inst.Status == "running" {
 		if err := b.ensureWorkflowTask(ctx, instanceID); err != nil {
@@ -640,6 +666,40 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	}
 	b.notifyTasks()
 	return nil
+}
+
+func (b *Backend) deleteSignalDedupeForInstance(ctx context.Context, id string) error {
+	out, err := b.client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(b.table("wf_signal_dedupe")),
+		KeyConditionExpression: aws.String("instance_id = :id"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":id": avS(id),
+		},
+	})
+	if err != nil {
+		return err
+	}
+	for _, m := range out.Items {
+		if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+			TableName: aws.String(b.table("wf_signal_dedupe")),
+			Key: map[string]types.AttributeValue{
+				"instance_id": m["instance_id"],
+				"dedupe_id":   m["dedupe_id"],
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isDedupeConflict(err error) bool {
+	var t *types.TransactionCanceledException
+	if !errors.As(err, &t) || len(t.CancellationReasons) == 0 {
+		return false
+	}
+	r := t.CancellationReasons[0]
+	return r.Code != nil && *r.Code == "ConditionalCheckFailed"
 }
 
 func put(table string, item map[string]types.AttributeValue, condition string) types.TransactWriteItem {
