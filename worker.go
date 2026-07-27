@@ -236,6 +236,9 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 	}
 	wf, err := w.reg.workflow(state.Instance.Name)
 	if err != nil {
+		if errors.Is(err, ErrWorkflowNotRegistered) {
+			return nil, w.nackIncompatible(ctx, t, "unregistered_workflow", err)
+		}
 		return nil, err
 	}
 
@@ -312,6 +315,9 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 	}
 
 	if res.Stuck {
+		if errors.Is(res.Err, journal.ErrDeterminismViolation) {
+			return nil, w.nackIncompatible(ctx, t, "determinism", res.Err)
+		}
 		adv.NewEvents = append(adv.NewEvents, res.NewCommands...)
 		adv.Terminal = &backend.TerminalUpdate{
 			Status:  "stuck",
@@ -470,6 +476,9 @@ func (w *Worker) attachEffects(adv *backend.Advancement, queue string, cmds []jo
 func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	act, err := w.reg.activity(t.Name)
 	if err != nil {
+		if errors.Is(err, ErrActivityNotRegistered) {
+			return w.nackIncompatible(ctx, t, "unregistered_activity", err)
+		}
 		return w.failActivity(ctx, t, err)
 	}
 
@@ -533,6 +542,25 @@ func (w *Worker) failActivity(ctx context.Context, t backend.Task, err error) er
 		RefSeq:  t.Seq,
 		Payload: payload,
 	})
+}
+
+func (w *Worker) nackIncompatible(ctx context.Context, t backend.Task, reason string, cause error) error {
+	var now time.Time
+	if st, loadErr := w.backend.LoadWorkflowHead(ctx, t.InstanceID); loadErr == nil {
+		now = st.Now
+	} else {
+		now = time.Now().UTC()
+	}
+	visibleAt := now.Add(w.opts.IncompatibleRetryDelay)
+	w.opts.Logger.Warn("incompatible worker nack",
+		"instance_id", t.InstanceID,
+		"task_id", t.ID,
+		"reason", reason,
+		"error", cause,
+		"visible_at", visibleAt,
+	)
+	w.opts.Metrics.AddIncompatibleNack(ctx, reason)
+	return w.backend.NackTask(ctx, t, visibleAt)
 }
 
 func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan struct{}) {

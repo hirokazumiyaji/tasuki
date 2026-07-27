@@ -17,8 +17,9 @@ type Metrics struct {
 	ActivityTasks    metric.Int64Counter
 	WorkflowDone     metric.Int64Counter // completed / failed / stuck / canceled
 	ActivityRetries  metric.Int64Counter
-	JournalWarnings  metric.Int64Counter
-	TaskBacklog      metric.Int64Gauge
+	JournalWarnings   metric.Int64Counter
+	IncompatibleNacks metric.Int64Counter
+	TaskBacklog       metric.Int64Gauge
 }
 
 // NewMetrics creates counters on the global MeterProvider (noop if unset).
@@ -50,6 +51,11 @@ func NewMetrics() (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	in, err := m.Int64Counter("tasuki.worker.incompatible_nacks",
+		metric.WithDescription("Tasks nacked because this Worker cannot process them"))
+	if err != nil {
+		return nil, err
+	}
 	tb, err := m.Int64Gauge("tasuki.tasks.backlog",
 		metric.WithDescription("Claimable tasks per queue"),
 		metric.WithUnit("{task}"))
@@ -57,12 +63,13 @@ func NewMetrics() (*Metrics, error) {
 		return nil, err
 	}
 	return &Metrics{
-		WorkflowTasks:   wt,
-		ActivityTasks:   at,
-		WorkflowDone:    wd,
-		ActivityRetries: ar,
-		JournalWarnings: jw,
-		TaskBacklog:     tb,
+		WorkflowTasks:     wt,
+		ActivityTasks:     at,
+		WorkflowDone:      wd,
+		ActivityRetries:   ar,
+		JournalWarnings:   jw,
+		IncompatibleNacks: in,
+		TaskBacklog:       tb,
 	}, nil
 }
 
@@ -100,6 +107,13 @@ func (m *Metrics) AddJournalWarning(ctx context.Context, n int64) {
 		return
 	}
 	m.JournalWarnings.Add(ctx, n)
+}
+
+func (m *Metrics) AddIncompatibleNack(ctx context.Context, reason string) {
+	if m == nil {
+		return
+	}
+	m.IncompatibleNacks.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
 }
 
 func (m *Metrics) RecordBacklog(ctx context.Context, kind, queue string, n int64) {

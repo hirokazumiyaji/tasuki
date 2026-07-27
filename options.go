@@ -21,6 +21,9 @@ type WorkerOptions struct {
 	Logger               *slog.Logger
 	Metrics              *observability.Metrics
 	JournalWarnThreshold int // 0 → 10000; <0 disabled
+	// IncompatibleRetryDelay is how long to hide a task after an incompatible Worker nacks it.
+	// Unset (0) defaults to 5s; negative means immediate re-visibility.
+	IncompatibleRetryDelay time.Duration
 }
 
 func (o WorkerOptions) withDefaults() WorkerOptions {
@@ -56,6 +59,11 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 	}
 	if o.JournalWarnThreshold == 0 {
 		o.JournalWarnThreshold = 10000
+	}
+	if o.IncompatibleRetryDelay == 0 {
+		o.IncompatibleRetryDelay = 5 * time.Second
+	} else if o.IncompatibleRetryDelay < 0 {
+		o.IncompatibleRetryDelay = 0
 	}
 	return o
 }
