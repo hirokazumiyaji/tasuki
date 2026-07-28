@@ -33,6 +33,7 @@ func Run(t *testing.T, newBackend Factory) {
 	t.Run("SignalDedupe", func(t *testing.T) { testSignalDedupe(t, newBackend) })
 	t.Run("NackTask", func(t *testing.T) { testNackTask(t, newBackend) })
 	t.Run("SearchAttributes", func(t *testing.T) { testSearchAttributes(t, newBackend) })
+	t.Run("Memo", func(t *testing.T) { testMemo(t, newBackend) })
 	RunConcurrent(t, newBackend)
 	RunM2(t, newBackend)
 	RunM3(t, newBackend)
