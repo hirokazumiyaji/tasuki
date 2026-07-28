@@ -92,8 +92,8 @@ List filtering: use native JSON operators where practical; otherwise filter afte
 
 ## Acceptance
 
-- [ ] `WithSearchAttributes` on Start
-- [ ] `workflow.UpsertSearchAttributes` + journal
-- [ ] Persist + List filter on all backends
-- [ ] Tests
-- [ ] Docs
+- [x] `WithSearchAttributes` on Start
+- [x] `workflow.UpsertSearchAttributes` + journal
+- [x] Persist + List filter on all backends
+- [x] Tests
+- [x] Docs

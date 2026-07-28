@@ -19,6 +19,7 @@ Worker はインスタンスごとの sticky ジャーナルキャッシュ（`n
 ワークフローの読み取り専用問い合わせは `workflow.SetQueryHandler` と `tasuki.Query`（Worker 同一プロセス）で行う。
 `Client.Signal` は `WithDedupeID` でインスタンス単位の再送冪等にできる。
 ローリング中に旧 Worker が新履歴を扱えない場合はタスクを Nack し、新 Worker が拾えるようにする（`IncompatibleRetryDelay`）。
+検索属性は `WithSearchAttributes`（Start）と `workflow.UpsertSearchAttributes` で付け、`Client.List` の完全一致フィルタで絞り込める。
 ペイロードの at-rest 暗号化は `codec.Encrypted`（AES-256-GCM、鍵ローテーション対応。Worker の `Codec` と Client の `WithCodec` に設定）。
 
 ## クイックスタート

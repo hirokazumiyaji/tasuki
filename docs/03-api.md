@@ -107,9 +107,13 @@ func main() {
 | `ContinueAsNew[I](ctx, in) error` | 履歴を打ち切り新しい実行へ引き継ぐ（return で使うエラー値） |
 | `Info(ctx) WorkflowInfo` | インスタンス ID、ワークフロー名、開始時刻 |
 | `SetQueryHandler[I, O](ctx, name, fn)` | 読み取り専用のクエリハンドラを登録する（ジャーナルには残らない） |
+| `UpsertSearchAttributes(ctx, attrs)` | 検索属性をマージ更新する（空文字の値はそのキーを削除） |
 
 `SetQueryHandler` はリプレイのたびに同じ決定的な位置で呼び出す。
 ハンドラは履歴を進めない（`Execute` や `Sleep` など新しいコマンドを記録してはならない）。
+
+`UpsertSearchAttributes` は決定的コマンドとしてジャーナルに残り、ペイロードは適用後のマップ全体である。
+クエリ実行中に呼ぶと、他の副作用と同様に拒否／サスペンドされる。
 
 長寿命・ループするワークフローは、イベント数が数千〜1万付近になったら `ContinueAsNew` で履歴を打ち切ることを推奨する（既定の警告しきい値と揃える）。警告自体は実行を止めない。
 
@@ -246,15 +250,25 @@ type Info struct {
 c := tasuki.NewClient(backend)
 
 h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID("order-123"))
+h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID("order-123"),
+    tasuki.WithSearchAttributes(map[string]string{"tenant": "acme", "order_id": "42"}))
 res, err := h.Result(ctx)                    // 終端までポーリングで待つ
 err = c.Signal(ctx, "order-123", "approve", payload)
 err = c.Signal(ctx, "order-123", "approve", payload, tasuki.WithDedupeID("pay-42"))
 err = c.Cancel(ctx, "order-123")             // 協調的キャンセル
 err = c.Terminate(ctx, "order-123")          // 即時終了
-info, err := c.Get(ctx, "order-123")         // 状態、結果、失敗理由
+info, err := c.Get(ctx, "order-123")         // 状態、結果、失敗理由、検索属性
 events, err := c.GetJournal(ctx, "order-123") // 実行履歴
 list, err := c.List(ctx, tasuki.InstanceFilter{Status: tasuki.StatusStuck})
+list, err := c.List(ctx, tasuki.InstanceFilter{
+    Status: tasuki.StatusRunning,
+    SearchAttributes: map[string]string{"tenant": "acme"},
+})
 ```
+
+`WithSearchAttributes` は Start 時に文字列キー／値の可視メタデータを付ける。
+`List` の `SearchAttributes` は各キーの完全一致を AND で絞り込む（未設定キーは不一致）。
+実行中の更新は `workflow.UpsertSearchAttributes`（マージ。空文字は削除）。
 
 `Signal` に `WithDedupeID` を付けると、同じインスタンス内でその ID の再送は inbox に増えない（戻り値は `nil`）。
 未指定または空文字のときは従来どおり、送信ごとの到着になる。
