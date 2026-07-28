@@ -1,7 +1,8 @@
 # M6 Local Activity Design
 
 **Date:** 2026-07-29  
-**Status:** Proposed  
+**Status:** Approved  
+ 
 **Parent:** Short, same-worker activity execution without the activity task queue  
 **Decisions:** Sync run on the workflow Worker; no retries in v1; dedicated `workflow.ExecuteLocal`; SideEffect-like single journal command (approach A).
 
