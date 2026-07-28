@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS wf_instances (
     parent_seq   INTEGER,
     next_seq     INTEGER NOT NULL DEFAULT 1,
     search_attributes TEXT NOT NULL DEFAULT '{}',
+    memo         TEXT NOT NULL DEFAULT '{}',
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     completed_at TEXT

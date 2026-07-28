@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS wf_instances (
     parent_seq   bigint,
     next_seq     bigint NOT NULL DEFAULT 1,
     search_attributes jsonb NOT NULL DEFAULT '{}'::jsonb,
+    memo         jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at   timestamptz NOT NULL DEFAULT now(),
     updated_at   timestamptz NOT NULL DEFAULT now(),
     completed_at timestamptz
@@ -86,3 +87,4 @@ CREATE INDEX IF NOT EXISTS wf_schedules_due_idx ON wf_schedules (next_run_at) WH
 
 ALTER TABLE wf_tasks ADD COLUMN IF NOT EXISTS heartbeat bytea;
 ALTER TABLE wf_instances ADD COLUMN IF NOT EXISTS search_attributes jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE wf_instances ADD COLUMN IF NOT EXISTS memo jsonb NOT NULL DEFAULT '{}'::jsonb;
