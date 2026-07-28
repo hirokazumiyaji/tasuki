@@ -41,6 +41,7 @@ func Query[I, O any](ctx context.Context, w *Worker, instanceID, name string, in
 			Name:       state.Instance.Name,
 		})
 		wctx.SetCodec(w.reg.codec)
+		wctx.SetSearchAttributes(state.Instance.SearchAttributes)
 		out, err := wf.fn(wctx, state.Instance.Input)
 		if err != nil {
 			return nil, err
