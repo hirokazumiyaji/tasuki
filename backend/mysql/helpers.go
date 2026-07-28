@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
@@ -167,6 +168,11 @@ func scanJSONNullString(v sql.NullString) []byte {
 		return nil
 	}
 	return []byte(v.String)
+}
+
+func scanSearchAttrs(v sql.NullString) map[string]string {
+	m, _ := backend.SearchAttributesFromPayload(scanJSONNullString(v))
+	return m
 }
 
 func leaseVisibleAt(lease time.Duration) time.Time {

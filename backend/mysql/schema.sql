@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS wf_instances (
     parent_id    VARCHAR(255) NULL,
     parent_seq   BIGINT NULL,
     next_seq     BIGINT NOT NULL DEFAULT 1,
+    search_attributes JSON NOT NULL DEFAULT (JSON_OBJECT()),
     created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     completed_at DATETIME(6) NULL,
