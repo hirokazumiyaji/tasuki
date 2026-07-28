@@ -88,8 +88,8 @@ Runner implementation: look up `w.reg.activity(name)`, invoke with a background/
 
 ## Acceptance
 
-- [ ] `workflow.ExecuteLocal` + `TypeLocalActivity`
-- [ ] Worker LocalRunner from activity registry
-- [ ] No activity task enqueue
-- [ ] Replay skips runner
-- [ ] Tests + docs
+- [x] `workflow.ExecuteLocal` + `TypeLocalActivity`
+- [x] Worker LocalRunner from activity registry
+- [x] No activity task enqueue
+- [x] Replay skips runner
+- [x] Tests + docs

@@ -92,6 +92,7 @@ func main() {
 | 関数 | 概要 |
 |---|---|
 | `Execute[I, O](ctx, fn, in, opts...) (O, error)` | アクティビティを実行し完了を待つ |
+| `ExecuteLocal[I, O](ctx, name, in) (O, error)` | 同一 Worker 上で同期実行し結果をジャーナルする（タスクキューなし・リトライなし） |
 | `ExecuteAsync[I, O](ctx, fn, in, opts...) *Future[O]` | アクティビティを開始し Future を返す |
 | `ExecuteChild[I, O](ctx, wf, in, opts...) (O, error)` | 子ワークフローを実行し完了を待つ（Async 版もある） |
 | `Sleep(ctx, d) error` / `SleepUntil(ctx, t) error` | durable なタイマーで待つ |
@@ -117,6 +118,9 @@ func main() {
 クエリ実行中に呼ぶと、他の副作用と同様に拒否／サスペンドされる。
 
 `UpsertMemo` も同様にジャーナルに残るが、`List` の絞り込みには使わない（Get で見える表示用メタデータ）。
+
+`ExecuteLocal` は `RegisterActivity` した関数をワークフロータスク内で同期実行する。
+通常の `Execute` と違いアクティビティタスクは作らず、リトライも行わない。短い・信頼できる処理向け。結果（またはエラー）は `local_activity` コマンドとしてジャーナルに残り、リプレイではランナーを呼ばない。
 
 長寿命・ループするワークフローは、イベント数が数千〜1万付近になったら `ContinueAsNew` で履歴を打ち切ることを推奨する（既定の警告しきい値と揃える）。警告自体は実行を止めない。
 
