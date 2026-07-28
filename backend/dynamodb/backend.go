@@ -45,6 +45,7 @@ func instanceItem(inst backend.NewInstance, queue string, now time.Time) map[str
 		"id": avS(inst.ID), "name": avS(inst.Name), "queue": avS(queue), "status": avS("running"),
 		"input": avJSON(inst.Input), "next_seq": avN(2), "created_at": avN(timeToN(now)), "updated_at": avN(timeToN(now)),
 		"search_attributes": avJSON(backend.MarshalSearchAttributes(inst.SearchAttributes)),
+		"memo":              avJSON(backend.MarshalSearchAttributes(inst.Memo)),
 	}
 	if inst.ParentID != "" {
 		m["parent_id"] = avS(inst.ParentID)
@@ -87,9 +88,10 @@ func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance
 
 func decodeInstance(m map[string]types.AttributeValue) *backend.Instance {
 	attrs, _ := backend.SearchAttributesFromPayload(fromJSON(m["search_attributes"]))
+	memo, _ := backend.SearchAttributesFromPayload(fromJSON(m["memo"]))
 	return &backend.Instance{ID: fromS(m["id"]), Name: fromS(m["name"]), Queue: fromS(m["queue"]), Status: fromS(m["status"]),
 		Input: fromJSON(m["input"]), Result: fromJSON(m["result"]), Failure: fromJSON(m["failure"]), NextSeq: fromN(m["next_seq"]),
-		ParentID: fromS(m["parent_id"]), ParentSeq: fromN(m["parent_seq"]), SearchAttributes: attrs}
+		ParentID: fromS(m["parent_id"]), ParentSeq: fromN(m["parent_seq"]), SearchAttributes: attrs, Memo: memo}
 }
 
 func (b *Backend) GetJournal(ctx context.Context, id string, afterSeq int64) ([]journal.Event, error) {
@@ -493,9 +495,10 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 		names = map[string]string{"#status": "status", "#result": "result"}
 	}
 	saUpdate := backend.HasSearchAttributesUpdate(adv.NewEvents)
+	memoUpdate := backend.HasMemoUpdate(adv.NewEvents)
 	items := []types.TransactWriteItem{{
 		Update: &types.Update{TableName: aws.String(b.table("wf_instances")), Key: map[string]types.AttributeValue{"id": avS(adv.InstanceID)},
-			UpdateExpression: aws.String(instanceAdvanceExpression(adv.Terminal, saUpdate)), ConditionExpression: aws.String("next_seq = :expected"),
+			UpdateExpression: aws.String(instanceAdvanceExpression(adv.Terminal, saUpdate, memoUpdate)), ConditionExpression: aws.String("next_seq = :expected"),
 			ExpressionAttributeNames: names, ExpressionAttributeValues: instanceAdvanceValues(newSeq, adv.ExpectedSeq, now, adv.Terminal, adv.NewEvents)}},
 	}
 	for _, e := range adv.NewEvents {
@@ -530,10 +533,13 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 	return items, parentID, nil
 }
 
-func instanceAdvanceExpression(t *backend.TerminalUpdate, withSearchAttrs bool) string {
+func instanceAdvanceExpression(t *backend.TerminalUpdate, withSearchAttrs, withMemo bool) string {
 	expr := "SET next_seq = :next, updated_at = :now"
 	if withSearchAttrs {
 		expr += ", search_attributes = :sa"
+	}
+	if withMemo {
+		expr += ", memo = :memo"
 	}
 	if t == nil {
 		return expr
@@ -544,6 +550,9 @@ func instanceAdvanceValues(next, expected int64, now time.Time, t *backend.Termi
 	m := map[string]types.AttributeValue{":next": avN(next), ":expected": avN(expected), ":now": avN(timeToN(now))}
 	if backend.HasSearchAttributesUpdate(events) {
 		m[":sa"] = avJSON(backend.MarshalSearchAttributes(backend.LastSearchAttributesUpdate(events)))
+	}
+	if backend.HasMemoUpdate(events) {
+		m[":memo"] = avJSON(backend.MarshalSearchAttributes(backend.LastMemoUpdate(events)))
 	}
 	if t != nil {
 		m[":status"], m[":result"], m[":failure"] = avS(t.Status), avJSON(t.Result), avJSON(t.Failure)

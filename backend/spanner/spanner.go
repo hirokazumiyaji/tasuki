@@ -201,14 +201,21 @@ CREATE TABLE wf_signal_dedupe (
 }
 
 func (b *Backend) ensureSearchAttributesColumn(ctx context.Context) error {
-	exists, err := b.columnExists(ctx, "wf_instances", "search_attributes")
+	if err := b.ensureJSONColumn(ctx, "search_attributes"); err != nil {
+		return err
+	}
+	return b.ensureJSONColumn(ctx, "memo")
+}
+
+func (b *Backend) ensureJSONColumn(ctx context.Context, column string) error {
+	exists, err := b.columnExists(ctx, "wf_instances", column)
 	if err != nil {
 		return err
 	}
 	if exists {
 		return nil
 	}
-	return b.applyDDL(ctx, []string{`ALTER TABLE wf_instances ADD COLUMN search_attributes JSON`})
+	return b.applyDDL(ctx, []string{fmt.Sprintf(`ALTER TABLE wf_instances ADD COLUMN %s JSON`, column)})
 }
 
 func (b *Backend) columnExists(ctx context.Context, table, column string) (bool, error) {

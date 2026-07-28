@@ -110,7 +110,8 @@ func unwrapInboxPayload(payload []byte) (string, []byte) {
 func decodeInstance(m map[string]any) *backend.Instance {
 	return &backend.Instance{ID: str(m, "id"), Name: str(m, "name"), Queue: str(m, "queue"), Status: str(m, "status"),
 		Input: bytes(m, "input"), Result: bytes(m, "result"), Failure: bytes(m, "failure"), NextSeq: i64(m, "next_seq"),
-		ParentID: str(m, "parent_id"), ParentSeq: i64(m, "parent_seq"), SearchAttributes: stringMap(m, "search_attributes")}
+		ParentID: str(m, "parent_id"), ParentSeq: i64(m, "parent_seq"),
+		SearchAttributes: stringMap(m, "search_attributes"), Memo: stringMap(m, "memo")}
 }
 
 func searchAttrsDoc(m map[string]string) map[string]string {

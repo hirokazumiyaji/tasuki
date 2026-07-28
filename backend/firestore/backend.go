@@ -25,6 +25,7 @@ func instanceDoc(inst backend.NewInstance, queue string, now time.Time) map[stri
 		"id": inst.ID, "name": inst.Name, "queue": queue, "status": "running",
 		"input": jsonString(inst.Input), "next_seq": int64(2), "created_at": now, "updated_at": now,
 		"search_attributes": searchAttrsDoc(inst.SearchAttributes),
+		"memo":              searchAttrsDoc(inst.Memo),
 	}
 	if inst.ParentID != "" {
 		m["parent_id"] = inst.ParentID
@@ -491,6 +492,12 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 		updates = append(updates, gcf.Update{
 			Path:  "search_attributes",
 			Value: searchAttrsDoc(backend.LastSearchAttributesUpdate(adv.NewEvents)),
+		})
+	}
+	if backend.HasMemoUpdate(adv.NewEvents) {
+		updates = append(updates, gcf.Update{
+			Path:  "memo",
+			Value: searchAttrsDoc(backend.LastMemoUpdate(adv.NewEvents)),
 		})
 	}
 	if err := tx.Update(prep.instRef, updates); err != nil {
