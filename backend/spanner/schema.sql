@@ -9,6 +9,7 @@ CREATE TABLE wf_instances (
   parent_id STRING(255),
   parent_seq INT64,
   next_seq INT64 NOT NULL DEFAULT (1),
+  search_attributes JSON,
   created_at TIMESTAMP NOT NULL,
   updated_at TIMESTAMP NOT NULL,
   completed_at TIMESTAMP

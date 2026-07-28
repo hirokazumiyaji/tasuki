@@ -187,15 +187,45 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if dedupeExists {
-		return nil
-	}
-	return b.applyDDL(ctx, []string{`
+	if !dedupeExists {
+		if err := b.applyDDL(ctx, []string{`
 CREATE TABLE wf_signal_dedupe (
   instance_id STRING(255) NOT NULL,
   dedupe_id STRING(255) NOT NULL,
   created_at TIMESTAMP NOT NULL
-) PRIMARY KEY (instance_id, dedupe_id)`})
+) PRIMARY KEY (instance_id, dedupe_id)`}); err != nil {
+			return err
+		}
+	}
+	return b.ensureSearchAttributesColumn(ctx)
+}
+
+func (b *Backend) ensureSearchAttributesColumn(ctx context.Context) error {
+	exists, err := b.columnExists(ctx, "wf_instances", "search_attributes")
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	return b.applyDDL(ctx, []string{`ALTER TABLE wf_instances ADD COLUMN search_attributes JSON`})
+}
+
+func (b *Backend) columnExists(ctx context.Context, table, column string) (bool, error) {
+	iter := b.client.Single().Query(ctx, spanner.Statement{
+		SQL: `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+			WHERE TABLE_SCHEMA = '' AND TABLE_NAME = @table AND COLUMN_NAME = @column LIMIT 1`,
+		Params: map[string]any{"table": table, "column": column},
+	})
+	defer iter.Stop()
+	_, err := iter.Next()
+	if err == iterator.Done {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (b *Backend) applyDDL(ctx context.Context, stmts []string) error {

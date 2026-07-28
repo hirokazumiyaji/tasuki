@@ -31,6 +31,7 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 				"next_seq":   int64(2),
 				"parent_id":  nullStr(inst.ParentID),
 				"parent_seq": nullInt(inst.ParentSeq),
+				"search_attributes": jsonVal(backend.MarshalSearchAttributes(inst.SearchAttributes)),
 				"created_at": now,
 				"updated_at": now,
 			}),
@@ -66,7 +67,7 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 
 func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance, error) {
 	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{id},
-		[]string{"id", "name", "queue", "status", "input", "result", "failure", "next_seq", "parent_id", "parent_seq"})
+		[]string{"id", "name", "queue", "status", "input", "result", "failure", "next_seq", "parent_id", "parent_seq", "search_attributes"})
 	if err != nil {
 		if isNotFound(err) {
 			return nil, backend.ErrNotFound
@@ -78,16 +79,17 @@ func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance
 
 func scanInstance(row *spanner.Row) (*backend.Instance, error) {
 	var inst backend.Instance
-	var input, result, failure spanner.NullJSON
+	var input, result, failure, searchAttrs spanner.NullJSON
 	var parentID spanner.NullString
 	var parentSeq spanner.NullInt64
 	if err := row.Columns(&inst.ID, &inst.Name, &inst.Queue, &inst.Status,
-		&input, &result, &failure, &inst.NextSeq, &parentID, &parentSeq); err != nil {
+		&input, &result, &failure, &inst.NextSeq, &parentID, &parentSeq, &searchAttrs); err != nil {
 		return nil, err
 	}
 	inst.Input = jsonBytes(input)
 	inst.Result = jsonBytes(result)
 	inst.Failure = jsonBytes(failure)
+	inst.SearchAttributes, _ = backend.SearchAttributesFromPayload(jsonBytes(searchAttrs))
 	if parentID.Valid {
 		inst.ParentID = parentID.StringVal
 	}
@@ -135,17 +137,20 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 	if limit <= 0 {
 		limit = 100
 	}
-	iter := b.client.Single().Query(ctx, spanner.Statement{
-		SQL: `SELECT id, name, queue, status, input, result, failure, next_seq, parent_id, parent_seq
+	sql := `SELECT id, name, queue, status, input, result, failure, next_seq, parent_id, parent_seq, search_attributes
 			FROM wf_instances
 			WHERE (@status = '' OR status = @status)
 			  AND (@name = '' OR name = @name)
-			ORDER BY created_at, id
-			LIMIT @limit OFFSET @offset`,
-		Params: map[string]any{
-			"status": f.Status, "name": f.Name, "limit": int64(limit), "offset": int64(f.Offset),
-		},
-	})
+			ORDER BY created_at, id`
+	params := map[string]any{
+		"status": f.Status, "name": f.Name,
+	}
+	if len(f.SearchAttributes) == 0 {
+		sql += ` LIMIT @limit OFFSET @offset`
+		params["limit"] = int64(limit)
+		params["offset"] = int64(f.Offset)
+	}
+	iter := b.client.Single().Query(ctx, spanner.Statement{SQL: sql, Params: params})
 	defer iter.Stop()
 	var out []backend.Instance
 	for {
@@ -160,7 +165,19 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 		if err != nil {
 			return nil, err
 		}
+		if !backend.MatchesSearchAttributes(inst.SearchAttributes, f.SearchAttributes) {
+			continue
+		}
 		out = append(out, *inst)
+	}
+	if len(f.SearchAttributes) > 0 {
+		if f.Offset >= len(out) {
+			return nil, nil
+		}
+		out = out[f.Offset:]
+		if len(out) > limit {
+			out = out[:limit]
+		}
 	}
 	return out, nil
 }
@@ -608,6 +625,13 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 			"recorded_at": now,
 		}))
 	}
+	if backend.HasSearchAttributesUpdate(adv.NewEvents) {
+		muts = append(muts, spanner.UpdateMap("wf_instances", map[string]any{
+			"id":                adv.InstanceID,
+			"search_attributes": jsonVal(backend.MarshalSearchAttributes(backend.LastSearchAttributesUpdate(adv.NewEvents))),
+			"updated_at":        now,
+		}))
+	}
 	for _, at := range adv.ActivityTasks {
 		payload, _ := json.Marshal(activityPayload{
 			Name:  at.Name,
@@ -675,6 +699,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 				"id": ch.ID, "name": ch.Name, "queue": q, "status": "running",
 				"input": jsonVal(ch.Input), "next_seq": int64(2),
 				"parent_id": ch.ParentID, "parent_seq": ch.ParentSeq,
+				"search_attributes": jsonVal(backend.MarshalSearchAttributes(ch.SearchAttributes)),
 				"created_at": now, "updated_at": now,
 			}),
 			spanner.InsertMap("wf_journal", map[string]any{
