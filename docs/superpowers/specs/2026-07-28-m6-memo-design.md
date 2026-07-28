@@ -1,7 +1,8 @@
 # M6 Memo Design
 
 **Date:** 2026-07-28  
-**Status:** Proposed  
+**Status:** Approved  
+ 
 **Parent:** Display-only instance annotations (alongside search attributes)  
 **Decisions:** Start + in-workflow upsert; `map[string]string` only; no List filter; merge upsert with empty string = delete; store as JSON map column `memo` on `wf_instances` (approach A).
 
