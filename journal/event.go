@@ -10,8 +10,9 @@ const (
 	TypeSideEffect               Type = "side_effect"
 	TypeNowRecorded              Type = "now_recorded"
 	TypeVersionMarker            Type = "version_marker"
-	TypeSearchAttributesUpdated  Type = "search_attributes_updated"
-	TypeActivityCompleted Type = "activity_completed"
+	TypeSearchAttributesUpdated Type = "search_attributes_updated"
+	TypeMemoUpdated             Type = "memo_updated"
+	TypeActivityCompleted       Type = "activity_completed"
 	TypeActivityFailed    Type = "activity_failed"
 	TypeTimerFired        Type = "timer_fired"
 	TypeChildCompleted    Type = "child_completed"
@@ -34,7 +35,7 @@ type Event struct {
 
 func (t Type) IsCommand() bool {
 	switch t {
-	case TypeActivityScheduled, TypeTimerCreated, TypeChildScheduled, TypeSideEffect, TypeNowRecorded, TypeVersionMarker, TypeSearchAttributesUpdated:
+	case TypeActivityScheduled, TypeTimerCreated, TypeChildScheduled, TypeSideEffect, TypeNowRecorded, TypeVersionMarker, TypeSearchAttributesUpdated, TypeMemoUpdated:
 		return true
 	default:
 		return false

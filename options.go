@@ -90,6 +90,7 @@ type startOptions struct {
 	id               string
 	queue            string
 	searchAttributes map[string]string
+	memo             map[string]string
 }
 
 type StartOption func(*startOptions)
@@ -115,6 +116,22 @@ func WithSearchAttributes(attrs map[string]string) StartOption {
 				continue
 			}
 			o.searchAttributes[k] = v
+		}
+	}
+}
+
+// WithMemo sets display-only string notes on Start (visible on Get, not List filters).
+func WithMemo(attrs map[string]string) StartOption {
+	return func(o *startOptions) {
+		if len(attrs) == 0 {
+			return
+		}
+		o.memo = make(map[string]string, len(attrs))
+		for k, v := range attrs {
+			if v == "" {
+				continue
+			}
+			o.memo[k] = v
 		}
 	}
 }

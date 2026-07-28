@@ -60,6 +60,7 @@ func Start[I any](ctx context.Context, c *Client, workflowName string, input I, 
 		Queue:            o.queue,
 		Input:            payload,
 		SearchAttributes: o.searchAttributes,
+		Memo:             o.memo,
 	})
 	h := &Handle{client: c, id: o.id}
 	if errors.Is(err, backend.ErrAlreadyExists) {
