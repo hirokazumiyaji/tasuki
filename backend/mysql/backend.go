@@ -22,10 +22,11 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 	err := withTx(ctx, b.db, func(conn *sql.Conn) error {
 		now := nowUTC()
 		_, err := conn.ExecContext(ctx, `
-		INSERT INTO wf_instances (id, name, queue, status, input, next_seq, parent_id, parent_seq, search_attributes, created_at, updated_at)
-		VALUES (?, ?, ?, 'running', ?, 2, NULLIF(?, ''), NULLIF(?, 0), CAST(? AS JSON), ?, ?)`,
+		INSERT INTO wf_instances (id, name, queue, status, input, next_seq, parent_id, parent_seq, search_attributes, memo, created_at, updated_at)
+		VALUES (?, ?, ?, 'running', ?, 2, NULLIF(?, ''), NULLIF(?, 0), CAST(? AS JSON), CAST(? AS JSON), ?, ?)`,
 			inst.ID, inst.Name, queue, jsonOrNull(inst.Input), inst.ParentID, inst.ParentSeq,
-			string(backend.MarshalSearchAttributes(inst.SearchAttributes)), now, now)
+			string(backend.MarshalSearchAttributes(inst.SearchAttributes)),
+			string(backend.MarshalSearchAttributes(inst.Memo)), now, now)
 		if err != nil {
 			if isUniqueViolation(err) {
 				return backend.ErrAlreadyExists
@@ -54,12 +55,12 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance, error) {
 	row := b.db.QueryRowContext(ctx, `
 		SELECT id, name, queue, status, input, result, failure, next_seq,
-		       COALESCE(parent_id, ''), COALESCE(parent_seq, 0), COALESCE(search_attributes, CAST('{}' AS JSON))
+		       COALESCE(parent_id, ''), COALESCE(parent_seq, 0), COALESCE(search_attributes, CAST('{}' AS JSON)), COALESCE(memo, CAST('{}' AS JSON))
 		FROM wf_instances WHERE id = ?`, id)
 	var inst backend.Instance
-	var input, result, failure, searchAttrs sql.NullString
+	var input, result, failure, searchAttrs, memo sql.NullString
 	if err := row.Scan(&inst.ID, &inst.Name, &inst.Queue, &inst.Status,
-		&input, &result, &failure, &inst.NextSeq, &inst.ParentID, &inst.ParentSeq, &searchAttrs); err != nil {
+		&input, &result, &failure, &inst.NextSeq, &inst.ParentID, &inst.ParentSeq, &searchAttrs, &memo); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, backend.ErrNotFound
 		}
@@ -69,6 +70,7 @@ func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance
 	inst.Result = scanJSONNullString(result)
 	inst.Failure = scanJSONNullString(failure)
 	inst.SearchAttributes = scanSearchAttrs(searchAttrs)
+	inst.Memo = scanSearchAttrs(memo)
 	return &inst, nil
 }
 
@@ -102,7 +104,7 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 	}
 	query := `
 		SELECT id, name, queue, status, input, result, failure, next_seq,
-		       COALESCE(parent_id, ''), COALESCE(parent_seq, 0), COALESCE(search_attributes, CAST('{}' AS JSON))
+		       COALESCE(parent_id, ''), COALESCE(parent_seq, 0), COALESCE(search_attributes, CAST('{}' AS JSON)), COALESCE(memo, CAST('{}' AS JSON))
 		FROM wf_instances
 		WHERE (? = '' OR status = ?)
 		  AND (? = '' OR name = ?)
@@ -120,15 +122,16 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 	var out []backend.Instance
 	for rows.Next() {
 		var inst backend.Instance
-		var input, result, failure, searchAttrs sql.NullString
+		var input, result, failure, searchAttrs, memo sql.NullString
 		if err := rows.Scan(&inst.ID, &inst.Name, &inst.Queue, &inst.Status,
-			&input, &result, &failure, &inst.NextSeq, &inst.ParentID, &inst.ParentSeq, &searchAttrs); err != nil {
+			&input, &result, &failure, &inst.NextSeq, &inst.ParentID, &inst.ParentSeq, &searchAttrs, &memo); err != nil {
 			return nil, err
 		}
 		inst.Input = scanJSONNullString(input)
 		inst.Result = scanJSONNullString(result)
 		inst.Failure = scanJSONNullString(failure)
 		inst.SearchAttributes = scanSearchAttrs(searchAttrs)
+		inst.Memo = scanSearchAttrs(memo)
 		if !backend.MatchesSearchAttributes(inst.SearchAttributes, f.SearchAttributes) {
 			continue
 		}
@@ -387,13 +390,13 @@ func (b *Backend) LoadWorkflowHead(ctx context.Context, instanceID string) (*bac
 	defer conn.Close()
 
 	var st backend.WorkflowState
-	var input, result, failure, searchAttrs sql.NullString
+	var input, result, failure, searchAttrs, memo sql.NullString
 	err = conn.QueryRowContext(ctx, `
 		SELECT id, name, queue, status, input, result, failure, next_seq,
-		       COALESCE(parent_id, ''), COALESCE(parent_seq, 0), COALESCE(search_attributes, CAST('{}' AS JSON))
+		       COALESCE(parent_id, ''), COALESCE(parent_seq, 0), COALESCE(search_attributes, CAST('{}' AS JSON)), COALESCE(memo, CAST('{}' AS JSON))
 		FROM wf_instances WHERE id = ?`, instanceID).Scan(
 		&st.Instance.ID, &st.Instance.Name, &st.Instance.Queue, &st.Instance.Status,
-		&input, &result, &failure, &st.NextSeq, &st.Instance.ParentID, &st.Instance.ParentSeq, &searchAttrs)
+		&input, &result, &failure, &st.NextSeq, &st.Instance.ParentID, &st.Instance.ParentSeq, &searchAttrs, &memo)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, backend.ErrNotFound
@@ -404,6 +407,7 @@ func (b *Backend) LoadWorkflowHead(ctx context.Context, instanceID string) (*bac
 	st.Instance.Result = scanJSONNullString(result)
 	st.Instance.Failure = scanJSONNullString(failure)
 	st.Instance.SearchAttributes = scanSearchAttrs(searchAttrs)
+	st.Instance.Memo = scanSearchAttrs(memo)
 	st.Instance.NextSeq = st.NextSeq
 	st.Now = nowUTC()
 
@@ -547,6 +551,15 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 			return err
 		}
 	}
+	if backend.HasMemoUpdate(adv.NewEvents) {
+		_, err = conn.ExecContext(ctx, `
+			UPDATE wf_instances SET memo = CAST(? AS JSON), updated_at = ? WHERE id = ?`,
+			string(backend.MarshalSearchAttributes(backend.LastMemoUpdate(adv.NewEvents))),
+			now, adv.InstanceID)
+		if err != nil {
+			return err
+		}
+	}
 	for _, at := range adv.ActivityTasks {
 		payload, _ := json.Marshal(activityPayload{
 			Name:  at.Name,
@@ -602,10 +615,11 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 			q = "default"
 		}
 		_, err = conn.ExecContext(ctx, `
-			INSERT INTO wf_instances (id, name, queue, status, input, next_seq, parent_id, parent_seq, search_attributes, created_at, updated_at)
-			VALUES (?, ?, ?, 'running', ?, 2, ?, ?, CAST(? AS JSON), ?, ?)`,
+			INSERT INTO wf_instances (id, name, queue, status, input, next_seq, parent_id, parent_seq, search_attributes, memo, created_at, updated_at)
+			VALUES (?, ?, ?, 'running', ?, 2, ?, ?, CAST(? AS JSON), CAST(? AS JSON), ?, ?)`,
 			ch.ID, ch.Name, q, jsonOrNull(ch.Input), ch.ParentID, ch.ParentSeq,
-			string(backend.MarshalSearchAttributes(ch.SearchAttributes)), now, now)
+			string(backend.MarshalSearchAttributes(ch.SearchAttributes)),
+			string(backend.MarshalSearchAttributes(ch.Memo)), now, now)
 		if err != nil {
 			return err
 		}

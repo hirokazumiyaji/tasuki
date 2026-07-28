@@ -34,10 +34,11 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 	defer tx.Rollback(ctx)
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO wf_instances (id, name, queue, status, input, next_seq, parent_id, parent_seq, search_attributes)
-		VALUES ($1, $2, $3, 'running', $4::jsonb, 2, NULLIF($5, ''), NULLIF($6, 0), $7::jsonb)`,
+		INSERT INTO wf_instances (id, name, queue, status, input, next_seq, parent_id, parent_seq, search_attributes, memo)
+		VALUES ($1, $2, $3, 'running', $4::jsonb, 2, NULLIF($5, ''), NULLIF($6, 0), $7::jsonb, $8::jsonb)`,
 		inst.ID, inst.Name, queue, jsonbOrNull(inst.Input), inst.ParentID, inst.ParentSeq,
-		backend.MarshalSearchAttributes(inst.SearchAttributes))
+		backend.MarshalSearchAttributes(inst.SearchAttributes),
+		backend.MarshalSearchAttributes(inst.Memo))
 	if err != nil {
 		if isUniqueViolation(err) {
 			return backend.ErrAlreadyExists
@@ -67,11 +68,11 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance, error) {
 	row := b.pool.QueryRow(ctx, `
 		SELECT id, name, queue, status, input, result, failure, next_seq, COALESCE(parent_id, ''), COALESCE(parent_seq, 0),
-		       COALESCE(search_attributes, '{}'::jsonb)
+		       COALESCE(search_attributes, '{}'::jsonb), COALESCE(memo, '{}'::jsonb)
 		FROM wf_instances WHERE id = $1`, id)
 	var inst backend.Instance
-	var input, result, failure, searchAttrs []byte
-	if err := row.Scan(&inst.ID, &inst.Name, &inst.Queue, &inst.Status, &input, &result, &failure, &inst.NextSeq, &inst.ParentID, &inst.ParentSeq, &searchAttrs); err != nil {
+	var input, result, failure, searchAttrs, memo []byte
+	if err := row.Scan(&inst.ID, &inst.Name, &inst.Queue, &inst.Status, &input, &result, &failure, &inst.NextSeq, &inst.ParentID, &inst.ParentSeq, &searchAttrs, &memo); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, backend.ErrNotFound
 		}
@@ -79,6 +80,7 @@ func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance
 	}
 	inst.Input, inst.Result, inst.Failure = input, result, failure
 	inst.SearchAttributes, _ = backend.SearchAttributesFromPayload(searchAttrs)
+	inst.Memo, _ = backend.SearchAttributesFromPayload(memo)
 	return &inst, nil
 }
 
@@ -113,7 +115,7 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 	filterJSON := backend.MarshalSearchAttributes(f.SearchAttributes)
 	rows, err := b.pool.Query(ctx, `
 		SELECT id, name, queue, status, input, result, failure, next_seq,
-		       COALESCE(parent_id, ''), COALESCE(parent_seq, 0), COALESCE(search_attributes, '{}'::jsonb)
+		       COALESCE(parent_id, ''), COALESCE(parent_seq, 0), COALESCE(search_attributes, '{}'::jsonb), COALESCE(memo, '{}'::jsonb)
 		FROM wf_instances
 		WHERE ($1 = '' OR status = $1)
 		  AND ($2 = '' OR name = $2)
@@ -127,13 +129,14 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 	var out []backend.Instance
 	for rows.Next() {
 		var inst backend.Instance
-		var input, result, failure, searchAttrs []byte
+		var input, result, failure, searchAttrs, memo []byte
 		if err := rows.Scan(&inst.ID, &inst.Name, &inst.Queue, &inst.Status, &input, &result, &failure,
-			&inst.NextSeq, &inst.ParentID, &inst.ParentSeq, &searchAttrs); err != nil {
+			&inst.NextSeq, &inst.ParentID, &inst.ParentSeq, &searchAttrs, &memo); err != nil {
 			return nil, err
 		}
 		inst.Input, inst.Result, inst.Failure = input, result, failure
 		inst.SearchAttributes, _ = backend.SearchAttributesFromPayload(searchAttrs)
+		inst.Memo, _ = backend.SearchAttributesFromPayload(memo)
 		out = append(out, inst)
 	}
 	return out, rows.Err()
@@ -300,14 +303,14 @@ func (b *Backend) LoadWorkflowHead(ctx context.Context, instanceID string) (*bac
 	defer tx.Rollback(ctx)
 
 	var st backend.WorkflowState
-	var input, result, failure, searchAttrs []byte
+	var input, result, failure, searchAttrs, memo []byte
 	var now time.Time
 	err = tx.QueryRow(ctx, `
 		SELECT id, name, queue, status, input, result, failure, next_seq, COALESCE(parent_id, ''), COALESCE(parent_seq, 0),
-		       COALESCE(search_attributes, '{}'::jsonb), now()
+		       COALESCE(search_attributes, '{}'::jsonb), COALESCE(memo, '{}'::jsonb), now()
 		FROM wf_instances WHERE id = $1`, instanceID).Scan(
 		&st.Instance.ID, &st.Instance.Name, &st.Instance.Queue, &st.Instance.Status,
-		&input, &result, &failure, &st.NextSeq, &st.Instance.ParentID, &st.Instance.ParentSeq, &searchAttrs, &now)
+		&input, &result, &failure, &st.NextSeq, &st.Instance.ParentID, &st.Instance.ParentSeq, &searchAttrs, &memo, &now)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, backend.ErrNotFound
@@ -316,6 +319,7 @@ func (b *Backend) LoadWorkflowHead(ctx context.Context, instanceID string) (*bac
 	}
 	st.Instance.Input, st.Instance.Result, st.Instance.Failure = input, result, failure
 	st.Instance.SearchAttributes, _ = backend.SearchAttributesFromPayload(searchAttrs)
+	st.Instance.Memo, _ = backend.SearchAttributesFromPayload(memo)
 	st.Instance.NextSeq = st.NextSeq
 	st.Now = now
 
@@ -441,6 +445,14 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 			return err
 		}
 	}
+	if backend.HasMemoUpdate(adv.NewEvents) {
+		_, err = tx.Exec(ctx, `
+			UPDATE wf_instances SET memo = $2::jsonb, updated_at = now() WHERE id = $1`,
+			adv.InstanceID, backend.MarshalSearchAttributes(backend.LastMemoUpdate(adv.NewEvents)))
+		if err != nil {
+			return err
+		}
+	}
 	for _, at := range adv.ActivityTasks {
 		payload, _ := json.Marshal(activityPayload{
 			Name:  at.Name,
@@ -495,10 +507,11 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 			q = "default"
 		}
 		_, err = tx.Exec(ctx, `
-			INSERT INTO wf_instances (id, name, queue, status, input, next_seq, parent_id, parent_seq, search_attributes)
-			VALUES ($1, $2, $3, 'running', $4::jsonb, 2, $5, $6, $7::jsonb)`,
+			INSERT INTO wf_instances (id, name, queue, status, input, next_seq, parent_id, parent_seq, search_attributes, memo)
+			VALUES ($1, $2, $3, 'running', $4::jsonb, 2, $5, $6, $7::jsonb, $8::jsonb)`,
 			ch.ID, ch.Name, q, jsonbOrNull(ch.Input), ch.ParentID, ch.ParentSeq,
-			backend.MarshalSearchAttributes(ch.SearchAttributes))
+			backend.MarshalSearchAttributes(ch.SearchAttributes),
+			backend.MarshalSearchAttributes(ch.Memo))
 		if err != nil {
 			return err
 		}

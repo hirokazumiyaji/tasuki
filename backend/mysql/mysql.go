@@ -53,6 +53,7 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	}
 	_, _ = b.db.ExecContext(ctx, `ALTER TABLE wf_tasks ADD COLUMN heartbeat BLOB NULL`)
 	_, _ = b.db.ExecContext(ctx, `ALTER TABLE wf_instances ADD COLUMN search_attributes JSON NULL`)
+	_, _ = b.db.ExecContext(ctx, `ALTER TABLE wf_instances ADD COLUMN memo JSON NULL`)
 	return nil
 }
 
