@@ -27,6 +27,7 @@ type NewInstance struct {
 	ParentID         string
 	ParentSeq        int64
 	SearchAttributes map[string]string
+	Memo             map[string]string
 }
 
 type Instance struct {
@@ -41,6 +42,7 @@ type Instance struct {
 	ParentID         string
 	ParentSeq        int64
 	SearchAttributes map[string]string
+	Memo             map[string]string
 }
 
 type WorkflowState struct {

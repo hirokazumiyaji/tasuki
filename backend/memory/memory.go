@@ -42,6 +42,7 @@ type instance struct {
 	parentID         string
 	parentSeq        int64
 	searchAttributes map[string]string
+	memo             map[string]string
 }
 
 type task struct {
@@ -137,6 +138,7 @@ func (b *Backend) GetInstance(_ context.Context, id string) (*backend.Instance, 
 		ParentID:         inst.parentID,
 		ParentSeq:        inst.parentSeq,
 		SearchAttributes: backend.CloneSearchAttributes(inst.searchAttributes),
+		Memo:             backend.CloneSearchAttributes(inst.memo),
 	}, nil
 }
 
@@ -193,6 +195,7 @@ func (b *Backend) ListInstances(_ context.Context, f backend.InstanceFilter) ([]
 			Failure: append([]byte(nil), inst.failure...), NextSeq: inst.nextSeq,
 			ParentID: inst.parentID, ParentSeq: inst.parentSeq,
 			SearchAttributes: backend.CloneSearchAttributes(inst.searchAttributes),
+			Memo:             backend.CloneSearchAttributes(inst.memo),
 		})
 	}
 	return out, nil
@@ -314,6 +317,7 @@ func (b *Backend) loadWorkflowHeadLocked(instanceID string) (*backend.WorkflowSt
 			ParentID:         inst.parentID,
 			ParentSeq:        inst.parentSeq,
 			SearchAttributes: backend.CloneSearchAttributes(inst.searchAttributes),
+			Memo:             backend.CloneSearchAttributes(inst.memo),
 		},
 		Inbox:   inbox,
 		NextSeq: inst.nextSeq,
@@ -498,6 +502,9 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 	}
 	if updated := backend.LastSearchAttributesUpdate(adv.NewEvents); updated != nil || backend.HasSearchAttributesUpdate(adv.NewEvents) {
 		inst.searchAttributes = updated
+	}
+	if updated := backend.LastMemoUpdate(adv.NewEvents); updated != nil || backend.HasMemoUpdate(adv.NewEvents) {
+		inst.memo = updated
 	}
 
 	for _, at := range adv.ActivityTasks {
@@ -738,6 +745,7 @@ func (b *Backend) createInstanceLocked(inst backend.NewInstance) error {
 		input: inst.Input, nextSeq: 2, journal: []journal.Event{ev},
 		parentID: inst.ParentID, parentSeq: inst.ParentSeq,
 		searchAttributes: backend.CloneSearchAttributes(inst.SearchAttributes),
+		memo:             backend.CloneSearchAttributes(inst.Memo),
 	}
 	b.enqueueWorkflowTaskLocked(inst.ID, queue)
 	return nil

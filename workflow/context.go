@@ -37,6 +37,7 @@ type Context struct {
 	queryInvoking    bool
 	queryHandlers    map[string]queryHandler
 	searchAttributes map[string]string
+	memo             map[string]string
 }
 
 func NewContext(events []journal.Event, now time.Time) *Context {
@@ -68,6 +69,11 @@ func NewContext(events []journal.Event, now time.Time) *Context {
 			var m map[string]string
 			_ = json.Unmarshal(e.Payload, &m)
 			ctx.searchAttributes = cloneSearchAttrs(m)
+		}
+		if e.Type == journal.TypeMemoUpdated {
+			var m map[string]string
+			_ = json.Unmarshal(e.Payload, &m)
+			ctx.memo = cloneSearchAttrs(m)
 		}
 	}
 	return ctx
