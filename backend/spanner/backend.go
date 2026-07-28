@@ -32,6 +32,7 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 				"parent_id":  nullStr(inst.ParentID),
 				"parent_seq": nullInt(inst.ParentSeq),
 				"search_attributes": jsonVal(backend.MarshalSearchAttributes(inst.SearchAttributes)),
+				"memo":              jsonVal(backend.MarshalSearchAttributes(inst.Memo)),
 				"created_at": now,
 				"updated_at": now,
 			}),
@@ -67,7 +68,7 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 
 func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance, error) {
 	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{id},
-		[]string{"id", "name", "queue", "status", "input", "result", "failure", "next_seq", "parent_id", "parent_seq", "search_attributes"})
+		[]string{"id", "name", "queue", "status", "input", "result", "failure", "next_seq", "parent_id", "parent_seq", "search_attributes", "memo"})
 	if err != nil {
 		if isNotFound(err) {
 			return nil, backend.ErrNotFound
@@ -79,17 +80,18 @@ func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance
 
 func scanInstance(row *spanner.Row) (*backend.Instance, error) {
 	var inst backend.Instance
-	var input, result, failure, searchAttrs spanner.NullJSON
+	var input, result, failure, searchAttrs, memo spanner.NullJSON
 	var parentID spanner.NullString
 	var parentSeq spanner.NullInt64
 	if err := row.Columns(&inst.ID, &inst.Name, &inst.Queue, &inst.Status,
-		&input, &result, &failure, &inst.NextSeq, &parentID, &parentSeq, &searchAttrs); err != nil {
+		&input, &result, &failure, &inst.NextSeq, &parentID, &parentSeq, &searchAttrs, &memo); err != nil {
 		return nil, err
 	}
 	inst.Input = jsonBytes(input)
 	inst.Result = jsonBytes(result)
 	inst.Failure = jsonBytes(failure)
 	inst.SearchAttributes, _ = backend.SearchAttributesFromPayload(jsonBytes(searchAttrs))
+	inst.Memo, _ = backend.SearchAttributesFromPayload(jsonBytes(memo))
 	if parentID.Valid {
 		inst.ParentID = parentID.StringVal
 	}
@@ -137,7 +139,7 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 	if limit <= 0 {
 		limit = 100
 	}
-	sql := `SELECT id, name, queue, status, input, result, failure, next_seq, parent_id, parent_seq, search_attributes
+	sql := `SELECT id, name, queue, status, input, result, failure, next_seq, parent_id, parent_seq, search_attributes, memo
 			FROM wf_instances
 			WHERE (@status = '' OR status = @status)
 			  AND (@name = '' OR name = @name)
@@ -632,6 +634,13 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 			"updated_at":        now,
 		}))
 	}
+	if backend.HasMemoUpdate(adv.NewEvents) {
+		muts = append(muts, spanner.UpdateMap("wf_instances", map[string]any{
+			"id":         adv.InstanceID,
+			"memo":       jsonVal(backend.MarshalSearchAttributes(backend.LastMemoUpdate(adv.NewEvents))),
+			"updated_at": now,
+		}))
+	}
 	for _, at := range adv.ActivityTasks {
 		payload, _ := json.Marshal(activityPayload{
 			Name:  at.Name,
@@ -700,6 +709,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 				"input": jsonVal(ch.Input), "next_seq": int64(2),
 				"parent_id": ch.ParentID, "parent_seq": ch.ParentSeq,
 				"search_attributes": jsonVal(backend.MarshalSearchAttributes(ch.SearchAttributes)),
+				"memo":              jsonVal(backend.MarshalSearchAttributes(ch.Memo)),
 				"created_at": now, "updated_at": now,
 			}),
 			spanner.InsertMap("wf_journal", map[string]any{
