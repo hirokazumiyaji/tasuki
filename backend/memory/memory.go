@@ -496,7 +496,7 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 			inst.nextSeq = last.Seq + 1
 		}
 	}
-	if updated := backend.LastSearchAttributesUpdate(adv.NewEvents); updated != nil || hasSearchAttributesUpdate(adv.NewEvents) {
+	if updated := backend.LastSearchAttributesUpdate(adv.NewEvents); updated != nil || backend.HasSearchAttributesUpdate(adv.NewEvents) {
 		inst.searchAttributes = updated
 	}
 
@@ -741,13 +741,4 @@ func (b *Backend) createInstanceLocked(inst backend.NewInstance) error {
 	}
 	b.enqueueWorkflowTaskLocked(inst.ID, queue)
 	return nil
-}
-
-func hasSearchAttributesUpdate(events []journal.Event) bool {
-	for _, ev := range events {
-		if ev.Type == journal.TypeSearchAttributesUpdated {
-			return true
-		}
-	}
-	return false
 }

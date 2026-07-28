@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
@@ -192,6 +193,11 @@ func scanJSONText(v sql.NullString) []byte {
 		return nil
 	}
 	return []byte(v.String)
+}
+
+func scanSearchAttrs(v sql.NullString) map[string]string {
+	m, _ := backend.SearchAttributesFromPayload(scanJSONText(v))
+	return m
 }
 
 func leaseVisibleAt(lease time.Duration) string {

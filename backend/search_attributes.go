@@ -64,6 +64,28 @@ func SearchAttributesFromPayload(payload []byte) (map[string]string, error) {
 	return CloneSearchAttributes(m), nil
 }
 
+// MarshalSearchAttributes encodes attrs as a JSON object (`{}` when empty).
+func MarshalSearchAttributes(m map[string]string) []byte {
+	if len(m) == 0 {
+		return []byte("{}")
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return []byte("{}")
+	}
+	return b
+}
+
+// HasSearchAttributesUpdate reports whether events include a search_attributes_updated command.
+func HasSearchAttributesUpdate(events []journal.Event) bool {
+	for _, ev := range events {
+		if ev.Type == journal.TypeSearchAttributesUpdated {
+			return true
+		}
+	}
+	return false
+}
+
 // LastSearchAttributesUpdate returns the merged map from the last
 // search_attributes_updated event in events, or nil if none.
 func LastSearchAttributesUpdate(events []journal.Event) map[string]string {
