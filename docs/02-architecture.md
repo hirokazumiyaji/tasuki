@@ -80,6 +80,7 @@ B案を退ける理由は、実装コストの大半が `workflow.Go`（ワー�
 | timer_created | コマンド | fire_at |
 | child_scheduled | コマンド | child_id, name, input |
 | side_effect | コマンド（即値） | value |
+| local_activity | コマンド（即値） | name, input, result / error |
 | now_recorded | コマンド（即値） | value |
 | version_marker | コマンド（即値） | change_id, version |
 | activity_completed | 完了 | ref_seq, result |

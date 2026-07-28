@@ -21,6 +21,7 @@ Worker はインスタンスごとの sticky ジャーナルキャッシュ（`n
 ローリング中に旧 Worker が新履歴を扱えない場合はタスクを Nack し、新 Worker が拾えるようにする（`IncompatibleRetryDelay`）。
 検索属性は `WithSearchAttributes`（Start）と `workflow.UpsertSearchAttributes` で付け、`Client.List` の完全一致フィルタで絞り込める。
 メモは `WithMemo` / `workflow.UpsertMemo` で付け、Get で見える表示用注釈（List フィルタには使わない）。
+短い同一 Worker 実行は `workflow.ExecuteLocal`（アクティビティタスクキューなし・リトライなし。結果はジャーナルに記録）。
 ペイロードの at-rest 暗号化は `codec.Encrypted`（AES-256-GCM、鍵ローテーション対応。Worker の `Codec` と Client の `WithCodec` に設定）。
 
 ## クイックスタート
