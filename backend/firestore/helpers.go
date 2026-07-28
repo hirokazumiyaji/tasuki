@@ -110,7 +110,35 @@ func unwrapInboxPayload(payload []byte) (string, []byte) {
 func decodeInstance(m map[string]any) *backend.Instance {
 	return &backend.Instance{ID: str(m, "id"), Name: str(m, "name"), Queue: str(m, "queue"), Status: str(m, "status"),
 		Input: bytes(m, "input"), Result: bytes(m, "result"), Failure: bytes(m, "failure"), NextSeq: i64(m, "next_seq"),
-		ParentID: str(m, "parent_id"), ParentSeq: i64(m, "parent_seq")}
+		ParentID: str(m, "parent_id"), ParentSeq: i64(m, "parent_seq"), SearchAttributes: stringMap(m, "search_attributes")}
+}
+
+func searchAttrsDoc(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return map[string]string{}
+	}
+	return backend.CloneSearchAttributes(m)
+}
+
+func stringMap(m map[string]any, key string) map[string]string {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return nil
+	}
+	switch t := v.(type) {
+	case map[string]string:
+		return backend.CloneSearchAttributes(t)
+	case map[string]any:
+		out := make(map[string]string, len(t))
+		for k, raw := range t {
+			if s, ok := raw.(string); ok {
+				out[k] = s
+			}
+		}
+		return backend.CloneSearchAttributes(out)
+	default:
+		return nil
+	}
 }
 func decodeTask(m map[string]any) backend.Task {
 	t := backend.Task{ID: i64(m, "id"), Kind: str(m, "kind"), Queue: str(m, "queue"), InstanceID: str(m, "instance_id"),

@@ -21,7 +21,11 @@ func (b *Backend) col(name string) *gcf.CollectionRef  { return b.client.Collect
 func (b *Backend) ref(col, id string) *gcf.DocumentRef { return b.col(col).Doc(id) }
 
 func instanceDoc(inst backend.NewInstance, queue string, now time.Time) map[string]any {
-	m := map[string]any{"id": inst.ID, "name": inst.Name, "queue": queue, "status": "running", "input": jsonString(inst.Input), "next_seq": int64(2), "created_at": now, "updated_at": now}
+	m := map[string]any{
+		"id": inst.ID, "name": inst.Name, "queue": queue, "status": "running",
+		"input": jsonString(inst.Input), "next_seq": int64(2), "created_at": now, "updated_at": now,
+		"search_attributes": searchAttrsDoc(inst.SearchAttributes),
+	}
 	if inst.ParentID != "" {
 		m["parent_id"] = inst.ParentID
 	}
@@ -120,7 +124,8 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 			return nil, err
 		}
 		x := decodeInstance(s.Data())
-		if (f.Status == "" || x.Status == f.Status) && (f.Name == "" || x.Name == f.Name) {
+		if (f.Status == "" || x.Status == f.Status) && (f.Name == "" || x.Name == f.Name) &&
+			backend.MatchesSearchAttributes(x.SearchAttributes, f.SearchAttributes) {
 			all = append(all, *x)
 		}
 	}
@@ -481,6 +486,12 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 	updates := []gcf.Update{{Path: "next_seq", Value: next}, {Path: "updated_at", Value: now}}
 	if adv.Terminal != nil {
 		updates = append(updates, gcf.Update{Path: "status", Value: adv.Terminal.Status}, gcf.Update{Path: "result", Value: jsonString(adv.Terminal.Result)}, gcf.Update{Path: "failure", Value: jsonString(adv.Terminal.Failure)}, gcf.Update{Path: "completed_at", Value: now})
+	}
+	if backend.HasSearchAttributesUpdate(adv.NewEvents) {
+		updates = append(updates, gcf.Update{
+			Path:  "search_attributes",
+			Value: searchAttrsDoc(backend.LastSearchAttributesUpdate(adv.NewEvents)),
+		})
 	}
 	if err := tx.Update(prep.instRef, updates); err != nil {
 		return err

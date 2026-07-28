@@ -44,6 +44,7 @@ func instanceItem(inst backend.NewInstance, queue string, now time.Time) map[str
 	m := map[string]types.AttributeValue{
 		"id": avS(inst.ID), "name": avS(inst.Name), "queue": avS(queue), "status": avS("running"),
 		"input": avJSON(inst.Input), "next_seq": avN(2), "created_at": avN(timeToN(now)), "updated_at": avN(timeToN(now)),
+		"search_attributes": avJSON(backend.MarshalSearchAttributes(inst.SearchAttributes)),
 	}
 	if inst.ParentID != "" {
 		m["parent_id"] = avS(inst.ParentID)
@@ -85,9 +86,10 @@ func (b *Backend) GetInstance(ctx context.Context, id string) (*backend.Instance
 }
 
 func decodeInstance(m map[string]types.AttributeValue) *backend.Instance {
+	attrs, _ := backend.SearchAttributesFromPayload(fromJSON(m["search_attributes"]))
 	return &backend.Instance{ID: fromS(m["id"]), Name: fromS(m["name"]), Queue: fromS(m["queue"]), Status: fromS(m["status"]),
 		Input: fromJSON(m["input"]), Result: fromJSON(m["result"]), Failure: fromJSON(m["failure"]), NextSeq: fromN(m["next_seq"]),
-		ParentID: fromS(m["parent_id"]), ParentSeq: fromN(m["parent_seq"])}
+		ParentID: fromS(m["parent_id"]), ParentSeq: fromN(m["parent_seq"]), SearchAttributes: attrs}
 }
 
 func (b *Backend) GetJournal(ctx context.Context, id string, afterSeq int64) ([]journal.Event, error) {
@@ -118,7 +120,10 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 		}
 		for _, m := range out.Items {
 			if (f.Status == "" || fromS(m["status"]) == f.Status) && (f.Name == "" || fromS(m["name"]) == f.Name) {
-				items = append(items, m)
+				inst := decodeInstance(m)
+				if backend.MatchesSearchAttributes(inst.SearchAttributes, f.SearchAttributes) {
+					items = append(items, m)
+				}
 			}
 		}
 		if out.LastEvaluatedKey == nil {
@@ -487,10 +492,11 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 	if adv.Terminal != nil {
 		names = map[string]string{"#status": "status", "#result": "result"}
 	}
+	saUpdate := backend.HasSearchAttributesUpdate(adv.NewEvents)
 	items := []types.TransactWriteItem{{
 		Update: &types.Update{TableName: aws.String(b.table("wf_instances")), Key: map[string]types.AttributeValue{"id": avS(adv.InstanceID)},
-			UpdateExpression: aws.String(instanceAdvanceExpression(adv.Terminal)), ConditionExpression: aws.String("next_seq = :expected"),
-			ExpressionAttributeNames: names, ExpressionAttributeValues: instanceAdvanceValues(newSeq, adv.ExpectedSeq, now, adv.Terminal)}},
+			UpdateExpression: aws.String(instanceAdvanceExpression(adv.Terminal, saUpdate)), ConditionExpression: aws.String("next_seq = :expected"),
+			ExpressionAttributeNames: names, ExpressionAttributeValues: instanceAdvanceValues(newSeq, adv.ExpectedSeq, now, adv.Terminal, adv.NewEvents)}},
 	}
 	for _, e := range adv.NewEvents {
 		items = append(items, put(b.table("wf_journal"), journalItem(adv.InstanceID, e.Seq, e, now), "attribute_not_exists(instance_id) AND attribute_not_exists(seq)"))
@@ -524,14 +530,21 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 	return items, parentID, nil
 }
 
-func instanceAdvanceExpression(t *backend.TerminalUpdate) string {
-	if t == nil {
-		return "SET next_seq = :next, updated_at = :now"
+func instanceAdvanceExpression(t *backend.TerminalUpdate, withSearchAttrs bool) string {
+	expr := "SET next_seq = :next, updated_at = :now"
+	if withSearchAttrs {
+		expr += ", search_attributes = :sa"
 	}
-	return "SET next_seq = :next, updated_at = :now, #status = :status, #result = :result, failure = :failure, completed_at = :now"
+	if t == nil {
+		return expr
+	}
+	return expr + ", #status = :status, #result = :result, failure = :failure, completed_at = :now"
 }
-func instanceAdvanceValues(next, expected int64, now time.Time, t *backend.TerminalUpdate) map[string]types.AttributeValue {
+func instanceAdvanceValues(next, expected int64, now time.Time, t *backend.TerminalUpdate, events []journal.Event) map[string]types.AttributeValue {
 	m := map[string]types.AttributeValue{":next": avN(next), ":expected": avN(expected), ":now": avN(timeToN(now))}
+	if backend.HasSearchAttributesUpdate(events) {
+		m[":sa"] = avJSON(backend.MarshalSearchAttributes(backend.LastSearchAttributesUpdate(events)))
+	}
 	if t != nil {
 		m[":status"], m[":result"], m[":failure"] = avS(t.Status), avJSON(t.Result), avJSON(t.Failure)
 	}
