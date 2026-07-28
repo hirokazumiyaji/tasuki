@@ -12,6 +12,7 @@ const (
 	TypeVersionMarker            Type = "version_marker"
 	TypeSearchAttributesUpdated Type = "search_attributes_updated"
 	TypeMemoUpdated             Type = "memo_updated"
+	TypeLocalActivity           Type = "local_activity"
 	TypeActivityCompleted       Type = "activity_completed"
 	TypeActivityFailed    Type = "activity_failed"
 	TypeTimerFired        Type = "timer_fired"
@@ -35,7 +36,7 @@ type Event struct {
 
 func (t Type) IsCommand() bool {
 	switch t {
-	case TypeActivityScheduled, TypeTimerCreated, TypeChildScheduled, TypeSideEffect, TypeNowRecorded, TypeVersionMarker, TypeSearchAttributesUpdated, TypeMemoUpdated:
+	case TypeActivityScheduled, TypeTimerCreated, TypeChildScheduled, TypeSideEffect, TypeNowRecorded, TypeVersionMarker, TypeSearchAttributesUpdated, TypeMemoUpdated, TypeLocalActivity:
 		return true
 	default:
 		return false

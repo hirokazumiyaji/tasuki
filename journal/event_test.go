@@ -33,6 +33,9 @@ func TestIsCommand(t *testing.T) {
 	if !journal.TypeMemoUpdated.IsCommand() {
 		t.Fatal("memo_updated should be command")
 	}
+	if !journal.TypeLocalActivity.IsCommand() {
+		t.Fatal("local_activity should be command")
+	}
 	if journal.TypeActivityCompleted.IsCommand() {
 		t.Fatal("activity_completed should not be command")
 	}

@@ -38,6 +38,7 @@ type Context struct {
 	queryHandlers    map[string]queryHandler
 	searchAttributes map[string]string
 	memo             map[string]string
+	localRunner      LocalActivityRunner
 }
 
 func NewContext(events []journal.Event, now time.Time) *Context {
@@ -85,6 +86,9 @@ func (c *Context) SetInfo(info WorkflowInfo) { c.info = info }
 
 // SetCodec injects the worker's payload codec. Unset, the context uses plain JSON.
 func (c *Context) SetCodec(m Codec) { c.codec = m }
+
+// SetLocalActivityRunner injects the worker's local activity invoker.
+func (c *Context) SetLocalActivityRunner(r LocalActivityRunner) { c.localRunner = r }
 
 func WasSuspended(c *Context) bool { return c.suspended }
 
