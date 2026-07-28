@@ -366,6 +366,7 @@ CREATE TABLE wf_instances (
     parent_seq   bigint,
     next_seq     bigint NOT NULL DEFAULT 1,  -- ジャーナル追記位置。楽観ロックのフェンシングトークンを兼ねる
     search_attributes jsonb NOT NULL DEFAULT '{}'::jsonb, -- 文字列検索属性（List の完全一致用）
+    memo         jsonb NOT NULL DEFAULT '{}'::jsonb, -- 表示用メモ（List フィルタ対象外）
     created_at   timestamptz NOT NULL DEFAULT now(),
     updated_at   timestamptz NOT NULL DEFAULT now(),
     completed_at timestamptz

@@ -93,9 +93,9 @@ Column / field on instance document: `memo` JSON object (default `{}`).
 
 ## Acceptance
 
-- [ ] `WithMemo` on Start
-- [ ] `workflow.UpsertMemo` + journal
-- [ ] Persist on all backends; Get returns Memo
-- [ ] No List filter on memo
-- [ ] Tests
-- [ ] Docs
+- [x] `WithMemo` on Start
+- [x] `workflow.UpsertMemo` + journal
+- [x] Persist on all backends; Get returns Memo
+- [x] No List filter on memo
+- [x] Tests
+- [x] Docs
