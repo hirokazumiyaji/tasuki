@@ -109,7 +109,7 @@ Query mode: Update handlers must not run as part of Query; `Update` is a mutatin
 
 ## Acceptance
 
-- [ ] Journal types + `SetUpdateHandler` + `tasuki.Update` + `WithUpdateID`
-- [ ] Worker cooperative dispatch; handler may `Execute` / `Sleep`
-- [ ] Idempotent completed Update ID
-- [ ] Tests + docs
+- [x] Journal types + `SetUpdateHandler` + `tasuki.Update` + `WithUpdateID`
+- [x] Worker cooperative dispatch; handler may `Execute` / `Sleep`
+- [x] Idempotent completed Update ID
+- [x] Tests + docs
