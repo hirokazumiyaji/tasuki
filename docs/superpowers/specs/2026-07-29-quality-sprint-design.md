@@ -88,8 +88,8 @@ Images/env should align with `docker-compose.yml` (postgres:17, mysql:8.4, Spann
 ## Acceptance criteria
 
 - [x] README and `04-plan.md` match current product status and point next work at this quality sprint
-- [ ] CI runs `go test` for sqlite, postgres, mysql, spanner, dynamodb, and firestore backends every push/PR
-- [ ] Cover profile appears in Job Summary and as an artifact; low coverage never fails the job
+- [x] CI runs `go test` for sqlite, postgres, mysql, spanner, dynamodb, and firestore backends every push/PR
+- [x] Cover profile appears in Job Summary and as an artifact; low coverage never fails the job
 - [x] Priority packages receive intentional new tests (perfect % not required; PRs note before/after)
 - [x] Docs include a reproducible memory bench procedure and one captured result memo
 - [x] Implemented design specs have acceptance checkboxes marked done; unimplemented ones untouched
