@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  root:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -30,9 +30,279 @@ jobs:
         with:
           go-version: "1.24.x"
       - name: Test root
-        run: go test ./... -race -count=1
-      - name: Test postgres backend
+        run: go test ./... -race -count=1 -timeout 10m
+
+  backend-sqlite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Test sqlite
+        working-directory: backend/sqlite
         run: go test ./... -count=1 -timeout 120s
+
+  backend-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: tasuki
+          POSTGRES_PASSWORD: tasuki
+          POSTGRES_DB: tasuki
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tasuki -d tasuki"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      TASUKI_POSTGRES_DSN: postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Test postgres
         working-directory: backend/postgres
-      - name: Chaos
-        run: go test ./chaos/ -count=1 -timeout 120s
+        run: go test ./... -count=1 -timeout 120s
+
+  backend-mysql:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_USER: tasuki
+          MYSQL_PASSWORD: tasuki
+          MYSQL_DATABASE: tasuki
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -utasuki -ptasuki"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      TASUKI_MYSQL_DSN: tasuki:tasuki@tcp(127.0.0.1:3306)/tasuki?parseTime=true&loc=UTC
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Test mysql
+        working-directory: backend/mysql
+        run: go test ./... -count=1 -timeout 180s
+
+  backend-spanner:
+    runs-on: ubuntu-latest
+    services:
+      spanner:
+        image: gcr.io/cloud-spanner-emulator/emulator:1.5.41
+        ports:
+          - 9010:9010
+          - 9020:9020
+    env:
+      SPANNER_EMULATOR_HOST: localhost:9010
+      TASUKI_SPANNER_DSN: projects/tasuki/instances/tasuki/databases/tasuki
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Wait for Spanner emulator
+        run: |
+          for i in $(seq 1 60); do
+            if (echo >/dev/tcp/127.0.0.1/9010) >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          echo "spanner emulator not ready" >&2
+          exit 1
+      - name: Test spanner
+        working-directory: backend/spanner
+        run: go test ./... -count=1 -timeout 180s
+
+  backend-dynamodb:
+    runs-on: ubuntu-latest
+    env:
+      TASUKI_DYNAMODB_ENDPOINT: http://127.0.0.1:8000
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Start DynamoDB Local
+        run: |
+          docker run -d --name dynamodb -p 8000:8000 amazon/dynamodb-local:2.5.2 \
+            -jar DynamoDBLocal.jar -sharedDb -inMemory
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8000/ >/dev/null 2>&1; then exit 0; fi
+            # DynamoDB Local may return non-200 on /; accept open port
+            if (echo >/dev/tcp/127.0.0.1/8000) >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          docker logs dynamodb || true
+          exit 1
+      - name: Test dynamodb
+        working-directory: backend/dynamodb
+        run: go test ./... -count=1 -timeout 180s
+
+  backend-firestore:
+    runs-on: ubuntu-latest
+    env:
+      FIRESTORE_EMULATOR_HOST: 127.0.0.1:8086
+      TASUKI_FIRESTORE_PROJECT: tasuki
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Start Firestore emulator
+        run: |
+          docker run -d --name firestore -p 8086:8086 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
+            gcloud beta emulators firestore start --host-port=0.0.0.0:8086
+          for i in $(seq 1 90); do
+            if (echo >/dev/tcp/127.0.0.1/8086) >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          docker logs firestore || true
+          exit 1
+      - name: Test firestore
+        working-directory: backend/firestore
+        run: go test ./... -count=1 -timeout 180s
+
+  chaos-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: tasuki
+          POSTGRES_PASSWORD: tasuki
+          POSTGRES_DB: tasuki
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tasuki -d tasuki"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      TASUKI_POSTGRES_DSN: postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Chaos postgres
+        run: go test ./chaos/ -run 'TestChaos_KillWorkers$' -count=1 -timeout 5m
+
+  chaos-mysql:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_USER: tasuki
+          MYSQL_PASSWORD: tasuki
+          MYSQL_DATABASE: tasuki
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -utasuki -ptasuki"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      TASUKI_MYSQL_DSN: tasuki:tasuki@tcp(127.0.0.1:3306)/tasuki?parseTime=true&loc=UTC
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Chaos mysql
+        run: go test ./chaos/ -run TestChaos_KillWorkers_MySQL -count=1 -timeout 5m
+
+  chaos-spanner:
+    runs-on: ubuntu-latest
+    services:
+      spanner:
+        image: gcr.io/cloud-spanner-emulator/emulator:1.5.41
+        ports:
+          - 9010:9010
+          - 9020:9020
+    env:
+      SPANNER_EMULATOR_HOST: localhost:9010
+      TASUKI_SPANNER_DSN: projects/tasuki/instances/tasuki/databases/tasuki
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Wait for Spanner emulator
+        run: |
+          for i in $(seq 1 60); do
+            if (echo >/dev/tcp/127.0.0.1/9010) >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - name: Chaos spanner
+        run: go test ./chaos/ -run TestChaos_KillWorkers_Spanner -count=1 -timeout 5m
+
+  chaos-dynamodb:
+    runs-on: ubuntu-latest
+    env:
+      TASUKI_DYNAMODB_ENDPOINT: http://127.0.0.1:8000
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Start DynamoDB Local
+        run: |
+          docker run -d --name dynamodb -p 8000:8000 amazon/dynamodb-local:2.5.2 \
+            -jar DynamoDBLocal.jar -sharedDb -inMemory
+          for i in $(seq 1 60); do
+            if (echo >/dev/tcp/127.0.0.1/8000) >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          docker logs dynamodb || true
+          exit 1
+      - name: Chaos dynamodb
+        run: go test ./chaos/ -run TestChaos_KillWorkers_DynamoDB -count=1 -timeout 5m
+
+  chaos-firestore:
+    runs-on: ubuntu-latest
+    env:
+      FIRESTORE_EMULATOR_HOST: 127.0.0.1:8086
+      TASUKI_FIRESTORE_PROJECT: tasuki
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Start Firestore emulator
+        run: |
+          docker run -d --name firestore -p 8086:8086 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
+            gcloud beta emulators firestore start --host-port=0.0.0.0:8086
+          for i in $(seq 1 90); do
+            if (echo >/dev/tcp/127.0.0.1/8086) >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          docker logs firestore || true
+          exit 1
+      - name: Chaos firestore
+        run: go test ./chaos/ -run TestChaos_KillWorkers_Firestore -count=1 -timeout 5m
