@@ -148,6 +148,7 @@ go run ./cmd/bench -backend=sqlite -instances=200 -workers=4
 `WorkerOptions.WorkflowConcurrency`（デフォルト 1）で Claim 済み workflow の並列度を変えられる（同一 instance はプロセス内で直列）。bench では `-workflow-concurrency`。
 
 詳細は [docs/superpowers/specs/2026-07-24-m5-bench-design.md](docs/superpowers/specs/2026-07-24-m5-bench-design.md)。
+基準メモ: [docs/06-bench-baseline.md](docs/06-bench-baseline.md)。
 
 テスト:
 
