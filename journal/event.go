@@ -13,6 +13,9 @@ const (
 	TypeSearchAttributesUpdated Type = "search_attributes_updated"
 	TypeMemoUpdated             Type = "memo_updated"
 	TypeLocalActivity           Type = "local_activity"
+	TypeUpdateRequested         Type = "update_requested"
+	TypeUpdateAccepted          Type = "update_accepted"
+	TypeUpdateCompleted         Type = "update_completed"
 	TypeActivityCompleted       Type = "activity_completed"
 	TypeActivityFailed    Type = "activity_failed"
 	TypeTimerFired        Type = "timer_fired"
@@ -36,7 +39,7 @@ type Event struct {
 
 func (t Type) IsCommand() bool {
 	switch t {
-	case TypeActivityScheduled, TypeTimerCreated, TypeChildScheduled, TypeSideEffect, TypeNowRecorded, TypeVersionMarker, TypeSearchAttributesUpdated, TypeMemoUpdated, TypeLocalActivity:
+	case TypeActivityScheduled, TypeTimerCreated, TypeChildScheduled, TypeSideEffect, TypeNowRecorded, TypeVersionMarker, TypeSearchAttributesUpdated, TypeMemoUpdated, TypeLocalActivity, TypeUpdateAccepted, TypeUpdateCompleted:
 		return true
 	default:
 		return false
@@ -45,7 +48,7 @@ func (t Type) IsCommand() bool {
 
 func (t Type) IsCompletion() bool {
 	switch t {
-	case TypeActivityCompleted, TypeActivityFailed, TypeTimerFired, TypeChildCompleted, TypeChildFailed, TypeSignalReceived, TypeCancelRequested:
+	case TypeActivityCompleted, TypeActivityFailed, TypeTimerFired, TypeChildCompleted, TypeChildFailed, TypeSignalReceived, TypeCancelRequested, TypeUpdateRequested:
 		return true
 	default:
 		return false
