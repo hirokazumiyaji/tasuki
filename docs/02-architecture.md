@@ -81,6 +81,9 @@ B案を退ける理由は、実装コストの大半が `workflow.Go`（ワー�
 | child_scheduled | コマンド | child_id, name, input |
 | side_effect | コマンド（即値） | value |
 | local_activity | コマンド（即値） | name, input, result / error |
+| update_requested | 完了（inbox） | name, id, input |
+| update_accepted | コマンド（即値） | name, id |
+| update_completed | コマンド（即値） | name, id, result / error |
 | now_recorded | コマンド（即値） | value |
 | version_marker | コマンド（即値） | change_id, version |
 | activity_completed | 完了 | ref_seq, result |
