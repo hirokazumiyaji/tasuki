@@ -433,9 +433,12 @@ func (w *Worker) attachEffects(adv *backend.Advancement, queue string, cmds []jo
 		case journal.TypeActivityScheduled:
 			input := append([]byte(nil), cmd.Payload...)
 			retry := backend.RetryPolicy{}
+			var startToClose time.Duration
 			var sched workflow.ActivitySchedule
-			if err := json.Unmarshal(cmd.Payload, &sched); err == nil && len(sched.Input) > 0 {
-				input = append([]byte(nil), sched.Input...)
+			if err := json.Unmarshal(cmd.Payload, &sched); err == nil {
+				if len(sched.Input) > 0 {
+					input = append([]byte(nil), sched.Input...)
+				}
 				if sched.Retry != nil {
 					retry = backend.RetryPolicy{
 						InitialInterval:    time.Duration(sched.Retry.InitialIntervalMs) * time.Millisecond,
@@ -444,16 +447,20 @@ func (w *Worker) attachEffects(adv *backend.Advancement, queue string, cmds []jo
 						MaxAttempts:        sched.Retry.MaxAttempts,
 					}
 				}
+				if sched.StartToCloseTimeoutMs > 0 {
+					startToClose = time.Duration(sched.StartToCloseTimeoutMs) * time.Millisecond
+				}
 			}
 			adv.ActivityTasks = append(adv.ActivityTasks, backend.NewTask{
-				Kind:        "activity",
-				Queue:       queue,
-				InstanceID:  adv.InstanceID,
-				Name:        cmd.Name,
-				Seq:         cmd.Seq,
-				Input:       input,
-				MaxAttempts: retry.MaxAttempts,
-				Retry:       retry,
+				Kind:                "activity",
+				Queue:               queue,
+				InstanceID:          adv.InstanceID,
+				Name:                cmd.Name,
+				Seq:                 cmd.Seq,
+				Input:               input,
+				MaxAttempts:         retry.MaxAttempts,
+				Retry:               retry,
+				StartToCloseTimeout: startToClose,
 			})
 		case journal.TypeTimerCreated:
 			var p struct {
@@ -493,7 +500,13 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	if attempt < 1 {
 		attempt = 1
 	}
-	actCtx := activity.WithEnv(ctx, &activity.Env{
+	runCtx := ctx
+	var cancel context.CancelFunc
+	if t.StartToCloseTimeout > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, t.StartToCloseTimeout)
+		defer cancel()
+	}
+	actCtx := activity.WithEnv(runCtx, &activity.Env{
 		Info: activity.Info{
 			InstanceID:     t.InstanceID,
 			ActivityName:   t.Name,
@@ -509,6 +522,9 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	})
 
 	out, err := act.fn(actCtx, t.Input)
+	if runCtx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
+		err = fmt.Errorf("activity start-to-close timeout")
+	}
 	if err != nil {
 		if IsNonRetryable(err) || (t.MaxAttempts > 0 && t.Attempt >= t.MaxAttempts) {
 			return w.failActivity(ctx, t, err)

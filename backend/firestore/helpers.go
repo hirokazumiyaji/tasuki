@@ -39,9 +39,10 @@ func signalDedupeID(instanceID, dedupeID string) string {
 }
 
 type activityPayload struct {
-	Name  string          `json:"name"`
-	Input json.RawMessage `json:"input"`
-	Retry retryJSON       `json:"retry"`
+	Name                    string          `json:"name"`
+	Input                   json.RawMessage `json:"input"`
+	Retry                   retryJSON       `json:"retry"`
+	StartToCloseTimeoutMs   int64           `json:"start_to_close_timeout_ms,omitempty"`
 }
 type retryJSON struct {
 	InitialIntervalMs  int64   `json:"initial_interval_ms"`
@@ -150,6 +151,7 @@ func decodeTask(m map[string]any) backend.Task {
 		_ = json.Unmarshal(bytes(m, "payload"), &p)
 		t.Name, t.Input, t.MaxAttempts = p.Name, p.Input, p.Retry.MaxAttempts
 		t.Retry = backend.RetryPolicy{InitialInterval: time.Duration(p.Retry.InitialIntervalMs) * time.Millisecond, BackoffCoefficient: p.Retry.BackoffCoefficient, MaxInterval: time.Duration(p.Retry.MaxIntervalMs) * time.Millisecond, MaxAttempts: p.Retry.MaxAttempts}
+		t.StartToCloseTimeout = time.Duration(p.StartToCloseTimeoutMs) * time.Millisecond
 	}
 	return t
 }

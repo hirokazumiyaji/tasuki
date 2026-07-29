@@ -305,6 +305,7 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				MaxInterval:        time.Duration(p.Retry.MaxIntervalMs) * time.Millisecond,
 				MaxAttempts:        p.Retry.MaxAttempts,
 			}
+			t.StartToCloseTimeout = time.Duration(p.StartToCloseTimeoutMs) * time.Millisecond
 		}
 		out = append(out, t)
 	}
@@ -570,6 +571,7 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 				MaxIntervalMs:      at.Retry.MaxInterval.Milliseconds(),
 				MaxAttempts:        at.MaxAttempts,
 			},
+			StartToCloseTimeoutMs: at.StartToCloseTimeout.Milliseconds(),
 		})
 		_, err = conn.ExecContext(ctx, `
 			INSERT INTO wf_tasks (kind, queue, instance_id, ref_seq, payload, max_attempts, visible_at, created_at)

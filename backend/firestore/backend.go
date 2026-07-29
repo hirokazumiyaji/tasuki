@@ -46,7 +46,7 @@ func activityTaskDoc(t backend.NewTask, id int64, now time.Time) map[string]any 
 	if q == "" {
 		q = "default"
 	}
-	p, _ := json.Marshal(activityPayload{Name: t.Name, Input: t.Input, Retry: retryJSON{InitialIntervalMs: t.Retry.InitialInterval.Milliseconds(), BackoffCoefficient: t.Retry.BackoffCoefficient, MaxIntervalMs: t.Retry.MaxInterval.Milliseconds(), MaxAttempts: t.MaxAttempts}})
+	p, _ := json.Marshal(activityPayload{Name: t.Name, Input: t.Input, Retry: retryJSON{InitialIntervalMs: t.Retry.InitialInterval.Milliseconds(), BackoffCoefficient: t.Retry.BackoffCoefficient, MaxIntervalMs: t.Retry.MaxInterval.Milliseconds(), MaxAttempts: t.MaxAttempts}, StartToCloseTimeoutMs: t.StartToCloseTimeout.Milliseconds()})
 	return map[string]any{"id": id, "kind": "activity", "queue": q, "instance_id": t.InstanceID, "ref_seq": t.Seq, "payload": string(p), "attempt": int64(0), "max_attempts": int64(t.MaxAttempts), "visible_at": now, "created_at": now}
 }
 func inboxDoc(instanceID string, id int64, ev journal.Event, now time.Time) map[string]any {
