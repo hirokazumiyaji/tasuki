@@ -275,6 +275,10 @@ h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID("order-123"),
 res, err := h.Result(ctx)                    // 終端までポーリングで待つ
 err = c.Signal(ctx, "order-123", "approve", payload)
 err = c.Signal(ctx, "order-123", "approve", payload, tasuki.WithDedupeID("pay-42"))
+err = c.SignalBatch(ctx, "order-123", []tasuki.SignalItem{
+    {Name: "approve", Payload: payload, DedupeID: "pay-42"},
+    {Name: "note", Payload: note},
+})
 err = c.Cancel(ctx, "order-123")             // 協調的キャンセル
 err = c.Terminate(ctx, "order-123")          // 即時終了
 info, err := c.Get(ctx, "order-123")         // 状態、結果、失敗理由、検索属性、メモ
@@ -296,6 +300,10 @@ list, err := c.List(ctx, tasuki.InstanceFilter{
 `Signal` に `WithDedupeID` を付けると、同じインスタンス内でその ID の再送は inbox に増えない（戻り値は `nil`）。
 未指定または空文字のときは従来どおり、送信ごとの到着になる。
 dedupe キーはインスタンスが終端になると消える。
+
+`SignalBatch` は同一インスタンスへ複数シグナルを原子的に投入する。
+各 item の `DedupeID` は任意で、ヒットした件だけスキップ（全体は成功）。空スライスは no-op。
+ストアの書き込み上限を超えると `backend.ErrBatchTooLarge`（部分適用なし）。
 
 `Start` は ID で冪等である。
 同じ ID がすでに存在する場合は `tasuki.ErrAlreadyStarted` を返し、そのとき返るハンドルは既存インスタンスを指す。
