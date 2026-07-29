@@ -94,12 +94,12 @@ Fields on each Backend: `notifyMu`, `taskSubs`, `terminalSubs` — mirror `backe
 
 ## Acceptance
 
-- [ ] `dynamodb.Backend` and `firestore.Backend` implement `TaskNotifier` and `TerminalNotifier`
-- [ ] Notify on listed task / terminal paths for both
-- [ ] Coalesced buffered channels; cancel unregisters without closing ch
-- [ ] Unit/integration tests above green (or skip without emulator)
-- [ ] README note covering all stores
-- [ ] No Streams/listen; no hub; no Worker/Client API changes
+- [x] `dynamodb.Backend` and `firestore.Backend` implement `TaskNotifier` and `TerminalNotifier`
+- [x] Notify on listed task / terminal paths for both
+- [x] Coalesced buffered channels; cancel unregisters without closing ch
+- [x] Unit/integration tests above green (or skip without emulator)
+- [x] README note covering all stores
+- [x] No Streams/listen; no hub; no Worker/Client API changes
 
 ## Follow-ups (out of scope)
 

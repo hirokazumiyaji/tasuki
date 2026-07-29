@@ -105,13 +105,13 @@ Fields on `Backend` (in `sqlite.go`): `notifyMu`, `taskSubs`, `terminalSubs` —
 
 ## Acceptance
 
-- [ ] `sqlite.Backend` implements `TaskNotifier` and `TerminalNotifier`
-- [ ] Notify on listed task / terminal paths
-- [ ] Coalesced buffered channels; cancel unregisters without closing ch
-- [ ] Unit/integration tests above green
-- [ ] README note
-- [ ] No required API changes on other backends or Worker/Client
-- [ ] No shared hub / no memory refactor in this slice
+- [x] `sqlite.Backend` implements `TaskNotifier` and `TerminalNotifier`
+- [x] Notify on listed task / terminal paths
+- [x] Coalesced buffered channels; cancel unregisters without closing ch
+- [x] Unit/integration tests above green
+- [x] README note
+- [x] No required API changes on other backends or Worker/Client
+- [x] No shared hub / no memory refactor in this slice
 
 ## Follow-ups (out of scope)
 

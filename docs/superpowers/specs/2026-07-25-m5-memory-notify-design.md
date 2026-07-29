@@ -114,12 +114,12 @@ func (b *Backend) notifyTerminal(id string) { ... }
 
 ## Acceptance
 
-- [ ] `memory.Backend` implements `TaskNotifier` and `TerminalNotifier`
-- [ ] Notify on listed task / terminal paths
-- [ ] Coalesced buffered channels; cancel unregisters
-- [ ] Unit/integration tests above green
-- [ ] README note
-- [ ] No required API changes on other backends or Worker/Client
+- [x] `memory.Backend` implements `TaskNotifier` and `TerminalNotifier`
+- [x] Notify on listed task / terminal paths
+- [x] Coalesced buffered channels; cancel unregisters
+- [x] Unit/integration tests above green
+- [x] README note
+- [x] No required API changes on other backends or Worker/Client
 
 ## Follow-ups (out of scope)
 
