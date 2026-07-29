@@ -133,7 +133,7 @@
 
 初期リリース後の候補として保持する（[01-overview.md](01-overview.md) の非目標は維持する）。
 
-（Web UI / 暗号化 Codec は M5、クエリハンドラ・シグナル重複排除・非互換 Worker の Nack・検索属性・メモ・ローカルアクティビティ・Activity StartToClose タイムアウトは M6 で実装済）
+（Web UI / 暗号化 Codec は M5、クエリハンドラ・シグナル重複排除・非互換 Worker の Nack・検索属性・メモ・ローカルアクティビティ・Activity StartToClose タイムアウト・Workflow Update は M6 で実装済）
 
 ## 次のアクション
 

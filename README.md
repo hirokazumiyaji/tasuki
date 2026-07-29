@@ -18,6 +18,7 @@ Worker はインスタンスごとの sticky ジャーナルキャッシュ（`n
 長時間アクティビティは `activity.RecordHeartbeat` でリース延長と進捗記録ができ、リトライ時に `GetHeartbeatDetails` で取り出せる。
 アクティビティの 1 試行上限は `workflow.WithStartToCloseTimeout`（超過は通常失敗としてリトライ対象）。
 ワークフローの読み取り専用問い合わせは `workflow.SetQueryHandler` と `tasuki.Query`（Worker 同一プロセス）で行う。
+実行中ワークフローへの同期 Update は `workflow.SetUpdateHandler` と `tasuki.Update`（任意 `WithUpdateID`）。
 `Client.Signal` は `WithDedupeID` でインスタンス単位の再送冪等にできる。
 ローリング中に旧 Worker が新履歴を扱えない場合はタスクを Nack し、新 Worker が拾えるようにする（`IncompatibleRetryDelay`）。
 検索属性は `WithSearchAttributes`（Start）と `workflow.UpsertSearchAttributes` で付け、`Client.List` の完全一致フィルタで絞り込める。

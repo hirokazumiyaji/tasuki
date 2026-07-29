@@ -108,11 +108,17 @@ func main() {
 | `ContinueAsNew[I](ctx, in) error` | 履歴を打ち切り新しい実行へ引き継ぐ（return で使うエラー値） |
 | `Info(ctx) WorkflowInfo` | インスタンス ID、ワークフロー名、開始時刻 |
 | `SetQueryHandler[I, O](ctx, name, fn)` | 読み取り専用のクエリハンドラを登録する（ジャーナルには残らない） |
+| `SetUpdateHandler[I, O](ctx, name, fn)` | 実行中インスタンスへの Update ハンドラを登録する（`Execute` / `Sleep` 可） |
 | `UpsertSearchAttributes(ctx, attrs)` | 検索属性をマージ更新する（空文字の値はそのキーを削除） |
 | `UpsertMemo(ctx, attrs)` | 表示用メモをマージ更新する（空文字の値はそのキーを削除） |
 
 `SetQueryHandler` はリプレイのたびに同じ決定的な位置で呼び出す。
 ハンドラは履歴を進めない（`Execute` や `Sleep` など新しいコマンドを記録してはならない）。
+
+`SetUpdateHandler` も同様に毎回同じ位置で登録する。
+ハンドラは `*workflow.Context` を受け取り、`Execute` / `Sleep` など通常のワークフロー API を使える。
+呼び出しは `tasuki.Update`（Worker 同一プロセス）。任意の `WithUpdateID` で再送冪等。
+進行中の Update があるあいだ、メインのワークフローは新しいコマンドを進めない（単一ゴルーチンの協調モデル）。
 
 `UpsertSearchAttributes` は決定的コマンドとしてジャーナルに残り、ペイロードは適用後のマップ全体である。
 クエリ実行中に呼ぶと、他の副作用と同様に拒否／サスペンドされる。
@@ -318,6 +324,19 @@ out, err := tasuki.Query[struct{}, int](ctx, w, "order-123", "count", struct{}{}
 内部では journal と可視な inbox を仮 seq で連結してリプレイし、名前付きハンドラを呼ぶ。
 Claim や Commit は行わないため、`next_seq` とタスクは変わらない。
 未登録の名前は `workflow.ErrUnknownQuery`、未知のインスタンスは `backend.ErrNotFound` を返す。
+
+### Update
+
+実行中インスタンスへリクエスト／レスポンス型の更新を送るには `tasuki.Update` を使う（Worker 同一プロセス）。
+
+```go
+out, err := tasuki.Update[ReviseIn, ReviseOut](ctx, w, "order-123", "revise", in,
+    tasuki.WithUpdateID("rev-42"))
+```
+
+inbox に `update_requested` を入れ、ワークフロータスクで `SetUpdateHandler` を実行する。
+ハンドラは `Execute` などでサスペンドでき、完了は `update_completed` としてジャーナルに残る。
+同じ `WithUpdateID` の再送は、完了済みなら同じ結果を返す。
 
 ## 登録と命名
 
