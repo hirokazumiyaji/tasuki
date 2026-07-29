@@ -128,6 +128,12 @@ type Advancement struct {
 	EnsureWorkflowTask bool // if true, enqueue workflow task after commit when inbox remains or always for M0 helpers
 }
 
+// InboxItem is one event for SendToInboxBatch.
+type InboxItem struct {
+	Event    journal.Event
+	DedupeID string
+}
+
 // NewSchedule is the input for UpsertSchedule.
 type NewSchedule struct {
 	ID       string

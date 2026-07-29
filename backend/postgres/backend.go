@@ -720,13 +720,21 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 
 
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
+	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
+}
+
+func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items []backend.InboxItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if len(items) > backend.InboxBatchLimit(b.Capabilities()) {
+		return backend.ErrBatchTooLarge
+	}
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	// Lock the instance row so this serialize with CommitAdvancement's next_seq CAS
-	// and cannot DO NOTHING against a task that the commit is about to delete (I1).
 	var status string
 	if err := tx.QueryRow(ctx, `SELECT status FROM wf_instances WHERE id = $1 FOR UPDATE`, instanceID).Scan(&status); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -734,27 +742,31 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 		}
 		return err
 	}
-	if dedupeID != "" {
-		var got string
-		err = tx.QueryRow(ctx, `
-			INSERT INTO wf_signal_dedupe (instance_id, dedupe_id) VALUES ($1, $2)
-			ON CONFLICT DO NOTHING RETURNING dedupe_id`, instanceID, dedupeID).Scan(&got)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
+	inserted := 0
+	for _, it := range items {
+		if it.DedupeID != "" {
+			var got string
+			err = tx.QueryRow(ctx, `
+				INSERT INTO wf_signal_dedupe (instance_id, dedupe_id) VALUES ($1, $2)
+				ON CONFLICT DO NOTHING RETURNING dedupe_id`, instanceID, it.DedupeID).Scan(&got)
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
 		}
+		payload := inboxPayload(it.Event)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO wf_inbox (instance_id, type, ref_seq, payload)
+			VALUES ($1, $2, NULLIF($3, 0), $4::jsonb)`,
+			instanceID, string(it.Event.Type), it.Event.RefSeq, jsonbOrNull(payload))
 		if err != nil {
 			return err
 		}
+		inserted++
 	}
-	payload := inboxPayload(ev)
-	_, err = tx.Exec(ctx, `
-		INSERT INTO wf_inbox (instance_id, type, ref_seq, payload)
-		VALUES ($1, $2, NULLIF($3, 0), $4::jsonb)`,
-		instanceID, string(ev.Type), ev.RefSeq, jsonbOrNull(payload))
-	if err != nil {
-		return err
-	}
-	if status == "running" {
+	if inserted > 0 && status == "running" {
 		_, err = tx.Exec(ctx, `
 			INSERT INTO wf_tasks (kind, instance_id, queue)
 			SELECT 'workflow', $1, queue FROM wf_instances WHERE id = $1 AND status = 'running'
@@ -766,7 +778,7 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	if status == "running" {
+	if inserted > 0 && status == "running" {
 		b.notifyTasks(ctx)
 	}
 	return nil

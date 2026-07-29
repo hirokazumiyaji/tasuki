@@ -21,6 +21,9 @@ type Backend interface {
 	// Non-empty dedupeID makes the send idempotent per (instanceID, dedupeID):
 	// a duplicate returns nil without inserting another inbox row.
 	SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error
+	// SendToInboxBatch appends items atomically. Per-item dedupe hits are skipped
+	// (not an error). Empty items is a no-op. Oversized batches return ErrBatchTooLarge.
+	SendToInboxBatch(ctx context.Context, instanceID string, items []InboxItem) error
 
 	ClaimTasks(ctx context.Context, req ClaimRequest) ([]Task, error)
 	// CountClaimableTasks returns per-queue counts of tasks with visible_at <= store now

@@ -822,7 +822,17 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 }
 
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
-	var skipped bool
+	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
+}
+
+func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items []backend.InboxItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if len(items) > backend.InboxBatchLimit(b.Capabilities()) {
+		return backend.ErrBatchTooLarge
+	}
+	var inserted int
 	err := withTx(ctx, b.db, func(conn *sql.Conn) error {
 		var status string
 		err := conn.QueryRowContext(ctx, `SELECT status FROM wf_instances WHERE id = ?`, instanceID).Scan(&status)
@@ -832,31 +842,33 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 			}
 			return err
 		}
-		if dedupeID != "" {
-			res, err := conn.ExecContext(ctx, `
-				INSERT OR IGNORE INTO wf_signal_dedupe (instance_id, dedupe_id, created_at)
-				VALUES (?, ?, ?)`, instanceID, dedupeID, nowStr())
+		for _, it := range items {
+			if it.DedupeID != "" {
+				res, err := conn.ExecContext(ctx, `
+					INSERT OR IGNORE INTO wf_signal_dedupe (instance_id, dedupe_id, created_at)
+					VALUES (?, ?, ?)`, instanceID, it.DedupeID, nowStr())
+				if err != nil {
+					return err
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if n == 0 {
+					continue
+				}
+			}
+			payload := inboxPayload(it.Event)
+			_, err = conn.ExecContext(ctx, `
+				INSERT INTO wf_inbox (instance_id, type, ref_seq, payload, created_at)
+				VALUES (?, ?, ?, ?, ?)`,
+				instanceID, string(it.Event.Type), nullIfZeroRefSeq(it.Event.RefSeq), jsonOrNull(payload), nowStr())
 			if err != nil {
 				return err
 			}
-			n, err := res.RowsAffected()
-			if err != nil {
-				return err
-			}
-			if n == 0 {
-				skipped = true
-				return nil
-			}
+			inserted++
 		}
-		payload := inboxPayload(ev)
-		_, err = conn.ExecContext(ctx, `
-			INSERT INTO wf_inbox (instance_id, type, ref_seq, payload, created_at)
-			VALUES (?, ?, ?, ?, ?)`,
-			instanceID, string(ev.Type), nullIfZeroRefSeq(ev.RefSeq), jsonOrNull(payload), nowStr())
-		if err != nil {
-			return err
-		}
-		if status == "running" {
+		if inserted > 0 && status == "running" {
 			if err := enqueueWorkflowTask(ctx, conn, instanceID); err != nil {
 				return err
 			}
@@ -866,11 +878,9 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	if err != nil {
 		return err
 	}
-	if skipped {
+	if inserted == 0 {
 		return nil
 	}
-	// Second pass: if a concurrent commit deleted the only workflow task after we
-	// OR IGNORE'd against it, recreate from inbox (I1).
 	if err := withTx(ctx, b.db, func(conn *sql.Conn) error {
 		return ensureWorkflowTaskIfInbox(ctx, conn, instanceID)
 	}); err != nil {

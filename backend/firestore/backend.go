@@ -646,41 +646,54 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	return nil
 }
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
+	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
+}
+
+func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items []backend.InboxItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if len(items) > backend.InboxBatchLimit(b.Capabilities()) {
+		return backend.ErrBatchTooLarge
+	}
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil {
 		return err
 	}
 	now := nowUTC()
-	id := newID()
-	var skipped bool
+	var inserted int
 	err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
-		if dedupeID != "" {
-			dref := b.ref("wf_signal_dedupe", signalDedupeID(instanceID, dedupeID))
-			snap, err := tx.Get(dref)
-			if err != nil && !isNotFound(err) {
+		inserted = 0
+		for _, it := range items {
+			if it.DedupeID != "" {
+				dref := b.ref("wf_signal_dedupe", signalDedupeID(instanceID, it.DedupeID))
+				snap, err := tx.Get(dref)
+				if err != nil && !isNotFound(err) {
+					return err
+				}
+				if err == nil && snap.Exists() {
+					continue
+				}
+				if err := tx.Create(dref, map[string]any{
+					"instance_id": instanceID,
+					"dedupe_id":   it.DedupeID,
+					"created_at":  now,
+				}); err != nil {
+					return err
+				}
+			}
+			id := newID()
+			if err := tx.Create(b.ref("wf_inbox", inboxID(instanceID, id)), inboxDoc(instanceID, id, it.Event, now)); err != nil {
 				return err
 			}
-			if err == nil && snap.Exists() {
-				skipped = true
-				return nil
-			}
-			if err := tx.Create(dref, map[string]any{
-				"instance_id": instanceID,
-				"dedupe_id":   dedupeID,
-				"created_at":  now,
-			}); err != nil {
-				return err
-			}
+			inserted++
 		}
-		return tx.Create(b.ref("wf_inbox", inboxID(instanceID, id)), inboxDoc(instanceID, id, ev, now))
+		return nil
 	})
 	if err != nil {
-		if status.Code(err) == codes.AlreadyExists && dedupeID != "" {
-			return nil
-		}
 		return err
 	}
-	if skipped {
+	if inserted == 0 {
 		return nil
 	}
 	if inst.Status == "running" {
