@@ -9,8 +9,9 @@ import (
 
 // ActivitySchedule is the journal payload for activity_scheduled.
 type ActivitySchedule struct {
-	Input json.RawMessage `json:"input"`
-	Retry *RetryPolicyJSON `json:"retry,omitempty"`
+	Input                 json.RawMessage  `json:"input"`
+	Retry                 *RetryPolicyJSON `json:"retry,omitempty"`
+	StartToCloseTimeoutMs int64            `json:"start_to_close_timeout_ms,omitempty"`
 }
 
 type RetryPolicyJSON struct {
@@ -32,15 +33,7 @@ func Execute[I, O any](ctx *Context, activityName string, in I, opts ...ExecuteO
 		return zero, err
 	}
 	sched := ActivitySchedule{Input: input}
-	if eo.retry != (RetryPolicy{}) {
-		r := eo.retry.withDefaults()
-		sched.Retry = &RetryPolicyJSON{
-			InitialIntervalMs:  r.InitialInterval.Milliseconds(),
-			BackoffCoefficient: r.BackoffCoefficient,
-			MaxIntervalMs:      r.MaxInterval.Milliseconds(),
-			MaxAttempts:        r.MaxAttempts,
-		}
-	}
+	applyExecuteOptions(&sched, eo)
 	payload, err := json.Marshal(sched)
 	if err != nil {
 		return zero, err
@@ -68,4 +61,19 @@ func Execute[I, O any](ctx *Context, activityName string, in I, opts ...ExecuteO
 		return zero, err
 	}
 	return out, nil
+}
+
+func applyExecuteOptions(sched *ActivitySchedule, eo executeOptions) {
+	if eo.retry != (RetryPolicy{}) {
+		r := eo.retry.withDefaults()
+		sched.Retry = &RetryPolicyJSON{
+			InitialIntervalMs:  r.InitialInterval.Milliseconds(),
+			BackoffCoefficient: r.BackoffCoefficient,
+			MaxIntervalMs:      r.MaxInterval.Milliseconds(),
+			MaxAttempts:        r.MaxAttempts,
+		}
+	}
+	if eo.startToClose > 0 {
+		sched.StartToCloseTimeoutMs = eo.startToClose.Milliseconds()
+	}
 }

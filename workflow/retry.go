@@ -23,13 +23,20 @@ func (p RetryPolicy) withDefaults() RetryPolicy {
 }
 
 type executeOptions struct {
-	retry RetryPolicy
+	retry        RetryPolicy
+	startToClose time.Duration
 }
 
 type ExecuteOption func(*executeOptions)
 
 func WithRetry(p RetryPolicy) ExecuteOption {
 	return func(o *executeOptions) { o.retry = p }
+}
+
+// WithStartToCloseTimeout bounds a single activity attempt. d <= 0 leaves the
+// attempt unbounded (aside from lease / worker lifetime).
+func WithStartToCloseTimeout(d time.Duration) ExecuteOption {
+	return func(o *executeOptions) { o.startToClose = d }
 }
 
 // Backoff returns the delay before the next attempt (attempt is 1-based, after a failure).
