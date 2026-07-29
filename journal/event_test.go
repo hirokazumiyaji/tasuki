@@ -36,6 +36,12 @@ func TestIsCommand(t *testing.T) {
 	if !journal.TypeLocalActivity.IsCommand() {
 		t.Fatal("local_activity should be command")
 	}
+	if !journal.TypeUpdateAccepted.IsCommand() || !journal.TypeUpdateCompleted.IsCommand() {
+		t.Fatal("update accepted/completed should be commands")
+	}
+	if !journal.TypeUpdateRequested.IsCompletion() {
+		t.Fatal("update_requested should be completion")
+	}
 	if journal.TypeActivityCompleted.IsCommand() {
 		t.Fatal("activity_completed should not be command")
 	}

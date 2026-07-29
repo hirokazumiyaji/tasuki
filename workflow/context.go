@@ -36,6 +36,7 @@ type Context struct {
 	queryMode        bool
 	queryInvoking    bool
 	queryHandlers    map[string]queryHandler
+	updateHandlers   map[string]updateHandler
 	searchAttributes map[string]string
 	memo             map[string]string
 	localRunner      LocalActivityRunner
@@ -91,6 +92,10 @@ func (c *Context) SetCodec(m Codec) { c.codec = m }
 func (c *Context) SetLocalActivityRunner(r LocalActivityRunner) { c.localRunner = r }
 
 func WasSuspended(c *Context) bool { return c.suspended }
+
+// ClearSuspended resets the suspend flag so a follow-up phase (e.g. Update
+// dispatch) can run on the same Context after the main workflow Goexit'd.
+func ClearSuspended(c *Context) { c.suspended = false }
 
 func (c *Context) recordOrReplay(cmd journal.Command, payload []byte) journal.Event {
 	recordedCmds := c.recordedCommands()
