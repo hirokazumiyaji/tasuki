@@ -46,19 +46,20 @@ type instance struct {
 }
 
 type task struct {
-	id          int64
-	kind        string
-	queue       string
-	instanceID  string
-	name        string
-	seq         int64
-	input       []byte
-	attempt     int
-	maxAttempts int
-	retry       backend.RetryPolicy
-	visibleAt   time.Time
-	workerID    string
-	heartbeat   []byte
+	id                  int64
+	kind                string
+	queue               string
+	instanceID          string
+	name                string
+	seq                 int64
+	input               []byte
+	attempt             int
+	maxAttempts         int
+	retry               backend.RetryPolicy
+	startToCloseTimeout time.Duration
+	visibleAt           time.Time
+	workerID            string
+	heartbeat           []byte
 }
 
 type timerKey struct {
@@ -510,16 +511,17 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 	for _, at := range adv.ActivityTasks {
 		b.nextTask++
 		b.tasks[b.nextTask] = &task{
-			id:          b.nextTask,
-			kind:        "activity",
-			queue:       at.Queue,
-			instanceID:  at.InstanceID,
-			name:        at.Name,
-			seq:         at.Seq,
-			input:       append([]byte(nil), at.Input...),
-			maxAttempts: at.MaxAttempts,
-			retry:       at.Retry,
-			visibleAt:   b.now,
+			id:                  b.nextTask,
+			kind:                "activity",
+			queue:               at.Queue,
+			instanceID:          at.InstanceID,
+			name:                at.Name,
+			seq:                 at.Seq,
+			input:               append([]byte(nil), at.Input...),
+			maxAttempts:         at.MaxAttempts,
+			retry:               at.Retry,
+			startToCloseTimeout: at.StartToCloseTimeout,
+			visibleAt:           b.now,
 		}
 	}
 	for _, tm := range adv.Timers {
@@ -682,19 +684,20 @@ func (b *Backend) enqueueWorkflowTaskLocked(instanceID, queue string) {
 
 func toTask(t *task) backend.Task {
 	return backend.Task{
-		ID:               t.id,
-		Kind:             t.kind,
-		Queue:            t.queue,
-		InstanceID:       t.instanceID,
-		Name:             t.name,
-		Seq:              t.seq,
-		Input:            append([]byte(nil), t.input...),
-		Attempt:          t.attempt,
-		MaxAttempts:      t.maxAttempts,
-		Retry:            t.retry,
-		VisibleAt:        t.visibleAt,
-		WorkerID:         t.workerID,
-		HeartbeatDetails: append([]byte(nil), t.heartbeat...),
+		ID:                  t.id,
+		Kind:                t.kind,
+		Queue:               t.queue,
+		InstanceID:          t.instanceID,
+		Name:                t.name,
+		Seq:                 t.seq,
+		Input:               append([]byte(nil), t.input...),
+		Attempt:             t.attempt,
+		MaxAttempts:         t.maxAttempts,
+		Retry:               t.retry,
+		StartToCloseTimeout: t.startToCloseTimeout,
+		VisibleAt:           t.visibleAt,
+		WorkerID:            t.workerID,
+		HeartbeatDetails:    append([]byte(nil), t.heartbeat...),
 	}
 }
 

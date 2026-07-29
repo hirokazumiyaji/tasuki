@@ -238,6 +238,7 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				MaxInterval:        time.Duration(p.Retry.MaxIntervalMs) * time.Millisecond,
 				MaxAttempts:        p.Retry.MaxAttempts,
 			}
+			t.StartToCloseTimeout = time.Duration(p.StartToCloseTimeoutMs) * time.Millisecond
 		}
 		out = append(out, t)
 	}
@@ -463,6 +464,7 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 				MaxIntervalMs:      at.Retry.MaxInterval.Milliseconds(),
 				MaxAttempts:        at.MaxAttempts,
 			},
+			StartToCloseTimeoutMs: at.StartToCloseTimeout.Milliseconds(),
 		})
 		_, err = tx.Exec(ctx, `
 			INSERT INTO wf_tasks (kind, queue, instance_id, ref_seq, payload, max_attempts, visible_at)
@@ -771,9 +773,10 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 }
 
 type activityPayload struct {
-	Name  string          `json:"name"`
-	Input json.RawMessage `json:"input"`
-	Retry retryJSON       `json:"retry"`
+	Name                    string          `json:"name"`
+	Input                   json.RawMessage `json:"input"`
+	Retry                   retryJSON       `json:"retry"`
+	StartToCloseTimeoutMs   int64           `json:"start_to_close_timeout_ms,omitempty"`
 }
 
 type retryJSON struct {

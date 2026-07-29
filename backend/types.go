@@ -69,6 +69,7 @@ type Task struct {
 	Attempt           int
 	MaxAttempts       int
 	Retry             RetryPolicy
+	StartToCloseTimeout time.Duration // 0 = unset
 	VisibleAt         time.Time
 	WorkerID          string
 	HeartbeatDetails  []byte // last RecordHeartbeat payload; may be nil
@@ -91,14 +92,15 @@ type ClaimRequest struct {
 }
 
 type NewTask struct {
-	Kind        string
-	Queue       string
-	InstanceID  string
-	Name        string
-	Seq         int64
-	Input       []byte
-	MaxAttempts int // 0 = unlimited
-	Retry       RetryPolicy
+	Kind                string
+	Queue               string
+	InstanceID          string
+	Name                string
+	Seq                 int64
+	Input               []byte
+	MaxAttempts         int // 0 = unlimited
+	Retry               RetryPolicy
+	StartToCloseTimeout time.Duration // 0 = unset
 }
 
 type NewTimer struct {

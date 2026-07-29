@@ -88,9 +88,10 @@ func inClause(n int) string {
 }
 
 type activityPayload struct {
-	Name  string          `json:"name"`
-	Input json.RawMessage `json:"input"`
-	Retry retryJSON       `json:"retry"`
+	Name                    string          `json:"name"`
+	Input                   json.RawMessage `json:"input"`
+	Retry                   retryJSON       `json:"retry"`
+	StartToCloseTimeoutMs   int64           `json:"start_to_close_timeout_ms,omitempty"`
 }
 
 type retryJSON struct {

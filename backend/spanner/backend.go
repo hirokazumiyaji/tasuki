@@ -393,6 +393,7 @@ func scanTask(row *spanner.Row) (backend.Task, error) {
 			MaxInterval:        time.Duration(p.Retry.MaxIntervalMs) * time.Millisecond,
 			MaxAttempts:        p.Retry.MaxAttempts,
 		}
+		t.StartToCloseTimeout = time.Duration(p.StartToCloseTimeoutMs) * time.Millisecond
 	}
 	return t, nil
 }
@@ -651,6 +652,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 				MaxIntervalMs:      at.Retry.MaxInterval.Milliseconds(),
 				MaxAttempts:        at.MaxAttempts,
 			},
+			StartToCloseTimeoutMs: at.StartToCloseTimeout.Milliseconds(),
 		})
 		q := at.Queue
 		if q == "" {
