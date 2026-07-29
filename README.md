@@ -20,6 +20,7 @@ Worker はインスタンスごとの sticky ジャーナルキャッシュ（`n
 ワークフローの読み取り専用問い合わせは `workflow.SetQueryHandler` と `tasuki.Query`（Worker 同一プロセス）で行う。
 実行中ワークフローへの同期 Update は `workflow.SetUpdateHandler` と `tasuki.Update`（任意 `WithUpdateID`）。
 `Client.Signal` は `WithDedupeID` でインスタンス単位の再送冪等にできる。
+同一インスタンスへの一括送信は `Client.SignalBatch`（原子的。item ごとの任意 dedupe）。
 ローリング中に旧 Worker が新履歴を扱えない場合はタスクを Nack し、新 Worker が拾えるようにする（`IncompatibleRetryDelay`）。
 検索属性は `WithSearchAttributes`（Start）と `workflow.UpsertSearchAttributes` で付け、`Client.List` の完全一致フィルタで絞り込める。
 メモは `WithMemo` / `workflow.UpsertMemo` で付け、Get で見える表示用注釈（List フィルタには使わない）。
