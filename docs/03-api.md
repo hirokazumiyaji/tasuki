@@ -91,9 +91,9 @@ func main() {
 
 | 関数 | 概要 |
 |---|---|
-| `Execute[I, O](ctx, fn, in, opts...) (O, error)` | アクティビティを実行し完了を待つ |
+| `Execute[I, O](ctx, fn, in, opts...) (O, error)` | アクティビティを実行し完了を待つ（`WithRetry` / `WithStartToCloseTimeout`） |
 | `ExecuteLocal[I, O](ctx, name, in) (O, error)` | 同一 Worker 上で同期実行し結果をジャーナルする（タスクキューなし・リトライなし） |
-| `ExecuteAsync[I, O](ctx, fn, in, opts...) *Future[O]` | アクティビティを開始し Future を返す |
+| `ExecuteAsync[I, O](ctx, fn, in, opts...) *Future[O]` | アクティビティを開始し Future を返す（同じオプション可） |
 | `ExecuteChild[I, O](ctx, wf, in, opts...) (O, error)` | 子ワークフローを実行し完了を待つ（Async 版もある） |
 | `Sleep(ctx, d) error` / `SleepUntil(ctx, t) error` | durable なタイマーで待つ |
 | `SleepAsync(ctx, d) *Future[struct{}]` | タイマーを Future として開始する（タイムアウトの Select 用） |
@@ -216,7 +216,11 @@ type RetryPolicy struct {
 ```
 
 既定は Temporal と同じく無制限リトライとする。
-一時障害で止まらないことを既定とし、打ち切りたい呼び出しに `MaxAttempts` やタイムアウトを与える設計である。
+一時障害で止まらないことを既定とし、打ち切りたい呼び出しには `MaxAttempts` や `WithStartToCloseTimeout` を与える。
+
+`WithStartToCloseTimeout(d)` は **1 試行**の開始から完了までの上限である（`d <= 0` は未指定＝上限なし）。
+超過するとその試行は `"activity start-to-close timeout"` で失敗し、通常の失敗と同じく `RetryPolicy` / `MaxAttempts` / `NonRetryable` の対象になる。
+ワーカーはアクティビティに渡す `context.Context` を打ち切る（コンテキストを無視する処理は止められない）。
 
 リトライしても意味のないエラー（バリデーション失敗など）は、アクティビティが `tasuki.NonRetryable(err)` で包んで返す。
 このエラーは即座に恒久的失敗となり、ワークフロー側へそのまま返る。
@@ -225,7 +229,8 @@ type RetryPolicy struct {
 ## アクティビティの定義と冪等性
 
 アクティビティは `context.Context` を取る通常の関数である。
-渡されるコンテキストはリースの残り時間で打ち切られる。
+渡されるコンテキストは、`WithStartToCloseTimeout` を付けた場合はその期限で打ち切られる。
+未指定時はリース延長（ハートビート／自動延長）により長く動き続けられる。
 
 ```go
 func ChargePayment(ctx context.Context, in ChargeInput) (ChargeResult, error)

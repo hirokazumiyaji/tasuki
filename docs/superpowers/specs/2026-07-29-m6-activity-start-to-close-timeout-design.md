@@ -82,7 +82,7 @@ Activities that ignore context may keep running after the deadline (same contrac
 
 ## Acceptance
 
-- [ ] `WithStartToCloseTimeout` on Execute / ExecuteAsync
-- [ ] Timeout persisted in schedule + task JSON; restored on Claim
-- [ ] Worker enforces via `context.WithTimeout`; timeout → retryable failure path
-- [ ] Tests + docs
+- [x] `WithStartToCloseTimeout` on Execute / ExecuteAsync
+- [x] Timeout persisted in schedule + task JSON; restored on Claim
+- [x] Worker enforces via `context.WithTimeout`; timeout → retryable failure path
+- [x] Tests + docs
