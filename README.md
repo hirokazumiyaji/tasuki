@@ -10,7 +10,9 @@ Temporal のような「リトライ、タイマー、状態永続化を自分�
 ## ステータス
 
 M4（バックエンド拡充）完了。PostgreSQL / SQLite / MySQL·MariaDB·TiDB / Spanner / DynamoDB / Firestore が適合・カオス可能な状態。
-M5 着手中（性能と拡張）。ベンチマーク基盤: `go run ./cmd/bench`（memory / postgres）。
+M5（性能と拡張）と M6（Query / Signal dedupe / Nack / SearchAttributes / Memo / LocalActivity / StartToClose / Update / SignalBatch など）は実装済。
+現在は品質スプリント（CI マトリクス・カバレッジ計測・ドキュメント鮮度）。詳細は [docs/superpowers/specs/2026-07-29-quality-sprint-design.md](docs/superpowers/specs/2026-07-29-quality-sprint-design.md)。
+M5 のベンチマーク基盤: `go run ./cmd/bench`（memory / postgres / sqlite）。
 PostgreSQL Worker は `LISTEN`/`NOTIFY`（チャネル `tasuki_tasks`）で起床し、`PollInterval` はフォールバックおよびタイマー／スケジュール用。memory / sqlite / mysql / spanner は同一 `Backend` 内のプロセス内 wakeup（`backend/hub`）。DynamoDB は `wf_wake`（Streams 有効）＋ wake アイテムポーリング、Firestore は `wf_notify` の Snapshot で**プロセスをまたいだ**起床もできる（いずれも hint。正しさは Claim / GetInstance）。
 Client の `Result` は postgres（`tasuki_terminal`）および他ストア（hub / 上記 cross-process 経路）で終端時に起床できる。
 Worker はインスタンスごとの sticky ジャーナルキャッシュ（`next_seq` 照合、差分は `GetJournal`）でフル履歴の再読を減らす。
