@@ -71,11 +71,11 @@ README / plan note: workflow commits may be batched per tick via `AdvancementBat
 
 ## Acceptance
 
-- [ ] `AdvancementBatcher` interface
-- [ ] Worker collect-then-flush for workflow wave
-- [ ] Postgres transactional `CommitAdvancements`
-- [ ] Tests (postgres batch + worker still green)
-- [ ] Fallback for non-batching backends
+- [x] `AdvancementBatcher` interface
+- [x] Worker collect-then-flush for workflow wave
+- [x] Postgres transactional `CommitAdvancements`
+- [x] Tests (postgres batch + worker still green)
+- [x] Fallback for non-batching backends
 
 ## Follow-ups
 

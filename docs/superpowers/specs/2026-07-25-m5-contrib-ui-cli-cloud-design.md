@@ -31,5 +31,5 @@ Complete `tasuki-ui` backend coverage for remaining M4 stores.
 
 ## Acceptance
 
-- [ ] Three backends wired + README
-- [ ] Handler unchanged
+- [x] Three backends wired + README
+- [x] Handler unchanged

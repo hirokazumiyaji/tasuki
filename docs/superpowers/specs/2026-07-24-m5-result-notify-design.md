@@ -80,11 +80,11 @@ README: Client `Result` can wake on `tasuki_terminal` when using postgres.
 
 ## Acceptance
 
-- [ ] `TerminalNotifier` interface
-- [ ] postgres SubscribeTerminal + notify on terminal paths
-- [ ] `Result` uses notify or ticker
-- [ ] Test + README
-- [ ] No required Backend method added
+- [x] `TerminalNotifier` interface
+- [x] postgres SubscribeTerminal + notify on terminal paths
+- [x] `Result` uses notify or ticker
+- [x] Test + README
+- [x] No required Backend method added
 
 ## Follow-ups
 

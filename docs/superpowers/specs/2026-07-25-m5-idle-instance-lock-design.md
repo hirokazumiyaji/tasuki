@@ -23,5 +23,5 @@ No new exported option required if default 10m is fine; optional `WorkerOptions.
 
 ## Acceptance
 
-- [ ] Eviction helper + call from tick
-- [ ] Unit test: create many locks, advance clock/fake now, evict unused
+- [x] Eviction helper + call from tick
+- [x] Unit test: create many locks, advance clock/fake now, evict unused

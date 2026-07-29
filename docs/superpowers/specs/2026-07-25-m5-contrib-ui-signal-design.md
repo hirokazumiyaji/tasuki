@@ -83,12 +83,12 @@ README: mention Signal form alongside Terminate.
 
 ## Acceptance
 
-- [ ] `POST /instances/{id}/signal` with CSRF
-- [ ] name required; empty payload → nil; invalid JSON → 400
-- [ ] Form only when `running`
-- [ ] 303 on success; inbox event via `LoadWorkflowHead`
-- [ ] httptest + README
-- [ ] No engine API changes
+- [x] `POST /instances/{id}/signal` with CSRF
+- [x] name required; empty payload → nil; invalid JSON → 400
+- [x] Form only when `running`
+- [x] 303 on success; inbox event via `LoadWorkflowHead`
+- [x] httptest + README
+- [x] No engine API changes
 
 ## Follow-ups
 

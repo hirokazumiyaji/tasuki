@@ -87,11 +87,11 @@ Practical update after success: start from the in-memory `events` slice used for
 
 ## Acceptance
 
-- [ ] `LoadWorkflowHead` on Backend + all store implementations
-- [ ] Worker sticky load/update/invalidate as above
-- [ ] Conform (all backends that CI/local can run) green
-- [ ] README note
-- [ ] No shared cache / LRU / replay skip
+- [x] `LoadWorkflowHead` on Backend + all store implementations
+- [x] Worker sticky load/update/invalidate as above
+- [x] Conform (all backends that CI/local can run) green
+- [x] README note
+- [x] No shared cache / LRU / replay skip
 
 ## Follow-ups
 

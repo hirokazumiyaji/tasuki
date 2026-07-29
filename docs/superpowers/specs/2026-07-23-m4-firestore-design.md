@@ -128,11 +128,11 @@ Worker already clamps inbox drain using `MaxAdvancementEffects` (DynamoDB work).
 
 ## Acceptance
 
-- [ ] Emulator up via compose  
-- [ ] `backendtest` green  
-- [ ] Chaos green  
-- [ ] `Capabilities.MaxAdvancementEffects` > 0  
-- [ ] README: M4 complete (all planned stores); next = M5 or backlog  
+- [x] Emulator up via compose  
+- [x] `backendtest` green  
+- [x] Chaos green  
+- [x] `Capabilities.MaxAdvancementEffects` > 0  
+- [x] README: M4 complete (all planned stores); next = M5 or backlog  
 
 ## Open implementation notes (non-blocking)
 

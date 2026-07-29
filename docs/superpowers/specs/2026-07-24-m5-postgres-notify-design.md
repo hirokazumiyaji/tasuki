@@ -101,13 +101,13 @@ Centralize emit in a small helper (e.g. `notifyTasks(ctx)`) called from the site
 
 ## Acceptance
 
-- [ ] `TaskNotifier` in `backend` package; postgres implements `Subscribe`
-- [ ] Notify on listed enqueue/ensure/release paths
-- [ ] Worker wakes on notify **or** ticker
-- [ ] postgres conform + chaos green
-- [ ] Notify subscribe unit/integration test
-- [ ] README note
-- [ ] No required API changes on other backends
+- [x] `TaskNotifier` in `backend` package; postgres implements `Subscribe`
+- [x] Notify on listed enqueue/ensure/release paths
+- [x] Worker wakes on notify **or** ticker
+- [x] postgres conform + chaos green
+- [x] Notify subscribe unit/integration test
+- [x] README note
+- [x] No required API changes on other backends
 
 ## Follow-ups (out of scope)
 

@@ -73,11 +73,11 @@ README: note `ActivityConcurrency` / `-activity-concurrency` (default 1).
 
 ## Acceptance
 
-- [ ] Option + default 1
-- [ ] Parallel activities in tick; workflows sequential
-- [ ] Bench flag
-- [ ] README
-- [ ] No Backend changes
+- [x] Option + default 1
+- [x] Parallel activities in tick; workflows sequential
+- [x] Bench flag
+- [x] README
+- [x] No Backend changes
 
 ## Follow-ups
 

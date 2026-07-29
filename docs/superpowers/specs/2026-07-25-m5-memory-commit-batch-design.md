@@ -16,5 +16,5 @@ Implement `AdvancementBatcher` on the memory backend so worker batch flush uses 
 
 ## Acceptance
 
-- [ ] `CommitAdvancements` on memory
-- [ ] Batch OK + conflict leaves both running
+- [x] `CommitAdvancements` on memory
+- [x] Batch OK + conflict leaves both running

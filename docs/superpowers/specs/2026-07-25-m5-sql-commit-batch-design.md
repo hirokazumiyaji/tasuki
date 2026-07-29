@@ -21,6 +21,6 @@ MySQL: keep post-commit `ensureWorkflowTaskIfInbox` second pass for each instanc
 
 ## Acceptance
 
-- [ ] Both implement `CommitAdvancements`
-- [ ] Worker already uses batcher when len>1
-- [ ] Tests as above
+- [x] Both implement `CommitAdvancements`
+- [x] Worker already uses batcher when len>1
+- [x] Tests as above

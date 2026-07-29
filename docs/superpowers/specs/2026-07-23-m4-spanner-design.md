@@ -159,11 +159,11 @@ Same discipline as MySQL/TiDB: one commit + one PR per task; merge before next; 
 
 ## Acceptance
 
-- [ ] Emulator up via compose; migrate idempotent  
-- [ ] `backendtest` green on Spanner  
-- [ ] Chaos kill-workers green  
-- [ ] README marks Spanner done; next = DynamoDB  
-- [ ] No new `backend/tidb`-style fork — Spanner is its own module as designed  
+- [x] Emulator up via compose; migrate idempotent  
+- [x] `backendtest` green on Spanner  
+- [x] Chaos kill-workers green  
+- [x] README marks Spanner done; next = DynamoDB  
+- [x] No new `backend/tidb`-style fork — Spanner is its own module as designed  
 
 ## Open implementation notes (non-blocking)
 
