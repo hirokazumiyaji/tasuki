@@ -306,3 +306,50 @@ jobs:
           exit 1
       - name: Chaos firestore
         run: go test ./chaos/ -run TestChaos_KillWorkers_Firestore -count=1 -timeout 5m
+
+  cover:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: tasuki
+          POSTGRES_PASSWORD: tasuki
+          POSTGRES_DB: tasuki
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tasuki -d tasuki"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      TASUKI_POSTGRES_DSN: postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Cover root
+        run: go test ./... -coverprofile=cover.out -count=1 -timeout 10m
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### Coverage (root module)'
+            echo '```'
+            if [ -f cover.out ]; then
+              go tool cover -func=cover.out | grep -Ev 'examples/|/cmd/|backendtest/' || true
+              echo
+              go tool cover -func=cover.out | tail -1
+            else
+              echo 'cover.out missing'
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cover-out
+          path: cover.out
+          if-no-files-found: ignore
