@@ -103,15 +103,41 @@ func (c *Client) Signal(ctx context.Context, id, name string, payload any, opts 
 	for _, opt := range opts {
 		opt(&o)
 	}
-	body, err := c.codec.Marshal(payload)
-	if err != nil {
-		return err
+	return c.SignalBatch(ctx, id, []SignalItem{{
+		Name:     name,
+		Payload:  payload,
+		DedupeID: o.dedupeID,
+	}})
+}
+
+// SignalItem is one signal for SignalBatch.
+type SignalItem struct {
+	Name     string
+	Payload  any
+	DedupeID string // optional; empty means no dedupe for this item
+}
+
+// SignalBatch appends multiple signals to one instance atomically.
+func (c *Client) SignalBatch(ctx context.Context, id string, items []SignalItem) error {
+	if len(items) == 0 {
+		return nil
 	}
-	return c.backend.SendToInbox(ctx, id, journal.Event{
-		Type:    journal.TypeSignalReceived,
-		Name:    name,
-		Payload: body,
-	}, o.dedupeID)
+	batch := make([]backend.InboxItem, 0, len(items))
+	for _, it := range items {
+		body, err := c.codec.Marshal(it.Payload)
+		if err != nil {
+			return err
+		}
+		batch = append(batch, backend.InboxItem{
+			Event: journal.Event{
+				Type:    journal.TypeSignalReceived,
+				Name:    it.Name,
+				Payload: body,
+			},
+			DedupeID: it.DedupeID,
+		})
+	}
+	return c.backend.SendToInboxBatch(ctx, id, batch)
 }
 
 func (c *Client) Cancel(ctx context.Context, id string) error {

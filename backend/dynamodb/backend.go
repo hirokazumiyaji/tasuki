@@ -671,37 +671,80 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 }
 
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
+	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
+}
+
+func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items []backend.InboxItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if len(items) > backend.InboxBatchLimit(b.Capabilities()) {
+		return backend.ErrBatchTooLarge
+	}
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil {
 		return err
 	}
-	now := nowUTC()
-	inbox := inboxItem(instanceID, newID(), ev, now)
-	if dedupeID != "" {
-		items := []types.TransactWriteItem{
-			put(b.table("wf_signal_dedupe"), map[string]types.AttributeValue{
-				"instance_id": avS(instanceID),
-				"dedupe_id":   avS(dedupeID),
-				"created_at":  avN(timeToN(now)),
-			}, "attribute_not_exists(instance_id) AND attribute_not_exists(dedupe_id)"),
-			put(b.table("wf_inbox"), inbox, "attribute_not_exists(instance_id) AND attribute_not_exists(id)"),
+	pending := append([]backend.InboxItem(nil), items...)
+	wrote := false
+	for len(pending) > 0 {
+		now := nowUTC()
+		var twi []types.TransactWriteItem
+		type meta struct {
+			pidx   int
+			dedupe bool
 		}
-		_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
-		if err != nil {
-			if isDedupeConflict(err) {
-				return nil
+		var metas []meta
+		for pi, it := range pending {
+			if it.DedupeID != "" {
+				twi = append(twi, put(b.table("wf_signal_dedupe"), map[string]types.AttributeValue{
+					"instance_id": avS(instanceID),
+					"dedupe_id":   avS(it.DedupeID),
+					"created_at":  avN(timeToN(now)),
+				}, "attribute_not_exists(instance_id) AND attribute_not_exists(dedupe_id)"))
+				metas = append(metas, meta{pi, true})
 			}
+			twi = append(twi, put(b.table("wf_inbox"), inboxItem(instanceID, newID(), it.Event, now),
+				"attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
+			metas = append(metas, meta{pi, false})
+		}
+		if len(twi) > 100 {
+			return backend.ErrBatchTooLarge
+		}
+		_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: twi})
+		if err == nil {
+			wrote = true
+			break
+		}
+		var tce *types.TransactionCanceledException
+		if !errors.As(err, &tce) {
 			return err
 		}
-	} else {
-		_, err = b.client.PutItem(ctx, &dynamodb.PutItemInput{
-			TableName:           aws.String(b.table("wf_inbox")),
-			Item:                inbox,
-			ConditionExpression: aws.String("attribute_not_exists(instance_id) AND attribute_not_exists(id)"),
-		})
-		if err != nil {
+		skip := map[int]bool{}
+		ok := true
+		for i, r := range tce.CancellationReasons {
+			if r.Code == nil || *r.Code == "None" {
+				continue
+			}
+			if *r.Code != "ConditionalCheckFailed" || i >= len(metas) || !metas[i].dedupe {
+				ok = false
+				break
+			}
+			skip[metas[i].pidx] = true
+		}
+		if !ok || len(skip) == 0 {
 			return err
 		}
+		next := make([]backend.InboxItem, 0, len(pending)-len(skip))
+		for i, it := range pending {
+			if !skip[i] {
+				next = append(next, it)
+			}
+		}
+		pending = next
+	}
+	if !wrote {
+		return nil
 	}
 	if inst.Status == "running" {
 		if err := b.ensureWorkflowTask(ctx, instanceID); err != nil {

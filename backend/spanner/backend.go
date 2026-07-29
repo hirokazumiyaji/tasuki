@@ -983,8 +983,20 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 }
 
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
+	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
+}
+
+func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items []backend.InboxItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if len(items) > backend.InboxBatchLimit(b.Capabilities()) {
+		return backend.ErrBatchTooLarge
+	}
 	now := nowUTC()
-	var skipped bool
+	var inserted int
+	var queue string
+	var status string
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"status", "queue"})
 		if err != nil {
@@ -993,37 +1005,36 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 			}
 			return err
 		}
-		var status, queue string
 		if err := row.Columns(&status, &queue); err != nil {
 			return err
 		}
-		if dedupeID != "" {
-			_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, dedupeID}, []string{"dedupe_id"})
-			if err == nil {
-				skipped = true
-				return nil
+		var muts []*spanner.Mutation
+		for _, it := range items {
+			if it.DedupeID != "" {
+				_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, it.DedupeID}, []string{"dedupe_id"})
+				if err == nil {
+					continue
+				}
+				if !isNotFound(err) {
+					return err
+				}
+				muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
+					"instance_id": instanceID, "dedupe_id": it.DedupeID, "created_at": now,
+				}))
 			}
-			if !isNotFound(err) {
-				return err
-			}
-			if err := txn.BufferWrite([]*spanner.Mutation{
-				spanner.InsertMap("wf_signal_dedupe", map[string]any{
-					"instance_id": instanceID, "dedupe_id": dedupeID, "created_at": now,
-				}),
-			}); err != nil {
+			payload := inboxPayload(it.Event)
+			muts = append(muts, spanner.InsertMap("wf_inbox", map[string]any{
+				"id": newID(), "instance_id": instanceID, "type": string(it.Event.Type),
+				"ref_seq": nullInt(it.Event.RefSeq), "payload": jsonVal(payload), "created_at": now,
+			}))
+			inserted++
+		}
+		if len(muts) > 0 {
+			if err := txn.BufferWrite(muts); err != nil {
 				return err
 			}
 		}
-		payload := inboxPayload(ev)
-		if err := txn.BufferWrite([]*spanner.Mutation{
-			spanner.InsertMap("wf_inbox", map[string]any{
-				"id": newID(), "instance_id": instanceID, "type": string(ev.Type),
-				"ref_seq": nullInt(ev.RefSeq), "payload": jsonVal(payload), "created_at": now,
-			}),
-		}); err != nil {
-			return err
-		}
-		if status == "running" {
+		if inserted > 0 && status == "running" {
 			return enqueueWorkflowTask(ctx, txn, instanceID, queue, now)
 		}
 		return nil
@@ -1031,7 +1042,7 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	if err != nil {
 		return err
 	}
-	if skipped {
+	if inserted == 0 {
 		return nil
 	}
 	if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {

@@ -701,29 +701,42 @@ func toTask(t *task) backend.Task {
 	}
 }
 
-func (b *Backend) SendToInbox(_ context.Context, instanceID string, ev journal.Event, dedupeID string) error {
+func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
+	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
+}
+
+func (b *Backend) SendToInboxBatch(_ context.Context, instanceID string, items []backend.InboxItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if len(items) > backend.InboxBatchLimit(b.Capabilities()) {
+		return backend.ErrBatchTooLarge
+	}
 	b.mu.Lock()
 	inst, ok := b.instances[instanceID]
 	if !ok {
 		b.mu.Unlock()
 		return backend.ErrNotFound
 	}
-	if dedupeID != "" {
-		seen := b.signalDedupe[instanceID]
-		if seen == nil {
-			seen = map[string]struct{}{}
-			b.signalDedupe[instanceID] = seen
+	inserted := 0
+	for _, it := range items {
+		if it.DedupeID != "" {
+			seen := b.signalDedupe[instanceID]
+			if seen == nil {
+				seen = map[string]struct{}{}
+				b.signalDedupe[instanceID] = seen
+			}
+			if _, dup := seen[it.DedupeID]; dup {
+				continue
+			}
+			seen[it.DedupeID] = struct{}{}
 		}
-		if _, dup := seen[dedupeID]; dup {
-			b.mu.Unlock()
-			return nil
-		}
-		seen[dedupeID] = struct{}{}
+		b.nextInbox++
+		b.inbox[instanceID] = append(b.inbox[instanceID], &inboxItem{id: b.nextInbox, event: it.Event})
+		inserted++
 	}
-	b.nextInbox++
-	b.inbox[instanceID] = append(b.inbox[instanceID], &inboxItem{id: b.nextInbox, event: ev})
 	wake := false
-	if inst.status == "running" {
+	if inserted > 0 && inst.status == "running" {
 		b.enqueueWorkflowTaskLocked(instanceID, inst.queue)
 		wake = true
 	}
