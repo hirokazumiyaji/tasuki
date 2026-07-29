@@ -51,11 +51,11 @@ README: note `-claim-limit` / `WorkerOptions.ClaimLimit` (default 10).
 
 ## Acceptance
 
-- [ ] `ClaimLimit` on `WorkerOptions` with default 10
-- [ ] Worker tick uses it for workflow and activity claims
-- [ ] Bench flag `-claim-limit`
-- [ ] README one-liner
-- [ ] No parallel execution; no Backend interface change
+- [x] `ClaimLimit` on `WorkerOptions` with default 10
+- [x] Worker tick uses it for workflow and activity claims
+- [x] Bench flag `-claim-limit`
+- [x] README one-liner
+- [x] No parallel execution; no Backend interface change
 
 ## Follow-ups
 

@@ -65,11 +65,11 @@ README: note `WorkflowConcurrency` / `-workflow-concurrency` (default 1); same-i
 
 ## Acceptance
 
-- [ ] Option + default 1
-- [ ] Parallel workflows with per-instance mutex
-- [ ] Activities still after workflows in tick
-- [ ] Bench flag + README
-- [ ] No Backend changes
+- [x] Option + default 1
+- [x] Parallel workflows with per-instance mutex
+- [x] Activities still after workflows in tick
+- [x] Bench flag + README
+- [x] No Backend changes
 
 ## Follow-ups
 

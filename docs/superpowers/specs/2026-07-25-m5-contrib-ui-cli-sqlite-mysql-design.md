@@ -58,12 +58,12 @@ README 閲覧 UI section: add sqlite / mysql examples and env names.
 
 ## Acceptance
 
-- [ ] `-backend=sqlite` with `TASUKI_SQLITE_PATH`
-- [ ] `-backend=mysql` with `TASUKI_MYSQL_DSN`
-- [ ] Migrate on start; no Reset
-- [ ] README updated
-- [ ] Smoke test for unknown backend + sqlite tempfile
-- [ ] Handler / engine unchanged
+- [x] `-backend=sqlite` with `TASUKI_SQLITE_PATH`
+- [x] `-backend=mysql` with `TASUKI_MYSQL_DSN`
+- [x] Migrate on start; no Reset
+- [x] README updated
+- [x] Smoke test for unknown backend + sqlite tempfile
+- [x] Handler / engine unchanged
 
 ## Follow-ups
 

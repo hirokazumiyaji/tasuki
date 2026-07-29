@@ -29,5 +29,5 @@ Env vars unchanged (`TASUKI_*`). Migrate always for persistent stores. Close via
 
 ## Acceptance
 
-- [ ] UI + bench call `backendopen.Open`
-- [ ] Existing smoke tests still pass
+- [x] UI + bench call `backendopen.Open`
+- [x] Existing smoke tests still pass

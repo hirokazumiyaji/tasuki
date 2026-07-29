@@ -58,6 +58,6 @@ README: document `TASUKI_UI_TOKEN` / `-token`.
 
 ## Acceptance
 
-- [ ] WithToken + middleware
-- [ ] CLI env/flag
-- [ ] Tests + README
+- [x] WithToken + middleware
+- [x] CLI env/flag
+- [x] Tests + README

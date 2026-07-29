@@ -60,11 +60,11 @@ README: short “閲覧 UI” section with run commands.
 
 ## Acceptance
 
-- [ ] `NewHandler` + routes
-- [ ] CLI memory + postgres
-- [ ] Read-only
-- [ ] README
-- [ ] No engine API changes
+- [x] `NewHandler` + routes
+- [x] CLI memory + postgres
+- [x] Read-only
+- [x] README
+- [x] No engine API changes
 
 ## Follow-ups
 

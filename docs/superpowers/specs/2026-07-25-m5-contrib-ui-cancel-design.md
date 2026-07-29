@@ -76,11 +76,11 @@ README: mention Cancel alongside Terminate / Signal (cooperative vs terminate).
 
 ## Acceptance
 
-- [ ] `POST /instances/{id}/cancel` with CSRF + confirm
-- [ ] Form only when `running`
-- [ ] 303 on success; inbox event via `LoadWorkflowHead`
-- [ ] httptest + README
-- [ ] No engine API changes
+- [x] `POST /instances/{id}/cancel` with CSRF + confirm
+- [x] Form only when `running`
+- [x] 303 on success; inbox event via `LoadWorkflowHead`
+- [x] httptest + README
+- [x] No engine API changes
 
 ## Follow-ups
 

@@ -157,11 +157,11 @@ Client clock (`time.Now().UTC()`). Lease / timer correctness relies on CAS/delet
 
 ## Acceptance
 
-- [ ] DynamoDB Local up via compose; migrate idempotent  
-- [ ] `backendtest` green  
-- [ ] Chaos kill-workers green  
-- [ ] `Capabilities.MaxAdvancementEffects` > 0 and enforced  
-- [ ] README marks DynamoDB done; next = Firestore  
+- [x] DynamoDB Local up via compose; migrate idempotent  
+- [x] `backendtest` green  
+- [x] Chaos kill-workers green  
+- [x] `Capabilities.MaxAdvancementEffects` > 0 and enforced  
+- [x] README marks DynamoDB done; next = Firestore  
 
 ## Open implementation notes (non-blocking)
 

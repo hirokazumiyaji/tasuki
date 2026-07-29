@@ -87,13 +87,13 @@ README “閲覧 UI” section: note that detail page can terminate running inst
 
 ## Acceptance
 
-- [ ] `POST /instances/{id}/terminate` with HMAC CSRF
-- [ ] Confirm checkbox required
-- [ ] Form only when `status == running`
-- [ ] 303 redirect on success
-- [ ] httptest coverage above
-- [ ] README note
-- [ ] No engine / Backend API changes
+- [x] `POST /instances/{id}/terminate` with HMAC CSRF
+- [x] Confirm checkbox required
+- [x] Form only when `status == running`
+- [x] 303 redirect on success
+- [x] httptest coverage above
+- [x] README note
+- [x] No engine / Backend API changes
 
 ## Follow-ups
 
