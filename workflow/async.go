@@ -19,15 +19,7 @@ func ExecuteAsync[I, O any](ctx *Context, activityName string, in I, opts ...Exe
 		input = []byte("null")
 	}
 	sched := ActivitySchedule{Input: input}
-	if eo.retry != (RetryPolicy{}) {
-		r := eo.retry.withDefaults()
-		sched.Retry = &RetryPolicyJSON{
-			InitialIntervalMs:  r.InitialInterval.Milliseconds(),
-			BackoffCoefficient: r.BackoffCoefficient,
-			MaxIntervalMs:      r.MaxInterval.Milliseconds(),
-			MaxAttempts:        r.MaxAttempts,
-		}
-	}
+	applyExecuteOptions(&sched, eo)
 	payload, _ := json.Marshal(sched)
 	ev := ctx.recordOrReplay(journal.Command{
 		Type: journal.TypeActivityScheduled,
