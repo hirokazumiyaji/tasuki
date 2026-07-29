@@ -301,6 +301,26 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 		return out, nil
 	})
 
+	if !res.Stuck && res.WorkflowContext() != nil {
+		for {
+			before := len(res.WorkflowContext().NewCommands())
+			ures := engine.ContinueUpdates(res.WorkflowContext())
+			res.NewCommands = res.WorkflowContext().NewCommands()
+			if ures.Stuck {
+				res.Stuck = true
+				res.Err = ures.Err
+				break
+			}
+			if ures.Suspended {
+				res.Suspended = true
+				break
+			}
+			if len(res.WorkflowContext().NewCommands()) == before {
+				break
+			}
+		}
+	}
+
 	adv := backend.Advancement{
 		InstanceID:   t.InstanceID,
 		TaskID:       t.ID,
