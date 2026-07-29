@@ -137,5 +137,5 @@
 
 ## 次のアクション
 
-1. 本設計書一式のレビューと承認
-2. 承認後、M0 の実装プラン（タスク分解、TDD の手順）を作成して実装に着手する
+1. 品質スプリントを実施する（[quality-sprint design](superpowers/specs/2026-07-29-quality-sprint-design.md) / [plan](superpowers/plans/2026-07-29-quality-sprint.md)）
+2. 完了後、リリース準備（タグ・CHANGELOG・公開 README 整備）を検討する
