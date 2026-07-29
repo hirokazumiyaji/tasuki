@@ -79,8 +79,8 @@ Semantics (one transaction / TransactWrite / equivalent):
 
 ## Acceptance
 
-- [ ] `Backend.SendToInboxBatch` on all stores
-- [ ] `Client.SignalBatch` + `SignalItem`
-- [ ] Atomic apply + per-item dedupe skip
-- [ ] `ErrBatchTooLarge` for oversized batches
-- [ ] Tests + docs
+- [x] `Backend.SendToInboxBatch` on all stores
+- [x] `Client.SignalBatch` + `SignalItem`
+- [x] Atomic apply + per-item dedupe skip
+- [x] `ErrBatchTooLarge` for oversized batches
+- [x] Tests + docs
