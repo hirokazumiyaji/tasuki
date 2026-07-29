@@ -59,7 +59,7 @@ Writes: `UpdateItem` `ADD n :one` (and `SET id = :id` for terminal).
 
 ## Acceptance
 
-- [ ] Firestore snapshot cross-process wake
-- [ ] DynamoDB wf_wake + Streams (or documented skip)
-- [ ] Hub path unchanged for same-process
-- [ ] README note
+- [x] Firestore snapshot cross-process wake
+- [x] DynamoDB wf_wake + Streams (or documented skip)
+- [x] Hub path unchanged for same-process
+- [x] README note

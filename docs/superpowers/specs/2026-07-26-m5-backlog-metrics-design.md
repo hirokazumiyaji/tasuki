@@ -52,7 +52,7 @@ Implement on memory, sqlite, mysql, postgres, spanner, dynamodb, firestore.
 
 ## Acceptance
 
-- [ ] Interface + all seven backends
-- [ ] backendtest coverage
-- [ ] Worker sampling + gauge helper
-- [ ] Observability docs
+- [x] Interface + all seven backends
+- [x] backendtest coverage
+- [x] Worker sampling + gauge helper
+- [x] Observability docs

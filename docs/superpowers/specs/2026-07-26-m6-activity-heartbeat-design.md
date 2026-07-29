@@ -67,7 +67,7 @@ Storage: `wf_tasks.heartbeat` (SQL/Spanner column or DDB/FS attribute). Migrate 
 
 ## Acceptance
 
-- [ ] `activity` package with API above
-- [ ] Backend.RecordHeartbeat + Task.HeartbeatDetails on all stores
-- [ ] Worker wiring + memory integration test
-- [ ] Docs updated
+- [x] `activity` package with API above
+- [x] Backend.RecordHeartbeat + Task.HeartbeatDetails on all stores
+- [x] Worker wiring + memory integration test
+- [x] Docs updated

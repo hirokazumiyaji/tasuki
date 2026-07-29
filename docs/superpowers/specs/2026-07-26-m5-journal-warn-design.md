@@ -77,8 +77,8 @@ Guidance content (keep short):
 
 ## Acceptance
 
-- [ ] `JournalWarnThreshold` on `WorkerOptions` with defaults above
-- [ ] Worker warn + `tasuki.workflow.journal_warnings` as specified
-- [ ] Docs/README updated
-- [ ] Tests cover warn / disable / non-warn paths
-- [ ] No change to ContinueAsNew runtime semantics
+- [x] `JournalWarnThreshold` on `WorkerOptions` with defaults above
+- [x] Worker warn + `tasuki.workflow.journal_warnings` as specified
+- [x] Docs/README updated
+- [x] Tests cover warn / disable / non-warn paths
+- [x] No change to ContinueAsNew runtime semantics

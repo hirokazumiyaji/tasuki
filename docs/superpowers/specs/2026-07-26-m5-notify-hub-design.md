@@ -76,12 +76,12 @@ Thin wrappers may live in a small `notify.go` per store or next to `New` — eit
 
 ## Acceptance
 
-- [ ] `backend/hub` with API above
-- [ ] Six in-process stores delegate Subscribe/notify to hub
-- [ ] No behavior change vs previous per-store notify
-- [ ] Hub unit tests + store subscribe tests green/skip
-- [ ] postgres untouched
-- [ ] README note
+- [x] `backend/hub` with API above
+- [x] Six in-process stores delegate Subscribe/notify to hub
+- [x] No behavior change vs previous per-store notify
+- [x] Hub unit tests + store subscribe tests green/skip
+- [x] postgres untouched
+- [x] README note
 
 ## Follow-ups (out of scope)
 

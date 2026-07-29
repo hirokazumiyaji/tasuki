@@ -103,13 +103,13 @@ Fields on `Backend`: `notifyMu`, `taskSubs`, `terminalSubs` — mirror `backend/
 
 ## Acceptance
 
-- [ ] `mysql.Backend` implements `TaskNotifier` and `TerminalNotifier`
-- [ ] Notify on listed task / terminal paths
-- [ ] Coalesced buffered channels; cancel unregisters without closing ch
-- [ ] Unit/integration tests above green (or skip without DSN)
-- [ ] README note
-- [ ] No required API changes on other backends or Worker/Client
-- [ ] No shared hub / no memory/sqlite refactor in this slice
+- [x] `mysql.Backend` implements `TaskNotifier` and `TerminalNotifier`
+- [x] Notify on listed task / terminal paths
+- [x] Coalesced buffered channels; cancel unregisters without closing ch
+- [x] Unit/integration tests above green (or skip without DSN)
+- [x] README note
+- [x] No required API changes on other backends or Worker/Client
+- [x] No shared hub / no memory/sqlite refactor in this slice
 
 ## Follow-ups (out of scope)
 
