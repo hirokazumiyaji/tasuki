@@ -72,3 +72,27 @@ func TestOpen_SpannerMissingEnv(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+func TestOpen_SQLiteNoReset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "open2.db")
+	t.Setenv("TASUKI_SQLITE_PATH", path)
+	b, closer, err := backendopen.Open(context.Background(), "sqlite", backendopen.Options{Reset: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closer()
+	if b == nil {
+		t.Fatal("nil")
+	}
+}
+
+func TestOpen_DynamoDBUnreachable(t *testing.T) {
+	t.Setenv("TASUKI_DYNAMODB_ENDPOINT", "http://127.0.0.1:1")
+	t.Setenv("AWS_ACCESS_KEY_ID", "local")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "local")
+	t.Setenv("AWS_REGION", "us-east-1")
+	_, _, err := backendopen.Open(context.Background(), "dynamodb", backendopen.Options{})
+	if err == nil {
+		t.Fatal("want error for unreachable endpoint")
+	}
+}
