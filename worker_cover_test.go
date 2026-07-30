@@ -2,6 +2,7 @@ package tasuki
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -82,6 +83,61 @@ func TestWithParentNotify_Failed(t *testing.T) {
 	w.withParentNotify(adv, "parent", 9)
 	if adv.ParentNotify == nil || adv.ParentNotify.Type != journal.TypeChildFailed || adv.ParentNotify.RefSeq != 9 {
 		t.Fatalf("%+v", adv.ParentNotify)
+	}
+}
+
+func TestLoadWorkflowState_StickyStaleRewind(t *testing.T) {
+	ctx := context.Background()
+	b := memory.New()
+	b.SetNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: "rw1", Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	w := NewWorker(b, WorkerOptions{Queues: []string{"default"}})
+	st, err := w.loadWorkflowState(ctx, "rw1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Poison sticky cache to look ahead of store head → rewind path.
+	w.setSticky("rw1", append([]journal.Event{}, st.Journal...), st.NextSeq+10)
+	st2, err := w.loadWorkflowState(ctx, "rw1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st2.NextSeq != st.NextSeq {
+		t.Fatalf("want rewound next=%d got %d", st.NextSeq, st2.NextSeq)
+	}
+}
+
+func TestCommitWorkflow_ConflictDropsSticky(t *testing.T) {
+	ctx := context.Background()
+	b := memory.New()
+	b.SetNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: "cf1", Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	w := NewWorker(b, WorkerOptions{Queues: []string{"default"}})
+	st, err := w.loadWorkflowState(ctx, "cf1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 1, Lease: time.Second, WorkerID: "w1",
+	})
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("%v", err)
+	}
+	err = w.commitWorkflow(ctx, "cf1", st.Journal, backend.Advancement{
+		InstanceID:  "cf1",
+		TaskID:      tasks[0].ID,
+		ExpectedSeq: st.NextSeq - 1, // stale
+		NewEvents:   []journal.Event{{Seq: st.NextSeq, Type: journal.TypeTimerCreated}},
+	})
+	if !errors.Is(err, backend.ErrConflict) {
+		t.Fatalf("got %v", err)
+	}
+	if _, ok := w.stickyGet("cf1"); ok {
+		t.Fatal("sticky should be dropped on conflict")
 	}
 }
 
