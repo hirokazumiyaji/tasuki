@@ -38,3 +38,13 @@ func Ok(ctx *workflow.Context, _ struct{}) error {
 	_ = workflow.Now(ctx)
 	return nil
 }
+
+// Non-workflow functions must not be flagged (covers isWorkflowFunc false paths).
+func NotWorkflow() {
+	_ = time.Now()
+}
+
+func AlsoNotWorkflow(x int) error {
+	go func() {}()
+	return nil
+}
