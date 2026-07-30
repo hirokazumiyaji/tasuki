@@ -58,3 +58,19 @@ func TestChildEventClassification(t *testing.T) {
 		t.Fatal("child_failed should be completion")
 	}
 }
+
+func TestIsTerminal(t *testing.T) {
+	for _, typ := range []journal.Type{
+		journal.TypeWorkflowCompleted,
+		journal.TypeWorkflowFailed,
+		journal.TypeWorkflowCanceled,
+		journal.TypeContinuedAsNew,
+	} {
+		if !typ.IsTerminal() {
+			t.Fatalf("%s should be terminal", typ)
+		}
+	}
+	if journal.TypeActivityScheduled.IsTerminal() {
+		t.Fatal("activity_scheduled should not be terminal")
+	}
+}
