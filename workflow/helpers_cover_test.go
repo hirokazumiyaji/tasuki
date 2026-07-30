@@ -102,6 +102,49 @@ func TestAwaitAll_ActivityFailed(t *testing.T) {
 	}
 }
 
+func TestAwaitAll_Canceled(t *testing.T) {
+	events := []journal.Event{
+		{Seq: 1, Type: journal.TypeWorkflowStarted, Name: "WF"},
+		{Seq: 2, Type: journal.TypeCancelRequested},
+	}
+	res := engine.Run(events, func(ctx *workflow.Context) (any, error) {
+		f := workflow.ExecuteAsync[int, int](ctx, "x", 1)
+		return nil, workflow.AwaitAll(ctx, f)
+	})
+	if res.Err != workflow.ErrCanceled {
+		t.Fatalf("%+v", res)
+	}
+}
+
+func TestAwaitAll_EmptyFailMessage(t *testing.T) {
+	events := []journal.Event{
+		{Seq: 1, Type: journal.TypeWorkflowStarted, Name: "WF"},
+		{Seq: 2, Type: journal.TypeActivityScheduled, Name: "x"},
+		{Seq: 3, Type: journal.TypeActivityFailed, RefSeq: 2, Payload: []byte(`""`)},
+	}
+	res := engine.Run(events, func(ctx *workflow.Context) (any, error) {
+		f := workflow.ExecuteAsync[int, int](ctx, "x", 1)
+		return nil, workflow.AwaitAll(ctx, f)
+	})
+	if res.Suspended || res.Err == nil || res.Err.Error() != "operation failed" {
+		t.Fatalf("%+v", res)
+	}
+}
+
+func TestFutureGet_Canceled(t *testing.T) {
+	events := []journal.Event{
+		{Seq: 1, Type: journal.TypeWorkflowStarted, Name: "WF"},
+		{Seq: 2, Type: journal.TypeCancelRequested},
+	}
+	res := engine.Run(events, func(ctx *workflow.Context) (any, error) {
+		f := workflow.ExecuteAsync[int, int](ctx, "x", 1)
+		return f.Get(ctx)
+	})
+	if res.Err != workflow.ErrCanceled {
+		t.Fatalf("%+v", res)
+	}
+}
+
 func TestContinueAsNew_ErrorMethods(t *testing.T) {
 	ctx := workflow.NewContext(nil, time.Time{})
 	err := workflow.ContinueAsNew(ctx, 1)
