@@ -192,3 +192,123 @@ func TestFlushWorkflowCommits_Batch(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadWorkflowState_StickyMergeMismatch(t *testing.T) {
+	ctx := context.Background()
+	b := memory.New()
+	b.SetNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: "mm1", Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	w := NewWorker(b, WorkerOptions{Queues: []string{"default"}})
+	st, err := w.loadWorkflowState(ctx, "mm1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 1, Lease: time.Second, WorkerID: "w1",
+	})
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("%v", err)
+	}
+	seq := st.NextSeq
+	if err := b.CommitAdvancement(ctx, backend.Advancement{
+		InstanceID:  "mm1",
+		TaskID:      tasks[0].ID,
+		ExpectedSeq: seq,
+		NewEvents: []journal.Event{
+			{Seq: seq, Type: journal.TypeTimerCreated, Payload: []byte(`{"fire_at":"2026-01-01T01:00:00Z"}`)},
+		},
+		Timers: []backend.NewTimer{{Seq: seq, FireAt: time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Sticky lags head but ends with a bogus high seq → merge expectedNextSeq mismatches head.
+	poison := append(append([]journal.Event{}, st.Journal...), journal.Event{Seq: 99, Type: journal.TypeTimerCreated})
+	w.setSticky("mm1", poison, st.NextSeq)
+	st2, err := w.loadWorkflowState(ctx, "mm1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st2.Journal) < 2 {
+		t.Fatalf("want full reload journal, got %d", len(st2.Journal))
+	}
+	for _, e := range st2.Journal {
+		if e.Seq == 99 {
+			t.Fatal("poison event should not survive reload")
+		}
+	}
+}
+
+func TestFlushWorkflowCommits_BatchConflictDropsSticky(t *testing.T) {
+	ctx := context.Background()
+	b := memory.New()
+	b.SetNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	w := NewWorker(b, WorkerOptions{Queues: []string{"default"}})
+	for _, id := range []string{"bc1", "bc2"} {
+		if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 2, Lease: time.Second, WorkerID: "w1",
+	})
+	if err != nil || len(tasks) != 2 {
+		t.Fatalf("%v %#v", err, tasks)
+	}
+	pending := make([]pendingWorkflowCommit, 0, 2)
+	for i, tsk := range tasks {
+		st, err := w.loadWorkflowState(ctx, tsk.InstanceID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exp := st.NextSeq
+		if i == 1 {
+			exp = 999 // force batch conflict
+		}
+		pending = append(pending, pendingWorkflowCommit{
+			instanceID:  tsk.InstanceID,
+			baseJournal: st.Journal,
+			adv: backend.Advancement{
+				InstanceID:  tsk.InstanceID,
+				TaskID:      tsk.ID,
+				ExpectedSeq: exp,
+				NewEvents: []journal.Event{
+					{Seq: st.NextSeq, Type: journal.TypeTimerCreated, Payload: []byte(`{"fire_at":"2026-01-02T00:00:00Z"}`)},
+				},
+			},
+		})
+	}
+	w.flushWorkflowCommits(ctx, pending)
+	for _, id := range []string{"bc1", "bc2"} {
+		if _, ok := w.stickyGet(id); ok {
+			t.Fatalf("%s sticky should be dropped after batch failure", id)
+		}
+	}
+}
+
+func TestLoadWorkflowState_TerminalDropsSticky(t *testing.T) {
+	ctx := context.Background()
+	b := memory.New()
+	b.SetNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: "term1", Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	w := NewWorker(b, WorkerOptions{Queues: []string{"default"}})
+	if _, err := w.loadWorkflowState(ctx, "term1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.TerminateInstance(ctx, "term1"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := w.loadWorkflowState(ctx, "term1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Instance.Status == "running" {
+		t.Fatal("want terminal")
+	}
+	if _, ok := w.stickyGet("term1"); ok {
+		t.Fatal("sticky dropped for non-running")
+	}
+}
