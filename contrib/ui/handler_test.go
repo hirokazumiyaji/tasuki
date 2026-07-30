@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend"
@@ -240,6 +241,45 @@ func TestHandler_Cancel(t *testing.T) {
 	inst, err := c.Get(ctx, "cancel-ui")
 	if err != nil || inst.Status != tasuki.StatusRunning {
 		t.Fatalf("still running want; status=%v err=%v", inst, err)
+	}
+}
+
+func TestHandler_DetailTruncatesLongPayload(t *testing.T) {
+	b := memory.New()
+	c := tasuki.NewClient(b)
+	ctx := context.Background()
+	if err := b.CreateInstance(ctx, backend.NewInstance{
+		ID: "long-ui", Name: "demo", Queue: "default", Input: []byte(`{}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 1, Lease: time.Second, WorkerID: "w1",
+	})
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("claim: %v", err)
+	}
+	st, _ := b.LoadWorkflow(ctx, "long-ui")
+	payload := strings.Repeat("x", 300)
+	if err := b.CommitAdvancement(ctx, backend.Advancement{
+		InstanceID:  "long-ui",
+		TaskID:      tasks[0].ID,
+		ExpectedSeq: st.NextSeq,
+		NewEvents: []journal.Event{
+			{Seq: st.NextSeq, Type: journal.TypeSideEffect, Payload: []byte(payload)},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	h := ui.NewHandler(c)
+	dr := httptest.NewRecorder()
+	h.ServeHTTP(dr, httptest.NewRequest(http.MethodGet, "/instances/long-ui", nil))
+	if dr.Code != http.StatusOK {
+		t.Fatalf("status=%d", dr.Code)
+	}
+	if !strings.Contains(dr.Body.String(), "…") {
+		t.Fatal("expected truncated payload ellipsis")
 	}
 }
 
