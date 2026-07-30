@@ -96,3 +96,13 @@ func TestOpen_DynamoDBUnreachable(t *testing.T) {
 		t.Fatal("want error for unreachable endpoint")
 	}
 }
+
+func TestOpen_SQLiteBadPath(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASUKI_SQLITE_PATH", dir) // directory, not a file → open/ping fails
+	_, _, err := backendopen.Open(context.Background(), "sqlite", backendopen.Options{})
+	if err == nil {
+		t.Fatal("want open error for directory path")
+	}
+}
+
