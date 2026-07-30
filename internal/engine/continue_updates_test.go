@@ -51,3 +51,22 @@ func TestContinueUpdates_NoPending(t *testing.T) {
 		t.Fatalf("%+v", ures)
 	}
 }
+
+func TestContinueUpdates_UnknownHandler(t *testing.T) {
+	req, _ := json.Marshal(map[string]any{"id": "u1", "input": 1})
+	events := []journal.Event{
+		{Seq: 1, Type: journal.TypeWorkflowStarted, Name: "WF"},
+		{Seq: 2, Type: journal.TypeUpdateRequested, Name: "missing", Payload: req},
+	}
+	res := engine.Run(events, func(ctx *workflow.Context) (any, error) {
+		return "ok", nil
+	})
+	ures := engine.ContinueUpdates(res.WorkflowContext())
+	if ures.Stuck || ures.Suspended {
+		t.Fatalf("%+v", ures)
+	}
+	cmds := res.WorkflowContext().NewCommands()
+	if len(cmds) < 2 {
+		t.Fatalf("want accept+complete, got %+v", cmds)
+	}
+}
