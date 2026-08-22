@@ -575,11 +575,14 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 
 func (b *Backend) ensureWorkflowTask(ctx context.Context, instanceID string) error {
 	inst, err := b.GetInstance(ctx, instanceID)
-	if err == backend.ErrNotFound || inst.Status != "running" {
-		return nil
-	}
 	if err != nil {
+		if err == backend.ErrNotFound {
+			return nil
+		}
 		return err
+	}
+	if inst.Status != "running" {
+		return nil
 	}
 	it := b.col("wf_inbox").Where("instance_id", "==", instanceID).Limit(1).Documents(ctx)
 	_, err = it.Next()

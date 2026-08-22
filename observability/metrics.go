@@ -13,10 +13,10 @@ const MeterName = "github.com/hirokazumiyaji/tasuki"
 
 // Metrics holds OpenTelemetry instruments for the worker.
 type Metrics struct {
-	WorkflowTasks    metric.Int64Counter
-	ActivityTasks    metric.Int64Counter
-	WorkflowDone     metric.Int64Counter // completed / failed / stuck / canceled
-	ActivityRetries  metric.Int64Counter
+	WorkflowTasks     metric.Int64Counter
+	ActivityTasks     metric.Int64Counter
+	WorkflowDone      metric.Int64Counter // completed / failed / stuck / canceled
+	ActivityRetries   metric.Int64Counter
 	JournalWarnings   metric.Int64Counter
 	IncompatibleNacks metric.Int64Counter
 	TaskBacklog       metric.Int64Gauge
@@ -91,8 +91,7 @@ func (m *Metrics) AddTerminal(ctx context.Context, status string) {
 	if m == nil {
 		return
 	}
-	m.WorkflowDone.Add(ctx, 1) // status via attribute would need otel attribute import; keep simple count
-	_ = status
+	m.WorkflowDone.Add(ctx, 1, metric.WithAttributes(attribute.String("status", status)))
 }
 
 func (m *Metrics) AddActivityRetry(ctx context.Context, n int64) {
