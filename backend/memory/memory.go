@@ -22,7 +22,7 @@ type Backend struct {
 	instances    map[string]*instance
 	tasks        map[int64]*task
 	timers       map[timerKey]*timer
-	inbox        map[string][]*inboxItem // instanceID → ordered
+	inbox        map[string][]*inboxItem        // instanceID → ordered
 	signalDedupe map[string]map[string]struct{} // instanceID → dedupeID
 	schedules    map[string]*schedule
 
@@ -577,7 +577,9 @@ func (b *Backend) CompleteActivity(_ context.Context, taskID int64, ev journal.E
 		b.mu.Unlock()
 		return nil
 	}
-	ev.RefSeq = t.seq
+	if ev.RefSeq == 0 {
+		ev.RefSeq = t.seq
+	}
 	b.nextInbox++
 	b.inbox[t.instanceID] = append(b.inbox[t.instanceID], &inboxItem{id: b.nextInbox, event: ev})
 	b.enqueueWorkflowTaskLocked(t.instanceID, inst.queue)
@@ -643,7 +645,7 @@ func (b *Backend) NextTimerFireAt() (time.Time, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var (
-		found bool
+		found    bool
 		earliest time.Time
 	)
 	for _, tm := range b.timers {
