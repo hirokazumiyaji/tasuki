@@ -16,6 +16,7 @@ type WorkerOptions struct {
 	ActivityConcurrency  int
 	WorkflowConcurrency  int
 	IdleInstanceLockTTL  time.Duration // evict unused per-instance locks; <=0 → 10m
+	StickyJournalTTL     time.Duration // evict unused sticky journal entries; <=0 → 10m
 	WorkerID             string
 	Codec                codec.Codec
 	Logger               *slog.Logger
@@ -47,6 +48,9 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 	}
 	if o.IdleInstanceLockTTL <= 0 {
 		o.IdleInstanceLockTTL = 10 * time.Minute
+	}
+	if o.StickyJournalTTL <= 0 {
+		o.StickyJournalTTL = 10 * time.Minute
 	}
 	if o.WorkerID == "" {
 		o.WorkerID = "worker"
