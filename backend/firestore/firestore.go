@@ -48,6 +48,7 @@ var collections = []string{
 	"wf_instances",
 	"wf_journal",
 	"wf_inbox",
+	"wf_inbox_seq",
 	"wf_signal_dedupe",
 	"wf_tasks",
 	"wf_timers",

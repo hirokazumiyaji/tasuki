@@ -197,7 +197,23 @@ CREATE TABLE wf_signal_dedupe (
 			return err
 		}
 	}
-	return b.ensureSearchAttributesColumn(ctx)
+	seqExists, err := b.tableExists(ctx, "wf_inbox_seq")
+	if err != nil {
+		return err
+	}
+	if !seqExists {
+		if err := b.applyDDL(ctx, []string{`
+CREATE TABLE wf_inbox_seq (
+  instance_id STRING(255) NOT NULL,
+  seq INT64 NOT NULL
+) PRIMARY KEY (instance_id)`}); err != nil {
+			return err
+		}
+	}
+	if err := b.ensureSearchAttributesColumn(ctx); err != nil {
+		return err
+	}
+	return b.ensureInt64Column(ctx, "wf_inbox", "seq")
 }
 
 func (b *Backend) ensureSearchAttributesColumn(ctx context.Context) error {
@@ -216,6 +232,17 @@ func (b *Backend) ensureJSONColumn(ctx context.Context, column string) error {
 		return nil
 	}
 	return b.applyDDL(ctx, []string{fmt.Sprintf(`ALTER TABLE wf_instances ADD COLUMN %s JSON`, column)})
+}
+
+func (b *Backend) ensureInt64Column(ctx context.Context, table, column string) error {
+	exists, err := b.columnExists(ctx, table, column)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	return b.applyDDL(ctx, []string{fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s INT64`, table, column)})
 }
 
 func (b *Backend) columnExists(ctx context.Context, table, column string) (bool, error) {
@@ -300,6 +327,7 @@ func (b *Backend) Reset(ctx context.Context) error {
 		{table: "wf_timers", sql: `SELECT instance_id, seq FROM wf_timers`, kind: "pair"},
 		{table: "wf_tasks", sql: `SELECT id FROM wf_tasks`, kind: "int64"},
 		{table: "wf_inbox", sql: `SELECT id FROM wf_inbox`, kind: "int64"},
+		{table: "wf_inbox_seq", sql: `SELECT instance_id FROM wf_inbox_seq`, kind: "string"},
 		{table: "wf_journal", sql: `SELECT instance_id, seq FROM wf_journal`, kind: "pair"},
 		{table: "wf_instances", sql: `SELECT id FROM wf_instances`, kind: "string"},
 	}

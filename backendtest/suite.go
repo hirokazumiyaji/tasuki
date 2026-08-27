@@ -3,6 +3,7 @@ package backendtest
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +32,7 @@ func Run(t *testing.T, newBackend Factory) {
 	t.Run("FireTimerWakesWorkflow", func(t *testing.T) { testFireTimer(t, newBackend) })
 	t.Run("CountClaimableTasks", func(t *testing.T) { testCountClaimableTasks(t, newBackend) })
 	t.Run("SignalDedupe", func(t *testing.T) { testSignalDedupe(t, newBackend) })
+	t.Run("InboxOrder", func(t *testing.T) { testInboxOrder(t, newBackend) })
 	t.Run("NackTask", func(t *testing.T) { testNackTask(t, newBackend) })
 	t.Run("SearchAttributes", func(t *testing.T) { testSearchAttributes(t, newBackend) })
 	t.Run("Memo", func(t *testing.T) { testMemo(t, newBackend) })
@@ -270,6 +272,12 @@ func scheduleActivity(t *testing.T, b backend.Backend, id, name string) int64 {
 
 func claimWF() backend.ClaimRequest {
 	return backend.ClaimRequest{Kind: "workflow", Queues: []string{"default"}, Limit: 1, Lease: time.Second, WorkerID: "tester"}
+}
+
+// instanceID derives a per-test instance ID safe for document-keyed backends.
+func instanceID(prefix string, t *testing.T) string {
+	t.Helper()
+	return prefix + strings.ReplaceAll(t.Name(), "/", "-")
 }
 
 func claimAct() backend.ClaimRequest {

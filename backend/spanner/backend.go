@@ -13,6 +13,32 @@ import (
 
 func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilities{} }
 
+// readInboxSeq returns the instance's inbox counter (0, false when unset).
+// The counter lives in wf_inbox_seq, kept off wf_instances so signal appends
+// never contend with advancement commits on the instance row.
+func readInboxSeq(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string) (int64, bool, error) {
+	row, err := txn.ReadRow(ctx, "wf_inbox_seq", spanner.Key{instanceID}, []string{"seq"})
+	if isNotFound(err) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	var seq int64
+	if err := row.Columns(&seq); err != nil {
+		return 0, false, err
+	}
+	return seq, true, nil
+}
+
+func inboxSeqMuts(instanceID string, seq int64, existed bool) []*spanner.Mutation {
+	m := map[string]any{"instance_id": instanceID, "seq": seq}
+	if existed {
+		return []*spanner.Mutation{spanner.UpdateMap("wf_inbox_seq", m)}
+	}
+	return []*spanner.Mutation{spanner.InsertMap("wf_inbox_seq", m)}
+}
+
 func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
 	queue := inst.Queue
 	if queue == "" {
@@ -486,7 +512,7 @@ func (b *Backend) LoadWorkflowHead(ctx context.Context, instanceID string) (*bac
 	}
 
 	iter := b.client.Single().Query(ctx, spanner.Statement{
-		SQL:    `SELECT id, type, ref_seq, payload FROM wf_inbox WHERE instance_id = @id ORDER BY id`,
+		SQL:    `SELECT id, seq, type, ref_seq, payload, created_at FROM wf_inbox WHERE instance_id = @id ORDER BY seq, created_at, id`,
 		Params: map[string]any{"id": instanceID},
 	})
 	defer iter.Stop()
@@ -499,10 +525,13 @@ func (b *Backend) LoadWorkflowHead(ctx context.Context, instanceID string) (*bac
 			return nil, err
 		}
 		var item backend.InboxEvent
+		// seq is NULL on rows written before inbox sequencing.
+		var seq spanner.NullInt64
 		var typ string
 		var refSeq spanner.NullInt64
 		var payload spanner.NullJSON
-		if err := row.Columns(&item.ID, &typ, &refSeq, &payload); err != nil {
+		var createdAt time.Time
+		if err := row.Columns(&item.ID, &seq, &typ, &refSeq, &payload, &createdAt); err != nil {
 			return nil, err
 		}
 		item.Event.Type = journal.Type(typ)
@@ -744,13 +773,18 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 			ev.RefSeq = parentSeq.Int64
 		}
 		inboxID := newID()
-		if err := txn.BufferWrite([]*spanner.Mutation{
+		pseq, existed, err := readInboxSeq(ctx, txn, parentID.StringVal)
+		if err != nil {
+			return err
+		}
+		pseq++
+		muts := append(inboxSeqMuts(parentID.StringVal, pseq, existed),
 			spanner.InsertMap("wf_inbox", map[string]any{
 				"id": inboxID, "instance_id": parentID.StringVal,
-				"type": string(ev.Type), "ref_seq": nullInt(ev.RefSeq),
+				"seq": pseq, "type": string(ev.Type), "ref_seq": nullInt(ev.RefSeq),
 				"payload": jsonVal(ev.Payload), "created_at": now,
-			}),
-		}); err != nil {
+			}))
+		if err := txn.BufferWrite(muts); err != nil {
 			return err
 		}
 		if parentStatus == "running" {
@@ -874,12 +908,16 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 		if ev.RefSeq == 0 && refSeq.Valid {
 			ev.RefSeq = refSeq.Int64
 		}
-		if err := txn.BufferWrite([]*spanner.Mutation{
+		seq, existed, err := readInboxSeq(ctx, txn, instanceID)
+		if err != nil {
+			return err
+		}
+		seq++
+		if err := txn.BufferWrite(append(inboxSeqMuts(instanceID, seq, existed),
 			spanner.InsertMap("wf_inbox", map[string]any{
-				"id": newID(), "instance_id": instanceID, "type": string(ev.Type),
+				"id": newID(), "instance_id": instanceID, "seq": seq, "type": string(ev.Type),
 				"ref_seq": nullInt(ev.RefSeq), "payload": jsonVal(ev.Payload), "created_at": now,
-			}),
-		}); err != nil {
+			}))); err != nil {
 			return err
 		}
 		wake = true
@@ -958,12 +996,17 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			if delN == 0 {
 				continue
 			}
-			if err := txn.BufferWrite([]*spanner.Mutation{
+			seq, existed, err := readInboxSeq(ctx, txn, d.instanceID)
+			if err != nil {
+				return err
+			}
+			seq++
+			muts := append(inboxSeqMuts(d.instanceID, seq, existed),
 				spanner.InsertMap("wf_inbox", map[string]any{
-					"id": newID(), "instance_id": d.instanceID,
+					"id": newID(), "instance_id": d.instanceID, "seq": seq,
 					"type": string(journal.TypeTimerFired), "ref_seq": d.seq, "created_at": now,
-				}),
-			}); err != nil {
+				}))
+			if err := txn.BufferWrite(muts); err != nil {
 				return err
 			}
 			if err := enqueueWorkflowTask(ctx, txn, d.instanceID, "", now); err != nil {
@@ -995,8 +1038,6 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	}
 	now := nowUTC()
 	var inserted int
-	var queue string
-	var status string
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"status", "queue"})
 		if err != nil {
@@ -1005,7 +1046,13 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			}
 			return err
 		}
+		var status string
+		var queue string
 		if err := row.Columns(&status, &queue); err != nil {
+			return err
+		}
+		seq, existed, err := readInboxSeq(ctx, txn, instanceID)
+		if err != nil {
 			return err
 		}
 		var muts []*spanner.Mutation
@@ -1023,11 +1070,15 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				}))
 			}
 			payload := inboxPayload(it.Event)
+			seq++
 			muts = append(muts, spanner.InsertMap("wf_inbox", map[string]any{
-				"id": newID(), "instance_id": instanceID, "type": string(it.Event.Type),
+				"id": newID(), "instance_id": instanceID, "seq": seq, "type": string(it.Event.Type),
 				"ref_seq": nullInt(it.Event.RefSeq), "payload": jsonVal(payload), "created_at": now,
 			}))
 			inserted++
+		}
+		if inserted > 0 {
+			muts = append(muts, inboxSeqMuts(instanceID, seq, existed)...)
 		}
 		if len(muts) > 0 {
 			if err := txn.BufferWrite(muts); err != nil {

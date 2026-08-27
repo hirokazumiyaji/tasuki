@@ -12,7 +12,7 @@ import (
 func testMemo(t *testing.T, newBackend Factory) {
 	ctx := context.Background()
 	b := newBackend(t)
-	id := "memo-" + t.Name()
+	id := instanceID("memo-", t)
 	if err := b.CreateInstance(ctx, backend.NewInstance{
 		ID: id, Name: "WF", Queue: "default",
 		Memo: map[string]string{"note": "vip"},

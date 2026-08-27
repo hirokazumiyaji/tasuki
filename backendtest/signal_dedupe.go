@@ -11,7 +11,7 @@ import (
 func testSignalDedupe(t *testing.T, newBackend Factory) {
 	ctx := context.Background()
 	b := newBackend(t)
-	id := "dedupe-" + t.Name()
+	id := instanceID("dedupe-", t)
 	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
 		t.Fatal(err)
 	}

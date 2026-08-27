@@ -12,7 +12,7 @@ import (
 func testSearchAttributes(t *testing.T, newBackend Factory) {
 	ctx := context.Background()
 	b := newBackend(t)
-	id := "sa-" + t.Name()
+	id := instanceID("sa-", t)
 	if err := b.CreateInstance(ctx, backend.NewInstance{
 		ID: id, Name: "WF", Queue: "default",
 		SearchAttributes: map[string]string{"tenant": "acme", "phase": "new"},
