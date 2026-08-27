@@ -374,7 +374,7 @@ func (b *Backend) ReleaseLease(ctx context.Context, id int64) error {
 	b.notifyTasks()
 	return nil
 }
-func (b *Backend) NackTask(ctx context.Context, t backend.Task, visibleAt time.Time) error {
+func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {
 	ref := b.ref("wf_tasks", actTaskID(t.ID))
 	if t.Kind == "workflow" {
 		ref = b.ref("wf_tasks", wfTaskID(t.InstanceID))
@@ -390,7 +390,7 @@ func (b *Backend) NackTask(ctx context.Context, t backend.Task, visibleAt time.T
 		if !s.Exists() {
 			return backend.ErrNotFound
 		}
-		return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: visibleAt.UTC()}, {Path: "worker_id", Value: gcf.Delete}})
+		return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(delay)}, {Path: "worker_id", Value: gcf.Delete}})
 	})
 	if err != nil {
 		return err
@@ -398,8 +398,8 @@ func (b *Backend) NackTask(ctx context.Context, t backend.Task, visibleAt time.T
 	b.notifyTasks()
 	return nil
 }
-func (b *Backend) RetryActivity(ctx context.Context, id int64, at time.Time) error {
-	return b.updateTask(ctx, id, true, []gcf.Update{{Path: "visible_at", Value: at.UTC()}, {Path: "worker_id", Value: gcf.Delete}})
+func (b *Backend) RetryActivity(ctx context.Context, id int64, delay time.Duration) error {
+	return b.updateTask(ctx, id, true, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(delay)}, {Path: "worker_id", Value: gcf.Delete}})
 }
 func (b *Backend) LoadWorkflowHead(ctx context.Context, id string) (*backend.WorkflowState, error) {
 	inst, err := b.GetInstance(ctx, id)

@@ -374,9 +374,9 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	return nil
 }
 
-func (b *Backend) NackTask(ctx context.Context, t backend.Task, visibleAt time.Time) error {
+func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {
 	res, err := b.db.ExecContext(ctx, `
-		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ?`, formatTime(visibleAt), t.ID)
+		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ?`, formatTime(nowUTC().Add(delay)), t.ID)
 	if err != nil {
 		return err
 	}
@@ -732,10 +732,10 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	return nil
 }
 
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, visibleAt time.Time) error {
+func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
 	res, err := b.db.ExecContext(ctx, `
 		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL
-		WHERE id = ? AND kind = 'activity'`, formatTime(visibleAt), taskID)
+		WHERE id = ? AND kind = 'activity'`, formatTime(nowUTC().Add(delay)), taskID)
 	if err != nil {
 		return err
 	}

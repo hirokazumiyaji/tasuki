@@ -464,7 +464,8 @@ type Backend interface {
     LoadWorkflow(ctx context.Context, instanceID string) (*WorkflowState, error) // ジャーナル + inbox + next_seq + 現在時刻
     CommitAdvancement(ctx context.Context, adv Advancement) error               // 状態遷移Tx。競合時 ErrConflict
     CompleteActivity(ctx context.Context, taskID int64, ev Event) error         // 完了Tx。タスク消失時 ErrSuperseded
-    RetryActivity(ctx context.Context, taskID int64, visibleAt time.Time) error
+    RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error
+    NackTask(ctx context.Context, t Task, delay time.Duration) error
     FireDueTimers(ctx context.Context, limit int) (int, error)
     ClaimDueSchedules(ctx context.Context, limit int) ([]Schedule, error)
 }

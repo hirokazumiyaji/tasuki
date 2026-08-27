@@ -318,7 +318,7 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	b.notifyTasks()
 	return nil
 }
-func (b *Backend) NackTask(ctx context.Context, t backend.Task, visibleAt time.Time) error {
+func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {
 	pk := actTaskPK(t.ID)
 	if t.Kind == "workflow" {
 		pk = wfTaskPK(t.InstanceID)
@@ -328,7 +328,7 @@ func (b *Backend) NackTask(ctx context.Context, t backend.Task, visibleAt time.T
 		Key:       map[string]types.AttributeValue{"task_pk": avS(pk)},
 		UpdateExpression: aws.String("SET visible_at = :v REMOVE worker_id"),
 		ConditionExpression: aws.String("attribute_exists(task_pk)"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(visibleAt.UTC()))},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(delay)))},
 	})
 	if conditional(err) {
 		return backend.ErrNotFound
@@ -339,8 +339,8 @@ func (b *Backend) NackTask(ctx context.Context, t backend.Task, visibleAt time.T
 	b.notifyTasks()
 	return nil
 }
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, at time.Time) error {
-	return b.updateTask(ctx, taskID, "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(at))}, "kind = :kind")
+func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
+	return b.updateTask(ctx, taskID, "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(delay)))}, "kind = :kind")
 }
 func (b *Backend) updateTask(ctx context.Context, id int64, update string, values map[string]types.AttributeValue, condition string) error {
 	if condition != "" {
