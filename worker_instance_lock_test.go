@@ -7,14 +7,37 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
 )
 
+func TestWorkflowActorDispatchesTurnsSequentially(t *testing.T) {
+	var actor workflowActor
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	order := make(chan int, 2)
+
+	go actor.dispatch(func() {
+		close(firstStarted)
+		<-releaseFirst
+		order <- 1
+	})
+	<-firstStarted
+	go actor.dispatch(func() { order <- 2 })
+
+	close(releaseFirst)
+	if got := <-order; got != 1 {
+		t.Fatalf("first callback order = %d", got)
+	}
+	if got := <-order; got != 2 {
+		t.Fatalf("second callback order = %d", got)
+	}
+}
+
 func TestEvictIdleInstanceLocks(t *testing.T) {
 	w := NewWorker(memory.New(), WorkerOptions{IdleInstanceLockTTL: time.Minute})
-	_ = w.instanceMutex("a")
-	_ = w.instanceMutex("b")
+	_ = w.actorFor("a")
+	_ = w.actorFor("b")
 
-	held := w.instanceMutex("held")
-	held.Lock()
-	defer held.Unlock()
+	held := w.actorFor("held")
+	held.mu.Lock()
+	defer held.mu.Unlock()
 
 	w.instMu.Lock()
 	w.instLock["a"].lastUsed = time.Now().Add(-2 * time.Minute)
@@ -39,7 +62,7 @@ func TestEvictIdleInstanceLocks(t *testing.T) {
 
 func TestEvictIdleInstanceLocks_RecentKept(t *testing.T) {
 	w := NewWorker(memory.New(), WorkerOptions{IdleInstanceLockTTL: time.Minute})
-	_ = w.instanceMutex("fresh")
+	_ = w.actorFor("fresh")
 	w.evictIdleInstanceLocks(time.Now())
 	w.instMu.Lock()
 	defer w.instMu.Unlock()

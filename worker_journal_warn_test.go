@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,12 +14,29 @@ import (
 	"github.com/hirokazumiyaji/tasuki/workflow"
 )
 
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func TestWorker_JournalWarnThreshold(t *testing.T) {
 	ctx := context.Background()
 	b := memory.New()
 	b.SetNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 
-	var buf bytes.Buffer
+	var buf lockedBuffer
 	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	w := tasuki.NewWorker(b, tasuki.WorkerOptions{
@@ -67,7 +85,7 @@ func TestWorker_JournalWarnThreshold_Disabled(t *testing.T) {
 	b := memory.New()
 	b.SetNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 
-	var buf bytes.Buffer
+	var buf lockedBuffer
 	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	w := tasuki.NewWorker(b, tasuki.WorkerOptions{

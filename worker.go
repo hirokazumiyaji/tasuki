@@ -29,7 +29,7 @@ type Worker struct {
 	sticky   map[string]stickyEntry
 
 	instMu   sync.Mutex
-	instLock map[string]*instanceLock
+	instLock map[string]*workflowActor
 }
 
 func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
@@ -40,7 +40,7 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		reg:      newRegistry(opts.Codec),
 		inFlight: map[int64]struct{}{},
 		sticky:   map[string]stickyEntry{},
-		instLock: map[string]*instanceLock{},
+		instLock: map[string]*workflowActor{},
 	}
 }
 
@@ -176,23 +176,23 @@ func (w *Worker) tick(ctx context.Context) {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				mu := w.instanceMutex(t.InstanceID)
-				mu.Lock()
-				defer mu.Unlock()
-				w.opts.Metrics.AddWorkflowTask(ctx, 1)
-				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
-				w.track(t.ID)
-				p, err := w.handleWorkflow(ctx, t)
-				w.untrack(t.ID)
-				if err != nil {
-					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", err)
-					return
-				}
-				if p != nil {
-					pendingMu.Lock()
-					pending = append(pending, *p)
-					pendingMu.Unlock()
-				}
+				actor := w.actorFor(t.InstanceID)
+				actor.dispatch(func() {
+					w.opts.Metrics.AddWorkflowTask(ctx, 1)
+					w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
+					w.track(t.ID)
+					p, err := w.handleWorkflow(ctx, t)
+					w.untrack(t.ID)
+					if err != nil {
+						w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", err)
+						return
+					}
+					if p != nil {
+						pendingMu.Lock()
+						pending = append(pending, *p)
+						pendingMu.Unlock()
+					}
+				})
 			}(t)
 		}
 		wg.Wait()
