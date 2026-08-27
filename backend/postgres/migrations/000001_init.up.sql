@@ -1,4 +1,4 @@
--- M1 schema for tasuki PostgreSQL backend
+-- 000001_init: baseline tasuki schema (tables, indexes, legacy column backfills)
 CREATE TABLE IF NOT EXISTS wf_instances (
     id           text PRIMARY KEY,
     name         text NOT NULL,
@@ -88,25 +88,3 @@ CREATE INDEX IF NOT EXISTS wf_schedules_due_idx ON wf_schedules (next_run_at) WH
 ALTER TABLE wf_tasks ADD COLUMN IF NOT EXISTS heartbeat bytea;
 ALTER TABLE wf_instances ADD COLUMN IF NOT EXISTS search_attributes jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE wf_instances ADD COLUMN IF NOT EXISTS memo jsonb NOT NULL DEFAULT '{}'::jsonb;
-
--- Autovacuum tuning for high-churn tables (details: docs/05-observability.md).
--- wf_tasks / wf_inbox are rewritten on every claim/complete; wf_instances gets
--- a row update on every advancement. Lower scale factors make autovacuum run
--- before dead tuples pile up; a smaller fillfactor leaves room in each page so
--- these updates stay HOT (no new index entries).
-ALTER TABLE wf_tasks SET (
-    autovacuum_vacuum_scale_factor = 0.05,
-    autovacuum_vacuum_cost_limit = 1000,
-    fillfactor = 80
-);
-ALTER TABLE wf_inbox SET (
-    autovacuum_vacuum_scale_factor = 0.05,
-    autovacuum_vacuum_cost_limit = 1000
-);
-ALTER TABLE wf_instances SET (
-    autovacuum_vacuum_scale_factor = 0.05,
-    fillfactor = 80
-);
-ALTER TABLE wf_signal_dedupe SET (
-    autovacuum_vacuum_scale_factor = 0.05
-);

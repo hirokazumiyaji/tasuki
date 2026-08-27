@@ -50,10 +50,27 @@ func (w *Worker) Start(parent context.Context) {
 	if w.cancel != nil {
 		return
 	}
+	if !w.opts.DisableSchemaValidation {
+		if err := ValidateSchema(parent, w.backend); err != nil {
+			w.opts.Logger.Error("tasuki: schema validation failed; worker not started", "error", err)
+			return
+		}
+	}
 	ctx, cancel := context.WithCancel(parent)
 	w.cancel = cancel
 	w.done = make(chan struct{})
 	go w.loop(ctx)
+}
+
+// ValidateSchema checks that the backend's store schema is ready for use.
+// It is a no-op for backends that do not implement backend.SchemaValidator.
+// Workers run it automatically at Start; call it explicitly to gate your own
+// startup sequence (e.g. before accepting traffic).
+func ValidateSchema(ctx context.Context, b backend.Backend) error {
+	if v, ok := b.(backend.SchemaValidator); ok {
+		return v.ValidateSchema(ctx)
+	}
+	return nil
 }
 
 // PollOnce runs one worker tick (timers, workflow tasks, activity tasks).

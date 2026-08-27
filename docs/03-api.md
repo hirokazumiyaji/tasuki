@@ -442,6 +442,17 @@ type WorkerOptions struct {
 決定性違反や未登録のワークフロー／アクティビティは terminal にせず Nack する（上記 Delay）。
 メトリクス `tasuki.worker.incompatible_nacks`。
 
+## スキーマの検証とマイグレーション
+
+ストアのスキーマ管理はバックエンドごとに行う。PostgreSQL バックエンドはバージョニングされたマイグレーションファイル（`backend/postgres/migrations/`）を持ち、詳細は [migrations の README](../backend/postgres/migrations/README.md) を参照。
+
+ストアが未マイグレーション（必要なテーブルが無い）とき、Worker は起動しない。
+`Worker.Start` は、バックエンドが `backend.SchemaValidator` を実装していれば起動前に検証し、失敗したら Error ログを出してポーリングループを起動しない。
+`WorkerOptions.DisableSchemaValidation` を `true` にすると、この検証を無効化できる（自己管理でスキーマを用意する運用向け）。
+
+アプリケーション側で明示的に検証したいときは `tasuki.ValidateSchema(ctx, backend)` を使う。
+未対応バックエンドに対しては何もしない。
+
 `w.Start(ctx)` は非同期にポーラーを起動して即座に返る。
 `w.Shutdown(ctx)` は新規獲得を止め、実行中タスクの完了を ctx の期限まで待ち、未完了タスクのリースを解放（`visible_at` を現在時刻へ戻す）してから返る。
 リース解放により、他のプロセスがリース期限を待たずに引き継げる。
