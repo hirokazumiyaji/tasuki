@@ -52,3 +52,36 @@ func testSignalDedupe(t *testing.T, newBackend Factory) {
 		t.Fatalf("inbox=%d want 4 after terminate clears dedupe", len(st.Inbox))
 	}
 }
+
+// testSignalDedupeBatch verifies that duplicate DedupeIDs within one
+// SendToInboxBatch are skipped (first wins) without failing the batch.
+func testSignalDedupeBatch(t *testing.T, newBackend Factory) {
+	ctx := context.Background()
+	b := newBackend(t)
+	id := instanceID("dedupe-batch-", t)
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	err := b.SendToInboxBatch(ctx, id, []backend.InboxItem{
+		{Event: journal.Event{Type: journal.TypeSignalReceived, Name: "a", Payload: []byte(`{"n":1}`)}, DedupeID: "pay-batch"},
+		{Event: journal.Event{Type: journal.TypeSignalReceived, Name: "b", Payload: []byte(`{"n":2}`)}, DedupeID: "pay-batch"},
+		{Event: journal.Event{Type: journal.TypeSignalReceived, Name: "c", Payload: []byte(`{"n":3}`)}, DedupeID: ""},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := b.LoadWorkflow(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Inbox) != 2 {
+		t.Fatalf("inbox=%d want 2 (one deduped + one undeduped)", len(st.Inbox))
+	}
+	got := map[string]bool{}
+	for _, item := range st.Inbox {
+		got[item.Event.Name] = true
+	}
+	if !got["a"] || !got["c"] || got["b"] {
+		t.Fatalf("inbox names=%v want {a,c} (first duplicate wins, b skipped)", got)
+	}
+}
