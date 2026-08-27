@@ -181,6 +181,7 @@ func (w *Worker) tick(ctx context.Context) {
 	wtasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
 		Kind: "workflow", Queues: w.opts.Queues, Limit: w.opts.ClaimLimit,
 		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
+		MaxPerInstance: w.opts.MaxPerInstance,
 	})
 	if err == nil && len(wtasks) > 0 {
 		sem := make(chan struct{}, w.opts.WorkflowConcurrency)
@@ -221,6 +222,7 @@ func (w *Worker) tick(ctx context.Context) {
 	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
 		Kind: "activity", Queues: w.opts.Queues, Limit: w.opts.ClaimLimit,
 		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
+		MaxPerInstance: w.opts.MaxPerInstance,
 	})
 	if err == nil && len(atasks) > 0 {
 		sem := make(chan struct{}, w.opts.ActivityConcurrency)

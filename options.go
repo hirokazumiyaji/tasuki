@@ -25,6 +25,10 @@ type WorkerOptions struct {
 	// IncompatibleRetryDelay is how long to hide a task after an incompatible Worker nacks it.
 	// Unset (0) defaults to 5s; negative means immediate re-visibility.
 	IncompatibleRetryDelay time.Duration
+	// MaxPerInstance caps how many tasks of one instance a single claim batch
+	// returns (fair dispatch; see docs/08-fair-dispatch.md). 0 disables the
+	// cap and keeps strict FIFO claiming.
+	MaxPerInstance int
 	// DisableSchemaValidation skips the startup check against backends that
 	// implement backend.SchemaValidator. Validation is on by default: when the
 	// store is missing tables (e.g. migrations have not run), Start logs an

@@ -176,6 +176,7 @@ go test ./chaos/ -timeout 5m
 | [docs/04-plan.md](docs/04-plan.md) | マイルストーン、テスト戦略、リスク |
 | [docs/05-observability.md](docs/05-observability.md) | ログと OpenTelemetry メトリクス |
 | [docs/07-retention.md](docs/07-retention.md) | 完了済みインスタンスの削除（Retention） |
+| [docs/08-fair-dispatch.md](docs/08-fair-dispatch.md) | 公平ディスパッチと高負荷ワークフローの隔離 |
 | [docs/superpowers/plans/2026-07-23-m0-execution-model.md](docs/superpowers/plans/2026-07-23-m0-execution-model.md) | M0 実装プラン |
 | [docs/superpowers/plans/2026-07-23-m1-postgres-backend.md](docs/superpowers/plans/2026-07-23-m1-postgres-backend.md) | M1 実装プラン |
 | [docs/superpowers/plans/2026-07-23-m2-expressiveness.md](docs/superpowers/plans/2026-07-23-m2-expressiveness.md) | M2 実装プラン |

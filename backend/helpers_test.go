@@ -62,6 +62,46 @@ func TestHasMemoUpdateAndLast(t *testing.T) {
 	}
 }
 
+func TestFairPick(t *testing.T) {
+	mk := func(spec string) []backend.FairTaskRef {
+		var out []backend.FairTaskRef
+		for i, c := range []byte(spec) {
+			out = append(out, backend.FairTaskRef{ID: int64(i + 1), InstanceID: string(c)})
+		}
+		return out
+	}
+	ids := func(refs []backend.FairTaskRef) string {
+		b := make([]byte, 0, len(refs))
+		for _, r := range refs {
+			b = append(b, r.InstanceID[0])
+		}
+		return string(b)
+	}
+	// Flooded instance does not starve the others; FIFO order preserved.
+	if got := ids(backend.FairPick(mk("AAAB"), 10, 1)); got != "AB" {
+		t.Fatalf("cap1: %q", got)
+	}
+	if got := ids(backend.FairPick(mk("AAAB"), 10, 2)); got != "AAB" {
+		t.Fatalf("cap2: %q", got)
+	}
+	// Strict FIFO when disabled or when capacity exhausts the list.
+	if got := ids(backend.FairPick(mk("AAAB"), 10, 0)); got != "AAAB" {
+		t.Fatalf("off: %q", got)
+	}
+	if got := ids(backend.FairPick(mk("AAAB"), 2, 1)); got != "AB" {
+		t.Fatalf("limit2: %q", got)
+	}
+	if got := backend.FairPick(mk("AAAB"), 0, 1); len(got) != 0 {
+		t.Fatalf("limit0: %v", got)
+	}
+	if of := backend.FairOverfetch(1); of < 64 || of <= 1 {
+		t.Fatalf("overfetch %d", of)
+	}
+	if of := backend.FairOverfetch(5000); of < 5000 || of > 8192 {
+		t.Fatalf("overfetch %d", of)
+	}
+}
+
 func TestNormalizePurgeStatuses(t *testing.T) {
 	got, err := backend.NormalizePurgeStatuses(nil)
 	if err != nil {

@@ -227,22 +227,31 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 	}
 	defer rollbackConn(ctx, conn)
 
+	var refs []backend.FairTaskRef
 	now := nowUTC()
 	visAt := leaseVisibleAt(req.Lease)
 
+	selectLimit := req.Limit
+	if req.MaxPerInstance > 0 {
+		selectLimit = backend.FairOverfetch(req.Limit)
+	}
 	args := make([]any, 0, 2+len(req.Queues)+1)
 	args = append(args, req.Kind, now)
 	for _, q := range req.Queues {
 		args = append(args, q)
 	}
-	args = append(args, req.Limit)
+	args = append(args, selectLimit)
 
+	selectCols := "id"
+	if req.MaxPerInstance > 0 {
+		selectCols = "id, instance_id"
+	}
 	query := fmt.Sprintf(`
-		SELECT id FROM wf_tasks
+		SELECT %s FROM wf_tasks
 		WHERE kind = ? AND visible_at <= ? AND queue IN (%s)
 		ORDER BY visible_at, id
 		LIMIT ?
-		FOR UPDATE SKIP LOCKED`, inClause(len(req.Queues)))
+		FOR UPDATE SKIP LOCKED`, selectCols, inClause(len(req.Queues)))
 
 	rows, err := conn.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -251,7 +260,15 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 	var ids []int64
 	for rows.Next() {
 		var id int64
-		if err := rows.Scan(&id); err != nil {
+		if req.MaxPerInstance > 0 {
+			var r backend.FairTaskRef
+			if err := rows.Scan(&r.ID, &r.InstanceID); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			id = r.ID
+			refs = append(refs, r)
+		} else if err := rows.Scan(&id); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -260,6 +277,13 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if req.MaxPerInstance > 0 {
+		picked := backend.FairPick(refs, req.Limit, req.MaxPerInstance)
+		ids = ids[:0]
+		for _, r := range picked {
+			ids = append(ids, r.ID)
+		}
 	}
 
 	var out []backend.Task

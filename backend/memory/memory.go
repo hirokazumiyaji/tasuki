@@ -401,8 +401,23 @@ func (b *Backend) ClaimTasks(_ context.Context, req backend.ClaimRequest) ([]bac
 	if limit <= 0 {
 		limit = 1
 	}
-	if len(cands) > limit {
+	if req.MaxPerInstance <= 0 && len(cands) > limit {
 		cands = cands[:limit]
+	}
+	if req.MaxPerInstance > 0 {
+		refs := make([]backend.FairTaskRef, 0, len(cands))
+		for _, c := range cands {
+			refs = append(refs, backend.FairTaskRef{ID: c.id, InstanceID: c.t.instanceID})
+		}
+		picked := backend.FairPick(refs, limit, req.MaxPerInstance)
+		byID := make(map[int64]cand, len(cands))
+		for _, c := range cands {
+			byID[c.id] = c
+		}
+		cands = cands[:0]
+		for _, r := range picked {
+			cands = append(cands, byID[r.ID])
+		}
 	}
 	out := make([]backend.Task, 0, len(cands))
 	for _, c := range cands {

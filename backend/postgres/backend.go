@@ -195,6 +195,9 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 	if req.Limit <= 0 {
 		req.Limit = 1
 	}
+	if req.MaxPerInstance > 0 {
+		return b.claimTasksFair(ctx, req)
+	}
 	rows, err := b.pool.Query(ctx, `
 		WITH picked AS (
 			SELECT id FROM wf_tasks
@@ -217,32 +220,111 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 	defer rows.Close()
 	var out []backend.Task
 	for rows.Next() {
-		var t backend.Task
-		var refSeq *int64
-		var payload []byte
-		if err := rows.Scan(&t.ID, &t.Kind, &t.Queue, &t.InstanceID, &refSeq, &payload, &t.Attempt, &t.VisibleAt, &t.WorkerID, &t.HeartbeatDetails); err != nil {
+		t, payload, err := scanClaimedTask(rows)
+		if err != nil {
 			return nil, err
 		}
-		if refSeq != nil {
-			t.Seq = *refSeq
-		}
 		if t.Kind == "activity" {
-			var p activityPayload
-			_ = json.Unmarshal(payload, &p)
-			t.Name = p.Name
-			t.Input = p.Input
-			t.MaxAttempts = p.Retry.MaxAttempts
-			t.Retry = backend.RetryPolicy{
-				InitialInterval:    time.Duration(p.Retry.InitialIntervalMs) * time.Millisecond,
-				BackoffCoefficient: p.Retry.BackoffCoefficient,
-				MaxInterval:        time.Duration(p.Retry.MaxIntervalMs) * time.Millisecond,
-				MaxAttempts:        p.Retry.MaxAttempts,
-			}
-			t.StartToCloseTimeout = time.Duration(p.StartToCloseTimeoutMs) * time.Millisecond
+			decodeActivityTask(&t, payload)
 		}
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// claimTasksFair caps claims per instance (ClaimRequest.MaxPerInstance).
+// It selects a bounded FIFO pool, trims it fairly in Go, then claims each
+// survivor with a visibility re-check: concurrent claimants lose the race on
+// already-leased rows (their visible_at moved to the future) and simply skip.
+func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
+		SELECT id, instance_id FROM wf_tasks
+		WHERE kind = $1 AND queue = ANY($2) AND visible_at <= now()
+		ORDER BY visible_at, id
+		LIMIT $3`,
+		req.Kind, req.Queues, backend.FairOverfetch(req.Limit))
+	if err != nil {
+		return nil, err
+	}
+	var refs []backend.FairTaskRef
+	for rows.Next() {
+		var r backend.FairTaskRef
+		if err := rows.Scan(&r.ID, &r.InstanceID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		refs = append(refs, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	picked := backend.FairPick(refs, req.Limit, req.MaxPerInstance)
+
+	var out []backend.Task
+	for _, r := range picked {
+		row := tx.QueryRow(ctx, `
+			UPDATE wf_tasks
+			SET visible_at = now() + $2::interval, attempt = attempt + 1, worker_id = $3
+			WHERE id = $1 AND visible_at <= now()
+			RETURNING id, kind, queue, instance_id, ref_seq, payload, attempt, visible_at, worker_id, heartbeat`,
+			r.ID, interval(req.Lease), req.WorkerID)
+		t, payload, err := scanClaimedTask(row)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue // claimed concurrently between select and update
+		}
+		if err != nil {
+			return nil, err
+		}
+		if t.Kind == "activity" {
+			decodeActivityTask(&t, payload)
+		}
+		out = append(out, t)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	if len(out) > 0 {
+		b.notifyTasks(ctx)
+	}
+	return out, nil
+}
+
+// scanClaimedTask scans the shared claim RETURNING column list and returns
+// the raw payload for activity decoding.
+func scanClaimedTask(sc interface{ Scan(dest ...any) error }) (backend.Task, []byte, error) {
+	var t backend.Task
+	var refSeq *int64
+	var payload []byte
+	if err := sc.Scan(&t.ID, &t.Kind, &t.Queue, &t.InstanceID, &refSeq, &payload, &t.Attempt, &t.VisibleAt, &t.WorkerID, &t.HeartbeatDetails); err != nil {
+		return t, nil, err
+	}
+	if refSeq != nil {
+		t.Seq = *refSeq
+	}
+	return t, payload, nil
+}
+
+// decodeActivityTask fills the activity-specific fields from the payload blob.
+func decodeActivityTask(t *backend.Task, payload []byte) {
+	var p activityPayload
+	_ = json.Unmarshal(payload, &p)
+	t.Name = p.Name
+	t.Input = p.Input
+	t.MaxAttempts = p.Retry.MaxAttempts
+	t.Retry = backend.RetryPolicy{
+		InitialInterval:    time.Duration(p.Retry.InitialIntervalMs) * time.Millisecond,
+		BackoffCoefficient: p.Retry.BackoffCoefficient,
+		MaxInterval:        time.Duration(p.Retry.MaxIntervalMs) * time.Millisecond,
+		MaxAttempts:        p.Retry.MaxAttempts,
+	}
+	t.StartToCloseTimeout = time.Duration(p.StartToCloseTimeoutMs) * time.Millisecond
 }
 
 func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
