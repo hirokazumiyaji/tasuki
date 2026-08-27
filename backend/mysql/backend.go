@@ -763,6 +763,66 @@ func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Du
 	return nil
 }
 
+// PurgeInstances deletes terminal instances and their dependent rows in one
+// transaction. Victim rows are selected FOR UPDATE so concurrent purge jobs do
+// not overlap.
+func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, statuses []string, limit int) (int, error) {
+	sts, lim, err := backend.ValidatePurgeArgs(olderThan, statuses, limit)
+	if err != nil {
+		return 0, err
+	}
+	cutoff := nowUTC().Add(-olderThan)
+	var ids []string
+	err = withTx(ctx, b.db, func(conn *sql.Conn) error {
+		args := make([]any, 0, len(sts)+2)
+		for _, s := range sts {
+			args = append(args, s)
+		}
+		args = append(args, cutoff, lim)
+		rows, err := conn.QueryContext(ctx, `
+		SELECT id FROM wf_instances
+		WHERE status IN (`+inClause(len(sts))+`)
+		  AND completed_at IS NOT NULL AND completed_at <= ?
+		ORDER BY completed_at, id
+		LIMIT ?
+		FOR UPDATE`, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		rows.Close()
+		if len(ids) == 0 {
+			return nil
+		}
+		idArgs := make([]any, 0, len(ids))
+		for _, id := range ids {
+			idArgs = append(idArgs, id)
+		}
+		for _, table := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox", "wf_journal"} {
+			if _, err := conn.ExecContext(ctx,
+				`DELETE FROM `+table+` WHERE instance_id IN (`+inClause(len(ids))+`)`, idArgs...); err != nil {
+				return err
+			}
+		}
+		_, err = conn.ExecContext(ctx, `DELETE FROM wf_instances WHERE id IN (`+inClause(len(ids))+`)`, idArgs...)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return len(ids), nil
+}
+
 func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	if limit <= 0 {
 		limit = 1

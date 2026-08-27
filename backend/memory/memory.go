@@ -43,6 +43,7 @@ type instance struct {
 	parentSeq        int64
 	searchAttributes map[string]string
 	memo             map[string]string
+	completedAt      time.Time // zero while running
 }
 
 type task struct {
@@ -210,6 +211,7 @@ func (b *Backend) TerminateInstance(_ context.Context, id string) error {
 		return backend.ErrNotFound
 	}
 	inst.status = "terminated"
+	inst.completedAt = b.now
 	delete(b.signalDedupe, id)
 	for tid, t := range b.tasks {
 		if t.instanceID == id {
@@ -535,6 +537,7 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 		inst.status = adv.Terminal.Status
 		inst.result = append([]byte(nil), adv.Terminal.Result...)
 		inst.failure = append([]byte(nil), adv.Terminal.Failure...)
+		inst.completedAt = b.now
 		delete(b.signalDedupe, adv.InstanceID)
 	}
 	for _, ch := range adv.Children {
@@ -705,6 +708,51 @@ func toTask(t *task) backend.Task {
 
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
 	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
+}
+
+// PurgeInstances removes terminal instances older than the retention window.
+func (b *Backend) PurgeInstances(_ context.Context, olderThan time.Duration, statuses []string, limit int) (int, error) {
+	sts, lim, err := backend.ValidatePurgeArgs(olderThan, statuses, limit)
+	if err != nil {
+		return 0, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	statusSet := make(map[string]struct{}, len(sts))
+	for _, s := range sts {
+		statusSet[s] = struct{}{}
+	}
+	cutoff := b.now.Add(-olderThan)
+	var victims []string
+	for id, inst := range b.instances {
+		if _, ok := statusSet[inst.status]; !ok {
+			continue
+		}
+		if inst.completedAt.IsZero() || inst.completedAt.After(cutoff) {
+			continue
+		}
+		victims = append(victims, id)
+	}
+	sort.Strings(victims)
+	if len(victims) > lim {
+		victims = victims[:lim]
+	}
+	for _, id := range victims {
+		delete(b.instances, id)
+		delete(b.inbox, id)
+		delete(b.signalDedupe, id)
+		for tid, t := range b.tasks {
+			if t.instanceID == id {
+				delete(b.tasks, tid)
+			}
+		}
+		for k := range b.timers {
+			if k.instanceID == id {
+				delete(b.timers, k)
+			}
+		}
+	}
+	return len(victims), nil
 }
 
 func (b *Backend) SendToInboxBatch(_ context.Context, instanceID string, items []backend.InboxItem) error {

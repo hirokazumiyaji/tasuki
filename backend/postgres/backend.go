@@ -650,6 +650,47 @@ func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Du
 	return nil
 }
 
+// PurgeInstances deletes terminal instances and all dependent rows in a single
+// atomic statement. SKIP LOCKED lets concurrent purge jobs make progress
+// without blocking each other.
+func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, statuses []string, limit int) (int, error) {
+	sts, lim, err := backend.ValidatePurgeArgs(olderThan, statuses, limit)
+	if err != nil {
+		return 0, err
+	}
+	tag, err := b.pool.Exec(ctx, `
+		WITH victims AS (
+			SELECT id FROM wf_instances
+			WHERE status = ANY($1)
+			  AND completed_at IS NOT NULL
+			  AND completed_at <= now() - $2::interval
+			ORDER BY completed_at, id
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		),
+		del_journal AS (
+			DELETE FROM wf_journal j USING victims v WHERE j.instance_id = v.id
+		),
+		del_inbox AS (
+			DELETE FROM wf_inbox x USING victims v WHERE x.instance_id = v.id
+		),
+		del_tasks AS (
+			DELETE FROM wf_tasks t USING victims v WHERE t.instance_id = v.id
+		),
+		del_timers AS (
+			DELETE FROM wf_timers m USING victims v WHERE m.instance_id = v.id
+		),
+		del_dedupe AS (
+			DELETE FROM wf_signal_dedupe d USING victims v WHERE d.instance_id = v.id
+		)
+		DELETE FROM wf_instances i USING victims v WHERE i.id = v.id`,
+		sts, interval(olderThan), lim)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	if limit <= 0 {
 		limit = 1

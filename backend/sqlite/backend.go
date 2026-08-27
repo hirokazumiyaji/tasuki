@@ -749,6 +749,71 @@ func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Du
 	return nil
 }
 
+// PurgeInstances deletes terminal instances and their dependent rows inside a
+// single immediate transaction. Child-row deletes are chunked so the bound
+// parameter count stays well under SQLITE_MAX_VARIABLE_NUMBER.
+func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, statuses []string, limit int) (int, error) {
+	sts, lim, err := backend.ValidatePurgeArgs(olderThan, statuses, limit)
+	if err != nil {
+		return 0, err
+	}
+	cutoff := formatTime(nowUTC().Add(-olderThan))
+	var ids []string
+	err = withTx(ctx, b.db, func(conn *sql.Conn) error {
+		args := make([]any, 0, len(sts)+2)
+		for _, s := range sts {
+			args = append(args, s)
+		}
+		args = append(args, cutoff, lim)
+		rows, err := conn.QueryContext(ctx, `
+		SELECT id FROM wf_instances
+		WHERE status IN (`+inClause(len(sts))+`)
+		  AND completed_at IS NOT NULL AND completed_at <= ?
+		ORDER BY completed_at, id
+		LIMIT ?`, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		rows.Close()
+		for start := 0; start < len(ids); start += purgeChunkSize {
+			end := min(start+purgeChunkSize, len(ids))
+			chunk := ids[start:end]
+			idArgs := make([]any, 0, len(chunk))
+			for _, id := range chunk {
+				idArgs = append(idArgs, id)
+			}
+			for _, table := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox", "wf_journal"} {
+				if _, err := conn.ExecContext(ctx,
+					`DELETE FROM `+table+` WHERE instance_id IN (`+inClause(len(chunk))+`)`, idArgs...); err != nil {
+					return err
+				}
+			}
+			if _, err := conn.ExecContext(ctx,
+				`DELETE FROM wf_instances WHERE id IN (`+inClause(len(chunk))+`)`, idArgs...); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return len(ids), nil
+}
+
+const purgeChunkSize = 500
+
 func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	if limit <= 0 {
 		limit = 1

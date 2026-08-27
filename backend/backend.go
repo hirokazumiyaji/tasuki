@@ -49,6 +49,14 @@ type Backend interface {
 	GetSchedule(ctx context.Context, id string) (*Schedule, error)
 	PauseSchedule(ctx context.Context, id string, paused bool) error
 	ClaimDueSchedules(ctx context.Context, limit int) ([]DueSchedule, error)
+
+	// PurgeInstances permanently deletes up to limit terminal instances whose
+	// completion time is at least olderThan in the past, together with every
+	// dependent row (journal events, inbox items, tasks, timers, signal
+	// dedupe). An empty statuses slice defaults to
+	// {completed, failed, terminated, canceled}; non-terminal or unknown
+	// statuses are rejected. It returns the number of instances purged.
+	PurgeInstances(ctx context.Context, olderThan time.Duration, statuses []string, limit int) (int, error)
 }
 
 // AdvancementBatcher optionally commits many workflow advancements in one round-trip.

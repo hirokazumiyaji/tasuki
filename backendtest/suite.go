@@ -37,9 +37,127 @@ func Run(t *testing.T, newBackend Factory) {
 	t.Run("NackTask", func(t *testing.T) { testNackTask(t, newBackend) })
 	t.Run("SearchAttributes", func(t *testing.T) { testSearchAttributes(t, newBackend) })
 	t.Run("Memo", func(t *testing.T) { testMemo(t, newBackend) })
+	t.Run("PurgeInstances", func(t *testing.T) { testPurgeInstances(t, newBackend) })
 	RunConcurrent(t, newBackend)
 	RunM2(t, newBackend)
 	RunM3(t, newBackend)
+}
+
+func testPurgeInstances(t *testing.T, newBackend Factory) {
+	t.Helper()
+	ctx := context.Background()
+	b := newBackend(t)
+	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	setNow(b, base)
+
+	// Three terminal instances with distinct statuses plus one running.
+	terminate := func(id, status, queue string) {
+		t.Helper()
+		if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: queue}); err != nil {
+			t.Fatal(err)
+		}
+		if status == "terminated" {
+			if err := b.TerminateInstance(ctx, id); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+		tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+			Kind: "workflow", Queues: []string{queue}, Limit: 1,
+			Lease: time.Minute, WorkerID: "purger",
+		})
+		if err != nil || len(tasks) != 1 {
+			t.Fatalf("claim %s: %v %#v", id, err, tasks)
+		}
+		st, err := b.LoadWorkflow(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = b.CommitAdvancement(ctx, backend.Advancement{
+			InstanceID:  id,
+			TaskID:      tasks[0].ID,
+			ExpectedSeq: st.NextSeq,
+			Terminal:    &backend.TerminalUpdate{Status: status},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	terminate("purge-done", "completed", "default")
+	terminate("purge-err", "failed", "default")
+	terminate("purge-stop", "terminated", "default")
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: "purge-live", Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	// Inbox/journal rows must disappear along with the instance row.
+	if err := b.SendToInbox(ctx, "purge-done", journal.Event{Type: journal.TypeSignalReceived, Name: "late"}, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Non-terminal statuses are rejected outright.
+	if _, err := b.PurgeInstances(ctx, time.Hour, []string{"running"}, 10); err == nil {
+		t.Fatal("expected error for running status")
+	}
+
+	older := time.Hour
+	if c, ok := b.(ClockSetter); ok {
+		c.SetNow(base.Add(2 * time.Hour))
+	} else {
+		older = 0 // real-time stores mark completions at wall-clock now
+	}
+
+	n, err := b.PurgeInstances(ctx, older, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("purged %d, want 3", n)
+	}
+	for _, id := range []string{"purge-done", "purge-err", "purge-stop"} {
+		if _, err := b.GetInstance(ctx, id); !errors.Is(err, backend.ErrNotFound) {
+			t.Fatalf("%s: want ErrNotFound, got %v", id, err)
+		}
+	}
+	list0, err := b.ListInstances(ctx, backend.InstanceFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, inst := range list0 {
+		for _, id := range []string{"purge-done", "purge-err", "purge-stop"} {
+			if inst.ID == id {
+				t.Fatalf("%s survived purge", id)
+			}
+		}
+	}
+	inst, err := b.GetInstance(ctx, "purge-live")
+	if err != nil || inst.Status != "running" {
+		t.Fatalf("running instance must survive purge: %v %#v", err, inst)
+	}
+
+	// Limit caps how many instances a single call removes.
+	setNow(b, base)
+	terminate("purge-a", "completed", "purge-q")
+	terminate("purge-b", "completed", "purge-q")
+	older = time.Hour
+	if c, ok := b.(ClockSetter); ok {
+		c.SetNow(base.Add(4 * time.Hour))
+	} else {
+		older = 0
+	}
+	n, err = b.PurgeInstances(ctx, older, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("limited purge removed %d, want 1", n)
+	}
+	list, err := b.ListInstances(ctx, backend.InstanceFilter{Status: "completed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("want one surviving instance, got %d", len(list))
+	}
 }
 
 func testCountClaimableTasks(t *testing.T, newBackend Factory) {
