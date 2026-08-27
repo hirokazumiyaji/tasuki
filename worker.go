@@ -198,6 +198,7 @@ func (w *Worker) tick(ctx context.Context) {
 		wg.Wait()
 		w.flushWorkflowCommits(ctx, pending)
 		w.evictIdleInstanceLocks(time.Now())
+		w.evictIdleSticky(time.Now())
 	}
 
 	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{

@@ -3,14 +3,16 @@ package tasuki
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
 type stickyEntry struct {
-	events  []journal.Event
-	nextSeq int64
+	events   []journal.Event
+	nextSeq  int64
+	lastUsed time.Time
 }
 
 func (w *Worker) dropSticky(instanceID string) {
@@ -26,8 +28,9 @@ func (w *Worker) setSticky(instanceID string, events []journal.Event, nextSeq in
 		w.sticky = map[string]stickyEntry{}
 	}
 	w.sticky[instanceID] = stickyEntry{
-		events:  append([]journal.Event(nil), events...),
-		nextSeq: nextSeq,
+		events:   append([]journal.Event(nil), events...),
+		nextSeq:  nextSeq,
+		lastUsed: time.Now(),
 	}
 }
 
@@ -38,11 +41,26 @@ func (w *Worker) stickyGet(instanceID string) (stickyEntry, bool) {
 	if !ok {
 		return stickyEntry{}, false
 	}
+	e.lastUsed = time.Now()
+	w.sticky[instanceID] = e
 	cp := stickyEntry{
-		events:  append([]journal.Event(nil), e.events...),
-		nextSeq: e.nextSeq,
+		events:   append([]journal.Event(nil), e.events...),
+		nextSeq:  e.nextSeq,
+		lastUsed: e.lastUsed,
 	}
 	return cp, true
+}
+
+func (w *Worker) evictIdleSticky(now time.Time) {
+	ttl := w.opts.StickyJournalTTL
+	w.stickyMu.Lock()
+	defer w.stickyMu.Unlock()
+	for id, e := range w.sticky {
+		if now.Sub(e.lastUsed) < ttl {
+			continue
+		}
+		delete(w.sticky, id)
+	}
 }
 
 func expectedNextSeq(events []journal.Event) int64 {
