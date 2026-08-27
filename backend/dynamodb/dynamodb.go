@@ -120,6 +120,15 @@ func (b *Backend) Migrate(ctx context.Context) error {
 			},
 		},
 		{
+			name: b.table("wf_inbox_seq"),
+			attrs: []types.AttributeDefinition{
+				{AttributeName: aws.String("id"), AttributeType: types.ScalarAttributeTypeS},
+			},
+			keys: []types.KeySchemaElement{
+				{AttributeName: aws.String("id"), KeyType: types.KeyTypeHash},
+			},
+		},
+		{
 			name: b.table("wf_signal_dedupe"),
 			attrs: []types.AttributeDefinition{
 				{AttributeName: aws.String("instance_id"), AttributeType: types.ScalarAttributeTypeS},
@@ -281,6 +290,7 @@ func (b *Backend) Reset(ctx context.Context) error {
 		b.table("wf_timers"),
 		b.table("wf_tasks"),
 		b.table("wf_inbox"),
+		b.table("wf_inbox_seq"),
 		b.table("wf_signal_dedupe"),
 		b.table("wf_journal"),
 		b.table("wf_instances"),

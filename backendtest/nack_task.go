@@ -11,7 +11,7 @@ import (
 func testNackTask(t *testing.T, newBackend Factory) {
 	ctx := context.Background()
 	b := newBackend(t)
-	id := "nack-" + t.Name()
+	id := instanceID("nack-", t)
 	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
 		t.Fatal(err)
 	}

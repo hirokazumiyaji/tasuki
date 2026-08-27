@@ -31,6 +31,7 @@ CREATE TABLE wf_journal (
 CREATE TABLE wf_inbox (
   id INT64 NOT NULL,
   instance_id STRING(255) NOT NULL,
+  seq INT64,
   type STRING(64) NOT NULL,
   ref_seq INT64,
   payload JSON,
@@ -38,6 +39,11 @@ CREATE TABLE wf_inbox (
 ) PRIMARY KEY (id);
 
 CREATE INDEX wf_inbox_instance_idx ON wf_inbox(instance_id, id);
+
+CREATE TABLE wf_inbox_seq (
+  instance_id STRING(255) NOT NULL,
+  seq INT64 NOT NULL
+) PRIMARY KEY (instance_id);
 
 CREATE TABLE wf_signal_dedupe (
   instance_id STRING(255) NOT NULL,

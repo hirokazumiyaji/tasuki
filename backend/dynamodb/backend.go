@@ -369,11 +369,47 @@ func (b *Backend) LoadWorkflowHead(ctx context.Context, instanceID string) (*bac
 	if err != nil {
 		return nil, err
 	}
+	items := make([]backend.InboxEntry, 0, len(out.Items))
 	for _, m := range out.Items {
 		name, payload := unwrapInboxPayload(fromJSON(m["payload"]))
-		st.Inbox = append(st.Inbox, backend.InboxEvent{ID: fromN(m["id"]), Event: journal.Event{Type: journal.Type(fromS(m["type"])), Name: name, RefSeq: fromN(m["ref_seq"]), Payload: payload}})
+		items = append(items, backend.InboxEntry{
+			Seq:       fromN(m["seq"]),
+			CreatedAt: fromN(m["created_at"]),
+			ID:        fromN(m["id"]),
+			Event:     journal.Event{Type: journal.Type(fromS(m["type"])), Name: name, RefSeq: fromN(m["ref_seq"]), Payload: payload},
+		})
+	}
+	backend.SortInbox(items)
+	for _, it := range items {
+		st.Inbox = append(st.Inbox, backend.InboxEvent{ID: it.ID, Event: it.Event})
 	}
 	return st, nil
+}
+
+// allocInboxSeqs atomically reserves n per-instance inbox sequence numbers
+// on the wf_inbox_seq item and returns the top of the reserved range [top-n+1, top].
+func (b *Backend) allocInboxSeqs(ctx context.Context, instanceID string, n int64) (int64, error) {
+	out, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:        aws.String(b.table("wf_inbox_seq")),
+		Key:              map[string]types.AttributeValue{"id": avS(instanceID)},
+		UpdateExpression: aws.String("ADD seq :n"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":n": avN(n),
+		},
+		ReturnValues: types.ReturnValueUpdatedNew,
+	})
+	var tip *types.TransactionInProgressException
+	if errors.As(err, &tip) {
+		return 0, backend.ErrConflict
+	}
+	if err != nil {
+		return 0, err
+	}
+	top := fromN(out.Attributes["seq"])
+	if top < n {
+		return 0, fmt.Errorf("dynamodb: invalid inbox_seq %d for %s", top, instanceID)
+	}
+	return top, nil
 }
 
 func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
@@ -523,11 +559,15 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 	}
 	parentID := ""
 	if adv.ParentNotify != nil && inst.ParentID != "" {
+		seq, err := b.allocInboxSeqs(ctx, inst.ParentID, 1)
+		if err != nil {
+			return nil, "", err
+		}
 		ev := *adv.ParentNotify
 		if ev.RefSeq == 0 {
 			ev.RefSeq = inst.ParentSeq
 		}
-		items = append(items, put(b.table("wf_inbox"), inboxItem(inst.ParentID, newID(), ev, now), "attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
+		items = append(items, put(b.table("wf_inbox"), inboxItem(inst.ParentID, newID(), seq, ev, now), "attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
 		parentID = inst.ParentID
 	}
 	items = append(items, delWithValues(b.table("wf_tasks"), map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))}, "id = :taskid AND kind = :workflow", map[string]types.AttributeValue{":taskid": avN(adv.TaskID), ":workflow": avS("workflow")}))
@@ -572,8 +612,8 @@ func activityTaskItem(t backend.NewTask, now time.Time) map[string]types.Attribu
 func timerItem(instanceID string, t backend.NewTimer, now time.Time) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{"instance_id": avS(instanceID), "seq": avN(t.Seq), "gsi_pk": avS("TIMER"), "fire_at": avN(timeToN(t.FireAt)), "created_at": avN(timeToN(now))}
 }
-func inboxItem(instanceID string, id int64, e journal.Event, now time.Time) map[string]types.AttributeValue {
-	m := map[string]types.AttributeValue{"instance_id": avS(instanceID), "id": avN(id), "type": avS(string(e.Type)), "payload": avJSON(inboxPayload(e)), "created_at": avN(timeToN(now))}
+func inboxItem(instanceID string, id, seq int64, e journal.Event, now time.Time) map[string]types.AttributeValue {
+	m := map[string]types.AttributeValue{"instance_id": avS(instanceID), "id": avN(id), "seq": avN(seq), "type": avS(string(e.Type)), "payload": avJSON(inboxPayload(e)), "created_at": avN(timeToN(now))}
 	if e.RefSeq != 0 {
 		m["ref_seq"] = avN(e.RefSeq)
 	}
@@ -612,7 +652,11 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	now := nowUTC()
 	items := []types.TransactWriteItem{del(b.table("wf_tasks"), key, "attribute_exists(task_pk)")}
 	if inst.Status == "running" {
-		items = append(items, put(b.table("wf_inbox"), inboxItem(inst.ID, newID(), ev, now), "attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
+		seq, err := b.allocInboxSeqs(ctx, inst.ID, 1)
+		if err != nil {
+			return err
+		}
+		items = append(items, put(b.table("wf_inbox"), inboxItem(inst.ID, newID(), seq, ev, now), "attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
 	}
 	_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 	if conditional(err) {
@@ -648,7 +692,11 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 		}
 		items := []types.TransactWriteItem{delWithValues(b.table("wf_timers"), timerKey(id, seq), "attribute_exists(instance_id)", nil)}
 		if inst.Status == "running" {
-			items = append(items, put(b.table("wf_inbox"), inboxItem(id, newID(), journal.Event{Type: journal.TypeTimerFired, RefSeq: seq}, now), "attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
+			is, err := b.allocInboxSeqs(ctx, id, 1)
+			if err != nil {
+				continue
+			}
+			items = append(items, put(b.table("wf_inbox"), inboxItem(id, newID(), is, journal.Event{Type: journal.TypeTimerFired, RefSeq: seq}, now), "attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
 		}
 		_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 		if conditional(err) {
@@ -689,12 +737,17 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	wrote := false
 	for len(pending) > 0 {
 		now := nowUTC()
+		top, err := b.allocInboxSeqs(ctx, instanceID, int64(len(pending)))
+		if err != nil {
+			return err
+		}
 		var twi []types.TransactWriteItem
 		type meta struct {
 			pidx   int
 			dedupe bool
 		}
 		var metas []meta
+		seq := top - int64(len(pending))
 		for pi, it := range pending {
 			if it.DedupeID != "" {
 				twi = append(twi, put(b.table("wf_signal_dedupe"), map[string]types.AttributeValue{
@@ -704,7 +757,8 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				}, "attribute_not_exists(instance_id) AND attribute_not_exists(dedupe_id)"))
 				metas = append(metas, meta{pi, true})
 			}
-			twi = append(twi, put(b.table("wf_inbox"), inboxItem(instanceID, newID(), it.Event, now),
+			seq++
+			twi = append(twi, put(b.table("wf_inbox"), inboxItem(instanceID, newID(), seq, it.Event, now),
 				"attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
 			metas = append(metas, meta{pi, false})
 		}
