@@ -748,8 +748,15 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		}
 		var metas []meta
 		seq := top - int64(len(pending))
+		// Skip same-batch DedupeID duplicates: TransactWriteItems rejects two
+		// operations on the same key and would not ConditionalCheckFailed-retry cleanly.
+		created := map[string]bool{}
 		for pi, it := range pending {
 			if it.DedupeID != "" {
+				if created[it.DedupeID] {
+					continue
+				}
+				created[it.DedupeID] = true
 				twi = append(twi, put(b.table("wf_signal_dedupe"), map[string]types.AttributeValue{
 					"instance_id": avS(instanceID),
 					"dedupe_id":   avS(it.DedupeID),

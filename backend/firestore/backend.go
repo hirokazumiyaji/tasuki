@@ -769,6 +769,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		if err := seedInboxSeqTx(b, tx, alloc, instanceID); err != nil {
 			return err
 		}
+		// Firestore requires all reads before writes; also skip same-batch DedupeID dups.
 		skip := make([]bool, len(items))
 		created := map[string]bool{}
 		for i, it := range items {

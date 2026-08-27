@@ -1056,10 +1056,17 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			return err
 		}
 		var muts []*spanner.Mutation
+		// Track DedupeIDs reserved in this transaction: ReadRow only sees committed
+		// rows, so same-batch duplicates would otherwise emit colliding InsertMaps.
+		created := map[string]bool{}
 		for _, it := range items {
 			if it.DedupeID != "" {
+				if created[it.DedupeID] {
+					continue
+				}
 				_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, it.DedupeID}, []string{"dedupe_id"})
 				if err == nil {
+					created[it.DedupeID] = true
 					continue
 				}
 				if !isNotFound(err) {
@@ -1068,6 +1075,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
 					"instance_id": instanceID, "dedupe_id": it.DedupeID, "created_at": now,
 				}))
+				created[it.DedupeID] = true
 			}
 			payload := inboxPayload(it.Event)
 			seq++
