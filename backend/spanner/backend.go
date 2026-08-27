@@ -479,11 +479,11 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	return nil
 }
 
-func (b *Backend) NackTask(ctx context.Context, t backend.Task, visibleAt time.Time) error {
+func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
 			SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id`,
-			Params: map[string]any{"v": visibleAt.UTC(), "id": t.ID},
+			Params: map[string]any{"v": nowUTC().Add(delay), "id": t.ID},
 		})
 		if err != nil {
 			return err
@@ -932,12 +932,12 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	return nil
 }
 
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, visibleAt time.Time) error {
+func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
 			SQL: `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL
 				WHERE id = @id AND kind = 'activity'`,
-			Params: map[string]any{"v": visibleAt.UTC(), "id": taskID},
+			Params: map[string]any{"v": nowUTC().Add(delay), "id": taskID},
 		})
 		if err != nil {
 			return err

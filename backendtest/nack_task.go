@@ -21,11 +21,7 @@ func testNackTask(t *testing.T, newBackend Factory) {
 	if err != nil || len(tasks) != 1 {
 		t.Fatalf("claim: %v len=%d", err, len(tasks))
 	}
-	at := time.Now().UTC().Add(time.Hour)
-	if cs, ok := b.(ClockSetter); ok {
-		at = cs.Now().Add(time.Hour)
-	}
-	if err := b.NackTask(ctx, tasks[0], at); err != nil {
+	if err := b.NackTask(ctx, tasks[0], time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	// Immediate reclaim should fail while visible_at is in the future.

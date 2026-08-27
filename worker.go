@@ -555,16 +555,10 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 			MaxInterval:        t.Retry.MaxInterval,
 			MaxAttempts:        t.Retry.MaxAttempts,
 		}.Backoff(t.Attempt)
-		var now time.Time
-		if st, loadErr := w.backend.LoadWorkflow(ctx, t.InstanceID); loadErr == nil {
-			now = st.Now
-		} else {
-			now = time.Now().UTC()
-		}
 		w.opts.Logger.Info("activity retry",
 			"instance_id", t.InstanceID, "activity", t.Name, "attempt", t.Attempt, "delay", delay)
 		w.opts.Metrics.AddActivityRetry(ctx, 1)
-		return w.backend.RetryActivity(ctx, t.ID, now.Add(delay))
+		return w.backend.RetryActivity(ctx, t.ID, delay)
 	}
 	return w.backend.CompleteActivity(ctx, t.ID, journal.Event{
 		Type:    journal.TypeActivityCompleted,
@@ -594,22 +588,16 @@ func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context) {
 }
 
 func (w *Worker) nackIncompatible(ctx context.Context, t backend.Task, reason string, cause error) error {
-	var now time.Time
-	if st, loadErr := w.backend.LoadWorkflowHead(ctx, t.InstanceID); loadErr == nil {
-		now = st.Now
-	} else {
-		now = time.Now().UTC()
-	}
-	visibleAt := now.Add(w.opts.IncompatibleRetryDelay)
+	delay := w.opts.IncompatibleRetryDelay
 	w.opts.Logger.Warn("incompatible worker nack",
 		"instance_id", t.InstanceID,
 		"task_id", t.ID,
 		"reason", reason,
 		"error", cause,
-		"visible_at", visibleAt,
+		"delay", delay,
 	)
 	w.opts.Metrics.AddIncompatibleNack(ctx, reason)
-	return w.backend.NackTask(ctx, t, visibleAt)
+	return w.backend.NackTask(ctx, t, delay)
 }
 
 func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan struct{}) {

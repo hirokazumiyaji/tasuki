@@ -283,9 +283,10 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 	return nil
 }
 
-func (b *Backend) NackTask(ctx context.Context, t backend.Task, visibleAt time.Time) error {
+func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {
 	tag, err := b.pool.Exec(ctx, `
-		UPDATE wf_tasks SET visible_at = $2, worker_id = NULL WHERE id = $1`, t.ID, visibleAt.UTC())
+		UPDATE wf_tasks SET visible_at = now() + $2::interval, worker_id = NULL WHERE id = $1`,
+		t.ID, interval(delay))
 	if err != nil {
 		return err
 	}
@@ -635,10 +636,11 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	return nil
 }
 
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, visibleAt time.Time) error {
+func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
 	tag, err := b.pool.Exec(ctx, `
-		UPDATE wf_tasks SET visible_at = $2, worker_id = NULL
-		WHERE id = $1 AND kind = 'activity'`, taskID, visibleAt.UTC())
+		UPDATE wf_tasks SET visible_at = now() + $2::interval, worker_id = NULL
+		WHERE id = $1 AND kind = 'activity'`,
+		taskID, interval(delay))
 	if err != nil {
 		return err
 	}

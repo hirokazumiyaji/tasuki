@@ -109,10 +109,11 @@ func TestMemory_ExtendLeaseAndRetryActivity(t *testing.T) {
 	if len(again) != 0 {
 		t.Fatal("should still be leased")
 	}
-	retryAt := now.Add(time.Minute)
-	if err := b.RetryActivity(ctx, atasks[0].ID, retryAt); err != nil {
+	const backoff = time.Minute
+	if err := b.RetryActivity(ctx, atasks[0].ID, backoff); err != nil {
 		t.Fatal(err)
 	}
+	// visible_at = store now (now+5s) + backoff
 	b.SetNow(now.Add(30 * time.Second))
 	again, _ = b.ClaimTasks(ctx, backend.ClaimRequest{
 		Kind: "activity", Queues: []string{"default"}, Limit: 1, Lease: time.Second, WorkerID: "w2",
@@ -120,7 +121,7 @@ func TestMemory_ExtendLeaseAndRetryActivity(t *testing.T) {
 	if len(again) != 0 {
 		t.Fatal("should be waiting on backoff")
 	}
-	b.SetNow(retryAt)
+	b.SetNow(now.Add(5*time.Second + backoff))
 	again, _ = b.ClaimTasks(ctx, backend.ClaimRequest{
 		Kind: "activity", Queues: []string{"default"}, Limit: 1, Lease: time.Second, WorkerID: "w2",
 	})
