@@ -36,6 +36,9 @@ func TestWorker_NackUnregisteredWorkflow(t *testing.T) {
 	if info.Status == "stuck" {
 		t.Fatal("old worker must not mark stuck")
 	}
+	if err := old.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	b.SetNow(b.Now().Add(2 * time.Hour))
 	newW := tasuki.NewWorker(b, tasuki.WorkerOptions{PollInterval: time.Millisecond})

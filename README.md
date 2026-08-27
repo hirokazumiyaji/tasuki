@@ -16,6 +16,7 @@ M5 のベンチマーク基盤: `go run ./cmd/bench`（memory / postgres / sqlit
 PostgreSQL Worker は `LISTEN`/`NOTIFY`（チャネル `tasuki_tasks`）で起床し、`PollInterval` はフォールバックおよびタイマー／スケジュール用。memory / sqlite / mysql / spanner は同一 `Backend` 内のプロセス内 wakeup（`backend/hub`）。DynamoDB は `wf_wake`（Streams 有効）＋ wake アイテムポーリング、Firestore は `wf_notify` の Snapshot で**プロセスをまたいだ**起床もできる（いずれも hint。正しさは Claim / GetInstance）。
 Client の `Result` は postgres（`tasuki_terminal`）および他ストア（hub / 上記 cross-process 経路）で終端時に起床できる。
 Worker はインスタンスごとの sticky ジャーナルキャッシュ（`next_seq` 照合、差分は `GetJournal`）でフル履歴の再読を減らす。
+tasuki は各 workflow instance を durable actor として扱い、journal replay モデルを維持する。
 ジャーナル件数が `JournalWarnThreshold`（既定 10000、負数で無効）以上のとき Worker は Warn ログとメトリクスを出す。長寿命ワークフローは `workflow.ContinueAsNew` で履歴を打ち切る（[docs/02-architecture.md](docs/02-architecture.md)、[docs/03-api.md](docs/03-api.md)）。
 長時間アクティビティは `activity.RecordHeartbeat` でリース延長と進捗記録ができ、リトライ時に `GetHeartbeatDetails` で取り出せる。
 アクティビティの 1 試行上限は `workflow.WithStartToCloseTimeout`（超過は通常失敗としてリトライ対象）。

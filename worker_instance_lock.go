@@ -5,21 +5,27 @@ import (
 	"time"
 )
 
-type instanceLock struct {
+type workflowActor struct {
 	mu       sync.Mutex
 	lastUsed time.Time
 }
 
-func (w *Worker) instanceMutex(instanceID string) *sync.Mutex {
+func (a *workflowActor) dispatch(fn func()) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	fn()
+}
+
+func (w *Worker) actorFor(instanceID string) *workflowActor {
 	w.instMu.Lock()
 	defer w.instMu.Unlock()
 	e, ok := w.instLock[instanceID]
 	if !ok {
-		e = &instanceLock{}
+		e = &workflowActor{}
 		w.instLock[instanceID] = e
 	}
 	e.lastUsed = time.Now()
-	return &e.mu
+	return e
 }
 
 func (w *Worker) evictIdleInstanceLocks(now time.Time) {

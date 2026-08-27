@@ -60,6 +60,23 @@ A案を退ける理由は、スリープ中のインスタンスがゴルーチ�
 B案を退ける理由は、実装コストの大半が `workflow.Go`（ワークフロー内で任意のゴルーチンを使う機能）の決定的リプレイに費やされることにある。
 並行実行の需要の多く（複数アクティビティの同時実行と待ち合わせ）は Future で表現でき、残り（独立した処理単位の並行実行）は子ワークフローで表現できるため、この機能は費用に見合わないと判断した。
 
+### Durable actor との対応
+
+tasuki は各 workflow instance を durable actor として扱うが、常駐する goroutine actor runtime ではない。
+待機中の workflow は actor goroutine を消費せず、次の workflow task が claim されたときに journal replay で turn を再構成して、一回の atomic commit で完了する。
+
+| Actor concept | tasuki |
+|---|---|
+| Identity | `workflow instance_id` |
+| Mailbox | `wf_inbox` の未取り込みイベント |
+| Private state | journal、instance metadata、仮想的に再構成された `workflow.Context` |
+| Message dispatch | Worker が claim した workflow task |
+| Single-threaded turn | instance ごとの `workflowActor` による逐次処理 |
+| Durable commit | `CommitAdvancement` と `next_seq` の optimistic concurrency |
+| Supervision / recovery | lease expiry、task retry、incompatible task の Nack |
+
+`workflowActor` はプロセス内での逐次処理を担う境界であり、プロセス間の正しさは Backend の lease と CAS が担う。
+
 ## ジャーナルとリプレイ
 
 インスタンスの状態は、状態スナップショットではなく **ジャーナル**（追記専用のイベント列）として永続化する。

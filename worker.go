@@ -29,7 +29,7 @@ type Worker struct {
 	sticky   map[string]stickyEntry
 
 	instMu   sync.Mutex
-	instLock map[string]*instanceLock
+	instLock map[string]*workflowActor
 }
 
 func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
@@ -40,7 +40,7 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		reg:      newRegistry(opts.Codec),
 		inFlight: map[int64]struct{}{},
 		sticky:   map[string]stickyEntry{},
-		instLock: map[string]*instanceLock{},
+		instLock: map[string]*workflowActor{},
 	}
 }
 
@@ -176,14 +176,7 @@ func (w *Worker) tick(ctx context.Context) {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				w.instMu.Lock()
-				actor, ok := w.instLock[t.InstanceID]
-				if !ok {
-					actor = &instanceLock{}
-					w.instLock[t.InstanceID] = actor
-				}
-				actor.lastUsed = time.Now()
-				w.instMu.Unlock()
+				actor := w.actorFor(t.InstanceID)
 				actor.dispatch(func() {
 					w.opts.Metrics.AddWorkflowTask(ctx, 1)
 					w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
