@@ -117,4 +117,23 @@ func RunFairDispatch(t *testing.T, newBackend Factory) {
 			t.Fatalf("cap2: expected only flood tasks, got %v", instances(got))
 		}
 	}
+
+	// A flood longer than one candidate page (FairOverfetch(3) is 64) must
+	// not hide the victims: fair claiming pages until the batch fills.
+	spawn("fair-flood2", 70)
+	spawn("fair-vc", 1)
+	spawn("fair-vd", 1)
+	got = claim(3, 1)
+	if len(got) != 3 {
+		t.Fatalf("paged: want 3 tasks, got %v", instances(got))
+	}
+	seen = map[string]bool{}
+	for _, id := range instances(got) {
+		seen[id] = true
+	}
+	for _, want := range []string{"fair-flood2", "fair-vc", "fair-vd"} {
+		if !seen[want] {
+			t.Fatalf("paged: %v missing %s", got, want)
+		}
+	}
 }

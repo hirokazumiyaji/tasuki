@@ -233,9 +233,11 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 }
 
 // claimTasksFair caps claims per instance (ClaimRequest.MaxPerInstance).
-// It selects a bounded FIFO pool, trims it fairly in Go, then claims each
-// survivor with a visibility re-check: concurrent claimants lose the race on
-// already-leased rows (their visible_at moved to the future) and simply skip.
+// It pages FIFO-ordered candidates (keyset on visible_at, id) through the
+// fair picker until the batch fills, so a victim hidden behind a flooding
+// instance is still found, then claims each survivor with a visibility
+// re-check: concurrent claimants lose the race on already-leased rows (their
+// visible_at moved to the future) and simply skip.
 func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
@@ -243,29 +245,53 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 	}
 	defer tx.Rollback(ctx)
 
-	rows, err := tx.Query(ctx, `
-		SELECT id, instance_id FROM wf_tasks
-		WHERE kind = $1 AND queue = ANY($2) AND visible_at <= now()
-		ORDER BY visible_at, id
-		LIMIT $3`,
-		req.Kind, req.Queues, backend.FairOverfetch(req.Limit))
-	if err != nil {
-		return nil, err
-	}
-	var refs []backend.FairTaskRef
-	for rows.Next() {
-		var r backend.FairTaskRef
-		if err := rows.Scan(&r.ID, &r.InstanceID); err != nil {
+	pageSize := backend.FairOverfetch(req.Limit)
+	picker := backend.NewFairPicker(req.Limit, req.MaxPerInstance)
+	first := true
+	var lastVis time.Time
+	var lastID int64
+	for !picker.Full() {
+		q := `
+			SELECT id, instance_id, visible_at FROM wf_tasks
+			WHERE kind = $1 AND queue = ANY($2) AND visible_at <= now()`
+		args := []any{req.Kind, req.Queues}
+		if !first {
+			q += ` AND (visible_at, id) > ($3, $4)`
+			args = append(args, lastVis, lastID)
+		}
+		q += fmt.Sprintf(` ORDER BY visible_at, id LIMIT $%d`, len(args)+1)
+		args = append(args, pageSize)
+		rows, err := tx.Query(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+		full := false
+		page := 0
+		for rows.Next() {
+			var r backend.FairTaskRef
+			var vis time.Time
+			if err := rows.Scan(&r.ID, &r.InstanceID, &vis); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			page++
+			first = false
+			lastVis, lastID = vis, r.ID
+			if picker.Offer(r) {
+				full = true
+				break
+			}
+		}
+		if err := rows.Err(); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		refs = append(refs, r)
+		rows.Close()
+		if full || page < pageSize {
+			break
+		}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	picked := backend.FairPick(refs, req.Limit, req.MaxPerInstance)
+	picked := picker.Picked()
 
 	var out []backend.Task
 	for _, r := range picked {

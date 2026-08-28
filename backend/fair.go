@@ -7,9 +7,11 @@ type FairTaskRef struct {
 	InstanceID string
 }
 
-// FairOverfetch is the candidate pool size backends should fetch when
+// FairOverfetch is the candidate page size backends should fetch when
 // MaxPerInstance is set: wide enough to interleave several instances, bounded
-// so the extra scan stays cheap.
+// so each page's extra scan stays cheap. Fair claiming pages through
+// candidates until the batch fills, so a victim further down the queue is
+// still found.
 func FairOverfetch(limit int) int {
 	of := limit * 4
 	if of < 64 {
@@ -28,6 +30,9 @@ func FairOverfetch(limit int) int {
 // instance, preserving input (FIFO) order. perInstance <= 0 keeps plain FIFO
 // (first limit candidates). Tasks of a flooding instance beyond the cap stay
 // claimable on later polls.
+//
+// Backends that page candidates from the database should use FairPicker
+// instead, so the batch can be filled from beyond a bounded page.
 func FairPick(refs []FairTaskRef, limit, perInstance int) []FairTaskRef {
 	if limit <= 0 {
 		return nil
@@ -52,3 +57,47 @@ func FairPick(refs []FairTaskRef, limit, perInstance int) []FairTaskRef {
 	}
 	return out
 }
+
+// FairPicker applies the FairPick policy incrementally over FIFO-ordered
+// candidates. Backends feed each candidate through Offer while paging through
+// the queue; paging stops once Full reports true, so a batch can be filled
+// from arbitrarily deep in the queue without buffering the whole candidate
+// pool in memory.
+type FairPicker struct {
+	limit       int
+	perInstance int
+	counts      map[string]int
+	picked      []FairTaskRef
+}
+
+// NewFairPicker starts a fair selection of up to limit tasks with at most
+// perInstance tasks per instance. perInstance must be positive; the uncapped
+// path pages plain FIFO instead.
+func NewFairPicker(limit, perInstance int) *FairPicker {
+	return &FairPicker{
+		limit:       limit,
+		perInstance: perInstance,
+		counts:      make(map[string]int),
+		picked:      make([]FairTaskRef, 0, limit),
+	}
+}
+
+// Offer feeds one candidate in FIFO order. It reports whether the batch is
+// full after considering the candidate, so callers can stop paging early.
+func (p *FairPicker) Offer(ref FairTaskRef) bool {
+	if len(p.picked) >= p.limit {
+		return true
+	}
+	if p.counts[ref.InstanceID] >= p.perInstance {
+		return false
+	}
+	p.counts[ref.InstanceID]++
+	p.picked = append(p.picked, ref)
+	return len(p.picked) >= p.limit
+}
+
+// Full reports whether the batch has been filled.
+func (p *FairPicker) Full() bool { return len(p.picked) >= p.limit }
+
+// Picked returns the fair selection gathered so far, in FIFO order.
+func (p *FairPicker) Picked() []FairTaskRef { return p.picked }
