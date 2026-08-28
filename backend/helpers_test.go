@@ -2,6 +2,7 @@ package backend_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/journal"
@@ -58,5 +59,34 @@ func TestHasMemoUpdateAndLast(t *testing.T) {
 	bad := []journal.Event{{Type: journal.TypeMemoUpdated, Payload: []byte(`not-json`)}}
 	if backend.LastMemoUpdate(bad) != nil {
 		t.Fatal("bad payload")
+	}
+}
+
+func TestNormalizePurgeStatuses(t *testing.T) {
+	got, err := backend.NormalizePurgeStatuses(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"completed", "failed", "terminated", "canceled"}
+	if len(got) != len(want) {
+		t.Fatalf("%v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v want %v", got, want)
+		}
+	}
+	if _, err := backend.NormalizePurgeStatuses([]string{"running"}); err == nil {
+		t.Fatal("running must be rejected")
+	}
+	sts, limit, err := backend.ValidatePurgeArgs(-time.Second, nil, 0)
+	if err == nil {
+		t.Fatal("negative olderThan must be rejected")
+	}
+	_ = sts
+	_ = limit
+	sts, limit, err = backend.ValidatePurgeArgs(time.Hour, []string{"completed", "completed"}, 0)
+	if err != nil || limit != backend.DefaultPurgeLimit || len(sts) != 1 {
+		t.Fatalf("%v %d %v", sts, limit, err)
 	}
 }
