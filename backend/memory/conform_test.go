@@ -16,3 +16,11 @@ func TestConformance(t *testing.T) {
 		return b
 	})
 }
+
+func TestFairDispatch(t *testing.T) {
+	backendtest.RunFairDispatch(t, func(t *testing.T) backend.Backend {
+		b := memory.New()
+		b.SetNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+		return b
+	})
+}

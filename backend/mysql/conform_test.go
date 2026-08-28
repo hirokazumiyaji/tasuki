@@ -29,3 +29,23 @@ func TestConformance(t *testing.T) {
 		return root
 	})
 }
+
+func TestFairDispatch(t *testing.T) {
+	dsn := dsnOrSkip(t)
+	ctx := context.Background()
+	root, err := mysql.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	if err := root.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	backendtest.RunFairDispatch(t, func(t *testing.T) backend.Backend {
+		t.Helper()
+		if err := root.Reset(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return root
+	})
+}

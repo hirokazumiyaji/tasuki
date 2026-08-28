@@ -89,6 +89,10 @@ type ClaimRequest struct {
 	Limit    int
 	Lease    time.Duration
 	WorkerID string
+	// MaxPerInstance caps how many tasks of one instance a single claim
+	// returns, interleaving instances instead of strict FIFO (fair dispatch).
+	// 0 disables the cap. Backends without native support ignore it.
+	MaxPerInstance int
 }
 
 type NewTask struct {

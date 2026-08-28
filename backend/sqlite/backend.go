@@ -228,34 +228,8 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 	now := nowStr()
 	visAt := leaseVisibleAt(req.Lease)
 
-	args := make([]any, 0, 2+len(req.Queues)+1)
-	args = append(args, req.Kind, now)
-	for _, q := range req.Queues {
-		args = append(args, q)
-	}
-	args = append(args, req.Limit)
-
-	query := fmt.Sprintf(`
-		SELECT id FROM wf_tasks
-		WHERE kind = ? AND visible_at <= ? AND queue IN (%s)
-		ORDER BY visible_at, id
-		LIMIT ?`, inClause(len(req.Queues)))
-
-	rows, err := conn.QueryContext(ctx, query, args...)
+	ids, err := selectClaimCandidates(ctx, conn, req, now)
 	if err != nil {
-		return nil, err
-	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
@@ -318,6 +292,100 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		return nil, err
 	}
 	return out, nil
+}
+
+// selectClaimCandidates returns the ids to claim in one batch. With
+// MaxPerInstance it pages FIFO-ordered candidates (keyset on visible_at, id)
+// through the fair picker until the batch fills, so a victim hidden behind a
+// flooding instance is still found beyond the first page.
+func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.ClaimRequest, now string) ([]int64, error) {
+	if req.MaxPerInstance <= 0 {
+		query := fmt.Sprintf(`
+			SELECT id FROM wf_tasks
+			WHERE kind = ? AND visible_at <= ? AND queue IN (%s)
+			ORDER BY visible_at, id
+			LIMIT ?`, inClause(len(req.Queues)))
+		args := make([]any, 0, 2+len(req.Queues)+1)
+		args = append(args, req.Kind, now)
+		for _, q := range req.Queues {
+			args = append(args, q)
+		}
+		args = append(args, req.Limit)
+		rows, err := conn.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var ids []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				return nil, err
+			}
+			ids = append(ids, id)
+		}
+		return ids, rows.Err()
+	}
+
+	pageSize := backend.FairOverfetch(req.Limit)
+	picker := backend.NewFairPicker(req.Limit, req.MaxPerInstance)
+	prefix := fmt.Sprintf(`
+		SELECT id, instance_id, visible_at FROM wf_tasks
+		WHERE kind = ? AND visible_at <= ? AND queue IN (%s)`, inClause(len(req.Queues)))
+	first := true
+	var lastVis string
+	var lastID int64
+	for !picker.Full() {
+		query := prefix
+		args := make([]any, 0, 2+len(req.Queues)+4)
+		args = append(args, req.Kind, now)
+		for _, q := range req.Queues {
+			args = append(args, q)
+		}
+		if !first {
+			query += ` AND (visible_at > ? OR (visible_at = ? AND id > ?))`
+			args = append(args, lastVis, lastVis, lastID)
+		}
+		query += `
+			ORDER BY visible_at, id
+			LIMIT ?`
+		args = append(args, pageSize)
+		rows, err := conn.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		full := false
+		page := 0
+		for rows.Next() {
+			var r backend.FairTaskRef
+			var vis string
+			if err := rows.Scan(&r.ID, &r.InstanceID, &vis); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			page++
+			first = false
+			lastVis, lastID = vis, r.ID
+			if picker.Offer(r) {
+				full = true
+				break
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+		if full || page < pageSize {
+			break
+		}
+	}
+	picked := picker.Picked()
+	ids := make([]int64, 0, len(picked))
+	for _, r := range picked {
+		ids = append(ids, r.ID)
+	}
+	return ids, nil
 }
 
 func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
