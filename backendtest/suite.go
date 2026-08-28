@@ -20,6 +20,12 @@ type ClockSetter interface {
 	Now() time.Time
 }
 
+// InboxSeqReader exposes the raw per-instance inbox sequence counter so the
+// purge test can assert the counter is removed along with the instance.
+type InboxSeqReader interface {
+	InboxSeq(ctx context.Context, instanceID string) (int64, bool, error)
+}
+
 // Run executes the M1 conformance suite against a backend factory.
 func Run(t *testing.T, newBackend Factory) {
 	t.Helper()
@@ -93,6 +99,13 @@ func testPurgeInstances(t *testing.T, newBackend Factory) {
 	if err := b.SendToInbox(ctx, "purge-done", journal.Event{Type: journal.TypeSignalReceived, Name: "late"}, ""); err != nil {
 		t.Fatal(err)
 	}
+	if probe, ok := b.(InboxSeqReader); ok {
+		if _, exists, err := probe.InboxSeq(ctx, "purge-done"); err != nil {
+			t.Fatal(err)
+		} else if !exists {
+			t.Fatal("purge-done: inbox sequence counter missing before purge")
+		}
+	}
 
 	// Non-terminal statuses are rejected outright.
 	if _, err := b.PurgeInstances(ctx, time.Hour, []string{"running"}, 10); err == nil {
@@ -116,6 +129,14 @@ func testPurgeInstances(t *testing.T, newBackend Factory) {
 	for _, id := range []string{"purge-done", "purge-err", "purge-stop"} {
 		if _, err := b.GetInstance(ctx, id); !errors.Is(err, backend.ErrNotFound) {
 			t.Fatalf("%s: want ErrNotFound, got %v", id, err)
+		}
+	}
+	// The per-instance inbox sequence counter must not survive the purge.
+	if probe, ok := b.(InboxSeqReader); ok {
+		if _, exists, err := probe.InboxSeq(ctx, "purge-done"); err != nil {
+			t.Fatal(err)
+		} else if exists {
+			t.Fatal("purge-done: inbox sequence counter survived purge")
 		}
 	}
 	list0, err := b.ListInstances(ctx, backend.InstanceFilter{})

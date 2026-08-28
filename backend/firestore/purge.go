@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	gcf "cloud.google.com/go/firestore"
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"google.golang.org/api/iterator"
 )
@@ -20,10 +19,10 @@ func purgeStatusSet(sts []string) map[string]struct{} {
 }
 
 // PurgeInstances removes terminal instances older than the retention window
-// together with their tasks, timers, dedupe entries, inbox items and journal.
-// Documents are removed in batches; concurrent progress on the same instance
-// is not possible (terminal instances are immutable), so best-effort batching
-// is safe.
+// together with their tasks, timers, dedupe entries, inbox items, journal and
+// inbox sequence counters. Documents are removed in batches; concurrent
+// progress on the same instance is not possible (terminal instances are
+// immutable), so best-effort batching is safe.
 func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, statuses []string, limit int) (int, error) {
 	sts, lim, err := backend.ValidatePurgeArgs(olderThan, statuses, limit)
 	if err != nil {
@@ -54,7 +53,15 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 		if err := b.purgeInstanceDocs(ctx, id); err != nil {
 			return purged, err
 		}
+		// Inbox writers read wf_instances inside their transaction, so once
+		// this delete commits no new child documents can appear for the
+		// instance (in-flight writers lose the race and retry into
+		// ErrNotFound). A writer that committed between the sweep above and
+		// this delete is reaped by the second pass below.
 		if _, err := b.ref("wf_instances", id).Delete(ctx); err != nil {
+			return purged, err
+		}
+		if err := b.purgeInstanceDocs(ctx, id); err != nil {
 			return purged, err
 		}
 		purged++
@@ -62,9 +69,15 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 	return purged, nil
 }
 
+// purgeInstanceDocs removes every child document of one instance. Batches
+// commit while iterating so a large journal or inbox never buffers fully in
+// memory. The wf_inbox_seq counter is keyed by instance ID (it carries no
+// instance_id field), so it is removed by ref; deleting a missing ref is a
+// no-op.
 func (b *Backend) purgeInstanceDocs(ctx context.Context, id string) error {
 	for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox", "wf_journal"} {
-		var refs []*gcf.DocumentRef
+		batch := b.client.Batch()
+		n := 0
 		it := b.col(col).Where("instance_id", "==", id).Documents(ctx)
 		for {
 			dsnap, err := it.Next()
@@ -75,19 +88,24 @@ func (b *Backend) purgeInstanceDocs(ctx context.Context, id string) error {
 				it.Stop()
 				return err
 			}
-			refs = append(refs, dsnap.Ref)
+			batch.Delete(dsnap.Ref)
+			n++
+			if n == 500 {
+				if _, err := batch.Commit(ctx); err != nil {
+					it.Stop()
+					return err
+				}
+				batch = b.client.Batch()
+				n = 0
+			}
 		}
 		it.Stop()
-		for start := 0; start < len(refs); start += 500 {
-			end := min(start+500, len(refs))
-			batch := b.client.Batch()
-			for _, r := range refs[start:end] {
-				batch.Delete(r)
-			}
+		if n > 0 {
 			if _, err := batch.Commit(ctx); err != nil {
 				return err
 			}
 		}
 	}
-	return nil
+	_, err := b.ref("wf_inbox_seq", id).Delete(ctx)
+	return err
 }

@@ -200,17 +200,25 @@ func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
 	}
 }
 
+// deleteTimersForInstance pages through the instance's timers (Query results
+// larger than 1 MB arrive in pages via LastEvaluatedKey) and removes each one.
 func (b *Backend) deleteTimersForInstance(ctx context.Context, id string) error {
-	out, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_timers")), KeyConditionExpression: aws.String("instance_id = :id"), ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)}})
-	if err != nil {
-		return err
-	}
-	for _, m := range out.Items {
-		if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_timers")), Key: timerKey(id, fromN(m["seq"]))}); err != nil {
+	var start map[string]types.AttributeValue
+	for {
+		out, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_timers")), KeyConditionExpression: aws.String("instance_id = :id"), ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)}, ExclusiveStartKey: start})
+		if err != nil {
 			return err
 		}
+		for _, m := range out.Items {
+			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_timers")), Key: timerKey(id, fromN(m["seq"]))}); err != nil {
+				return err
+			}
+		}
+		if out.LastEvaluatedKey == nil {
+			return nil
+		}
+		start = out.LastEvaluatedKey
 	}
-	return nil
 }
 
 func (b *Backend) CountClaimableTasks(ctx context.Context, kind string, queues []string) (map[string]int64, error) {
@@ -410,6 +418,22 @@ func (b *Backend) allocInboxSeqs(ctx context.Context, instanceID string, n int64
 		return 0, fmt.Errorf("dynamodb: invalid inbox_seq %d for %s", top, instanceID)
 	}
 	return top, nil
+}
+
+// InboxSeq reports the raw per-instance inbox sequence counter for tests
+// (found=false when the counter does not exist).
+func (b *Backend) InboxSeq(ctx context.Context, instanceID string) (int64, bool, error) {
+	out, err := b.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(b.table("wf_inbox_seq")),
+		Key:       map[string]types.AttributeValue{"id": avS(instanceID)},
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	if len(out.Item) == 0 {
+		return 0, false, nil
+	}
+	return fromN(out.Item["seq"]), true, nil
 }
 
 func (b *Backend) LoadWorkflow(ctx context.Context, instanceID string) (*backend.WorkflowState, error) {
@@ -816,29 +840,37 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	return nil
 }
 
+// deleteSignalDedupeForInstance pages through the instance's dedupe entries
+// (Query results larger than 1 MB arrive in pages via LastEvaluatedKey) and
+// removes each one.
 func (b *Backend) deleteSignalDedupeForInstance(ctx context.Context, id string) error {
-	out, err := b.client.Query(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(b.table("wf_signal_dedupe")),
-		KeyConditionExpression: aws.String("instance_id = :id"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":id": avS(id),
-		},
-	})
-	if err != nil {
-		return err
-	}
-	for _, m := range out.Items {
-		if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-			TableName: aws.String(b.table("wf_signal_dedupe")),
-			Key: map[string]types.AttributeValue{
-				"instance_id": m["instance_id"],
-				"dedupe_id":   m["dedupe_id"],
-			},
-		}); err != nil {
+	var start map[string]types.AttributeValue
+	for {
+		out, err := b.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:                 aws.String(b.table("wf_signal_dedupe")),
+			KeyConditionExpression:    aws.String("instance_id = :id"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)},
+			ExclusiveStartKey:         start,
+		})
+		if err != nil {
 			return err
 		}
+		for _, m := range out.Items {
+			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+				TableName: aws.String(b.table("wf_signal_dedupe")),
+				Key: map[string]types.AttributeValue{
+					"instance_id": m["instance_id"],
+					"dedupe_id":   m["dedupe_id"],
+				},
+			}); err != nil {
+				return err
+			}
+		}
+		if out.LastEvaluatedKey == nil {
+			return nil
+		}
+		start = out.LastEvaluatedKey
 	}
-	return nil
 }
 
 func isDedupeConflict(err error) bool {

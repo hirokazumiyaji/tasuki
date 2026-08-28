@@ -115,6 +115,19 @@ func (b *Backend) flushInboxSeqs(tx *gcf.Transaction, a *inboxSeqAlloc) error {
 	return nil
 }
 
+// InboxSeq reports the raw per-instance inbox sequence counter for tests
+// (found=false when the counter does not exist).
+func (b *Backend) InboxSeq(ctx context.Context, instanceID string) (int64, bool, error) {
+	snap, err := b.ref("wf_inbox_seq", instanceID).Get(ctx)
+	if isNotFound(err) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return i64(snap.Data(), "n"), true, nil
+}
+
 func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
 	q := inst.Queue
 	if q == "" {
@@ -765,6 +778,23 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	var inserted int
 	err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		inserted = 0
+		// Read the parent inside the transaction: PurgeInstances deletes
+		// wf_instances after sweeping children, and Firestore aborts a
+		// transaction whose read documents changed, so an in-flight send
+		// either commits before the purge deletes the parent (its documents
+		// are reaped by the purge's second sweep) or retries into this
+		// ErrNotFound branch. Without this read a send could create inbox
+		// rows for an instance that no longer exists.
+		isnap, err := tx.Get(b.ref("wf_instances", instanceID))
+		if isNotFound(err) {
+			return backend.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if !isnap.Exists() {
+			return backend.ErrNotFound
+		}
 		alloc := newInboxSeqAlloc()
 		if err := seedInboxSeqTx(b, tx, alloc, instanceID); err != nil {
 			return err

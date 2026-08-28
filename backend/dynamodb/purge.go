@@ -12,7 +12,8 @@ import (
 )
 
 // PurgeInstances removes terminal instances older than the retention window
-// together with their tasks, timers, dedupe entries, inbox items and journal.
+// together with their tasks, timers, dedupe entries, inbox items, journal and
+// inbox sequence counters.
 // DynamoDB has no cross-table transaction, so deletion is best-effort per
 // instance (the same model as the existing Terminate path).
 func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, statuses []string, limit int) (int, error) {
@@ -70,6 +71,16 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 			return purged, err
 		}
 		if err := b.deleteJournalForInstance(ctx, id); err != nil {
+			return purged, err
+		}
+		// The per-instance inbox sequence counter is keyed by instance ID,
+		// not queried by instance_id; remove it so retention leaves nothing
+		// behind and a recreated ID starts from a fresh sequence. Deleting a
+		// missing item is a no-op.
+		if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+			TableName: aws.String(b.table("wf_inbox_seq")),
+			Key:       map[string]types.AttributeValue{"id": avS(id)},
+		}); err != nil {
 			return purged, err
 		}
 		if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{

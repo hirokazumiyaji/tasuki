@@ -39,6 +39,23 @@ func inboxSeqMuts(instanceID string, seq int64, existed bool) []*spanner.Mutatio
 	return []*spanner.Mutation{spanner.InsertMap("wf_inbox_seq", m)}
 }
 
+// InboxSeq reports the raw per-instance inbox sequence counter for tests
+// (found=false when the counter does not exist).
+func (b *Backend) InboxSeq(ctx context.Context, instanceID string) (int64, bool, error) {
+	row, err := b.client.Single().ReadRow(ctx, "wf_inbox_seq", spanner.Key{instanceID}, []string{"seq"})
+	if isNotFound(err) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	var seq int64
+	if err := row.Columns(&seq); err != nil {
+		return 0, false, err
+	}
+	return seq, true, nil
+}
+
 func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
 	queue := inst.Queue
 	if queue == "" {

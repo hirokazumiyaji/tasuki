@@ -45,7 +45,7 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 		if len(ids) == 0 {
 			return nil
 		}
-		for _, table := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox", "wf_journal"} {
+		for _, table := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox", "wf_journal", "wf_inbox_seq"} {
 			if _, err := txn.Update(ctx, spanner.Statement{
 				SQL:    `DELETE FROM ` + table + ` WHERE instance_id IN UNNEST(@ids)`,
 				Params: map[string]any{"ids": ids},
