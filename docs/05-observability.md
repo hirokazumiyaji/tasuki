@@ -43,7 +43,7 @@ tasuki は `Migrate` 実行時に高頻度テーブルへ次の reloptions を�
 小さいテーブルでは既定値で十分なので、大規模環境での調整が出発点になる。
 
 ```sql
--- backend/postgres/schema.sql と同じ内容
+-- backend/postgres/migrations/000002_vacuum_tuning.up.sql と同じ内容
 ALTER TABLE wf_tasks SET (
     autovacuum_vacuum_scale_factor = 0.05,  -- 既定 0.2: テーブルの 5% がデッドタプルになったら VACUUM
     autovacuum_vacuum_cost_limit = 1000,    -- 既定 200: 1 ラウンドでより多くの掃除を進める

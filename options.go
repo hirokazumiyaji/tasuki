@@ -25,6 +25,11 @@ type WorkerOptions struct {
 	// IncompatibleRetryDelay is how long to hide a task after an incompatible Worker nacks it.
 	// Unset (0) defaults to 5s; negative means immediate re-visibility.
 	IncompatibleRetryDelay time.Duration
+	// DisableSchemaValidation skips the startup check against backends that
+	// implement backend.SchemaValidator. Validation is on by default: when the
+	// store is missing tables (e.g. migrations have not run), Start logs an
+	// error and does not launch the poll loop.
+	DisableSchemaValidation bool
 }
 
 func (o WorkerOptions) withDefaults() WorkerOptions {

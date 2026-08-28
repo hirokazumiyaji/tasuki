@@ -1,0 +1,8 @@
+-- Revert 000001_init: drop all tasuki tables.
+DROP TABLE IF EXISTS wf_schedules CASCADE;
+DROP TABLE IF EXISTS wf_timers CASCADE;
+DROP TABLE IF EXISTS wf_tasks CASCADE;
+DROP TABLE IF EXISTS wf_signal_dedupe CASCADE;
+DROP TABLE IF EXISTS wf_inbox CASCADE;
+DROP TABLE IF EXISTS wf_journal CASCADE;
+DROP TABLE IF EXISTS wf_instances CASCADE;
