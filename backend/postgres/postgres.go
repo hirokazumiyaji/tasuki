@@ -33,6 +33,12 @@ func (b *Backend) Close() {
 	b.pool.Close()
 }
 
+// Pool exposes the underlying connection pool. Use it for monitoring queries
+// (pg_stat_user_tables, pgstattuple) and operational maintenance.
+func (b *Backend) Pool() *pgxpool.Pool {
+	return b.pool
+}
+
 func (b *Backend) Migrate(ctx context.Context) error {
 	sql, err := schemaFS.ReadFile("schema.sql")
 	if err != nil {
