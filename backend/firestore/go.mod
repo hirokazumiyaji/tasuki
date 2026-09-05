@@ -1,6 +1,6 @@
 module github.com/hirokazumiyaji/tasuki/backend/firestore
 
-go 1.26.4
+go 1.24
 
 require (
 	cloud.google.com/go/firestore v1.24.0

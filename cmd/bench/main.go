@@ -21,11 +21,21 @@ func main() {
 	claimLimit := flag.Int("claim-limit", 0, "tasks per claim (0 = worker default 10)")
 	activityConc := flag.Int("activity-concurrency", 0, "parallel activities (0 = worker default 1)")
 	workflowConc := flag.Int("workflow-concurrency", 0, "parallel workflows (0 = worker default 1)")
+	scenario := flag.String("scenario", "chain", "chain|long-history|mixed")
+	runID := flag.String("run-id", "", "run prefix for instance IDs (default auto-generated)")
+	reset := flag.Bool("reset", false, "DANGER: wipe the target store before running (must confirm target)")
 	jsonOut := flag.Bool("json", false, "emit JSON result")
 	flag.Parse()
 
 	ctx := context.Background()
-	b, closer, err := backendopen.Open(ctx, *backendFlag, backendopen.Options{Reset: true})
+	if *reset {
+		fmt.Fprintf(os.Stderr, "bench: --reset wipes backend=%q target %s\n", *backendFlag, backendopen.DescribeTarget(*backendFlag))
+		if os.Getenv("TASUKI_ALLOW_RESET") != "1" {
+			fmt.Fprintln(os.Stderr, "bench: refusing --reset without TASUKI_ALLOW_RESET=1 (set it to confirm the wipe target)")
+			os.Exit(2)
+		}
+	}
+	b, closer, err := backendopen.Open(ctx, *backendFlag, backendopen.Options{Reset: *reset})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
@@ -41,6 +51,8 @@ func main() {
 		ClaimLimit:          *claimLimit,
 		ActivityConcurrency: *activityConc,
 		WorkflowConcurrency: *workflowConc,
+		Scenario:            *scenario,
+		RunID:               *runID,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

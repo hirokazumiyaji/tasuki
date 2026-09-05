@@ -150,7 +150,7 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 			for _, p := range pending {
 				w.dropSticky(p.instanceID)
 			}
-			w.opts.Logger.Debug("workflow batch commit failed", "err", err, "n", len(pending))
+			w.recordStoreError(ctx, "commit_workflow", err, "n", len(pending))
 			return
 		}
 		for _, p := range pending {
@@ -160,7 +160,7 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 	}
 	for _, p := range pending {
 		if err := w.commitWorkflow(ctx, p.instanceID, p.baseJournal, p.adv); err != nil {
-			w.opts.Logger.Debug("workflow commit failed", "instance_id", p.instanceID, "err", err)
+			w.recordStoreError(ctx, "commit_workflow", err, "instance_id", p.instanceID)
 		}
 	}
 }

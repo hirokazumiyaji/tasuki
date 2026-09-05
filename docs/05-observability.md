@@ -15,6 +15,12 @@ tasuki ワーカーが出すログとメトリクスの一覧。
 | activity task 開始 | Debug | `instance_id`, `task_id`, `activity`, `attempt` |
 | activity リトライ | Info | `instance_id`, `activity`, `attempt`, `visible_at` |
 | activity 恒久失敗 | Warn | `instance_id`, `activity`, `error` |
+| activity panic 回収 | Warn | `panic`（+ `activity` for local） |
+| store 操作失敗 | Warn | `op`, `err`（+ `instance_id` 等） |
+| store 競合/停止時キャンセル | Debug | `op`, `err` |
+| orphan task 回復 | Info | `n` |
+| truncated fanout | Info | `instance_id`, `kept_commands`, `total_commands`, `budget` |
+| shutdown lease 解放失敗/タイムアウト | Warn | `task_id` / `remaining`, `error` |
 
 ## メトリクス（OpenTelemetry）
 
@@ -28,10 +34,22 @@ Meter 名: `github.com/hirokazumiyaji/tasuki`
 | `tasuki.activity.retries` | Counter | スケジュールしたアクティビティリトライ数 |
 | `tasuki.workflow.journal_warnings` | Counter | ジャーナル件数警告の回数 |
 | `tasuki.tasks.backlog` | Gauge | キューごとの claim 可能タスク数（属性 `kind`, `queue`）。Worker がポーリング tick ごとにサンプリング |
+| `tasuki.worker.incompatible_nacks` | Counter | 非対応タスクの nack 回数（属性 `reason`） |
+| `tasuki.worker.store_errors` | Counter | ストア操作失敗数（属性 `op`: `fire_timers`, `claim_schedules`, `claim_workflow`, `claim_activity`, `commit_workflow`, `complete_activity`, `retry_activity`, `release_lease`, `extend_lease`, `recover_tasks`） |
 
 `WorkerOptions.Metrics` に `observability.NewMetrics()` の結果を渡す。未設定時は記録しない（noop）。
 グローバル `MeterProvider` が未設定なら OTel 既定の noop 実装が使われる。
 backlog Gauge は `Metrics` 設定時のみ、`CountClaimableTasks` でストア上の claim 可能件数を読む（失敗してもタスク処理は継続）。
+
+## 検知条件と切り分け手順
+
+- `tasuki.worker.store_errors{op="claim_workflow"|"claim_activity"}` の継続増加 + 進行停止 → ストア接続・認証・スロットリングを疑う。`store operation failed` ログの `err` と `op` を確認し、DB/エミュレータの死活と `TASUKI_*_DSN` を点検する。
+- `op="fire_timers"` の増加 → timer テーブルの肥大・インデックス欠落。Postgres では `wf_timers(fire_at)` の VACUUM 状況を確認する。
+- `op="commit_workflow"` の増加 + `ErrConflict` ではない → 永続障害。`debug` の `store contention`（`ErrConflict`/`ErrSuperseded`）は正常系（競合・重複 acquisiton）でアラート対象外。
+- `op="complete_activity"` / `"retry_activity"` の増加 → activity 完了パスの障害。`activity failed` と区別する（後者は業務失敗、前者はストア失敗）。
+- `op="release_lease"` / `"extend_lease"` の増加 → シャットダウン時や長時間 activity の lease 延長失敗。`ShutdownReleaseTimeout`（既定 5s）超過は Warn ログに残り、lease 失効後の再獲得で回復する。
+- `op="recover_tasks"` の増加 → orphan 回復スキャンの失敗。DynamoDB/Firestore の権限・スロットリングを確認する。
+- 通常の競合（`ErrConflict`、`ErrSuperseded`）や停止時キャンセル（`context.Canceled`）は Debug のみで `store_errors` に計上しない。継続障害のみ Warn + カウンタで検知し、ラベル数は `op` の固定集合に有界化している。
 
 ## PostgreSQL のデッドタプルと Bloat 監視
 

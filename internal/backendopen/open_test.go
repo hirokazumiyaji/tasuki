@@ -1,3 +1,5 @@
+//go:build tasuki_all
+
 package backendopen_test
 
 import (

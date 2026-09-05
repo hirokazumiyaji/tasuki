@@ -13,3 +13,7 @@ func (b *Backend) SubscribeTerminal(ctx context.Context) (<-chan string, error) 
 func (b *Backend) notifyTasks() { b.hub.NotifyTasks() }
 
 func (b *Backend) notifyTerminal(instanceID string) { b.hub.NotifyTerminal(instanceID) }
+
+// TerminalSubCount reports in-process terminal subscribers (test hook for
+// Result subscription-leak regression).
+func (b *Backend) TerminalSubCount() int { return b.hub.TerminalSubCount() }

@@ -76,6 +76,13 @@ func (h *Hub) removeTerminalSub(sub *terminalSub) {
 	h.terminalSubs = out
 }
 
+// TerminalSubCount reports current terminal subscribers (test hook).
+func (h *Hub) TerminalSubCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.terminalSubs)
+}
+
 func (h *Hub) NotifyTasks() {
 	h.mu.Lock()
 	subs := append([]*taskSub(nil), h.taskSubs...)

@@ -100,46 +100,59 @@ go run ./analyzers/determinism/cmd/determinism -- ./...
 
 インスタンス一覧・ジャーナルビューア。詳細ページでは running インスタンスを Cancel / Terminate / Signal できる（Cancel・Terminate は確認チェック、Signal は name + JSON。いずれも CSRF。Cancel は協調キャンセル、Terminate は即時終了）。
 
-共有デプロイでは `TASUKI_UI_TOKEN` または `-token` で共有シークレットを設定する（Bearer / HTTP Basic。未設定なら認証なし）:
+既定は loopback（`127.0.0.1:8080`）のみで待ち受け、HTTP タイムアウト付き（ReadHeader 5s / Read 10s / Write 15s / Idle 60s）。外部公開はトークン必須。無認証の外部公開は `--allow-unauthenticated-external` の明示 opt-in が必要（危険）:
 
 ```bash
-go run ./contrib/ui/cmd/tasuki-ui -backend=memory -addr=:8080
+go run ./contrib/ui/cmd/tasuki-ui -backend=memory -addr=127.0.0.1:8080
 export TASUKI_UI_TOKEN='change-me'
-go run ./contrib/ui/cmd/tasuki-ui -backend=memory -addr=:8080 -token="$TASUKI_UI_TOKEN"
-# open http://localhost:8080
+go run ./contrib/ui/cmd/tasuki-ui -backend=memory -addr=127.0.0.1:8080 -token="$TASUKI_UI_TOKEN"
+# open http://127.0.0.1:8080
+# 外部公開（認証付き）
+go run ./contrib/ui/cmd/tasuki-ui -backend=memory -addr=0.0.0.0:8080 -token="$TASUKI_UI_TOKEN"
+# 共有デプロイ例（TLS 終端 + 認証）: リバースプロキシで TLS を終端し、UI は loopback + token で起動する
+# Caddy 例:
+# example.com {
+#   reverse_proxy 127.0.0.1:8080
+# }
+# TASUKI_UI_TOKEN='...' go run ./contrib/ui/cmd/tasuki-ui -backend=postgres -addr=127.0.0.1:8080 -token="$TASUKI_UI_TOKEN"
 docker compose up -d postgres
 export TASUKI_POSTGRES_DSN='postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable'
-go run ./contrib/ui/cmd/tasuki-ui -backend=postgres -addr=:8080
+go run -tags tasuki_all ./contrib/ui/cmd/tasuki-ui -backend=postgres -addr=127.0.0.1:8080 -token="$TASUKI_UI_TOKEN"
 
 export TASUKI_SQLITE_PATH=./tasuki.db
-go run ./contrib/ui/cmd/tasuki-ui -backend=sqlite -addr=:8080
+go run -tags tasuki_all ./contrib/ui/cmd/tasuki-ui -backend=sqlite -addr=127.0.0.1:8080 -token="$TASUKI_UI_TOKEN"
 
 export TASUKI_MYSQL_DSN='tasuki:tasuki@tcp(localhost:3306)/tasuki?parseTime=true'
-go run ./contrib/ui/cmd/tasuki-ui -backend=mysql -addr=:8080
+go run -tags tasuki_all ./contrib/ui/cmd/tasuki-ui -backend=mysql -addr=127.0.0.1:8080 -token="$TASUKI_UI_TOKEN"
 
 export TASUKI_SPANNER_DSN='projects/p/instances/i/databases/d'
-go run ./contrib/ui/cmd/tasuki-ui -backend=spanner -addr=:8080
+go run -tags tasuki_all ./contrib/ui/cmd/tasuki-ui -backend=spanner -addr=127.0.0.1:8080 -token="$TASUKI_UI_TOKEN"
 
 export TASUKI_DYNAMODB_ENDPOINT=http://localhost:8000
-go run ./contrib/ui/cmd/tasuki-ui -backend=dynamodb -addr=:8080
+go run -tags tasuki_all ./contrib/ui/cmd/tasuki-ui -backend=dynamodb -addr=127.0.0.1:8080 -token="$TASUKI_UI_TOKEN"
 
 export FIRESTORE_EMULATOR_HOST=localhost:8081
 export TASUKI_FIRESTORE_PROJECT=tasuki
-go run ./contrib/ui/cmd/tasuki-ui -backend=firestore -addr=:8080
+go run -tags tasuki_all ./contrib/ui/cmd/tasuki-ui -backend=firestore -addr=127.0.0.1:8080 -token="$TASUKI_UI_TOKEN"
 ```
 
 ## ベンチマーク
 
-E2E スループット（完走インスタンス数 / 秒）を測る:
+E2E スループット（投入開始→全完了の完走インスタンス数 / 秒）と遅延分布（p50/p95/p99）を測る。
+既定で既存データを削除しない（`--reset` + `TASUKI_ALLOW_RESET=1` の明示指定のみ削除）。同一ストアでの繰り返しは `--run-id` で分離される:
 
 ```bash
 go run ./cmd/bench -backend=memory -instances=200 -workers=4
 go run ./cmd/bench -backend=memory -instances=200 -workers=4 -claim-limit=50 -activity-concurrency=8 -workflow-concurrency=8
+go run ./cmd/bench -backend=memory -instances=200 -workers=4 -scenario=mixed -run-id=try1
+go run ./cmd/bench -backend=memory -instances=50 -workers=2 -scenario=long-history
+# 破壊的リセット（対象を確認して明示指定）
+TASUKI_ALLOW_RESET=1 go run ./cmd/bench -backend=memory -instances=200 -workers=4 --reset
 docker compose up -d postgres
 export TASUKI_POSTGRES_DSN='postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable'
-go run ./cmd/bench -backend=postgres -instances=200 -workers=4
+go run -tags tasuki_all ./cmd/bench -backend=postgres -instances=200 -workers=4
 export TASUKI_SQLITE_PATH=./bench.db
-go run ./cmd/bench -backend=sqlite -instances=200 -workers=4
+go run -tags tasuki_all ./cmd/bench -backend=sqlite -instances=200 -workers=4
 ```
 
 `WorkerOptions.ClaimLimit`（デフォルト 10）で 1 tick あたりの Claim 件数を変えられる。bench では `-claim-limit`。

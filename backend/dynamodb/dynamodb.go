@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -20,6 +21,11 @@ type Backend struct {
 	client *dynamodb.Client
 	prefix string
 	hub    *hub.Hub
+
+	// recoverMu/recoverCursor rotate orphan-recovery scans across passes
+	// so large fleets are eventually fully visited.
+	recoverMu     sync.Mutex
+	recoverCursor map[string]types.AttributeValue
 }
 
 // Config holds connection options.

@@ -507,6 +507,12 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 				}
 			}
 		}
+		if adv.EnsureWorkflowTask {
+			if err := b.ensureWorkflowTaskForced(ctx, adv.InstanceID); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := b.ensureWorkflowTask(ctx, adv.InstanceID); err != nil {
 			return err
 		}
@@ -671,10 +677,21 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 	if prep.hasInbox && adv.Terminal == nil {
 		return tx.Set(prep.taskRef, workflowTaskDoc(adv.InstanceID, inst.Queue, newID(), now))
 	}
+	if adv.EnsureWorkflowTask && adv.Terminal == nil {
+		return tx.Set(prep.taskRef, workflowTaskDoc(adv.InstanceID, inst.Queue, newID(), now))
+	}
 	return tx.Delete(prep.taskRef)
 }
 
 func (b *Backend) ensureWorkflowTask(ctx context.Context, instanceID string) error {
+	return b.ensureWorkflowTaskWithForce(ctx, instanceID, false)
+}
+
+func (b *Backend) ensureWorkflowTaskForced(ctx context.Context, instanceID string) error {
+	return b.ensureWorkflowTaskWithForce(ctx, instanceID, true)
+}
+
+func (b *Backend) ensureWorkflowTaskWithForce(ctx context.Context, instanceID string, force bool) error {
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil {
 		if err == backend.ErrNotFound {
@@ -685,14 +702,16 @@ func (b *Backend) ensureWorkflowTask(ctx context.Context, instanceID string) err
 	if inst.Status != "running" {
 		return nil
 	}
-	it := b.col("wf_inbox").Where("instance_id", "==", instanceID).Limit(1).Documents(ctx)
-	_, err = it.Next()
-	it.Stop()
-	if err == iterator.Done {
-		return nil
-	}
-	if err != nil {
-		return err
+	if !force {
+		it := b.col("wf_inbox").Where("instance_id", "==", instanceID).Limit(1).Documents(ctx)
+		_, err = it.Next()
+		it.Stop()
+		if err == iterator.Done {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 	}
 	_, err = b.ref("wf_tasks", wfTaskID(instanceID)).Create(ctx, workflowTaskDoc(instanceID, inst.Queue, newID(), nowUTC()))
 	if status.Code(err) == codes.AlreadyExists {
@@ -846,6 +865,11 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	if err != nil {
 		return err
 	}
+	// Even on pure dedupe hits, ensure a task when inbox remains: a prior
+	// crash between commit and ensure must not stall the instance forever.
+	if inst.Status == "running" {
+		_ = b.ensureWorkflowTask(ctx, instanceID)
+	}
 	if inserted == 0 {
 		return nil
 	}
@@ -856,6 +880,80 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	}
 	b.notifyTasks()
 	return nil
+}
+
+// RecoverOrphanedWorkflowTasks re-creates workflow tasks for running
+// instances with inbox events but no workflow task (crash between inbox
+// commit and ensureWorkflowTask). notify is only a hint, so recovery is
+// persistent via the durable task row.
+//
+// The scan resumes from a persisted document cursor on each pass and rotates
+// through the fleet, so orphans beyond the per-call bound are eventually
+// visited instead of starving behind the first page on every pass. Only
+// newly created tasks are counted: instances that already have a task are
+// skipped without inflating the recovered count (and its log line).
+func (b *Backend) RecoverOrphanedWorkflowTasks(ctx context.Context) (int, error) {
+	b.recoverMu.Lock()
+	cursor := b.recoverCursor
+	b.recoverMu.Unlock()
+	const bound = 200
+	q := b.col("wf_instances").Where("status", "==", "running").OrderBy(gcf.DocumentID, gcf.Asc).Limit(bound)
+	if cursor != "" {
+		q = q.StartAfter(cursor)
+	}
+	it := q.Documents(ctx)
+	defer it.Stop()
+	recovered := 0
+	last := ""
+	exhausted := false
+	for {
+		s, err := it.Next()
+		if err == iterator.Done {
+			exhausted = true
+			break
+		}
+		if err != nil {
+			return recovered, err
+		}
+		id := s.Ref.ID
+		if id == "" {
+			if mid, _ := s.Data()["id"].(string); mid != "" {
+				id = mid
+			}
+		}
+		last = id
+		inboxIt := b.col("wf_inbox").Where("instance_id", "==", id).Limit(1).Documents(ctx)
+		_, err = inboxIt.Next()
+		inboxIt.Stop()
+		if err == iterator.Done {
+			continue
+		}
+		if err != nil {
+			continue
+		}
+		// Check task existence first: ensureWorkflowTask reports success
+		// even when the task already exists, which would miscount healthy
+		// instances as recovered on every pass.
+		tsnap, terr := b.ref("wf_tasks", wfTaskID(id)).Get(ctx)
+		if terr == nil && tsnap.Exists() {
+			continue
+		}
+		if terr != nil && !isNotFound(terr) {
+			continue
+		}
+		if err := b.ensureWorkflowTask(ctx, id); err == nil {
+			recovered++
+		}
+	}
+	b.recoverMu.Lock()
+	if exhausted {
+		// Full fleet visited: restart from the beginning next pass.
+		b.recoverCursor = ""
+	} else {
+		b.recoverCursor = last
+	}
+	b.recoverMu.Unlock()
+	return recovered, nil
 }
 func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	if limit <= 0 {

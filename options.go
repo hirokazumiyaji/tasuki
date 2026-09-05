@@ -34,6 +34,10 @@ type WorkerOptions struct {
 	// store is missing tables (e.g. migrations have not run), Start logs an
 	// error and does not launch the poll loop.
 	DisableSchemaValidation bool
+	// ShutdownReleaseTimeout bounds lease release during Shutdown.
+	// Unreleased leases expire via lease timeout and are reclaimed by peers.
+	// <=0 defaults to 5s.
+	ShutdownReleaseTimeout time.Duration
 }
 
 func (o WorkerOptions) withDefaults() WorkerOptions {
