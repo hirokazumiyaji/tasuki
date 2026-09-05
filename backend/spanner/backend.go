@@ -816,7 +816,19 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	}); err != nil {
 		return err
 	}
-	return ensureWorkflowTaskIfInbox(ctx, txn, adv.InstanceID)
+	if err := ensureWorkflowTaskIfInbox(ctx, txn, adv.InstanceID); err != nil {
+		return err
+	}
+	if adv.EnsureWorkflowTask {
+		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{adv.InstanceID}, []string{"queue"})
+		if err == nil {
+			var q string
+			if err := row.Columns(&q); err == nil {
+				_ = enqueueWorkflowTask(ctx, txn, adv.InstanceID, q, nowUTC())
+			}
+		}
+	}
+	return nil
 }
 
 func enqueueWorkflowTask(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID, queue string, now time.Time) error {

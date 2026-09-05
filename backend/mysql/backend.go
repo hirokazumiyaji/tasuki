@@ -749,6 +749,11 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 	if err := ensureWorkflowTaskIfInbox(ctx, conn, adv.InstanceID); err != nil {
 		return err
 	}
+	if adv.EnsureWorkflowTask {
+		if err := enqueueWorkflowTask(ctx, conn, adv.InstanceID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

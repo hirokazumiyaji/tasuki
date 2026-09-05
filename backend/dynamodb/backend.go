@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -95,15 +96,28 @@ func decodeInstance(m map[string]types.AttributeValue) *backend.Instance {
 }
 
 func (b *Backend) GetJournal(ctx context.Context, id string, afterSeq int64) ([]journal.Event, error) {
-	out, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_journal")),
-		KeyConditionExpression:    aws.String("instance_id = :id AND seq > :after"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id), ":after": avN(afterSeq)}, ScanIndexForward: aws.Bool(true)})
-	if err != nil {
-		return nil, err
-	}
-	events := make([]journal.Event, 0, len(out.Items))
-	for _, m := range out.Items {
-		events = append(events, journal.Event{Seq: fromN(m["seq"]), Type: journal.Type(fromS(m["type"])), Name: fromS(m["name"]), RefSeq: fromN(m["ref_seq"]), Payload: fromJSON(m["payload"])})
+	var events []journal.Event
+	var start map[string]types.AttributeValue
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		out, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_journal")),
+			KeyConditionExpression:    aws.String("instance_id = :id AND seq > :after"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id), ":after": avN(afterSeq)}, ScanIndexForward: aws.Bool(true),
+			ConsistentRead: aws.Bool(true), ExclusiveStartKey: start})
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range out.Items {
+			events = append(events, journal.Event{Seq: fromN(m["seq"]), Type: journal.Type(fromS(m["type"])), Name: fromS(m["name"]), RefSeq: fromN(m["ref_seq"]), Payload: fromJSON(m["payload"])})
+		}
+		if out.LastEvaluatedKey == nil {
+			break
+		}
+		start = out.LastEvaluatedKey
 	}
 	return events, nil
 }
@@ -113,9 +127,21 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 	if limit <= 0 {
 		limit = 100
 	}
-	var items []map[string]types.AttributeValue
+	// Keep only what we need for ordering + filtering to avoid holding full
+	// DynamoDB items for large scans. Full decode happens after Offset/Limit.
+	type cand struct {
+		created int64
+		id      string
+		item    map[string]types.AttributeValue
+	}
+	var cands []cand
 	var start map[string]types.AttributeValue
 	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
 		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(b.table("wf_instances")), ExclusiveStartKey: start})
 		if err != nil {
 			return nil, err
@@ -124,7 +150,7 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 			if (f.Status == "" || fromS(m["status"]) == f.Status) && (f.Name == "" || fromS(m["name"]) == f.Name) {
 				inst := decodeInstance(m)
 				if backend.MatchesSearchAttributes(inst.SearchAttributes, f.SearchAttributes) {
-					items = append(items, m)
+					cands = append(cands, cand{created: fromN(m["created_at"]), id: fromS(m["id"]), item: m})
 				}
 			}
 		}
@@ -134,23 +160,20 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 		start = out.LastEvaluatedKey
 	}
 	// Stable order mirrors SQL backends; timestamps are numeric and IDs break ties.
-	for i := range items {
-		for j := i + 1; j < len(items); j++ {
-			if fromN(items[j]["created_at"]) < fromN(items[i]["created_at"]) || (fromN(items[j]["created_at"]) == fromN(items[i]["created_at"]) && fromS(items[j]["id"]) < fromS(items[i]["id"])) {
-				items[i], items[j] = items[j], items[i]
-			}
-		}
-	}
-	if f.Offset >= len(items) {
+	// O(M log M) standard sort replaces the former O(M²) double loop.
+	sort.Slice(cands, func(i, j int) bool {
+		return lessInstance(cands[i].created, cands[i].id, cands[j].created, cands[j].id)
+	})
+	if f.Offset >= len(cands) {
 		return nil, nil
 	}
-	items = items[f.Offset:]
-	if len(items) > limit {
-		items = items[:limit]
+	cands = cands[f.Offset:]
+	if len(cands) > limit {
+		cands = cands[:limit]
 	}
-	result := make([]backend.Instance, 0, len(items))
-	for _, m := range items {
-		result = append(result, *decodeInstance(m))
+	result := make([]backend.Instance, 0, len(cands))
+	for _, c := range cands {
+		result = append(result, *decodeInstance(c.item))
 	}
 	return result, nil
 }
@@ -464,6 +487,7 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	}
 	var all []types.TransactWriteItem
 	var ensures []string
+	var forcedEnsures map[string]bool
 	var parentEnsures []string
 	for _, adv := range advs {
 		items, parentID, err := b.buildAdvancementItems(ctx, adv)
@@ -481,6 +505,12 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		}
 		all = append(all, items...)
 		ensures = append(ensures, adv.InstanceID)
+		if adv.EnsureWorkflowTask {
+			if forcedEnsures == nil {
+				forcedEnsures = map[string]bool{}
+			}
+			forcedEnsures[adv.InstanceID] = true
+		}
 		if parentID != "" {
 			parentEnsures = append(parentEnsures, parentID)
 		}
@@ -498,6 +528,12 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		}
 	}
 	for _, id := range ensures {
+		if forcedEnsures[id] {
+			if err := b.ensureWorkflowTaskForced(ctx, id); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := b.ensureWorkflowTask(ctx, id); err != nil {
 			return err
 		}
@@ -522,7 +558,7 @@ func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advance
 		return err
 	}
 	if len(items) > 100 {
-		return fmt.Errorf("dynamodb: advancement produces %d transaction operations", len(items))
+		return fmt.Errorf("dynamodb: advancement produces %d transaction operations (budget %d; see docs/09-limits.md)", len(items), b.Capabilities().MaxAdvancementEffects)
 	}
 	_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 	if conditional(err) {
@@ -535,6 +571,9 @@ func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advance
 		if err := b.ensureWorkflowTask(ctx, parentID); err != nil {
 			return err
 		}
+	}
+	if adv.EnsureWorkflowTask {
+		return b.ensureWorkflowTaskForced(ctx, adv.InstanceID)
 	}
 	return b.ensureWorkflowTask(ctx, adv.InstanceID)
 }
@@ -645,13 +684,23 @@ func inboxItem(instanceID string, id, seq int64, e journal.Event, now time.Time)
 }
 
 func (b *Backend) ensureWorkflowTask(ctx context.Context, instanceID string) error {
+	return b.ensureWorkflowTaskWithForce(ctx, instanceID, false)
+}
+
+func (b *Backend) ensureWorkflowTaskForced(ctx context.Context, instanceID string) error {
+	return b.ensureWorkflowTaskWithForce(ctx, instanceID, true)
+}
+
+func (b *Backend) ensureWorkflowTaskWithForce(ctx context.Context, instanceID string, force bool) error {
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil || inst.Status != "running" {
 		return err
 	}
-	inbox, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_inbox")), KeyConditionExpression: aws.String("instance_id = :id"), ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(instanceID)}, Limit: aws.Int32(1)})
-	if err != nil || len(inbox.Items) == 0 {
-		return err
+	if !force {
+		inbox, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_inbox")), KeyConditionExpression: aws.String("instance_id = :id"), ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(instanceID)}, Limit: aws.Int32(1)})
+		if err != nil || len(inbox.Items) == 0 {
+			return err
+		}
 	}
 	_, err = b.client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(b.table("wf_tasks")), Item: workflowTaskItem(instanceID, inst.Queue, newID(), nowUTC()), ConditionExpression: aws.String("attribute_not_exists(task_pk)")})
 	if conditional(err) {
@@ -829,6 +878,12 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		pending = next
 	}
 	if !wrote {
+		// All items were dedupe hits: no new inbox, but a prior crash
+		// between commit and ensure may have orphaned earlier inbox.
+		// Ensure so a resend never permanently stalls the instance.
+		if inst.Status == "running" {
+			_ = b.ensureWorkflowTask(ctx, instanceID)
+		}
 		return nil
 	}
 	if inst.Status == "running" {
@@ -840,6 +895,74 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	return nil
 }
 
+// RecoverOrphanedWorkflowTasks re-creates workflow tasks for running
+// instances that hold inbox events but no workflow task. It closes the
+// commit→ensure crash gap (TransactWriteItems cannot atomically delete the
+// old singleton task and re-create it on the same key, so ensure runs
+// outside the transaction). Bounded to ~200 instances per call; workers
+// throttle calls to once per few seconds.
+func (b *Backend) RecoverOrphanedWorkflowTasks(ctx context.Context) (int, error) {
+	var start map[string]types.AttributeValue
+	checked := 0
+	recovered := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return recovered, ctx.Err()
+		default:
+		}
+		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{
+			TableName:         aws.String(b.table("wf_instances")),
+			ExclusiveStartKey: start,
+		})
+		if err != nil {
+			return recovered, err
+		}
+		for _, m := range out.Items {
+			if fromS(m["status"]) != "running" {
+				continue
+			}
+			id := fromS(m["id"])
+			checked++
+			if checked > 200 {
+				return recovered, nil
+			}
+			inbox, err := b.client.Query(ctx, &dynamodb.QueryInput{
+				TableName:                 aws.String(b.table("wf_inbox")),
+				KeyConditionExpression:    aws.String("instance_id = :id"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)},
+				Limit:                     aws.Int32(1),
+			})
+			if err != nil || len(inbox.Items) == 0 {
+				continue
+			}
+			tout, err := b.client.GetItem(ctx, &dynamodb.GetItemInput{
+				TableName: aws.String(b.table("wf_tasks")),
+				Key:       map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(id))},
+			})
+			if err != nil {
+				continue
+			}
+			if len(tout.Item) != 0 {
+				continue
+			}
+			inst := decodeInstance(m)
+			_, err = b.client.PutItem(ctx, &dynamodb.PutItemInput{
+				TableName:           aws.String(b.table("wf_tasks")),
+				Item:                workflowTaskItem(id, inst.Queue, newID(), nowUTC()),
+				ConditionExpression: aws.String("attribute_not_exists(task_pk)"),
+			})
+			if err == nil {
+				recovered++
+			}
+		}
+		if out.LastEvaluatedKey == nil {
+			break
+		}
+		start = out.LastEvaluatedKey
+	}
+	return recovered, nil
+}
 // deleteSignalDedupeForInstance pages through the instance's dedupe entries
 // (Query results larger than 1 MB arrive in pages via LastEvaluatedKey) and
 // removes each one.
@@ -901,6 +1024,15 @@ func delWithValues(table string, key map[string]types.AttributeValue, condition 
 }
 func inboxKey(instanceID string, id int64) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{"instance_id": avS(instanceID), "id": avN(id)}
+}
+
+// lessInstance orders ListInstances results by (created_at, id), mirroring
+// SQL backends. Extracted for unit testing the sort contract.
+func lessInstance(aCreated int64, aID string, bCreated int64, bID string) bool {
+	if aCreated != bCreated {
+		return aCreated < bCreated
+	}
+	return aID < bID
 }
 func timerKey(instanceID string, seq int64) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{"instance_id": avS(instanceID), "seq": avN(seq)}

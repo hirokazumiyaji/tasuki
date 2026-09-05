@@ -141,13 +141,60 @@ func (c *Client) SignalBatch(ctx context.Context, id string, items []SignalItem)
 }
 
 func (c *Client) Cancel(ctx context.Context, id string) error {
-	return c.backend.SendToInbox(ctx, id, journal.Event{
+	// Forward to the tail of a ContinueAsNew chain so waiting on the
+	// original Handle observes cancellation.
+	headErr := c.backend.SendToInbox(ctx, id, journal.Event{
 		Type: journal.TypeCancelRequested,
 	}, "")
+	tail, terr := c.resolveContinuedTail(ctx, id)
+	if terr == nil && tail != "" && tail != id {
+		_ = c.backend.SendToInbox(ctx, tail, journal.Event{
+			Type: journal.TypeCancelRequested,
+		}, "")
+		if headErr != nil {
+			// Head may already be "continued" (still cancelable via tail).
+			return nil
+		}
+	}
+	return headErr
 }
 
 func (c *Client) Terminate(ctx context.Context, id string) error {
-	return c.backend.TerminateInstance(ctx, id)
+	if err := c.backend.TerminateInstance(ctx, id); err != nil {
+		return err
+	}
+	// Also terminate the continued tail so Result does not hang on the child.
+	if tail, err := c.resolveContinuedTail(ctx, id); err == nil && tail != "" && tail != id {
+		_ = c.backend.TerminateInstance(ctx, tail)
+	}
+	return nil
+}
+
+// resolveContinuedTail follows "continued" statuses to the running tail.
+// Returns "" when there is no continuation.
+func (c *Client) resolveContinuedTail(ctx context.Context, id string) (string, error) {
+	cur := id
+	for i := 0; i < 32; i++ {
+		inst, err := c.backend.GetInstance(ctx, cur)
+		if err != nil {
+			if cur == id {
+				return "", err
+			}
+			return cur, nil
+		}
+		if inst.Status != StatusContinued && inst.Status != "continued" {
+			if cur == id {
+				return "", nil
+			}
+			return cur, nil
+		}
+		next, err := continuedChildID(ctx, c.backend, cur)
+		if err != nil || next == "" {
+			return cur, err
+		}
+		cur = next
+	}
+	return cur, nil
 }
 
 func (c *Client) UpsertSchedule(ctx context.Context, s backend.NewSchedule) error {
@@ -168,16 +215,23 @@ func Result[O any](ctx context.Context, h *Handle) (O, error) {
 	ticker := time.NewTicker(h.client.pollInterval)
 	defer ticker.Stop()
 
+	// Use a derived context for the terminal subscription so every exit path
+	// releases the subscriber/goroutine (and Postgres LISTEN connection)
+	// without cancelling the caller's context.
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var wake <-chan string
 	if n, ok := h.client.backend.(backend.TerminalNotifier); ok {
-		ch, err := n.SubscribeTerminal(ctx)
+		ch, err := n.SubscribeTerminal(subCtx)
 		if err == nil {
 			wake = ch
 		}
 	}
 
+	currentID := h.id
 	for {
-		inst, err := h.client.backend.GetInstance(ctx, h.id)
+		inst, err := h.client.backend.GetInstance(ctx, currentID)
 		if err != nil {
 			return zero, err
 		}
@@ -196,6 +250,19 @@ func Result[O any](ctx context.Context, h *Handle) (O, error) {
 			return zero, ErrCanceled
 		case "stuck":
 			return zero, fmt.Errorf("%w: %s", ErrStuck, string(inst.Failure))
+		case StatusContinued:
+			// Follow ContinueAsNew chains so the original Handle observes
+			// the final result. The child ID is "<parent>~<continued-seq>";
+			// resolve it via the journal to avoid guessing.
+			next, cerr := continuedChildID(ctx, h.client.backend, currentID)
+			if cerr != nil {
+				// Journal not yet visible or transient: keep polling.
+				break
+			}
+			if next != "" && next != currentID {
+				currentID = next
+				continue
+			}
 		}
 		if wake == nil {
 			select {
@@ -210,11 +277,34 @@ func Result[O any](ctx context.Context, h *Handle) (O, error) {
 			return zero, ctx.Err()
 		case <-ticker.C:
 		case id := <-wake:
-			if id != "" && id != h.id {
+			if id != "" && id != currentID && id != h.id {
+				// Ignore unrelated terminals but re-check current in case
+				// the wake was coalesced.
 				continue
 			}
 		}
 	}
+}
+
+// continuedChildID resolves the ContinueAsNew child for a "continued"
+// instance by reading its journal for TypeContinuedAsNew.
+func continuedChildID(ctx context.Context, b backend.Backend, id string) (string, error) {
+	j, err := b.GetJournal(ctx, id, 0)
+	if err != nil {
+		return "", err
+	}
+	var seq int64
+	for _, e := range j {
+		if string(e.Type) == string(journal.TypeContinuedAsNew) {
+			if e.Seq > seq {
+				seq = e.Seq
+			}
+		}
+	}
+	if seq == 0 {
+		return "", nil
+	}
+	return fmt.Sprintf("%s~%d", id, seq), nil
 }
 
 func newID() string {

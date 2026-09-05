@@ -30,6 +30,14 @@ type Worker struct {
 
 	instMu   sync.Mutex
 	instLock map[string]*workflowActor
+
+	// Persistent execution slots bound concurrent workflow/activity handlers
+	// across ticks so a blocked activity cannot stall timers or workflows.
+	wfSem  chan struct{}
+	actSem chan struct{}
+
+	recoverMu   sync.Mutex
+	lastRecover time.Time
 }
 
 func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
@@ -41,6 +49,8 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		inFlight: map[int64]struct{}{},
 		sticky:   map[string]stickyEntry{},
 		instLock: map[string]*workflowActor{},
+		wfSem:    make(chan struct{}, opts.WorkflowConcurrency),
+		actSem:   make(chan struct{}, opts.ActivityConcurrency),
 	}
 }
 
@@ -74,8 +84,27 @@ func ValidateSchema(ctx context.Context, b backend.Backend) error {
 }
 
 // PollOnce runs one worker tick (timers, workflow tasks, activity tasks).
+// Unlike the background loop (which never blocks on long activities),
+// PollOnce waits for activities claimed in this tick so single-threaded
+// test environments observe synchronous progress.
 func (w *Worker) PollOnce(ctx context.Context) {
-	w.tick(ctx)
+	w.tickSync(ctx)
+}
+
+func (w *Worker) tickSync(ctx context.Context) {
+	if n, err := w.backend.FireDueTimers(ctx, 100); err != nil {
+		w.recordStoreError(ctx, "fire_timers", err)
+	} else if n > 0 {
+		w.opts.Logger.Debug("fired timers", "n", n)
+	}
+	if _, err := w.backend.ClaimDueSchedules(ctx, 100); err != nil {
+		w.recordStoreError(ctx, "claim_schedules", err)
+	}
+	w.sampleBacklog(ctx)
+	w.recoverOrphanedTasks(ctx)
+	w.tickWorkflows(ctx)
+	// Synchronous activities for PollOnce/test determinism.
+	w.tickActivitiesSync(ctx)
 }
 
 func (w *Worker) Shutdown(ctx context.Context) error {
@@ -94,7 +123,16 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		waitErr = ctx.Err()
 	}
-	w.releaseInFlight(context.Background())
+	// Bound lease release: the store may hang, but Shutdown must return
+	// within a predictable budget. Unreleased leases expire via lease timeout
+	// and are reclaimed by other workers.
+	releaseTimeout := w.opts.ShutdownReleaseTimeout
+	if releaseTimeout <= 0 {
+		releaseTimeout = 5 * time.Second
+	}
+	relCtx, relCancel := context.WithTimeout(context.Background(), releaseTimeout)
+	defer relCancel()
+	w.releaseInFlight(relCtx)
 	return waitErr
 }
 
@@ -119,7 +157,24 @@ func (w *Worker) releaseInFlight(ctx context.Context) {
 	w.inFlight = map[int64]struct{}{}
 	w.mu.Unlock()
 	for _, id := range ids {
-		_ = w.backend.ReleaseLease(ctx, id)
+		select {
+		case <-ctx.Done():
+			w.opts.Logger.Warn("shutdown lease release timed out",
+				"released", 0, "remaining", len(ids), "error", ctx.Err())
+			w.opts.Metrics.AddStoreError(context.Background(), "release_lease")
+			return
+		default:
+		}
+		if err := w.backend.ReleaseLease(ctx, id); err != nil {
+			w.opts.Logger.Warn("shutdown lease release failed",
+				"task_id", id, "error", err)
+			w.opts.Metrics.AddStoreError(context.Background(), "release_lease")
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
 	}
 }
 
@@ -174,75 +229,185 @@ func (w *Worker) sampleBacklog(ctx context.Context) {
 }
 
 func (w *Worker) tick(ctx context.Context) {
-	_, _ = w.backend.FireDueTimers(ctx, 100)
-	_, _ = w.backend.ClaimDueSchedules(ctx, 100)
+	if n, err := w.backend.FireDueTimers(ctx, 100); err != nil {
+		w.recordStoreError(ctx, "fire_timers", err)
+	} else if n > 0 {
+		w.opts.Logger.Debug("fired timers", "n", n)
+	}
+	if _, err := w.backend.ClaimDueSchedules(ctx, 100); err != nil {
+		w.recordStoreError(ctx, "claim_schedules", err)
+	}
 	w.sampleBacklog(ctx)
+	// Best-effort recovery for inbox→task gaps (crash between commit and
+	// ensure). Backends without support are skipped.
+	w.recoverOrphanedTasks(ctx)
 
+	w.tickWorkflows(ctx)
+	w.tickActivities(ctx)
+}
+
+func (w *Worker) availableSlots(sem chan struct{}) int {
+	return cap(sem) - len(sem)
+}
+
+func (w *Worker) tickWorkflows(ctx context.Context) {
+	avail := w.availableSlots(w.wfSem)
+	if avail <= 0 {
+		return
+	}
+	limit := w.opts.ClaimLimit
+	if limit <= 0 || limit > avail {
+		limit = avail
+	}
 	wtasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
-		Kind: "workflow", Queues: w.opts.Queues, Limit: w.opts.ClaimLimit,
+		Kind: "workflow", Queues: w.opts.Queues, Limit: limit,
 		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
 		MaxPerInstance: w.opts.MaxPerInstance,
 	})
-	if err == nil && len(wtasks) > 0 {
-		sem := make(chan struct{}, w.opts.WorkflowConcurrency)
-		var wg sync.WaitGroup
-		var pendingMu sync.Mutex
-		var pending []pendingWorkflowCommit
-		for _, t := range wtasks {
-			wg.Add(1)
-			go func(t backend.Task) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-				actor := w.actorFor(t.InstanceID)
-				actor.dispatch(func() {
-					w.opts.Metrics.AddWorkflowTask(ctx, 1)
-					w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
-					w.track(t.ID)
-					p, err := w.handleWorkflow(ctx, t)
-					w.untrack(t.ID)
-					if err != nil {
-						w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", err)
-						return
-					}
-					if p != nil {
-						pendingMu.Lock()
-						pending = append(pending, *p)
-						pendingMu.Unlock()
-					}
-				})
-			}(t)
-		}
-		wg.Wait()
-		w.flushWorkflowCommits(ctx, pending)
-		w.evictIdleInstanceLocks(time.Now())
-		w.evictIdleSticky(time.Now())
+	if err != nil {
+		w.recordStoreError(ctx, "claim_workflow", err)
+		return
 	}
-
-	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
-		Kind: "activity", Queues: w.opts.Queues, Limit: w.opts.ClaimLimit,
-		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
-		MaxPerInstance: w.opts.MaxPerInstance,
-	})
-	if err == nil && len(atasks) > 0 {
-		sem := make(chan struct{}, w.opts.ActivityConcurrency)
-		var wg sync.WaitGroup
-		for _, t := range atasks {
-			wg.Add(1)
-			go func(t backend.Task) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-				w.opts.Metrics.AddActivityTask(ctx, 1)
-				w.opts.Logger.Debug("activity task",
-					"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
+	if len(wtasks) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	var pendingMu sync.Mutex
+	var pending []pendingWorkflowCommit
+	for _, t := range wtasks {
+		// Reserve a slot before dispatch so Claim never over-subscribes and
+		// lease extension starts without semaphore wait.
+		select {
+		case w.wfSem <- struct{}{}:
+		default:
+			// No slot: make the task visible again promptly for peers.
+			_ = w.backend.ReleaseLease(ctx, t.ID)
+			continue
+		}
+		wg.Add(1)
+		go func(t backend.Task) {
+			defer wg.Done()
+			defer func() { <-w.wfSem }()
+			// Lease extension starts immediately after claim (extendLoop
+			// runs inside handleActivity; workflows are short so no
+			// extension needed here).
+			actor := w.actorFor(t.InstanceID)
+			actor.dispatch(func() {
+				w.opts.Metrics.AddWorkflowTask(ctx, 1)
+				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
 				w.track(t.ID)
-				_ = w.handleActivity(ctx, t)
+				p, herr := w.handleWorkflow(ctx, t)
 				w.untrack(t.ID)
-			}(t)
-		}
-		wg.Wait()
+				if herr != nil {
+					w.recordStoreError(ctx, "commit_workflow", herr,
+						"instance_id", t.InstanceID, "task_id", t.ID)
+					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", herr)
+					return
+				}
+				if p != nil {
+					pendingMu.Lock()
+					pending = append(pending, *p)
+					pendingMu.Unlock()
+				}
+			})
+		}(t)
 	}
+	wg.Wait()
+	w.flushWorkflowCommits(ctx, pending)
+	w.evictIdleInstanceLocks(time.Now())
+	w.evictIdleSticky(time.Now())
+}
+
+func (w *Worker) tickActivities(ctx context.Context) {
+	avail := w.availableSlots(w.actSem)
+	if avail <= 0 {
+		return
+	}
+	limit := w.opts.ClaimLimit
+	if limit <= 0 || limit > avail {
+		limit = avail
+	}
+	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "activity", Queues: w.opts.Queues, Limit: limit,
+		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
+		MaxPerInstance: w.opts.MaxPerInstance,
+	})
+	if err != nil {
+		w.recordStoreError(ctx, "claim_activity", err)
+		return
+	}
+	for _, t := range atasks {
+		select {
+		case w.actSem <- struct{}{}:
+		default:
+			_ = w.backend.ReleaseLease(ctx, t.ID)
+			continue
+		}
+		// Lease extension starts in the handler goroutine immediately,
+		// before any semaphore wait (slot already reserved), so long
+		// activities do not lose their lease while queued.
+		w.opts.Metrics.AddActivityTask(ctx, 1)
+		w.opts.Logger.Debug("activity task",
+			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
+		w.track(t.ID)
+		go func(t backend.Task) {
+			defer func() { <-w.actSem }()
+			defer w.untrack(t.ID)
+			if herr := w.handleActivity(ctx, t); herr != nil {
+				w.opts.Logger.Debug("activity task error",
+					"instance_id", t.InstanceID, "task_id", t.ID, "err", herr)
+			}
+		}(t)
+	}
+	// Do not wait: long activities must not block the next tick's timers
+	// or workflow progress. Concurrency stays bounded by actSem and Lease
+	// expiry reclaims tasks from crashed workers.
+}
+
+// tickActivitiesSync is the PollOnce path: claim and run activities to
+// completion before returning for deterministic single-threaded tests.
+func (w *Worker) tickActivitiesSync(ctx context.Context) {
+	avail := w.availableSlots(w.actSem)
+	if avail <= 0 {
+		return
+	}
+	limit := w.opts.ClaimLimit
+	if limit <= 0 || limit > avail {
+		limit = avail
+	}
+	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "activity", Queues: w.opts.Queues, Limit: limit,
+		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
+		MaxPerInstance: w.opts.MaxPerInstance,
+	})
+	if err != nil {
+		w.recordStoreError(ctx, "claim_activity", err)
+		return
+	}
+	var wg sync.WaitGroup
+	for _, t := range atasks {
+		select {
+		case w.actSem <- struct{}{}:
+		default:
+			_ = w.backend.ReleaseLease(ctx, t.ID)
+			continue
+		}
+		wg.Add(1)
+		w.opts.Metrics.AddActivityTask(ctx, 1)
+		w.opts.Logger.Debug("activity task",
+			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
+		w.track(t.ID)
+		go func(t backend.Task) {
+			defer wg.Done()
+			defer func() { <-w.actSem }()
+			defer w.untrack(t.ID)
+			if herr := w.handleActivity(ctx, t); herr != nil {
+				w.opts.Logger.Debug("activity task error",
+					"instance_id", t.InstanceID, "task_id", t.ID, "err", herr)
+			}
+		}(t)
+	}
+	wg.Wait()
 }
 
 func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWorkflowCommit, error) {
@@ -378,6 +543,9 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 		adv.NewEvents = append(adv.NewEvents, res.NewCommands...)
 		w.attachEffects(&adv, state.Instance.Queue, res.NewCommands)
 		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
+		if err := w.fitAdvancementToBudget(&adv, res.NewCommands, state.Instance.Queue); err != nil {
+			return nil, err
+		}
 		p := pending()
 		p.adv = adv
 		return p, nil
@@ -400,6 +568,10 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 			Name:  state.Instance.Name,
 			Queue: state.Instance.Queue,
 			Input: input,
+			// Inherit the parent chain so the final run still notifies
+			// the original parent exactly once.
+			ParentID:  state.Instance.ParentID,
+			ParentSeq: state.Instance.ParentSeq,
 		})
 		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
 		p := pending()
@@ -523,6 +695,96 @@ func (w *Worker) attachEffects(adv *backend.Advancement, queue string, cmds []jo
 	}
 }
 
+// advancementOps estimates DynamoDB-style TransactWriteItems operations for an
+// advancement: 1 instance CAS + N journal puts + activity/timer puts +
+// inbox deletes + 3 per child + parent inbox + 1 task delete.
+// It mirrors backend/dynamodb buildAdvancementItems counting so workers can
+// stay within backend.Capabilities.MaxAdvancementEffects atomically.
+func advancementOps(adv *backend.Advancement) int {
+	n := 2 + len(adv.NewEvents) + len(adv.ActivityTasks) + len(adv.Timers) + len(adv.DrainedInbox) + 3*len(adv.Children)
+	if adv.ParentNotify != nil {
+		n++
+	}
+	return n
+}
+
+func advancementBudget(b backend.Backend) int {
+	if caps := b.Capabilities(); caps.MaxAdvancementEffects > 0 {
+		return caps.MaxAdvancementEffects
+	}
+	return 100
+}
+
+// fitAdvancementToBudget truncates suspended advancements to the backend
+// transaction budget while keeping journal and tasks consistent (prefix).
+// Truncated work is re-emitted on replay, so no duplication occurs; the
+// advancement is flagged EnsureWorkflowTask for an immediate follow-up tick.
+// Terminal advancements are never truncated: oversized single operations
+// return a diagnostic error.
+func (w *Worker) fitAdvancementToBudget(adv *backend.Advancement, commands []journal.Event, queue string) error {
+	budget := advancementBudget(w.backend)
+	if advancementOps(adv) <= budget {
+		return nil
+	}
+	if adv.Terminal != nil {
+		return fmt.Errorf("tasuki: advancement needs %d ops, budget %d: single terminal advancement does not fit (reduce fanout per tick)",
+			advancementOps(adv), budget)
+	}
+	ingestedLen := len(adv.DrainedInbox)
+	if ingestedLen > len(adv.NewEvents) {
+		ingestedLen = len(adv.NewEvents)
+	}
+	ingested := append([]journal.Event(nil), adv.NewEvents[:ingestedLen]...)
+	// Base cost with zero new commands.
+	base := 2 + len(ingested) + len(adv.DrainedInbox)
+	if adv.ParentNotify != nil {
+		base++
+	}
+	if base >= budget {
+		return fmt.Errorf("tasuki: inbox drain alone needs %d ops, budget %d: reduce MaxPerInstance/inbox batch",
+			base, budget)
+	}
+	kept := 0
+	// Incremental cost per command: 1 journal + task/timer/child extras.
+	for i, cmd := range commands {
+		extra := 1
+		switch cmd.Type {
+		case journal.TypeActivityScheduled:
+			extra = 2 // journal + activity task
+		case journal.TypeTimerCreated:
+			extra = 2 // journal + timer
+		case journal.TypeChildScheduled:
+			extra = 4 // journal + instance/journal/task
+		}
+		_ = i
+		if base+extra > budget {
+			break
+		}
+		base += extra
+		kept++
+	}
+	if kept == 0 {
+		return fmt.Errorf("tasuki: single command needs %d ops, budget %d", base+1, budget)
+	}
+	if kept >= len(commands) {
+		return nil
+	}
+	// Rebuild prefix consistently.
+	adv.NewEvents = append(append([]journal.Event(nil), ingested...), commands[:kept]...)
+	adv.ActivityTasks = nil
+	adv.Timers = nil
+	// Children from truncated commands only; preserve pre-existing children
+	// that came from elsewhere (none for suspended, but be safe: children
+	// derived from commands are rebuilt, others kept).
+	// Suspended advancements have no prior children, so rebuild fully.
+	adv.Children = nil
+	w.attachEffects(adv, queue, commands[:kept])
+	adv.EnsureWorkflowTask = true
+	w.opts.Logger.Info("truncated fanout advancement to budget",
+		"instance_id", adv.InstanceID, "kept_commands", kept, "total_commands", len(commands), "budget", budget)
+	return nil
+}
+
 func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	act, err := w.reg.activity(t.Name)
 	if err != nil {
@@ -561,7 +823,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		},
 	})
 
-	out, err := act.fn(actCtx, t.Input)
+	out, err := w.invokeActivity(actCtx, act.fn, t.Input)
 	if runCtx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
 		err = fmt.Errorf("activity start-to-close timeout")
 	}
@@ -578,27 +840,80 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		w.opts.Logger.Info("activity retry",
 			"instance_id", t.InstanceID, "activity", t.Name, "attempt", t.Attempt, "delay", delay)
 		w.opts.Metrics.AddActivityRetry(ctx, 1)
-		return w.backend.RetryActivity(ctx, t.ID, delay)
+		if rerr := w.backend.RetryActivity(ctx, t.ID, delay); rerr != nil {
+			w.recordStoreError(ctx, "retry_activity", rerr, "instance_id", t.InstanceID, "activity", t.Name)
+			return rerr
+		}
+		return nil
 	}
-	return w.backend.CompleteActivity(ctx, t.ID, journal.Event{
+	if cerr := w.backend.CompleteActivity(ctx, t.ID, journal.Event{
 		Type:    journal.TypeActivityCompleted,
 		RefSeq:  t.Seq,
 		Payload: out,
-	})
+	}); cerr != nil {
+		w.recordStoreError(ctx, "complete_activity", cerr, "instance_id", t.InstanceID, "activity", t.Name)
+		return cerr
+	}
+	return nil
+}
+
+// invokeActivity runs a user activity function, converting panics into
+// retryable errors so one bad activity cannot crash the worker process.
+func (w *Worker) invokeActivity(ctx context.Context, fn func(context.Context, []byte) ([]byte, error), input []byte) (out []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.opts.Logger.Warn("activity panic recovered",
+				"panic", fmt.Sprint(r))
+			err = fmt.Errorf("activity panic: %v", r)
+		}
+	}()
+	return fn(ctx, input)
 }
 
 func (w *Worker) failActivity(ctx context.Context, t backend.Task, err error) error {
 	w.opts.Logger.Warn("activity failed", "instance_id", t.InstanceID, "activity", t.Name, "error", err)
 	payload, _ := json.Marshal(err.Error())
-	return w.backend.CompleteActivity(ctx, t.ID, journal.Event{
+	if cerr := w.backend.CompleteActivity(ctx, t.ID, journal.Event{
 		Type:    journal.TypeActivityFailed,
 		RefSeq:  t.Seq,
 		Payload: payload,
-	})
+	}); cerr != nil {
+		w.recordStoreError(ctx, "complete_activity", cerr, "instance_id", t.InstanceID, "activity", t.Name)
+		return cerr
+	}
+	return nil
+}
+
+// recordStoreError logs a store failure with its operation name and counts it.
+// Expected contention (ErrConflict/ErrSuperseded) and shutdown cancellations
+// are debug-level and uncounted; genuine failures are warn-level with a bounded
+// op label.
+func (w *Worker) recordStoreError(ctx context.Context, op string, err error, attrs ...any) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, backend.ErrConflict) || errors.Is(err, backend.ErrSuperseded) {
+		w.opts.Logger.Debug("store contention", append([]any{"op", op, "err", err}, attrs...)...)
+		return
+	}
+	if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+		w.opts.Logger.Debug("store op canceled on shutdown", append([]any{"op", op}, attrs...)...)
+		return
+	}
+	w.opts.Logger.Warn("store operation failed", append([]any{"op", op, "err", err}, attrs...)...)
+	w.opts.Metrics.AddStoreError(ctx, op)
 }
 
 func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context) {
-	wctx.SetLocalActivityRunner(func(name string, input []byte) ([]byte, error) {
+	wctx.SetLocalActivityRunner(func(name string, input []byte) (out []byte, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				w.opts.Logger.Warn("local activity panic recovered",
+					"activity", name, "panic", fmt.Sprint(r))
+				out = nil
+				err = fmt.Errorf("activity panic: %v", r)
+			}
+		}()
 		act, err := w.reg.activity(name)
 		if err != nil {
 			return nil, err
@@ -634,7 +949,41 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = w.backend.ExtendLease(ctx, taskID, w.opts.LeaseDuration)
+			if err := w.backend.ExtendLease(ctx, taskID, w.opts.LeaseDuration); err != nil {
+				w.recordStoreError(ctx, "extend_lease", err, "task_id", taskID)
+			}
 		}
+	}
+}
+
+// TaskRecoverer is implemented by backends that can re-create workflow tasks
+// for committed inbox events orphaned by a crash between commit and ensure.
+// Workers call it best-effort each tick; missing support is skipped.
+type TaskRecoverer interface {
+	RecoverOrphanedWorkflowTasks(ctx context.Context) (int, error)
+}
+
+func (w *Worker) recoverOrphanedTasks(ctx context.Context) {
+	r, ok := w.backend.(TaskRecoverer)
+	if !ok {
+		return
+	}
+	// Throttle full scans: at most once per 5s. Crash gaps are recovered
+	// within seconds without scanning on every poll tick.
+	w.recoverMu.Lock()
+	since := time.Since(w.lastRecover)
+	if since < 5*time.Second && !w.lastRecover.IsZero() {
+		w.recoverMu.Unlock()
+		return
+	}
+	w.lastRecover = time.Now()
+	w.recoverMu.Unlock()
+	n, err := r.RecoverOrphanedWorkflowTasks(ctx)
+	if err != nil {
+		w.recordStoreError(ctx, "recover_tasks", err)
+		return
+	}
+	if n > 0 {
+		w.opts.Logger.Info("recovered orphaned workflow tasks", "n", n)
 	}
 }

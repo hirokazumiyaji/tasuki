@@ -20,11 +20,22 @@ type Metrics struct {
 	JournalWarnings   metric.Int64Counter
 	IncompatibleNacks metric.Int64Counter
 	TaskBacklog       metric.Int64Gauge
+	StoreErrors       metric.Int64Counter // worker store-operation failures by op
 }
 
 // NewMetrics creates counters on the global MeterProvider (noop if unset).
 func NewMetrics() (*Metrics, error) {
-	m := otel.Meter(MeterName)
+	return NewMetricsWithMeter(otel.Meter(MeterName))
+}
+
+// NewMetricsWithMeter builds Metrics on an explicit Meter (test hook to use a
+// ManualReader provider without touching global state).
+func NewMetricsWithMeter(m metric.Meter) (*Metrics, error) {
+	return newMetricsOn(m)
+}
+
+// newMetricsOn builds Metrics on an explicit Meter (avoids global state in tests).
+func newMetricsOn(m metric.Meter) (*Metrics, error) {
 	wt, err := m.Int64Counter("tasuki.workflow.tasks",
 		metric.WithDescription("Workflow tasks processed"))
 	if err != nil {
@@ -62,6 +73,11 @@ func NewMetrics() (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	se, err := m.Int64Counter("tasuki.worker.store_errors",
+		metric.WithDescription("Worker store operation failures by op"))
+	if err != nil {
+		return nil, err
+	}
 	return &Metrics{
 		WorkflowTasks:     wt,
 		ActivityTasks:     at,
@@ -70,6 +86,7 @@ func NewMetrics() (*Metrics, error) {
 		JournalWarnings:   jw,
 		IncompatibleNacks: in,
 		TaskBacklog:       tb,
+		StoreErrors:       se,
 	}, nil
 }
 
@@ -125,6 +142,17 @@ func (m *Metrics) RecordBacklog(ctx context.Context, kind, queue string, n int64
 			attribute.String("queue", queue),
 		),
 	)
+}
+
+// AddStoreError counts a worker store-operation failure labeled by op.
+// op is one of: fire_timers, claim_schedules, claim_workflow, claim_activity,
+// commit_workflow, complete_activity, retry_activity, release_lease,
+// extend_lease, heartbeat. Nil receiver is a no-op.
+func (m *Metrics) AddStoreError(ctx context.Context, op string) {
+	if m == nil {
+		return
+	}
+	m.StoreErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("op", op)))
 }
 
 // MustNewMetrics panics on instrument creation failure.

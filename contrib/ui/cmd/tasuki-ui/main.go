@@ -15,13 +15,19 @@ import (
 
 func main() {
 	backendFlag := flag.String("backend", "memory", "memory|postgres|sqlite|mysql|spanner|dynamodb|firestore")
-	addr := flag.String("addr", ":8080", "listen address")
-	tokenFlag := flag.String("token", "", "shared secret (overrides TASUKI_UI_TOKEN); empty disables auth")
+	addr := flag.String("addr", "127.0.0.1:8080", "listen address (default loopback)")
+	tokenFlag := flag.String("token", "", "shared secret (overrides TASUKI_UI_TOKEN); empty disables auth only on loopback")
+	allowUnauthExternal := flag.Bool("allow-unauthenticated-external", false, "explicit opt-in to expose without auth on non-loopback (dangerous)")
 	flag.Parse()
 
 	token := *tokenFlag
 	if token == "" {
 		token = os.Getenv("TASUKI_UI_TOKEN")
+	}
+
+	if err := ui.ValidateAddr(*addr, token != "", *allowUnauthExternal); err != nil {
+		fmt.Fprintln(os.Stderr, "tasuki-ui: ", err)
+		os.Exit(2)
 	}
 
 	ctx := context.Background()
@@ -40,8 +46,9 @@ func main() {
 		auth = "on"
 	}
 	h := ui.NewHandler(c, opts...)
-	log.Printf("tasuki ui listening on http://localhost%s backend=%s auth=%s", *addr, *backendFlag, auth)
-	if err := http.ListenAndServe(*addr, h); err != nil {
+	srv := ui.NewServer(*addr, h)
+	log.Printf("tasuki ui listening on http://%s backend=%s auth=%s", *addr, *backendFlag, auth)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 }

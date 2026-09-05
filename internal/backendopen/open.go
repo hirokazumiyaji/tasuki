@@ -4,15 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/hirokazumiyaji/tasuki/backend"
-	"github.com/hirokazumiyaji/tasuki/backend/dynamodb"
-	"github.com/hirokazumiyaji/tasuki/backend/firestore"
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
-	"github.com/hirokazumiyaji/tasuki/backend/mysql"
-	"github.com/hirokazumiyaji/tasuki/backend/postgres"
-	"github.com/hirokazumiyaji/tasuki/backend/spanner"
-	"github.com/hirokazumiyaji/tasuki/backend/sqlite"
 )
 
 // Options controls open behavior for persistent stores.
@@ -20,67 +15,106 @@ type Options struct {
 	Reset bool // when true, call Reset after Migrate (bench)
 }
 
+var (
+	mu       sync.RWMutex
+	openers  = map[string]func(ctx context.Context) (backend.Backend, func(), error){}
+)
+
+// Register adds a backend opener (called from tasuki_all-tagged backends).
+func Register(name string, fn func(ctx context.Context) (backend.Backend, func(), error)) {
+	mu.Lock()
+	defer mu.Unlock()
+	openers[name] = fn
+}
+
+func registered(name string) (func(ctx context.Context) (backend.Backend, func(), error), bool) {
+	mu.RLock()
+	defer mu.RUnlock()
+	fn, ok := openers[name]
+	return fn, ok
+}
+
 // Open returns a backend for name (memory|postgres|sqlite|mysql|spanner|dynamodb|firestore).
-// The closer should be deferred by the caller.
+// Memory is always available. Other backends require registration via the
+// tasuki_all build tag (workspace build) or an explicit blank import of the
+// backend's register package. The closer should be deferred by the caller.
 func Open(ctx context.Context, name string, opts Options) (backend.Backend, func(), error) {
-	switch name {
-	case "memory":
+	if name == "memory" {
 		return memory.New(), func() {}, nil
-	case "postgres":
-		dsn := os.Getenv("TASUKI_POSTGRES_DSN")
-		if dsn == "" {
-			return nil, nil, fmt.Errorf("TASUKI_POSTGRES_DSN required")
-		}
-		b, err := postgres.New(ctx, dsn)
+	}
+	if fn, ok := registered(name); ok {
+		b, closer, err := fn(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
-		return finish(ctx, b, opts, func() { b.Close() })
-	case "sqlite":
-		path := os.Getenv("TASUKI_SQLITE_PATH")
-		if path == "" {
-			return nil, nil, fmt.Errorf("TASUKI_SQLITE_PATH required")
-		}
-		b, err := sqlite.New(path)
-		if err != nil {
-			return nil, nil, err
-		}
-		return finish(ctx, b, opts, func() { _ = b.Close() })
-	case "mysql":
-		dsn := os.Getenv("TASUKI_MYSQL_DSN")
-		if dsn == "" {
-			return nil, nil, fmt.Errorf("TASUKI_MYSQL_DSN required")
-		}
-		b, err := mysql.New(ctx, dsn)
-		if err != nil {
-			return nil, nil, err
-		}
-		return finish(ctx, b, opts, func() { _ = b.Close() })
-	case "spanner":
-		dsn := os.Getenv("TASUKI_SPANNER_DSN")
-		if dsn == "" {
-			return nil, nil, fmt.Errorf("TASUKI_SPANNER_DSN required")
-		}
-		b, err := spanner.New(ctx, dsn)
-		if err != nil {
-			return nil, nil, err
-		}
-		return finish(ctx, b, opts, func() { _ = b.Close() })
-	case "dynamodb":
-		b, err := dynamodb.New(ctx, dynamodb.Config{Endpoint: os.Getenv("TASUKI_DYNAMODB_ENDPOINT")})
-		if err != nil {
-			return nil, nil, err
-		}
-		return finish(ctx, b, opts, func() { _ = b.Close() })
-	case "firestore":
-		b, err := firestore.New(ctx, os.Getenv("TASUKI_FIRESTORE_PROJECT"))
-		if err != nil {
-			return nil, nil, err
-		}
-		return finish(ctx, b, opts, func() { _ = b.Close() })
+		return finish(ctx, b, opts, closer)
+	}
+	switch name {
+	case "postgres", "sqlite", "mysql", "spanner", "dynamodb", "firestore":
+		// Friendly error that guides GOWORK=off users.
+		return nil, nil, fmt.Errorf("backend %q not registered (build without tasuki_all tag only supports memory; build with -tags tasuki_all in the workspace or import the backend package)", name)
 	default:
 		return nil, nil, fmt.Errorf("unknown -backend=%q (want memory|postgres|sqlite|mysql|spanner|dynamodb|firestore)", name)
 	}
+}
+
+// OpenWithDSN is a test helper that bypasses env for sqlite/memory.
+func OpenWithDSN(ctx context.Context, name, dsn string, opts Options) (backend.Backend, func(), error) {
+	if name == "memory" {
+		return memory.New(), func() {}, nil
+	}
+	return Open(ctx, name, opts)
+}
+
+// DescribeTarget returns a human-readable wipe target for --reset confirmation.
+func DescribeTarget(name string) string {
+	switch name {
+	case "memory":
+		return "in-process memory (no persistent data)"
+	case "postgres":
+		return "TASUKI_POSTGRES_DSN=" + redactDSN(os.Getenv("TASUKI_POSTGRES_DSN"))
+	case "sqlite":
+		return "TASUKI_SQLITE_PATH=" + os.Getenv("TASUKI_SQLITE_PATH")
+	case "mysql":
+		return "TASUKI_MYSQL_DSN=" + redactDSN(os.Getenv("TASUKI_MYSQL_DSN"))
+	case "spanner":
+		return "TASUKI_SPANNER_DSN=" + os.Getenv("TASUKI_SPANNER_DSN")
+	case "dynamodb":
+		return "endpoint=" + os.Getenv("TASUKI_DYNAMODB_ENDPOINT")
+	case "firestore":
+		return "project=" + os.Getenv("TASUKI_FIRESTORE_PROJECT")
+	default:
+		return name
+	}
+}
+
+func redactDSN(s string) string {
+	if s == "" {
+		return "(unset)"
+	}
+	// Keep host/db, hide credentials after :// and before @.
+	if i := len("postgres://"); len(s) > i {
+		rest := s[i:]
+		if at := lastIndex(rest, "@"); at >= 0 {
+			return s[:i] + "***@" + rest[at+1:]
+		}
+	}
+	if at := lastIndex(s, "@"); at >= 0 {
+		// mysql DSN user:pass@...
+		if colon := lastIndex(s[:at], ":"); colon >= 0 {
+			return s[:colon+1] + "***" + s[at:]
+		}
+	}
+	return s
+}
+
+func lastIndex(s, sub string) int {
+	for i := len(s) - len(sub); i >= 0; i-- {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
 }
 
 type preparer interface {

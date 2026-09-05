@@ -692,6 +692,19 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 	if err != nil {
 		return err
 	}
+	if adv.EnsureWorkflowTask {
+		// Truncated fanout: force a follow-up tick even though remaining
+		// work is not yet in the inbox (it replays).
+		_, err = tx.Exec(ctx, `
+			INSERT INTO wf_tasks (kind, instance_id, queue)
+			SELECT 'workflow', $1, i.queue
+			FROM wf_instances i
+			WHERE i.id = $1 AND i.status = 'running'
+			ON CONFLICT (instance_id) WHERE kind = 'workflow' DO NOTHING`, adv.InstanceID)
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

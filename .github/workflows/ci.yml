@@ -353,3 +353,19 @@ jobs:
           name: cover-out
           path: cover.out
           if-no-files-found: ignore
+
+  gowork-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Independent build without workspace (no hidden deps)
+        run: |
+          GOWORK=off GOPROXY=off go list ./... > /dev/null
+          GOWORK=off go build ./...
+      - name: Minimal Go version with local toolchain
+        run: GOTOOLCHAIN=local go build ./...
+      - name: Full workspace build with all backends
+        run: go build -tags tasuki_all ./...

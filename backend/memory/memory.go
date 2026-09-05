@@ -570,8 +570,10 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 
 	delete(b.tasks, adv.TaskID)
 
-	// Ensure workflow task if inbox remains and still running
-	if inst.status == "running" && len(b.inbox[adv.InstanceID]) > 0 {
+	// Ensure workflow task if inbox remains and still running.
+	// EnsureWorkflowTask forces a follow-up tick for truncated fanout
+	// advancements whose remaining work is not yet in the inbox (replayed).
+	if inst.status == "running" && (len(b.inbox[adv.InstanceID]) > 0 || adv.EnsureWorkflowTask) {
 		b.enqueueWorkflowTaskLocked(adv.InstanceID, inst.queue)
 	}
 	return nil
@@ -801,15 +803,54 @@ func (b *Backend) SendToInboxBatch(_ context.Context, instanceID string, items [
 		inserted++
 	}
 	wake := false
-	if inserted > 0 && inst.status == "running" {
+	// Ensure a workflow task whenever unprocessed inbox remains, even on
+	// pure dedupe hits: a prior crash between commit and ensure must not
+	// permanently stall the instance.
+	if inst.status == "running" && len(b.inbox[instanceID]) > 0 {
+		before := len(b.tasks)
 		b.enqueueWorkflowTaskLocked(instanceID, inst.queue)
-		wake = true
+		if len(b.tasks) != before || inserted > 0 {
+			wake = true
+		} else if inserted == 0 {
+			// Task already exists; still wake pollers that may have missed
+			// the hint (notify is only a hint, recovery is via the task).
+			wake = true
+		}
 	}
 	b.mu.Unlock()
 	if wake {
 		b.notifyTasks()
 	}
 	return nil
+}
+
+// RecoverOrphanedWorkflowTasks re-creates workflow tasks for running
+// instances that hold inbox events but no claimable workflow task.
+// It closes the commit→ensure crash gap without requiring new signals.
+func (b *Backend) RecoverOrphanedWorkflowTasks(_ context.Context) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	hasTask := map[string]bool{}
+	for _, t := range b.tasks {
+		if t.kind == "workflow" {
+			hasTask[t.instanceID] = true
+		}
+	}
+	n := 0
+	for id, inst := range b.instances {
+		if inst.status != "running" {
+			continue
+		}
+		if len(b.inbox[id]) == 0 {
+			continue
+		}
+		if hasTask[id] {
+			continue
+		}
+		b.enqueueWorkflowTaskLocked(id, inst.queue)
+		n++
+	}
+	return n, nil
 }
 
 func (b *Backend) createInstanceLocked(inst backend.NewInstance) error {
