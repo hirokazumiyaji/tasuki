@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 
 	"cloud.google.com/go/firestore"
 	"github.com/hirokazumiyaji/tasuki/backend/hub"
@@ -15,6 +16,11 @@ type Backend struct {
 	client  *firestore.Client
 	project string
 	hub     *hub.Hub
+
+	// recoverMu/recoverCursor rotate orphan-recovery scans across passes
+	// so large fleets are eventually fully visited.
+	recoverMu     sync.Mutex
+	recoverCursor string
 }
 
 // New opens a Firestore client. Set FIRESTORE_EMULATOR_HOST for the emulator.

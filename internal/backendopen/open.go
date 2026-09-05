@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/hirokazumiyaji/tasuki/backend"
@@ -92,29 +93,25 @@ func redactDSN(s string) string {
 	if s == "" {
 		return "(unset)"
 	}
-	// Keep host/db, hide credentials after :// and before @.
-	if i := len("postgres://"); len(s) > i {
-		rest := s[i:]
-		if at := lastIndex(rest, "@"); at >= 0 {
-			return s[:i] + "***@" + rest[at+1:]
+	// Postgres URLs: mask the userinfo between "://" and "@".
+	if strings.HasPrefix(s, "postgres://") || strings.HasPrefix(s, "postgresql://") {
+		if i := strings.Index(s, "://"); i >= 0 {
+			rest := s[i+3:]
+			if at := strings.LastIndex(rest, "@"); at >= 0 {
+				return s[:i+3] + "***@" + rest[at+1:]
+			}
 		}
+		return s
 	}
-	if at := lastIndex(s, "@"); at >= 0 {
-		// mysql DSN user:pass@...
-		if colon := lastIndex(s[:at], ":"); colon >= 0 {
+	// MySQL-style DSNs ("user:password@protocol(...)/db"): mask only when
+	// the "@" is preceded by userinfo, i.e. no "/" appears before it.
+	// (A bare length check would slice into the password itself.)
+	if at := strings.LastIndex(s, "@"); at >= 0 && !strings.Contains(s[:at], "/") {
+		if colon := strings.LastIndex(s[:at], ":"); colon >= 0 {
 			return s[:colon+1] + "***" + s[at:]
 		}
 	}
 	return s
-}
-
-func lastIndex(s, sub string) int {
-	for i := len(s) - len(sub); i >= 0; i-- {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }
 
 type preparer interface {

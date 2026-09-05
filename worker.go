@@ -36,6 +36,13 @@ type Worker struct {
 	wfSem  chan struct{}
 	actSem chan struct{}
 
+	// actWg tracks detached activity goroutines so Shutdown can wait for
+	// them within its grace period instead of releasing their leases early
+	// (which would let peers duplicate the execution).
+	actWg   sync.WaitGroup
+	actMu   sync.Mutex
+	stopping bool
+
 	recoverMu   sync.Mutex
 	lastRecover time.Time
 }
@@ -69,6 +76,9 @@ func (w *Worker) Start(parent context.Context) {
 	ctx, cancel := context.WithCancel(parent)
 	w.cancel = cancel
 	w.done = make(chan struct{})
+	w.actMu.Lock()
+	w.stopping = false
+	w.actMu.Unlock()
 	go w.loop(ctx)
 }
 
@@ -123,6 +133,14 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		waitErr = ctx.Err()
 	}
+	// Mark stopping so no new detached activities start, then wait for
+	// in-flight activities within the remaining grace period. Only
+	// activities still running after the grace get their leases released
+	// (peers reclaim them after lease expiry or via the release below).
+	w.actMu.Lock()
+	w.stopping = true
+	w.actMu.Unlock()
+	waitForWaitGroup(&w.actWg, ctx)
 	// Bound lease release: the store may hang, but Shutdown must return
 	// within a predictable budget. Unreleased leases expire via lease timeout
 	// and are reclaimed by other workers.
@@ -134,6 +152,34 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 	defer relCancel()
 	w.releaseInFlight(relCtx)
 	return waitErr
+}
+
+// waitForWaitGroup blocks until wg drains or ctx ends.
+func waitForWaitGroup(wg *sync.WaitGroup, ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
+// trackActivity registers one detached activity for Shutdown-aware waiting.
+// It returns a done func that must be called when the activity finishes.
+// When the worker is stopping it returns ok=false and the caller must
+// release the task lease instead of running it, so Shutdown never waits on
+// work claimed after the stop began.
+func (w *Worker) trackActivity() (done func(), ok bool) {
+	w.actMu.Lock()
+	defer w.actMu.Unlock()
+	if w.stopping {
+		return nil, false
+	}
+	w.actWg.Add(1)
+	return w.actWg.Done, true
 }
 
 func (w *Worker) track(taskID int64) {
@@ -350,7 +396,15 @@ func (w *Worker) tickActivities(ctx context.Context) {
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
 		w.track(t.ID)
+		done, ok := w.trackActivity()
+		if !ok {
+			w.untrack(t.ID)
+			<-w.actSem
+			_ = w.backend.ReleaseLease(ctx, t.ID)
+			continue
+		}
 		go func(t backend.Task) {
+			defer done()
 			defer func() { <-w.actSem }()
 			defer w.untrack(t.ID)
 			if herr := w.handleActivity(ctx, t); herr != nil {
@@ -397,8 +451,12 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
 		w.track(t.ID)
+		done, global := w.trackActivity()
 		go func(t backend.Task) {
 			defer wg.Done()
+			if global {
+				defer done()
+			}
 			defer func() { <-w.actSem }()
 			defer w.untrack(t.ID)
 			if herr := w.handleActivity(ctx, t); herr != nil {
@@ -532,6 +590,9 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 			Failure: []byte(res.Err.Error()),
 		}
 		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
+		if err := w.checkTerminalBudget(&adv); err != nil {
+			return nil, err
+		}
 		w.opts.Logger.Warn("workflow stuck", "instance_id", t.InstanceID, "error", res.Err)
 		w.opts.Metrics.AddTerminal(ctx, "stuck")
 		p := pending()
@@ -574,6 +635,9 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 			ParentSeq: state.Instance.ParentSeq,
 		})
 		w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
+		if err := w.checkTerminalBudget(&adv); err != nil {
+			return nil, err
+		}
 		p := pending()
 		p.adv = adv
 		return p, nil
@@ -615,6 +679,9 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 	}
 	w.withParentNotify(&adv, state.Instance.ParentID, state.Instance.ParentSeq)
 	if adv.Terminal != nil {
+		if err := w.checkTerminalBudget(&adv); err != nil {
+			return nil, err
+		}
 		w.opts.Logger.Info("workflow terminal", "instance_id", t.InstanceID, "status", adv.Terminal.Status)
 		w.opts.Metrics.AddTerminal(ctx, adv.Terminal.Status)
 	}
@@ -713,6 +780,18 @@ func advancementBudget(b backend.Backend) int {
 		return caps.MaxAdvancementEffects
 	}
 	return 100
+}
+
+// checkTerminalBudget validates a terminal advancement against the backend
+// transaction budget. Terminal turns cannot be split across ticks, so an
+// oversized single terminal advancement is a diagnostic error (the backend
+// would reject the transaction anyway).
+func (w *Worker) checkTerminalBudget(adv *backend.Advancement) error {
+	if ops, budget := advancementOps(adv), advancementBudget(w.backend); ops > budget {
+		return fmt.Errorf("tasuki: terminal advancement needs %d ops, budget %d: split fanout across ticks or child workflows (see docs/09-limits.md)",
+			ops, budget)
+	}
+	return nil
 }
 
 // fitAdvancementToBudget truncates suspended advancements to the backend

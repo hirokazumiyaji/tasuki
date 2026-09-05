@@ -26,7 +26,7 @@
 
 ## Fanout の前進方式
 
-`suspended` advancement が予算を超える場合、Worker は新規 commands の prefix のみをコミットし、残りを次 tick の replay に委ねる（journal と task の整合性を保つため中間不整合を作らない）。`EnsureWorkflowTask` で即時フォローアップを確保する。activity 完了時にもフォローアップが発生するため、フォローアップが遅れても前進は止まらない。
+`suspended` advancement が予算を超える場合、Worker は新規 commands の prefix のみをコミットし、残りを次 tick の replay に委ねる（journal と task の整合性を保つため中間不整合を作らない）。`EnsureWorkflowTask` で即時フォローアップを確保する。フォローアップは可能な限り同一トランザクション内で原子的に確保する（DynamoDB は singleton タスク行の in-place 更新、Firestore/SQL は同一トランザクション内の upsert）。そのためコミット→ensure の隙間でクラッシュしても残 replay が失われることはない。activity 完了時にもフォローアップが発生するため、前進は止まらない。
 
 - 50 件の `ExecuteAsync` fanout（DynamoDB 換算 102 ops）は 2 回程度に分割して完了する。
 - 100 件も同様に分割して完了する（再起動しても scheduled event と task が重複しない。journal の `attribute_not_exists` 条件と replay の prefix 一致で冪等）。
@@ -34,7 +34,7 @@
 
 ## 永続的に収まらない単一操作
 
-- terminal を含む advancement が予算を超える場合は切り詰めず診断エラーにする（例: `tasuki: advancement needs 120 ops, budget 80`）。fanout を 1 tick あたりに収まる粒度に分割するか、子ワークフローに分割する。
+- terminal を含む advancement が予算を超える場合は切り詰めず診断エラーにする（例: `tasuki: terminal advancement needs 120 ops, budget 80`）。Worker は terminal turn（完了・失敗・ContinueAsNew・stuck）も事前に検証する。fanout を 1 tick あたりに収まる粒度に分割するか、子ワークフローに分割する。
 - `SendToInboxBatch` が予算超の場合は `ErrBatchTooLarge` を返す（`InboxBatchLimit` = `MaxAdvancementEffects/4`、無制限時は 100）。
 
 ## Scan コストの限界（DynamoDB）

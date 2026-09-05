@@ -886,23 +886,42 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 // instances with inbox events but no workflow task (crash between inbox
 // commit and ensureWorkflowTask). notify is only a hint, so recovery is
 // persistent via the durable task row.
+//
+// The scan resumes from a persisted document cursor on each pass and rotates
+// through the fleet, so orphans beyond the per-call bound are eventually
+// visited instead of starving behind the first page on every pass. Only
+// newly created tasks are counted: instances that already have a task are
+// skipped without inflating the recovered count (and its log line).
 func (b *Backend) RecoverOrphanedWorkflowTasks(ctx context.Context) (int, error) {
-	it := b.col("wf_instances").Where("status", "==", "running").Limit(200).Documents(ctx)
+	b.recoverMu.Lock()
+	cursor := b.recoverCursor
+	b.recoverMu.Unlock()
+	const bound = 200
+	q := b.col("wf_instances").Where("status", "==", "running").OrderBy(gcf.DocumentID, gcf.Asc).Limit(bound)
+	if cursor != "" {
+		q = q.StartAfter(cursor)
+	}
+	it := q.Documents(ctx)
 	defer it.Stop()
 	recovered := 0
+	last := ""
+	exhausted := false
 	for {
 		s, err := it.Next()
 		if err == iterator.Done {
+			exhausted = true
 			break
 		}
 		if err != nil {
 			return recovered, err
 		}
-		m := s.Data()
-		id, _ := m["id"].(string)
+		id := s.Ref.ID
 		if id == "" {
-			id = s.Ref.ID
+			if mid, _ := s.Data()["id"].(string); mid != "" {
+				id = mid
+			}
 		}
+		last = id
 		inboxIt := b.col("wf_inbox").Where("instance_id", "==", id).Limit(1).Documents(ctx)
 		_, err = inboxIt.Next()
 		inboxIt.Stop()
@@ -912,10 +931,28 @@ func (b *Backend) RecoverOrphanedWorkflowTasks(ctx context.Context) (int, error)
 		if err != nil {
 			continue
 		}
+		// Check task existence first: ensureWorkflowTask reports success
+		// even when the task already exists, which would miscount healthy
+		// instances as recovered on every pass.
+		tsnap, terr := b.ref("wf_tasks", wfTaskID(id)).Get(ctx)
+		if terr == nil && tsnap.Exists() {
+			continue
+		}
+		if terr != nil && !isNotFound(terr) {
+			continue
+		}
 		if err := b.ensureWorkflowTask(ctx, id); err == nil {
 			recovered++
 		}
 	}
+	b.recoverMu.Lock()
+	if exhausted {
+		// Full fleet visited: restart from the beginning next pass.
+		b.recoverCursor = ""
+	} else {
+		b.recoverCursor = last
+	}
+	b.recoverMu.Unlock()
 	return recovered, nil
 }
 func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {

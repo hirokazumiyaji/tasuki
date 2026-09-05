@@ -487,7 +487,10 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	}
 	var all []types.TransactWriteItem
 	var ensures []string
-	var forcedEnsures map[string]bool
+	// refreshed marks advancements whose workflow task was refreshed
+	// atomically inside the transaction (truncated fanout): they need no
+	// post-commit ensure.
+	var refreshed map[string]bool
 	var parentEnsures []string
 	for _, adv := range advs {
 		items, parentID, err := b.buildAdvancementItems(ctx, adv)
@@ -506,10 +509,10 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		all = append(all, items...)
 		ensures = append(ensures, adv.InstanceID)
 		if adv.EnsureWorkflowTask {
-			if forcedEnsures == nil {
-				forcedEnsures = map[string]bool{}
+			if refreshed == nil {
+				refreshed = map[string]bool{}
 			}
-			forcedEnsures[adv.InstanceID] = true
+			refreshed[adv.InstanceID] = true
 		}
 		if parentID != "" {
 			parentEnsures = append(parentEnsures, parentID)
@@ -528,10 +531,9 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		}
 	}
 	for _, id := range ensures {
-		if forcedEnsures[id] {
-			if err := b.ensureWorkflowTaskForced(ctx, id); err != nil {
-				return err
-			}
+		// Truncated advancements refreshed their task atomically inside
+		// the transaction; only inbox-backed ensures remain here.
+		if refreshed[id] {
 			continue
 		}
 		if err := b.ensureWorkflowTask(ctx, id); err != nil {
@@ -573,7 +575,9 @@ func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advance
 		}
 	}
 	if adv.EnsureWorkflowTask {
-		return b.ensureWorkflowTaskForced(ctx, adv.InstanceID)
+		// Follow-up task was refreshed atomically inside the transaction;
+		// notifyAfterAdvancements (caller) still fires task wake hints.
+		return nil
 	}
 	return b.ensureWorkflowTask(ctx, adv.InstanceID)
 }
@@ -633,8 +637,34 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 		items = append(items, put(b.table("wf_inbox"), inboxItem(inst.ParentID, newID(), seq, ev, now), "attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
 		parentID = inst.ParentID
 	}
-	items = append(items, delWithValues(b.table("wf_tasks"), map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))}, "id = :taskid AND kind = :workflow", map[string]types.AttributeValue{":taskid": avN(adv.TaskID), ":workflow": avS("workflow")}))
+	if adv.EnsureWorkflowTask {
+		// Truncated fanout: keep the singleton workflow task alive with an
+		// in-place refresh instead of delete + post-commit ensure. The
+		// follow-up is then part of the same atomic transaction, so no
+		// crash gap can stall the remaining replayed commands (recovery
+		// cannot detect them: they leave no inbox behind).
+		items = append(items, b.refreshWorkflowTask(adv.InstanceID, adv.TaskID, inst.Queue, now))
+	} else {
+		items = append(items, delWithValues(b.table("wf_tasks"), map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))}, "id = :taskid AND kind = :workflow", map[string]types.AttributeValue{":taskid": avN(adv.TaskID), ":workflow": avS("workflow")}))
+	}
 	return items, parentID, nil
+}
+
+// refreshWorkflowTask atomically carries the singleton workflow task past a
+// truncated advancement: one Update on the same key instead of Delete +
+// post-commit Put. The fence (id/kind condition) is preserved so a zombie
+// task that lost its lease still fails the transaction.
+func (b *Backend) refreshWorkflowTask(instanceID string, taskID int64, queue string, now time.Time) types.TransactWriteItem {
+	return types.TransactWriteItem{Update: &types.Update{
+		TableName:           aws.String(b.table("wf_tasks")),
+		Key:                 map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(instanceID))},
+		UpdateExpression:    aws.String("SET id = :newid, visible_at = :v, attempt = :zero, created_at = :now REMOVE worker_id"),
+		ConditionExpression: aws.String("id = :taskid AND kind = :workflow"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":newid": avN(newID()), ":v": avN(timeToN(now)), ":zero": avN(0), ":now": avN(timeToN(now)),
+			":taskid": avN(taskID), ":workflow": avS("workflow"),
+		},
+	}}
 }
 
 func instanceAdvanceExpression(t *backend.TerminalUpdate, withSearchAttrs, withMemo bool) string {
@@ -684,23 +714,13 @@ func inboxItem(instanceID string, id, seq int64, e journal.Event, now time.Time)
 }
 
 func (b *Backend) ensureWorkflowTask(ctx context.Context, instanceID string) error {
-	return b.ensureWorkflowTaskWithForce(ctx, instanceID, false)
-}
-
-func (b *Backend) ensureWorkflowTaskForced(ctx context.Context, instanceID string) error {
-	return b.ensureWorkflowTaskWithForce(ctx, instanceID, true)
-}
-
-func (b *Backend) ensureWorkflowTaskWithForce(ctx context.Context, instanceID string, force bool) error {
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil || inst.Status != "running" {
 		return err
 	}
-	if !force {
-		inbox, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_inbox")), KeyConditionExpression: aws.String("instance_id = :id"), ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(instanceID)}, Limit: aws.Int32(1)})
-		if err != nil || len(inbox.Items) == 0 {
-			return err
-		}
+	inbox, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_inbox")), KeyConditionExpression: aws.String("instance_id = :id"), ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(instanceID)}, Limit: aws.Int32(1)})
+	if err != nil || len(inbox.Items) == 0 {
+		return err
 	}
 	_, err = b.client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(b.table("wf_tasks")), Item: workflowTaskItem(instanceID, inst.Queue, newID(), nowUTC()), ConditionExpression: aws.String("attribute_not_exists(task_pk)")})
 	if conditional(err) {
@@ -897,12 +917,19 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 
 // RecoverOrphanedWorkflowTasks re-creates workflow tasks for running
 // instances that hold inbox events but no workflow task. It closes the
-// commit→ensure crash gap (TransactWriteItems cannot atomically delete the
-// old singleton task and re-create it on the same key, so ensure runs
-// outside the transaction). Bounded to ~200 instances per call; workers
-// throttle calls to once per few seconds.
+// commit→ensure crash gap on inbox paths (activity completion, timers,
+// signals: their follow-up ensure runs outside the transaction).
+// Truncated fanout follow-ups need no recovery: they refresh the singleton
+// task atomically inside the advancement transaction.
+//
+// The scan resumes from a persisted cursor on each pass and rotates through
+// the fleet, so orphans beyond the per-call bound are eventually visited
+// instead of starving behind the first page on every pass.
 func (b *Backend) RecoverOrphanedWorkflowTasks(ctx context.Context) (int, error) {
-	var start map[string]types.AttributeValue
+	b.recoverMu.Lock()
+	start := b.recoverCursor
+	b.recoverMu.Unlock()
+	const bound = 200
 	checked := 0
 	recovered := 0
 	for {
@@ -922,11 +949,15 @@ func (b *Backend) RecoverOrphanedWorkflowTasks(ctx context.Context) (int, error)
 			if fromS(m["status"]) != "running" {
 				continue
 			}
-			id := fromS(m["id"])
-			checked++
-			if checked > 200 {
+			if checked >= bound {
+				// Bound reached: resume from this page on the next pass.
+				b.recoverMu.Lock()
+				b.recoverCursor = start
+				b.recoverMu.Unlock()
 				return recovered, nil
 			}
+			checked++
+			id := fromS(m["id"])
 			inbox, err := b.client.Query(ctx, &dynamodb.QueryInput{
 				TableName:                 aws.String(b.table("wf_inbox")),
 				KeyConditionExpression:    aws.String("instance_id = :id"),
@@ -957,6 +988,10 @@ func (b *Backend) RecoverOrphanedWorkflowTasks(ctx context.Context) (int, error)
 			}
 		}
 		if out.LastEvaluatedKey == nil {
+			// Full fleet visited: restart from the beginning next pass.
+			b.recoverMu.Lock()
+			b.recoverCursor = nil
+			b.recoverMu.Unlock()
 			break
 		}
 		start = out.LastEvaluatedKey

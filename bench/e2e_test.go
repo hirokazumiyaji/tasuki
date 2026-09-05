@@ -39,6 +39,13 @@ func TestRun_E2EIncludesSubmitAndLatency(t *testing.T) {
 	if res.Settings == nil || res.Settings["run_id"] != "e2e-test" {
 		t.Fatalf("settings missing run_id: %+v", res.Settings)
 	}
+	// Zero config must report the worker defaults actually used, not zeros.
+	if res.Settings["claim_limit"] != 10 {
+		t.Fatalf("claim_limit=%v, want resolved default 10", res.Settings["claim_limit"])
+	}
+	if res.Settings["activity_concurrency"] != 1 || res.Settings["workflow_concurrency"] != 1 {
+		t.Fatalf("concurrency not resolved: %+v", res.Settings)
+	}
 }
 
 func TestRun_RunIsolationAndRepeat(t *testing.T) {

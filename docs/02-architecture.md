@@ -186,10 +186,12 @@ RETURNING t.*;
 
 ## Worker の停止契約（Shutdown）
 
-`Shutdown(ctx)` は二相で停止する。
+`Shutdown(ctx)` は三相で停止する。
 
-- **正常終了**: ループを停止し、in-flight タスクの lease を `ShutdownReleaseTimeout`（既定 5s）以内に解放する。解放に失敗したタスクは lease 失効後に別 Worker が再獲得する（失敗は Warn ログ + `tasuki.worker.store_errors{op="release_lease"}` で観測可能）。
-- **強制終了**: `ctx` の期限到来でループ待ちを打ち切り、その後も lease 解放には `ShutdownReleaseTimeout` の上限を適用する。`Shutdown` は必ず時間予算内に返る。ストアが応答しない場合も `ctx` を超えてブロックしない。
+- **ループ停止**: ポーリングループを止め、新規の detached activity を受け付けない。
+- **実行中 activity の待機**: 実行中の activity が終わるまで `ctx` の残り猶予内で待つ。先に終わればその結果を消費済みとして扱い、他ワーカーによる二重実行を防ぐ。猶予切れで残ったもののみ lease 解放の対象になる。
+- **lease 解放**: in-flight タスクの lease を `ShutdownReleaseTimeout`（既定 5s）以内に解放する。解放に失敗したタスクは lease 失効後に別 Worker が再獲得する（失敗は Warn ログ + `tasuki.worker.store_errors{op="release_lease"}` で観測可能）。
+- **強制終了**: `ctx` の期限到来で各待ちを打ち切る。`Shutdown` は必ず時間予算内に返る。ストアが応答しない場合も `ctx` を超えてブロックしない。
 
 未解放タスクの回復は lease expiry に依存するため、`LeaseDuration` を短くしすぎると再実行が増え、長くしすぎると回復が遅くなる。既定 30s を起点に調整する。
 

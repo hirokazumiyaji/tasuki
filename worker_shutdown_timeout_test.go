@@ -2,6 +2,7 @@ package tasuki_test
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -125,4 +126,70 @@ func TestWorker_LongActivityDoesNotBlockTimer(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatal("timer did not progress while activity blocked")
+}
+
+// TestWorker_ShutdownWaitsForActivities verifies Shutdown waits for running
+// activities within its grace period instead of releasing their leases
+// immediately (which would let peers duplicate the execution).
+func TestWorker_ShutdownWaitsForActivities(t *testing.T) {
+	ctx := context.Background()
+	b := memory.New()
+	b.SetNow(time.Now().UTC())
+	var calls atomic.Int32
+	w := tasuki.NewWorker(b, tasuki.WorkerOptions{PollInterval: time.Millisecond})
+	tasuki.RegisterActivity(w, func(ctx context.Context, _ struct{}) (string, error) {
+		calls.Add(1)
+		time.Sleep(100 * time.Millisecond)
+		return "done", nil
+	}, tasuki.WithName("quick"))
+	tasuki.RegisterWorkflow(w, func(wctx *workflow.Context, _ struct{}) (string, error) {
+		return workflow.Execute[struct{}, string](wctx, "quick", struct{}{})
+	}, tasuki.WithName("WF"))
+	c := tasuki.NewClient(b)
+	h, err := tasuki.Start(ctx, c, "WF", struct{}{}, tasuki.WithID("shut-wait-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Start(ctx)
+	// Wait until the activity is claimed and running.
+	deadline := time.Now().Add(3 * time.Second)
+	for calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if calls.Load() == 0 {
+		t.Fatal("activity did not start")
+	}
+	start := time.Now()
+	shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := w.Shutdown(shCtx); err != nil {
+		t.Fatal(err)
+	}
+	// Shutdown must have waited for the activity, not released it early.
+	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
+		t.Fatalf("Shutdown returned too early (%v): activity lease released before completion", elapsed)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("activity executed %d times, want exactly once", n)
+	}
+	// The activity task was consumed (not lease-released for a duplicate):
+	// no claimable activity task may remain.
+	leftover, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "activity", Queues: []string{"default"}, Limit: 10, Lease: time.Second, WorkerID: "w2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftover) != 0 {
+		t.Fatalf("%d activity tasks leaked for duplicate execution", len(leftover))
+	}
+	// Follow-up workflow work resumes on the next worker start; the instance
+	// must not have failed.
+	info, err := c.Get(ctx, h.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Status == tasuki.StatusFailed {
+		t.Fatalf("status=%q after graceful shutdown", info.Status)
+	}
 }

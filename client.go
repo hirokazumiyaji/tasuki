@@ -146,26 +146,32 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 	headErr := c.backend.SendToInbox(ctx, id, journal.Event{
 		Type: journal.TypeCancelRequested,
 	}, "")
-	tail, terr := c.resolveContinuedTail(ctx, id)
-	if terr == nil && tail != "" && tail != id {
-		_ = c.backend.SendToInbox(ctx, tail, journal.Event{
+	if tail, terr := c.resolveContinuedTail(ctx, id); terr == nil && tail != "" && tail != id {
+		// The tail is the live execution: its delivery failure must be
+		// reported even when the head send succeeded.
+		if tailErr := c.backend.SendToInbox(ctx, tail, journal.Event{
 			Type: journal.TypeCancelRequested,
-		}, "")
-		if headErr != nil {
-			// Head may already be "continued" (still cancelable via tail).
-			return nil
+		}, ""); tailErr != nil {
+			return tailErr
 		}
+		return nil
 	}
 	return headErr
 }
 
 func (c *Client) Terminate(ctx context.Context, id string) error {
+	// Resolve the live tail BEFORE terminating the head: terminating first
+	// would overwrite the head's "continued" status and hide the child,
+	// leaving the active tail running despite success.
+	tail, terr := c.resolveContinuedTail(ctx, id)
 	if err := c.backend.TerminateInstance(ctx, id); err != nil {
 		return err
 	}
 	// Also terminate the continued tail so Result does not hang on the child.
-	if tail, err := c.resolveContinuedTail(ctx, id); err == nil && tail != "" && tail != id {
-		_ = c.backend.TerminateInstance(ctx, tail)
+	if terr == nil && tail != "" && tail != id {
+		if err := c.backend.TerminateInstance(ctx, tail); err != nil && !errors.Is(err, backend.ErrNotFound) {
+			return err
+		}
 	}
 	return nil
 }

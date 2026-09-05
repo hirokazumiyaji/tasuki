@@ -820,13 +820,12 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		return err
 	}
 	if adv.EnsureWorkflowTask {
-		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{adv.InstanceID}, []string{"queue"})
-		if err == nil {
-			var q string
-			if err := row.Columns(&q); err == nil {
-				_ = enqueueWorkflowTask(ctx, txn, adv.InstanceID, q, nowUTC())
-			}
-		}
+		// Truncated fanout: force a follow-up tick even though the
+		// remaining work replays (no inbox yet). enqueueWorkflowTask reads
+		// the instance row itself, so no separate pre-read is needed, and
+		// its error must fail the advancement: without the follow-up task
+		// the uncommitted remainder could never be reached.
+		return enqueueWorkflowTask(ctx, txn, adv.InstanceID, "", nowUTC())
 	}
 	return nil
 }

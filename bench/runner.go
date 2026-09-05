@@ -61,14 +61,42 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
+// resolvedClaimLimit reports the effective claim limit (worker default 10).
+func (c Config) resolvedClaimLimit() int {
+	if c.ClaimLimit <= 0 {
+		return 10
+	}
+	return c.ClaimLimit
+}
+
+// resolvedActivityConcurrency reports the effective activity concurrency
+// (worker default 1).
+func (c Config) resolvedActivityConcurrency() int {
+	if c.ActivityConcurrency <= 0 {
+		return 1
+	}
+	return c.ActivityConcurrency
+}
+
+// resolvedWorkflowConcurrency reports the effective workflow concurrency
+// (worker default 1).
+func (c Config) resolvedWorkflowConcurrency() int {
+	if c.WorkflowConcurrency <= 0 {
+		return 1
+	}
+	return c.WorkflowConcurrency
+}
+
 // effectiveSettings snapshots the resolved worker settings for Result.
+// Zero values are reported as the worker defaults actually used, so the
+// emitted JSON stays reproducible across CLI invocations.
 func (c Config) effectiveSettings() map[string]any {
 	return map[string]any{
 		"poll_ms":              c.Poll.Milliseconds(),
 		"lease_ms":             c.Lease.Milliseconds(),
-		"claim_limit":          c.ClaimLimit,
-		"activity_concurrency": c.ActivityConcurrency,
-		"workflow_concurrency": c.WorkflowConcurrency,
+		"claim_limit":          c.resolvedClaimLimit(),
+		"activity_concurrency": c.resolvedActivityConcurrency(),
+		"workflow_concurrency": c.resolvedWorkflowConcurrency(),
 		"scenario":             c.Scenario,
 		"run_id":               c.RunID,
 	}
@@ -88,9 +116,9 @@ func Run(ctx context.Context, b backend.Backend, backendName string, cfg Config)
 		w := tasuki.NewWorker(b, tasuki.WorkerOptions{
 			PollInterval:        cfg.Poll,
 			LeaseDuration:       cfg.Lease,
-			ClaimLimit:          cfg.ClaimLimit,
-			ActivityConcurrency: cfg.ActivityConcurrency,
-			WorkflowConcurrency: cfg.WorkflowConcurrency,
+			ClaimLimit:          cfg.resolvedClaimLimit(),
+			ActivityConcurrency: cfg.resolvedActivityConcurrency(),
+			WorkflowConcurrency: cfg.resolvedWorkflowConcurrency(),
 			WorkerID:            fmt.Sprintf("bench-w-%d", i),
 			Logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
 		})
@@ -107,14 +135,22 @@ func Run(ctx context.Context, b backend.Backend, backendName string, cfg Config)
 	}()
 
 	client := tasuki.NewClient(b)
+	// waitCtx bounds the whole run including submission when Duration caps it.
+	waitCtx := ctx
+	var cancel context.CancelFunc = func() {}
+	if cfg.Duration > 0 {
+		waitCtx, cancel = context.WithTimeout(ctx, cfg.Duration)
+	} else {
+		waitCtx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
+
 	// E2E clock includes submission.
 	e2eStart := time.Now()
-	type submitted struct {
-		h   *tasuki.Handle
-		t0  time.Time
-		idx int
-	}
-	submittedHandles := make([]submitted, 0, cfg.Instances)
+	var completed, failed atomic.Int64
+	latencies := make([]float64, cfg.Instances)
+	var latMu sync.Mutex
+	var wg sync.WaitGroup
 	for i := 0; i < cfg.Instances; i++ {
 		id := fmt.Sprintf("%s-%d", cfg.RunID, i)
 		t0 := time.Now()
@@ -122,25 +158,13 @@ func Run(ctx context.Context, b backend.Backend, backendName string, cfg Config)
 		if err != nil {
 			return Result{}, fmt.Errorf("start %s: %w", id, err)
 		}
-		submittedHandles = append(submittedHandles, submitted{h: h, t0: t0, idx: i})
-	}
-
-	waitCtx := ctx
-	var cancel context.CancelFunc
-	if cfg.Duration > 0 {
-		waitCtx, cancel = context.WithTimeout(ctx, cfg.Duration)
-		defer cancel()
-	}
-
-	var completed, failed atomic.Int64
-	latencies := make([]float64, cfg.Instances)
-	var latMu sync.Mutex
-	var wg sync.WaitGroup
-	for _, s := range submittedHandles {
+		// Observe latency from each instance's own submission moment:
+		// waiters launched after the whole batch would inflate early
+		// completions by the remaining submission delay.
 		wg.Add(1)
-		go func(s submitted) {
+		go func(h *tasuki.Handle, t0 time.Time, idx int) {
 			defer wg.Done()
-			_, err := tasuki.Result[int](waitCtx, s.h)
+			_, err := tasuki.Result[int](waitCtx, h)
 			if err != nil {
 				// Duration cut-off / cancel: incomplete, not failed.
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || waitCtx.Err() != nil {
@@ -151,10 +175,11 @@ func Run(ctx context.Context, b backend.Backend, backendName string, cfg Config)
 			}
 			completed.Add(1)
 			latMu.Lock()
-			latencies[s.idx] = time.Since(s.t0).Seconds() * 1000
+			latencies[idx] = time.Since(t0).Seconds() * 1000
 			latMu.Unlock()
-		}(s)
+		}(h, t0, i)
 	}
+
 	wg.Wait()
 	wall := time.Since(e2eStart).Seconds()
 	comp := int(completed.Load())
@@ -163,13 +188,9 @@ func Run(ctx context.Context, b backend.Backend, backendName string, cfg Config)
 	if wall > 0 {
 		throughput = float64(comp) / wall
 	}
-	// Latency distribution over completed instances only.
+	// Latency distribution over completed instances only (sparse when a
+	// Duration cut-off leaves instances incomplete: keep >0 entries).
 	var lats []float64
-	for i := 0; i < comp; i++ {
-		// latencies indexed by submit order; completed may be sparse when
-		// Duration cuts off. Collect non-zero entries.
-	}
-	// Re-collect: iterate all, keep >0 (completed).
 	for _, ms := range latencies {
 		if ms > 0 {
 			lats = append(lats, ms)
