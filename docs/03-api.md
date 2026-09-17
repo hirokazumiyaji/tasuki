@@ -1,16 +1,18 @@
-# 公開 API 設計
+# Public API Design
 
-本書はライブラリ利用者から見た API を定める。
-モジュールパスは `github.com/hirokazumiyaji/tasuki`、ルートパッケージ名は `tasuki` とする。
+[English] | [日本語](ja/03-api.md)
 
-## 設計方針
+This document defines the public API of tasuki from the perspective of library consumers.  
+The module path is `github.com/hirokazumiyaji/tasuki`, and the root package name is `tasuki`.
 
-- ジェネリクスで型を通す。公開 API に `interface{}`（`any`）を出さず、入出力の型はコンパイル時に検査される。
-- ワークフロー内で使えるコンテキストは `context.Context` ではなく専用の `*workflow.Context` とする。型を分けることで、ワークフロー内から IO を伴う関数（`context.Context` を要求する）をうっかり呼ぶ誤りを型エラーにできる。
-- Go にはジェネリックなメソッドがないため、型パラメータを持つ操作（Execute、Start など）はパッケージ関数として提供する。
-- バックエンドは `backend.Backend` インターフェースで差し替えられる。ワークフローとアクティビティのコードはストアに依存せず、バックエンドの変更で書き換えを要求しない。
+## Design Principles
 
-## 最小構成の例
+- **Compile-Time Type Safety via Generics**: The public API does not expose `interface{}` or `any`. Input and output types are verified at compile time.
+- **Dedicated Workflow Context**: Workflows accept `*workflow.Context` instead of standard `context.Context`. This type separation turns accidental calls to blocking I/O functions (which require `context.Context`) into compile errors.
+- **Package Functions for Parameterized Operations**: Because Go does not support generic methods on structs, generic operations such as `Execute` and `Start` are provided as package-level functions.
+- **Pluggable Persistence**: The storage backend is abstracted behind `backend.Backend`. Workflow and activity code is completely decoupled from database specifics and requires no changes when switching backends.
+
+## Minimal Configuration Example
 
 ```go
 package main
@@ -29,17 +31,26 @@ import (
 type OrderInput struct{ OrderID string }
 type OrderResult struct{ InvoiceID string }
 
-// ワークフロー: 決定的なオーケストレーションだけを書く
+type ChargeInput struct{ OrderID string }
+type ChargeResult struct {
+    InvoiceID     string
+    CustomerEmail string
+}
+type ShipInput struct{ OrderID string }
+type ShipResult struct{ TrackingID string }
+type MailInput struct{ To string }
+
+// Workflow: Contains strictly deterministic orchestration logic.
 func OrderWorkflow(ctx *workflow.Context, in OrderInput) (OrderResult, error) {
-    charge, err := workflow.Execute(ctx, ChargePayment, ChargeInput{OrderID: in.OrderID},
+    charge, err := workflow.Execute[ChargeInput, ChargeResult](ctx, "ChargePayment", ChargeInput{OrderID: in.OrderID},
         workflow.WithRetry(workflow.RetryPolicy{MaxAttempts: 5}))
     if err != nil {
         return OrderResult{}, err
     }
 
-    // 配送手配とメール送信を並行実行する
-    ship := workflow.ExecuteAsync(ctx, ShipOrder, ShipInput{OrderID: in.OrderID})
-    mail := workflow.ExecuteAsync(ctx, SendReceiptMail, MailInput{To: charge.CustomerEmail})
+    // Execute shipping and email notification concurrently
+    ship := workflow.ExecuteAsync[ShipInput, ShipResult](ctx, "ShipOrder", ShipInput{OrderID: in.OrderID})
+    mail := workflow.ExecuteAsync[MailInput, struct{}](ctx, "SendReceiptMail", MailInput{To: charge.CustomerEmail})
     if _, err := ship.Get(ctx); err != nil {
         return OrderResult{}, err
     }
@@ -47,17 +58,17 @@ func OrderWorkflow(ctx *workflow.Context, in OrderInput) (OrderResult, error) {
         return OrderResult{}, err
     }
 
-    // 7 日後のフォローアップまで durable にスリープする
+    // Sleep durably for 7 days until follow-up
     if err := workflow.Sleep(ctx, 7*24*time.Hour); err != nil {
         return OrderResult{}, err
     }
-    if _, err := workflow.Execute(ctx, SendFollowUpMail, MailInput{To: charge.CustomerEmail}); err != nil {
+    if _, err := workflow.Execute[MailInput, struct{}](ctx, "SendFollowUpMail", MailInput{To: charge.CustomerEmail}); err != nil {
         return OrderResult{}, err
     }
     return OrderResult{InvoiceID: charge.InvoiceID}, nil
 }
 
-// アクティビティ: 副作用はここに置く。at-least-once 実行のため冪等に実装する
+// Activity: Encapsulates side effects. Implemented idempotently for at-least-once execution.
 func ChargePayment(ctx context.Context, in ChargeInput) (ChargeResult, error) {
     key := activity.GetInfo(ctx).IdempotencyKey
     return paymentClient.Charge(ctx, in.OrderID, key)
@@ -76,7 +87,7 @@ func main() {
     w.Start(ctx)
     defer w.Shutdown(ctx)
 
-    // 開始はどのプロセスからでもよい（Client はワーカーなしでも作れる）
+    // Starting workflows can be performed from any process (Clients do not require workers)
     c := tasuki.NewClient(postgres.NewBackend(pool))
     h, _ := tasuki.Start(ctx, c, OrderWorkflow, OrderInput{OrderID: "order-123"},
         tasuki.WithID("order-123"))
@@ -85,184 +96,154 @@ func main() {
 }
 ```
 
-## ワークフロー内 API
+## Workflow In-Scope API
 
-`workflow` パッケージが提供する操作の一覧。
+Functions provided by the `workflow` package:
 
-| 関数 | 概要 |
+| Function | Description |
 |---|---|
-| `Execute[I, O](ctx, fn, in, opts...) (O, error)` | アクティビティを実行し完了を待つ（`WithRetry` / `WithStartToCloseTimeout`） |
-| `ExecuteLocal[I, O](ctx, name, in) (O, error)` | 同一 Worker 上で同期実行し結果をジャーナルする（タスクキューなし・リトライなし） |
-| `ExecuteAsync[I, O](ctx, fn, in, opts...) *Future[O]` | アクティビティを開始し Future を返す（同じオプション可） |
-| `ExecuteChild[I, O](ctx, wf, in, opts...) (O, error)` | 子ワークフローを実行し完了を待つ（Async 版もある） |
-| `Sleep(ctx, d) error` / `SleepUntil(ctx, t) error` | durable なタイマーで待つ |
-| `SleepAsync(ctx, d) *Future[struct{}]` | タイマーを Future として開始する（タイムアウトの Select 用） |
-| `Now(ctx) time.Time` | リプレイで変わらない現在時刻 |
-| `ReceiveSignal[T](ctx, name) (T, error)` | シグナルの到着を待つ |
-| `ReceiveSignalWithTimeout[T](ctx, name, d) (T, bool, error)` | タイムアウト付きで待つ（第 2 戻り値が受信可否） |
-| `SideEffect[T](ctx, fn) (T, error)` | 非決定的な値の生成を一度だけ実行して記録する |
-| `NewUUID(ctx) (string, error)` | 記録される UUID 生成（SideEffect の糖衣） |
-| `Await(ctx, futures...) (int, error)` | 最初に完了した Future の添字を返す |
-| `AwaitAll(ctx, futures...) error` | すべての完了を待ち、最初のエラーを返す |
-| `GetVersion(ctx, changeID, min, max) int` | 実行中インスタンスと共存するコード変更の分岐 |
-| `ContinueAsNew[I](ctx, in) error` | 履歴を打ち切り新しい実行へ引き継ぐ（return で使うエラー値） |
-| `Info(ctx) WorkflowInfo` | インスタンス ID、ワークフロー名、開始時刻 |
-| `SetQueryHandler[I, O](ctx, name, fn)` | 読み取り専用のクエリハンドラを登録する（ジャーナルには残らない） |
-| `SetUpdateHandler[I, O](ctx, name, fn)` | 実行中インスタンスへの Update ハンドラを登録する（`Execute` / `Sleep` 可） |
-| `UpsertSearchAttributes(ctx, attrs)` | 検索属性をマージ更新する（空文字の値はそのキーを削除） |
-| `UpsertMemo(ctx, attrs)` | 表示用メモをマージ更新する（空文字の値はそのキーを削除） |
+| `Execute[I, O](ctx, fn, in, opts...) (O, error)` | Runs an activity and waits for completion (`WithRetry`, `WithStartToCloseTimeout`) |
+| `ExecuteLocal[I, O](ctx, name, in) (O, error)` | Executes an activity synchronously on the same worker, recording results directly in the journal (no task queue, no retry) |
+| `ExecuteAsync[I, O](ctx, fn, in, opts...) *Future[O]` | Schedules an activity asynchronously and returns a `Future` |
+| `ExecuteChild[I, O](ctx, wf, in, opts...) (O, error)` | Runs a child workflow and waits for completion (`ExecuteChildAsync` also available) |
+| `Sleep(ctx, d) error` / `SleepUntil(ctx, t) error` | Suspends execution using a durable timer |
+| `SleepAsync(ctx, d) *Future[struct{}]` | Starts a durable timer as a `Future` (useful for Select timeouts) |
+| `Now(ctx) time.Time` | Returns the recorded current time that remains constant across replays |
+| `ReceiveSignal[T](ctx, name) (T, error)` | Waits for a signal with the specified name |
+| `ReceiveSignalWithTimeout[T](ctx, name, d) (T, bool, error)` | Waits for a signal with a duration timeout (second return value indicates receipt) |
+| `SideEffect[T](ctx, fn) (T, error)` | Executes a non-deterministic value generator once and records the result in the journal |
+| `NewUUID(ctx) (string, error)` | Returns a deterministic UUID (syntactic sugar over `SideEffect`) |
+| `Await(ctx, futures...) (int, error)` | Waits until any of the provided futures complete, returning the index of the first completion |
+| `AwaitAll(ctx, futures...) error` | Waits until all futures complete, returning the first encountered error |
+| `GetVersion(ctx, changeID, min, max) int` | Evaluates version branches to support backward-compatible code evolution on running instances |
+| `ContinueAsNew[I](ctx, in) error` | Ends the current instance and restarts execution with a fresh history (used as a return error) |
+| `Info(ctx) WorkflowInfo` | Returns instance metadata (ID, workflow name, start time) |
+| `SetQueryHandler[I, O](ctx, name, fn)` | Registers a read-only query handler (queries leave no journal events) |
+| `SetUpdateHandler[I, O](ctx, name, fn)` | Registers a synchronous update handler for running instances (`Execute` and `Sleep` are permitted) |
+| `UpsertSearchAttributes(ctx, attrs)` | Merges string key-value attributes for instance filtering (empty values remove keys) |
+| `UpsertMemo(ctx, attrs)` | Merges display annotations for instance inspection (empty values remove keys) |
 
-`SetQueryHandler` はリプレイのたびに同じ決定的な位置で呼び出す。
-ハンドラは履歴を進めない（`Execute` や `Sleep` など新しいコマンドを記録してはならない）。
+`SetQueryHandler` must be registered at a deterministic position during replay. Query handlers must never record new commands (no `Execute` or `Sleep`).
 
-`SetUpdateHandler` も同様に毎回同じ位置で登録する。
-ハンドラは `*workflow.Context` を受け取り、`Execute` / `Sleep` など通常のワークフロー API を使える。
-呼び出しは `tasuki.Update`（Worker 同一プロセス）。任意の `WithUpdateID` で再送冪等。
-進行中の Update があるあいだ、メインのワークフローは新しいコマンドを進めない（単一ゴルーチンの協調モデル）。
+`SetUpdateHandler` must similarly be registered at a deterministic position. Handlers receive `*workflow.Context` and may call standard workflow operations such as `Execute` and `Sleep`. Updates are triggered using `tasuki.Update` (within the same worker process) and support optional `WithUpdateID` for idempotent resends. While an update turn is processing, the main workflow routine does not advance.
 
-`UpsertSearchAttributes` は決定的コマンドとしてジャーナルに残り、ペイロードは適用後のマップ全体である。
-クエリ実行中に呼ぶと、他の副作用と同様に拒否／サスペンドされる。
+`UpsertSearchAttributes` is recorded as a command event in the journal, with the full merged attribute map as its payload. Calling it during query execution is rejected.
 
-`UpsertMemo` も同様にジャーナルに残るが、`List` の絞り込みには使わない（Get で見える表示用メタデータ）。
+`UpsertMemo` is similarly recorded as a command event, but memo fields are intended for display metadata and are not indexed for `List` filtering.
 
-`ExecuteLocal` は `RegisterActivity` した関数をワークフロータスク内で同期実行する。
-通常の `Execute` と違いアクティビティタスクは作らず、リトライも行わない。短い・信頼できる処理向け。結果（またはエラー）は `local_activity` コマンドとしてジャーナルに残り、リプレイではランナーを呼ばない。
+`ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay.
 
-長寿命・ループするワークフローは、イベント数が数千〜1万付近になったら `ContinueAsNew` で履歴を打ち切ることを推奨する（既定の警告しきい値と揃える）。警告自体は実行を止めない。
+For long-running or looping workflows, calling `ContinueAsNew` when event counts reach thousands is strongly recommended to bound history size.
 
-`Future[O]` は `Get(ctx) (O, error)` を持つ。
-`Await` に異なる型の Future を混ぜられるよう、すべての Future は型を消した `Awaitable` インターフェースを満たす。
+`Future[O]` exposes `Get(ctx) (O, error)`. All futures implement the non-generic `Awaitable` interface, allowing heterogeneous types to be awaited together in `Await`.
 
-### 並行実行の考え方
+### Concurrency Model
 
-ワークフロー関数自体は常に単一ゴルーチンで実行される（[02-architecture.md](02-architecture.md) の実行モデル）。
-並行なのは「進行中のアクティビティと子ワークフロー」であり、ワークフローコードの並行性は `ExecuteAsync` と `Await` 系で表現する。
-ワークフロー内で `go` 文やチャネルを使うことはできない。
-それより大きな並行構造が必要な場合は子ワークフローへ分割する。
+A workflow function executes sequentially within a single goroutine per task turn (see [02-architecture.md](02-architecture.md)).  
+What executes concurrently are external activities and child workflows. Concurrency in workflow logic is expressed using `ExecuteAsync`, `Await`, and `AwaitAll`. Workflows must not spawn goroutines (`go` statements) or use channels. For larger units of independent concurrency, split execution into child workflows.
 
-高頻度イベントを 1 インスタンスに集めると遷移が直列化して頭打ちになる（ホットインスタンス）。
-キー単位のインスタンス分割や子ワークフローへの枝分けを使う。詳細は [02-architecture.md](02-architecture.md) の「ホットインスタンスと分割指針」。
+Concentrating high-frequency events onto a single workflow instance serializes execution and creates a throughput bottleneck (hot instances). Use key-based partitioning or child workflows instead (see the "Hot Instances and Partitioning Guidelines" section in [02-architecture.md](02-architecture.md)).
 
-タイムアウト付きの外部処理は、タイマーとの Select として書ける。
+Timeouts for asynchronous operations can be expressed by combining a task future with a timer future in `Await`:
 
 ```go
-f := workflow.ExecuteAsync(ctx, CallSlowAPI, in)
+f := workflow.ExecuteAsync[SlowInput, SlowOutput](ctx, "CallSlowAPI", in)
 t := workflow.SleepAsync(ctx, 10*time.Minute)
 idx, err := workflow.Await(ctx, f, t)
 if err != nil {
     return out, err
 }
 if idx == 1 {
-    return out, ErrAPITimeout // タイマーが先に完了した
+    return out, ErrAPITimeout // Timer finished first
 }
 ```
 
-### キャンセルの現れ方
+### Cancellation Handling
 
-キャンセル要求が取り込まれた後、待ち受け API（Sleep、Get、ReceiveSignal、Await）は `workflow.ErrCanceled` を返す。
-`Execute` はキャンセル後も使える。
-補償処理（返金、予約の取り消しなど）をアクティビティとして実行してから return するためである。
-return したとき、エラーが `ErrCanceled`（を包むもの）ならインスタンスは canceled、それ以外は通常の終端になる。
+Once a cancellation request is ingested from the inbox, future blocking calls (`Sleep`, `Future.Get`, `ReceiveSignal`, `Await`) immediately return `workflow.ErrCanceled`.  
+`Execute` remains callable after cancellation to allow workflows to run compensation activities (e.g., issuing refunds or cleaning up resources) before exiting. When the workflow returns, if the returned error wraps `workflow.ErrCanceled`, the instance transitions to `canceled`; otherwise, it transitions to standard `completed` or `failed`.
 
-### GetVersion とコード変更
+### `GetVersion` and Code Evolution
 
-実行中インスタンスが残っている間、そのインスタンスが通過済みの区間の呼び出し列を変えると決定性違反になる。
-呼び出し列が変わる変更は `GetVersion` で分岐する。
+Modifying the sequence of commands in code paths already traversed by active instances causes determinism violations. Use `GetVersion` to introduce branching changes safely:
 
 ```go
 v := workflow.GetVersion(ctx, "add-fraud-check", 1, 2)
 if v >= 2 {
-    if _, err := workflow.Execute(ctx, FraudCheck, in); err != nil {
+    if _, err := workflow.Execute[CheckInput, CheckResult](ctx, "FraudCheck", in); err != nil {
         return out, err
     }
 }
 ```
 
-`GetVersion` は次の規則で動く。
+`GetVersion` operates according to the following rules:
+- Upon first execution, it records `max` as a `version_marker` in the journal and returns that value in subsequent replays.
+- During replays of code paths traversed before the change (where no marker exists), it returns `min`.
+- `version_marker` events are ignored by older workers that predate the marker. If the resulting branch generates different commands, subsequent command matching safely catches the violation.
 
-- 初めて実行に到達した時点で `max` を version_marker として記録し、以後のリプレイでは記録値を返す。
-- 記録がない位置のリプレイ（変更前に通過済みの履歴）では `min` を返す。
-- version_marker は照合で特別扱いされ、marker を知らない旧コードは読み飛ばす。分岐の実体が異なれば、次のコマンド照合が違反として検出する。
+During rolling deployments, older workers may encounter tasks containing newer history events. Rather than failing the instance or marking it `stuck`, workers Nack the task, delaying its visibility (`IncompatibleRetryDelay`, default 5s) so a newer worker can claim it.
 
-ローリングデプロイ中は新旧ワーカーが混在するため、新コードが記録した履歴を旧ワーカーがリプレイすると決定性違反になり得る。
-Worker は決定性違反、および未登録のワークフロー／アクティビティを terminal `stuck` や activity fail にせず、タスクを Nack して再可視にする（`IncompatibleRetryDelay`、既定 5 秒。負数で即時）。
-混在が解消すれば新ワーカーが拾って前進する。大きな変更では新しいワークフロー名（`OrderWorkflowV2`）を切ることも有効。
+## Determinism Constraints
 
-## 決定性の制約
+Workflow functions must produce the exact same sequence of commands given the same execution history.
 
-ワークフロー関数は、同じ履歴に対して同じ呼び出し列を生成しなければならない。
-禁止事項と代替を対で示す。
-
-| 禁止 | 代替 |
+| Forbidden | Permitted Alternative |
 |---|---|
-| `time.Now()`、`time.Since` | `workflow.Now(ctx)` |
-| `time.Sleep`、`time.After` | `workflow.Sleep` / `SleepAsync` |
-| `rand`、UUID 生成 | `workflow.SideEffect` / `workflow.NewUUID` |
-| `go` 文、チャネル、`sync` パッケージ | `ExecuteAsync` + `Await`、子ワークフロー |
-| map の反復順に依存する分岐、呼び出し順 | キーをソートしてから反復する |
-| ネットワーク、ファイル、DB などの IO | アクティビティに置く |
-| グローバル可変状態、環境変数の参照 | ワークフロー入力か SideEffect で渡す |
-| defer 内の副作用 | defer はサスペンドのたびに実行されるため、純粋な処理のみ許す |
+| `time.Now()`, `time.Since()` | `workflow.Now(ctx)` |
+| `time.Sleep()`, `time.After()` | `workflow.Sleep()`, `workflow.SleepAsync()` |
+| `rand`, UUID generation | `workflow.SideEffect()`, `workflow.NewUUID()` |
+| `go` statements, channels, `sync` package | `ExecuteAsync` + `Await`, Child workflows |
+| Map iteration order dependencies | Sort map keys before iterating |
+| Network, filesystem, or database I/O | Move logic into activities |
+| Global mutable state, reading environment variables | Pass via workflow input or `SideEffect` |
+| Side effects inside `defer` statements | Only pure logic allowed; defers run on every suspension |
 
-このうち IO とゴルーチンは `*workflow.Context` の型で構造的に防げるが、`time.Now` や map の反復順は型では防げない。
-`go vet` 互換の静的解析器を提供して検出する（[04-plan.md](04-plan.md) M3）。
-すり抜けた違反も、リプレイ時の照合が実行時に検出してインスタンスを stuck に隔離する（違反したままの前進はしない）。
+While I/O and goroutines are structurally prevented by the type system via `*workflow.Context`, time calls and map iteration cannot be prevented by types alone. A `go vet`-compatible static analyzer is provided (`analyzers/determinism`). Any runtime violation that bypasses static analysis is detected during replay command matching, safely quarantining the instance into `stuck`.
 
-## リトライとエラー
+## Retries and Errors
 
-アクティビティのリトライは呼び出し側がポリシーとして与える。
+Activity retry behavior is configured via `RetryPolicy`:
 
 ```go
 type RetryPolicy struct {
-    InitialInterval    time.Duration // 既定 1s
-    BackoffCoefficient float64       // 既定 2.0
-    MaxInterval        time.Duration // 既定 1m
-    MaxAttempts        int           // 既定 0（無制限）
+    InitialInterval    time.Duration // Default: 1s
+    BackoffCoefficient float64       // Default: 2.0
+    MaxInterval        time.Duration // Default: 1m
+    MaxAttempts        int           // Default: 0 (unlimited)
 }
 ```
 
-既定は Temporal と同じく無制限リトライとする。
-一時障害で止まらないことを既定とし、打ち切りたい呼び出しには `MaxAttempts` や `WithStartToCloseTimeout` を与える。
+By default, retries are unlimited (matching Temporal's convention) so that transient outages do not fail workflows. To bound retries, configure `MaxAttempts` or `WithStartToCloseTimeout`.
 
-`WithStartToCloseTimeout(d)` は **1 試行**の開始から完了までの上限である（`d <= 0` は未指定＝上限なし）。
-超過するとその試行は `"activity start-to-close timeout"` で失敗し、通常の失敗と同じく `RetryPolicy` / `MaxAttempts` / `NonRetryable` の対象になる。
-ワーカーはアクティビティに渡す `context.Context` を打ち切る（コンテキストを無視する処理は止められない）。
+`WithStartToCloseTimeout(d)` sets a maximum execution duration for a **single attempt** (`d <= 0` disables the limit). If an attempt exceeds this duration, it fails with `"activity start-to-close timeout"`, triggering standard retry backoff according to the `RetryPolicy`. The worker cancels the `context.Context` passed to the activity.
 
-リトライしても意味のないエラー（バリデーション失敗など）は、アクティビティが `tasuki.NonRetryable(err)` で包んで返す。
-このエラーは即座に恒久的失敗となり、ワークフロー側へそのまま返る。
-`MaxAttempts` 到達時も同様にワークフロー側へエラーが返り、以後の対処（補償、別経路、失敗として終端）はワークフローコードが決める。
+Non-retriable errors (such as invalid user input) should be wrapped with `tasuki.NonRetryable(err)`. The worker immediately halts retries and returns the error to the workflow.
 
-## アクティビティの定義と冪等性
+## Activity Definition and Idempotency
 
-アクティビティは `context.Context` を取る通常の関数である。
-渡されるコンテキストは、`WithStartToCloseTimeout` を付けた場合はその期限で打ち切られる。
-未指定時はリース延長（ハートビート／自動延長）により長く動き続けられる。
+Activities are standard Go functions taking a `context.Context`:
 
 ```go
 func ChargePayment(ctx context.Context, in ChargeInput) (ChargeResult, error)
 ```
 
-実行情報は `activity.GetInfo(ctx)` から得る。
+Execution metadata is retrieved using `activity.GetInfo(ctx)`:
 
 ```go
 type Info struct {
     InstanceID     string
     ActivityName   string
-    Attempt        int    // 1 始まり
+    Attempt        int    // 1-indexed
     TaskID         int64
-    IdempotencyKey string // InstanceID とスケジュール seq から成る。リトライ間で不変
+    IdempotencyKey string // Derived from InstanceID and schedule sequence; stable across retries
 }
 ```
 
-長時間アクティビティは `activity.RecordHeartbeat(ctx, details)` でリースを延ばし、進捗を記録できる。
-リトライ時は `activity.GetHeartbeatDetails(ctx, &dest)` で直前の details を取り出せる（未記録なら `activity.ErrNoDetails`）。
-ワーカーはフォールバックとしてリース半減期ごとの自動延長も行う。
+Long-running activities can invoke `activity.RecordHeartbeat(ctx, details)` to extend their lease and record progress. On retry, previous progress can be retrieved using `activity.GetHeartbeatDetails(ctx, &dest)` (returns `activity.ErrNoDetails` if none exists).
 
-アクティビティは at-least-once 実行である（[02-architecture.md](02-architecture.md)）。
-外部システムへの副作用を一度きりにしたい場合は、`IdempotencyKey` を外部 API の冪等キーや一意制約に使う。
-このキーはリトライ間で変わらず、同じ論理呼び出しを識別する。
+Because activities follow an **at-least-once** execution contract, side effects must be idempotent. Use `IdempotencyKey` as an external idempotency key or database unique constraint.
 
-## クライアント API
+## Client API
 
 ```go
 c := tasuki.NewClient(backend)
@@ -272,17 +253,18 @@ h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID("order-123"),
     tasuki.WithSearchAttributes(map[string]string{"tenant": "acme", "order_id": "42"}))
 h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID("order-123"),
     tasuki.WithMemo(map[string]string{"note": "vip"}))
-res, err := h.Result(ctx)                    // 終端までポーリングで待つ
+
+res, err := h.Result(ctx)                    // Awaits terminal completion
 err = c.Signal(ctx, "order-123", "approve", payload)
 err = c.Signal(ctx, "order-123", "approve", payload, tasuki.WithDedupeID("pay-42"))
 err = c.SignalBatch(ctx, "order-123", []tasuki.SignalItem{
     {Name: "approve", Payload: payload, DedupeID: "pay-42"},
     {Name: "note", Payload: note},
 })
-err = c.Cancel(ctx, "order-123")             // 協調的キャンセル
-err = c.Terminate(ctx, "order-123")          // 即時終了
-info, err := c.Get(ctx, "order-123")         // 状態、結果、失敗理由、検索属性、メモ
-events, err := c.GetJournal(ctx, "order-123") // 実行履歴
+err = c.Cancel(ctx, "order-123")             // Cooperative cancellation
+err = c.Terminate(ctx, "order-123")          // Immediate termination
+info, err := c.Get(ctx, "order-123")         // Status, result, failure, search attributes, memo
+events, err := c.GetJournal(ctx, "order-123") // Execution history
 list, err := c.List(ctx, tasuki.InstanceFilter{Status: tasuki.StatusStuck})
 list, err := c.List(ctx, tasuki.InstanceFilter{
     Status: tasuki.StatusRunning,
@@ -290,75 +272,44 @@ list, err := c.List(ctx, tasuki.InstanceFilter{
 })
 ```
 
-`WithSearchAttributes` は Start 時に文字列キー／値の可視メタデータを付ける。
-`List` の `SearchAttributes` は各キーの完全一致を AND で絞り込む（未設定キーは不一致）。
-実行中の更新は `workflow.UpsertSearchAttributes`（マージ。空文字は削除）。
+- `WithSearchAttributes` attaches string metadata at start time. `List` filters search attributes using exact-match AND queries.
+- `WithMemo` attaches arbitrary display metadata visible in `Get` (not filtered in `List`).
+- `Signal` with `WithDedupeID` prevents duplicate delivery of the same signal identifier within an instance.
+- `SignalBatch` atomically delivers multiple signals to an instance.
+- `Start` is idempotent on instance ID: if an instance with the given ID already exists, it returns `tasuki.ErrAlreadyStarted` along with a valid handle to the existing instance.
 
-`WithMemo` は表示用の文字列注釈を付ける（Get で見える。List フィルタには使わない）。
-実行中の更新は `workflow.UpsertMemo`（マージ。空文字は削除）。
+### Query
 
-`Signal` に `WithDedupeID` を付けると、同じインスタンス内でその ID の再送は inbox に増えない（戻り値は `nil`）。
-未指定または空文字のときは従来どおり、送信ごとの到着になる。
-dedupe キーはインスタンスが終端になると消える。
-
-`SignalBatch` は同一インスタンスへ複数シグナルを原子的に投入する。
-各 item の `DedupeID` は任意で、ヒットした件だけスキップ（全体は成功）。空スライスは no-op。
-ストアの書き込み上限を超えると `backend.ErrBatchTooLarge`（部分適用なし）。
-
-`Start` は ID で冪等である。
-同じ ID がすでに存在する場合は `tasuki.ErrAlreadyStarted` を返し、そのとき返るハンドルは既存インスタンスを指す。
-API ハンドラのリトライで二重開始しない、という組み込み用途で重要な性質のため、エラーではなく正常系の一部として文書化する。
-
-```go
-h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID(orderID))
-if err != nil && !errors.Is(err, tasuki.ErrAlreadyStarted) {
-    return err
-}
-res, err := h.Result(ctx) // 新規でも既存でも同じに扱える
-```
-
-`Handle[O].Result` はポーリング（既定 200ms 間隔）で待つ。
-通知による即時化は最適化として計画する（[04-plan.md](04-plan.md) M5）。
-
-### クエリ
-
-実行中（または終端）のインスタンスから、シグナルなしで派生状態を読むには `tasuki.Query` を使う。
-ワークフローを登録した同一プロセスの Worker が必要である（レジストリでハンドラ定義を解決するため）。
+To inspect derived state from running or completed workflows without mutating history, use `tasuki.Query`:
 
 ```go
 out, err := tasuki.Query[struct{}, int](ctx, w, "order-123", "count", struct{}{})
 ```
 
-内部では journal と可視な inbox を仮 seq で連結してリプレイし、名前付きハンドラを呼ぶ。
-Claim や Commit は行わないため、`next_seq` とタスクは変わらない。
-未登録の名前は `workflow.ErrUnknownQuery`、未知のインスタンスは `backend.ErrNotFound` を返す。
+Queries replay history in-memory up to the current point and invoke the registered query handler without claiming tasks or updating sequence numbers.
 
 ### Update
 
-実行中インスタンスへリクエスト／レスポンス型の更新を送るには `tasuki.Update` を使う（Worker 同一プロセス）。
+To send synchronous request-response mutations to running instances, use `tasuki.Update`:
 
 ```go
 out, err := tasuki.Update[ReviseIn, ReviseOut](ctx, w, "order-123", "revise", in,
     tasuki.WithUpdateID("rev-42"))
 ```
 
-inbox に `update_requested` を入れ、ワークフロータスクで `SetUpdateHandler` を実行する。
-ハンドラは `Execute` などでサスペンドでき、完了は `update_completed` としてジャーナルに残る。
-同じ `WithUpdateID` の再送は、完了済みなら同じ結果を返す。
+Updates enqueue an `update_requested` event to the inbox. The worker executes the registered `SetUpdateHandler`, which can invoke activities or sleep. Completed updates commit as `update_completed` events.
 
-## 登録と命名
+## Registration and Naming
 
-ワークフローとアクティビティの名前は DB に永続化され、リプレイの照合キーになる。
-既定ではリフレクションで関数名（`OrderWorkflow`）を導出するが、関数のリネームは互換性の破壊（実行中インスタンスの stuck 化）になる。
-実運用では明示的な名前を推奨する。
+Workflow and activity names are stored in the database and serve as matching keys during replay. By default, names are derived from function reflection (e.g., `OrderWorkflow`). In production, explicit names are recommended to safeguard against accidental refactoring breakages:
 
 ```go
 tasuki.RegisterWorkflow(w, OrderWorkflow, tasuki.WithName("order"))
 ```
 
-## シリアライゼーション
+## Serialization
 
-入出力とイベントペイロードの直列化は `Codec` で差し替えられる。
+Payload serialization is handled via the `Codec` interface:
 
 ```go
 type Codec interface {
@@ -367,21 +318,16 @@ type Codec interface {
 }
 ```
 
-既定は `encoding/json`。
-運用上の指針を二つ定める。
+The default implementation uses `encoding/json`. Field additions to payload structs are backward-compatible; renaming or deleting fields on running instances should be avoided.
 
-- 構造体の進化はフィールド追加までを互換とする。実行中インスタンスが残る間のフィールド削除、リネーム、型変更は避ける。
-- ペイロードは小さく保つ。大きなデータは本体を渡さず、オブジェクトストレージのキーなど参照を渡す。
+### Payload Encryption
 
-### 暗号化
-
-保存されるユーザーペイロード（入力、結果、アクティビティ入出力、シグナル、SideEffect、子ワークフロー入力）を AES-256-GCM で暗号化する `Encrypted` コーデックを同梱する。
-出力は鍵 ID とノンスを含む JSON 封筒であり、jsonb カラムにもそのまま保存できる。
+An `Encrypted` codec is provided to encrypt payloads (inputs, results, signal payloads, side effects) at rest using AES-256-GCM. Outputs are formatted as JSON envelopes, compatible with SQL `jsonb` columns:
 
 ```go
 keys, err := codec.StaticKeys("2026-07", map[string][]byte{
-    "2026-07": currentKey, // 32 バイト
-    "2026-01": oldKey,     // ローテーション済みの鍵も復号用に残す
+    "2026-07": currentKey, // 32 bytes
+    "2026-01": oldKey,     // Preserved for decrypting historical payloads
 })
 enc := codec.Encrypted(codec.JSON(), keys)
 
@@ -389,16 +335,11 @@ w := tasuki.NewWorker(b, tasuki.WorkerOptions{Codec: enc})
 c := tasuki.NewClient(b, tasuki.WithCodec(enc))
 ```
 
-運用規則を四つ定める。
+Key rotation is supported by specifying a new primary key while retaining historical keys in the keyring. Unencrypted payloads lacking envelope markers fall back to plaintext reading, allowing encryption to be enabled on existing deployments without data migration.
 
-- Worker と Client に同じコーデックを設定する。
-- ローテーションは primary の切り替えで行い、旧鍵は該当ペイロードが残る間 `Lookup` に残す（再暗号化は不要）。
-- 封筒マーカーのないペイロードは平文として読むため、既存インスタンスが残るストアでも有効化できる。
-- インスタンス ID、ワークフロー名、キュー名、時刻は暗号化されない（メタデータは平文）。
+## Testing Support
 
-## テスト支援
-
-`wftest` パッケージで、DB なし、仮想時計のユニットテストを書ける。
+The `wftest` package enables unit testing workflows without databases and with virtual clocks:
 
 ```go
 func TestOrderWorkflow(t *testing.T) {
@@ -418,41 +359,32 @@ func TestOrderWorkflow(t *testing.T) {
 }
 ```
 
-仮想時計は、進行できるタスクがなくなった時点で最も近いタイマーまで自動で進む。
-7 日のスリープを含むワークフローも実時間なしでテストできる。
-シグナルは `env.Signal(name, payload)` で任意のタイミングに注入する。
+Virtual clocks automatically fast-forward to the earliest pending timer when no tasks are runnable, completing long-running workflows instantly. Signals can be injected at any time using `env.Signal(name, payload)`.
 
-## ワーカー設定
+## Worker Options
 
 ```go
 type WorkerOptions struct {
-    Queues               []string      // 既定 ["default"]
-    WorkflowSlots        int           // 既定 100。同時に処理するワークフロータスク数
-    ActivitySlots        int           // 既定 100。同時に実行するアクティビティ数
-    PollInterval         time.Duration // 既定 1s
-    LeaseDuration        time.Duration // 既定 30s
-    WorkerID             string        // 既定 ホスト名 + ランダムサフィックス
-    Codec                Codec         // 既定 JSON
-    Logger               *slog.Logger  // 既定 slog.Default()
-    JournalWarnThreshold int           // 0 → 既定 10000。負数で無効。超過時は Warn + メトリクスのみ
-    IncompatibleRetryDelay time.Duration // 0 → 既定 5s。負数で即時再可視。非互換 Nack 後の hidden 時間
+    Queues                 []string      // Default: ["default"]
+    WorkflowSlots          int           // Default: 100 concurrent workflow tasks
+    ActivitySlots          int           // Default: 100 concurrent activities
+    PollInterval           time.Duration // Default: 1s
+    LeaseDuration          time.Duration // Default: 30s
+    WorkerID               string        // Default: hostname + random suffix
+    Codec                  Codec         // Default: JSON
+    Logger                 *slog.Logger  // Default: slog.Default()
+    JournalWarnThreshold   int           // Default: 10000; negative disables
+    IncompatibleRetryDelay time.Duration // Default: 5s; negative redisplays immediately
 }
 ```
 
-決定性違反や未登録のワークフロー／アクティビティは terminal にせず Nack する（上記 Delay）。
-メトリクス `tasuki.worker.incompatible_nacks`。
+## Schema Validation and Migrations
 
-## スキーマの検証とマイグレーション
+Schema migrations are managed per backend. The PostgreSQL backend uses versioned migration files under `backend/postgres/migrations/` (see the [PostgreSQL Migrations README](../backend/postgres/migrations/README.md)).
 
-ストアのスキーマ管理はバックエンドごとに行う。PostgreSQL バックエンドはバージョニングされたマイグレーションファイル（`backend/postgres/migrations/`）を持ち、詳細は [migrations の README](../backend/postgres/migrations/README.md) を参照。
+Workers verify database schemas at startup if the backend implements `backend.SchemaValidator`. If required tables are missing, the worker logs an error and avoids starting the polling loop. This validation can be disabled using `WorkerOptions.DisableSchemaValidation`.
 
-ストアが未マイグレーション（必要なテーブルが無い）とき、Worker は起動しない。
-`Worker.Start` は、バックエンドが `backend.SchemaValidator` を実装していれば起動前に検証し、失敗したら Error ログを出してポーリングループを起動しない。
-`WorkerOptions.DisableSchemaValidation` を `true` にすると、この検証を無効化できる（自己管理でスキーマを用意する運用向け）。
+Applications can explicitly trigger validation using `tasuki.ValidateSchema(ctx, backend)`.
 
-アプリケーション側で明示的に検証したいときは `tasuki.ValidateSchema(ctx, backend)` を使う。
-未対応バックエンドに対しては何もしない。
-
-`w.Start(ctx)` は非同期にポーラーを起動して即座に返る。
-`w.Shutdown(ctx)` は新規獲得を止め、実行中タスクの完了を ctx の期限まで待ち、未完了タスクのリースを解放（`visible_at` を現在時刻へ戻す）してから返る。
-リース解放により、他のプロセスがリース期限を待たずに引き継げる。
+- `w.Start(ctx)` starts task polling loops asynchronously and returns immediately.
+- `w.Shutdown(ctx)` gracefully halts new task acquisition, waits for in-flight tasks within the context deadline, and releases task leases so peer workers can claim them without waiting for expiration.

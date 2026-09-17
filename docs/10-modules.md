@@ -1,52 +1,56 @@
-# Modules, versions, and publishing
+# Modules, Versions, and Publishing
 
-公開単位・依存バージョン・タグ方針。
+[English] | [日本語](ja/10-modules.md)
 
-## モジュール構成
+Module hierarchy, dependencies, versioning, and publishing workflow.
 
-| Module | Path | 公開対象 |
+## Module Layout
+
+| Module | Path | Target |
 |---|---|---|
-| root | `github.com/hirokazumiyaji/tasuki` | ライブラリ本体（workflow/activity/client/worker/memory/bench/contrib/ui）。`GOWORK=off` で独立ビルド可能 |
-| dynamodb | `.../backend/dynamodb` | DynamoDB ストア |
-| firestore | `.../backend/firestore` | Firestore ストア |
-| mysql | `.../backend/mysql` | MySQL ストア |
-| postgres | `.../backend/postgres` | Postgres ストア |
-| spanner | `.../backend/spanner` | Spanner ストア |
-| sqlite | `.../backend/sqlite` | SQLite ストア |
+| root | `github.com/hirokazumiyaji/tasuki` | Core library (`workflow`, `activity`, `client`, `worker`, `memory`, `bench`, `contrib/ui`). Builds independently with `GOWORK=off` |
+| dynamodb | `.../backend/dynamodb` | DynamoDB backend |
+| firestore | `.../backend/firestore` | Firestore backend |
+| mysql | `.../backend/mysql` | MySQL / MariaDB / TiDB backend |
+| postgres | `.../backend/postgres` | PostgreSQL reference backend |
+| spanner | `.../backend/spanner` | Cloud Spanner backend |
+| sqlite | `.../backend/sqlite` | SQLite backend |
 
-root は既定ビルドで backend サブモジュールに依存しない。`internal/backendopen` は既定で memory のみを内蔵し、他 backend は `-tags tasuki_all` ビルド（workspace 内）で登録される。examples の非 memory 系（m1/m3/m4）と `chaos/cmd/worker` も `tasuki_all` タグ付きのため、既定の `GOWORK=off go list ./...` は root のみで成功する。
+The root module does not depend on database drivers or cloud SDKs by default. `internal/backendopen` embeds only the in-memory backend by default; other backends are registered via `-tags tasuki_all` builds (within the multi-module workspace). Non-memory examples (`m1`, `m3`, `m4`) and `chaos/cmd/worker` are tagged with `tasuki_all`, allowing standard `GOWORK=off go list ./...` to build the root module cleanly.
 
-## 最小 Go バージョン
+## Minimum Go Version
 
-- 宣言: root `go 1.24`、`go.work` も `go 1.24`（CI `1.24.x` と一致）。
-- 検証: `GOTOOLCHAIN=local go build ./...`（workspace 外の Go 1.24 環境で確認）。
+- **Declaration**: Root `go 1.24`, `go.work` declares `go 1.24` (aligned with CI `1.24.x`).
+- **Validation**: `GOTOOLCHAIN=local go build ./...` (verified outside workspace in a Go 1.24 environment).
 
-## 依存バージョン
+## Dependency Versioning
 
-- root の間接依存（`x/sync`、`x/mod` 等）は `go.mod`/`go.sum` に明示し、workspace の置換で隠さない。CI の `gowork-check` が `GOWORK=off GOPROXY=off go list ./...` で検証する。
-- backend ごとの AWS/GCP/DB ドライバは各 backend の `go.mod` に閉じる。root に持ち込まない。
+- Indirect dependencies of the root module (`x/sync`, `x/mod`, etc.) are explicitly pinned in `go.mod` / `go.sum` without being shadowed by workspace replacements. The CI `gowork-check` job verifies this using `GOWORK=off GOPROXY=off go list ./...`.
+- Database drivers and cloud SDKs (AWS, Google Cloud, pgx, mysql) remain confined within their respective `backend/<name>/go.mod` files and are never leaked into the root module.
 
-## バージョン付与と公開手順
+## Versioning and Publishing Workflow
 
-1. root と各 backend は独立タグで公開する（例: `v0.2.0` は root、`backend/dynamodb/v0.2.0` は DynamoDB モジュール）。
-2. backend の `go.mod` の `replace github.com/hirokazumiyaji/tasuki => ../..` はローカル開発用。タグ付け前に置換先の root バージョンが公開済みであることを確認し、必要なら `require github.com/hirokazumiyaji/tasuki vX.Y.Z` に更新する。
-3. 公開前チェック:
+1. The root module and backend submodules are released with independent semantic version tags (e.g. `v0.2.0` for root, `backend/dynamodb/v0.2.0` for DynamoDB).
+2. The `replace github.com/hirokazumiyaji/tasuki => ../..` directive in backend `go.mod` files is used for local workspace development. Before publishing a backend tag, ensure the target root version is published and update the backend `require` directive to `github.com/hirokazumiyaji/tasuki vX.Y.Z` if necessary.
+3. Pre-release verification checklist:
    ```bash
-   # root 独立ビルド
+   # Verify root independent build
    GOWORK=off GOPROXY=off go list ./...
    GOWORK=off go build ./...
    GOTOOLCHAIN=local go build ./...
-   # workspace 全体（全 backend 込み）
+
+   # Verify workspace build (with all backends)
    go build -tags tasuki_all ./...
-   # 利用者側 smoke（要公開タグ）
+
+   # Consumer smoke test (requires published tags)
    mkdir /tmp/smoke && cd /tmp/smoke && go mod init smoke
    go get github.com/hirokazumiyaji/tasuki@vX.Y.Z
-   go get github.com/hirokazumiyaji/tasuki/backend/sqlite@vX.Y.Z # 任意
+   go get github.com/hirokazumiyaji/tasuki/backend/sqlite@vX.Y.Z # Optional
    ```
-4. CLI（`cmd/bench`、`contrib/ui/cmd/tasuki-ui`）は root モジュールに含まれる。非 memory backend を使う CLI ビルドは `-tags tasuki_all` が必要（workspace 内）。
+4. CLI tools (`cmd/bench`, `contrib/ui/cmd/tasuki-ui`) are packaged in the root module. Building CLI tools with non-memory backend support requires `-tags tasuki_all` within the workspace.
 
-## CI
+## Continuous Integration (CI)
 
-- `root` ジョブ: `go test ./...`（workspace）。
-- `gowork-check` ジョブ: `GOWORK=off GOPROXY=off go list ./...` + `GOTOOLCHAIN=local go build ./...` で独立性を検証。
-- 各 backend ジョブ: 対応する `backend/<name>` ディレクトリで `go test`。
+- **`root` Job**: `go test ./...` across the workspace.
+- **`gowork-check` Job**: Validates root module independence via `GOWORK=off GOPROXY=off go list ./...` and `GOTOOLCHAIN=local go build ./...`.
+- **Backend Jobs**: Executes `go test ./...` in each individual `backend/<name>` directory.

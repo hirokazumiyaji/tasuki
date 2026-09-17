@@ -1,130 +1,123 @@
-# 概要と要求
+# Overview and Requirements
 
-本書は tasuki プロジェクトの目的、要求、非目標を定める。
-アーキテクチャは [02-architecture.md](02-architecture.md)、公開 API は [03-api.md](03-api.md)、開発プランは [04-plan.md](04-plan.md) に定める。
+[English] | [日本語](ja/01-overview.md)
 
-## 目的
+This document defines the goals, requirements, and non-goals of the tasuki project.  
+The architecture is defined in [02-architecture.md](02-architecture.md), public APIs in [03-api.md](03-api.md), and the development plan in [04-plan.md](04-plan.md).
 
-tasuki は、Go アプリケーションに組み込んで使う **durable workflow engine**（プロセスの停止をまたいで実行を継続できるワークフロー実行基盤）である。
-名前は駅伝の襷に由来する。
-走者から走者へ襷を引き継いで長い距離を走り切るように、ワーカーからワーカーへ実行を引き継いでワークフローを完走させる。
-Temporal が提供する体験、すなわち「リトライ、タイマー、状態永続化を自分で書かず、ビジネスロジックをコードとして書く」体験を、専用サーバーなしで提供する。
+## Goals
 
-Temporal は強力だが、動かすには frontend、history、matching、worker の各サービスと、その背後のデータベース、必要に応じて可視化用の Elasticsearch まで運用する必要がある。
-小規模なチームやサービスにとって、この構築の手間とインフラ費用は、ワークフローエンジンの利益に見合わないことが多い。
+tasuki is an embedded **durable workflow engine** for Go applications (an execution foundation capable of continuing workflow execution seamlessly across process crashes and restarts).  
+The name originates from the Japanese *tasuki* (襷)—the sash passed from runner to runner in ekiden long-distance relay races. Just as runners hand off the tasuki across legs of a race, workers hand over execution state to drive workflows to completion across restarts and process boundaries.
 
-tasuki は逆の配置を取る。
-エンジンをライブラリとしてアプリケーションプロセスの中で動かし、永続化はアプリケーションがすでに持っているデータストアに相乗りする。
-追加で必要になるインフラはゼロである。
+tasuki provides the developer experience pioneered by Temporal—authoring business logic as standard code without manually writing retries, timers, or state persistence—without operating a separate dedicated server cluster.
+
+While Temporal is powerful, running it requires operating multiple separate services (frontend, history, matching, worker), their underlying database, and optionally Elasticsearch for visibility. For small teams or services, this operational complexity and infrastructure cost often outweigh the benefits of a workflow engine.
+
+tasuki takes the inverted approach: the engine runs as an in-process library within the application, and persistence co-locates directly on the application's existing database. Zero additional infrastructure is required.
 
 ```go
-// 追加インフラなしで動く最小構成のイメージ
+// Minimal setup running with zero additional infrastructure
 w := tasuki.NewWorker(postgres.NewBackend(pool), tasuki.WorkerOptions{})
 tasuki.RegisterWorkflow(w, OrderWorkflow)
 tasuki.RegisterActivity(w, ChargePayment)
 w.Start(ctx)
 ```
 
-## 解決したい課題
+## Problems to Solve
 
-Temporal 型のサーバー構成には、導入をためらわせる要因が三つある。
+Server-centric workflow architectures introduce three major adoption barriers:
 
-- **インフラ構築の手間**：複数サービスとデータストアの構築、監視、アップグレードが必要になる。
-- **インフラ費用**：常時稼働するサーバー群（またはマネージドサービスの利用料）が、ワークロードの規模と無関係に発生する。
-- **開発体験の距離**：ローカル開発や CI でもサーバーを立てる必要があり、テストの敷居が上がる。
+- **Infrastructure complexity**: Deploying, monitoring, and upgrading multiple services and dedicated databases.
+- **Infrastructure cost**: Continuously running server clusters (or managed cloud fees) regardless of workload volume.
+- **Developer ergonomics gap**: Running local servers or containers in local development and CI, raising testing friction.
 
-ライブラリ形式であれば、これらは「go get する」「ストアの接続を渡す」「テストではインメモリ実装を使う」に置き換わる。
+In an embedded library format, these hurdles become: `go get`, pass the existing database connection, and use an in-memory backend for unit tests.
 
-## ユースケース
+## Use Cases
 
-主な想定ユースケースは、単発のジョブキューでは表現しにくい、複数ステップにまたがる処理である。
+The primary target use cases are multi-step operations that cannot be cleanly expressed with a basic single-shot job queue:
 
-- 注文処理（決済、在庫引き当て、配送手配、失敗時の補償処理）
-- 外部 API 連携のリトライとタイムアウト管理（決済プロバイダ、メール送信）
-- 長い待ち時間を挟むフロー（トライアル終了 14 日後の通知、承認待ち）
-- ユーザーオンボーディングのような、外部イベント（シグナル）で進行するフロー
-- cron 的な定期実行と、その各回の多段処理
+- Order fulfillment (payment processing, inventory allocation, shipment dispatch, compensation upon failure)
+- External API integration with retry and timeout management (payment gateways, notification services)
+- Long-delayed workflows (trial expiration follow-up after 14 days, approval wait states)
+- Event-driven progression driven by external signals (e.g., user onboarding flows)
+- Cron-like recurring schedules with multi-step executions per run
 
-## 機能要求
+## Functional Requirements
 
-優先度は must（初期リリースに必須）、should（初期リリース後の早期に必要）、could（将来）で表す。
+Priorities are designated as **must** (essential for initial release), **should** (needed shortly after initial release), and **could** (future enhancement).
 
-| ID | 要求 | 優先度 |
-|----|------|--------|
-| FR-1 | ワークフローを通常の Go 関数として定義できる | must |
-| FR-2 | プロセスが停止しても、再起動後にワークフローが途中から継続する | must |
-| FR-3 | アクティビティ（副作用を持つ処理）を自動リトライできる（バックオフ、最大試行回数） | must |
-| FR-4 | durable なタイマーで長時間（日、月単位）スリープできる | must |
-| FR-5 | 同一ワークフロー ID による開始の重複を排除できる（冪等な開始） | must |
-| FR-6 | 複数のアプリケーションインスタンスが同じストアを共有して安全に分担実行できる | must |
-| FR-7 | 外部からシグナルを送ってワークフローを進行させられる | should |
-| FR-8 | アクティビティを並行実行し、完了を待ち合わせられる（Future、Select 相当） | should |
-| FR-9 | 子ワークフローを起動できる | should |
-| FR-10 | ワークフローをキャンセル、強制終了できる | should |
-| FR-11 | 実行中コードの変更に対するバージョニング手段がある（GetVersion 相当） | should |
-| FR-12 | cron 式による定期実行スケジュールを定義できる | should |
-| FR-13 | ContinueAsNew で履歴を打ち切って実行を続けられる | should |
-| FR-14 | 実行履歴とインスタンス状態を検索、閲覧できる | should |
-| FR-15 | Web UI で状態を閲覧できる | could |
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR-1 | Define workflows as standard Go functions | must |
+| FR-2 | Resume workflows from the point of interruption upon process restart | must |
+| FR-3 | Automatically retry activities (side effects) with backoff and maximum attempts | must |
+| FR-4 | Sleep for extended periods (days, months) using durable timers | must |
+| FR-5 | Deduplicate workflow starts using workflow IDs (idempotent start) | must |
+| FR-6 | Safely share execution across multiple application instances on the same database | must |
+| FR-7 | Progress workflows via external signals | should |
+| FR-8 | Execute activities concurrently and wait for results (Future / Select equivalent) | should |
+| FR-9 | Spawn child workflows | should |
+| FR-10 | Cancel or terminate workflows | should |
+| FR-11 | Version workflows to support code modifications to running instances (GetVersion equivalent) | should |
+| FR-12 | Define cron schedules for recurring executions | should |
+| FR-13 | Reset history and continue execution via ContinueAsNew | should |
+| FR-14 | Search and inspect execution history and instance state | should |
+| FR-15 | View instance state via a Web UI | could |
 
-## 非機能要求
+## Non-Functional Requirements
 
-| ID | 要求 |
-|----|------|
-| NFR-1 | 必要な外部依存はデータストアひとつだけとする（参照実装は PostgreSQL） |
-| NFR-2 | ワークフローの状態遷移は exactly-once とする（クラッシュや二重実行で履歴が壊れない） |
-| NFR-3 | アクティビティは at-least-once 実行とし、その前提を API とドキュメントで明示する |
-| NFR-4 | アプリケーションインスタンスの追加だけでワーカーを水平スケールできる |
-| NFR-5 | graceful shutdown できる（実行中タスクの完了待ちと、リースの早期解放） |
-| NFR-6 | ユニットテストは DB なし（インメモリバックエンド）で書け、タイマーを仮想時計でスキップできる |
-| NFR-7 | メトリクス（OpenTelemetry）とログ（slog）のフックを持つ |
-| NFR-8 | 対応 Go バージョンは 1.24 以上とし、依存ライブラリは最小限にとどめる。各ストアのドライバや SDK はバックエンド別の Go モジュールに分離し、本体に持ち込まない |
-| NFR-9 | 永続化はバックエンドインターフェースで差し替え可能とする。対応対象は RDBMS（PostgreSQL、MySQL、MariaDB、SQLite）、NewSQL（Spanner、TiDB）、ドキュメントストア（DynamoDB、Firestore） |
+| ID | Requirement |
+|----|-------------|
+| NFR-1 | Depend on only a single external data store (PostgreSQL reference implementation) |
+| NFR-2 | Exactly-once workflow state transitions (crashes or dual execution do not corrupt history) |
+| NFR-3 | At-least-once activity execution, clearly stated as an API and documentation contract |
+| NFR-4 | Horizontally scale workers simply by adding application process instances |
+| NFR-5 | Graceful shutdown (waiting for in-flight tasks and releasing leases early) |
+| NFR-6 | Write unit tests without databases (in-memory backend) with virtual clock timer fast-forwarding |
+| NFR-7 | Metrics hooks (OpenTelemetry) and structured logging (slog) |
+| NFR-8 | Support Go 1.24+ with minimal dependencies. Separate database drivers/SDKs into dedicated backend Go modules |
+| NFR-9 | Pluggable persistence via a backend interface, targeting RDBMS (PostgreSQL, MySQL, MariaDB, SQLite), NewSQL (Spanner, TiDB), and Document stores (DynamoDB, Firestore) |
 
-## 非目標
+## Non-Goals
 
-初期リリースでは次を扱わない。
-多くは将来の拡張候補であり、[04-plan.md](04-plan.md) の将来候補に挙げる。
+The following areas are intentionally out of scope:
 
-- 複数言語 SDK（Go 専用とする）
-- マルチテナントの namespace、認証認可
-- Elasticsearch 相当の専用検索基盤（SQL で直接検索できることをもって代替とする）
-- クロスリージョンレプリケーション（DB のレプリケーション機構に委ねる）
-- 汎用メッセージングやイベントバスとしての利用
-- Temporal との API 互換やデータ移行
+- Multi-language SDKs (Go-only)
+- Multi-tenant namespaces, authentication, and authorization
+- Dedicated search clusters like Elasticsearch (direct SQL / store queries suffice)
+- Cross-region active replication (delegated to underlying database replication)
+- General-purpose messaging or pub/sub event bus
+- Temporal API compatibility or data migration tooling
 
-## 既存プロダクトとの比較
+## Comparison with Existing Products
 
-同じ問題領域のプロダクトを、実行形態で分類する。
-
-| プロダクト | 形態 | 追加インフラ | 実行モデル | 備考 |
+| Product | Architecture | Additional Infra | Execution Model | Notes |
 |---|---|---|---|---|
-| Temporal / Cadence | 専用サーバー群 | サーバー4種 + DB (+ES) | イベントソーシングとリプレイ | 機能は最も豊富。運用負荷が高い |
-| go-workflows | Go ライブラリ | DB (SQLite/MySQL/Redis) | イベントソーシングとリプレイ | 本プロジェクトに最も近い先行例 |
-| durabletask-go | Go ライブラリ | SQLite 等 | イベントソーシングとリプレイ | Azure Durable Task 系の Go 実装 |
-| DBOS Transact | ライブラリ | PostgreSQL | ステップ結果のメモ化と常駐実行 | ワークフローがゴルーチンとして常駐する |
-| Inngest / Hatchet / Restate | サーバー（単体バイナリあり） | サーバー + ストア | ステップ実行 | セルフホストは単体でも常駐サーバーが必要 |
-| River | Go ライブラリ | PostgreSQL | ジョブキュー | オーケストレーションは対象外。キュー実装の参考 |
+| Temporal / Cadence | Dedicated servers | 4 server services + DB (+ ES) | Event sourcing and replay | Richest feature set; high operational burden |
+| go-workflows | Go library | DB (SQLite/MySQL/Redis) | Event sourcing and replay | Closest architectural precedent |
+| durabletask-go | Go library | SQLite, etc. | Event sourcing and replay | Azure Durable Task Go implementation |
+| DBOS Transact | Library | PostgreSQL | Step memoization & resident execution | Workflows remain resident as goroutines |
+| Inngest / Hatchet / Restate | Server (single binary available) | Server + storage | Step execution | Self-hosting still requires running a server |
+| River | Go library | PostgreSQL | Job queue | Not an orchestrator; reference for queueing patterns |
 
-ライブラリ形式という選択自体は go-workflows と durabletask-go に先行例があり、実行モデルの実装可能性はそこで実証されている。
-本プロジェクトはそれらを参考にしつつ、次の点を設計の主眼とする。
+The feasibility of an embedded library workflow engine has been established by prior works such as go-workflows and durabletask-go. tasuki builds on these ideas with the following core design priorities:
 
-- exactly-once 状態遷移プロトコルをストア非依存の実装契約として明文化し、単一の適合テストスイートで全バックエンドを検証すること（[02-architecture.md](02-architecture.md) の中心テーマ）
-- Go のジェネリクスを前提とした型安全な API（`interface{}` を公開 API に出さない）
-- 決定性制約を最初から小さくする実行モデル（ワークフロー内の並行性をエンジン提供のプリミティブに限定する）
-- テスト体験（インメモリバックエンド、仮想時計）を初期マイルストーンに含める
+- An explicitly specified, store-agnostic exactly-once state transition protocol, verified across all backends using a single compliance test suite (the central theme of [02-architecture.md](02-architecture.md))
+- Fully type-safe APIs leveraging Go generics (no `interface{}` or `any` in public APIs)
+- A minimal determinism constraint surface from day one (concurrency within workflows is restricted to engine primitives)
+- First-class testing ergonomics (in-memory backend, virtual clock) built into the foundation
 
-## 用語
+## Terminology
 
-以降の文書で使う用語を定める。
-
-- **ワークフロー（workflow）**：オーケストレーションを記述する決定的な Go 関数。副作用を持たず、アクティビティの呼び出し順序と分岐だけを表す。
-- **アクティビティ（activity）**：副作用（API 呼び出し、DB 書き込みなど）を持つ Go 関数。リトライされるため at-least-once 実行となる。
-- **インスタンス（instance）**：ワークフロー定義の一回の実行。ワークフロー ID で一意に識別する。
-- **ジャーナル（journal）**：インスタンスごとの実行履歴イベント列。リプレイの入力であり、durability の根拠となる。
-- **リプレイ（replay）**：ワークフロー関数を先頭から再実行し、ジャーナルに記録済みの結果を返すことで、中断時点の状態を復元する操作。
-- **タスク（task）**：ワーカーが取り合う実行単位。ワークフロータスク（オーケストレーションを一歩進める）とアクティビティタスクの二種がある。
-- **ワーカー（worker）**：アプリケーションプロセス内でタスクをポーリングし実行するコンポーネント。
-- **バックエンド（backend）**：永続化と排他制御を担う抽象。参照実装は PostgreSQL。
-- **リース（lease）**：タスクの実行権を一定時間ワーカーに割り当てる仕組み。期限切れのタスクは他のワーカーが取り直せる。
-- **シグナル（signal）**：実行中のインスタンスへ外部から送る非同期メッセージ。
+- **Workflow**: A deterministic Go function defining orchestration logic. Contains no side effects; only coordinates activity invocation order and branching.
+- **Activity**: A Go function performing side effects (API calls, DB writes). Retried automatically under an at-least-once execution contract.
+- **Instance**: A single execution of a workflow definition, uniquely identified by a workflow ID.
+- **Journal**: An append-only sequence of execution history events per instance. Serves as replay input and the foundation of durability.
+- **Replay**: Re-running a workflow function from the beginning and returning recorded events to reconstruct state up to the point of interruption.
+- **Task**: The unit of execution claimed by workers. Divided into workflow tasks (advancing orchestration one turn) and activity tasks.
+- **Worker**: An in-process component that polls for and executes tasks.
+- **Backend**: The storage abstraction responsible for persistence and concurrency control.
+- **Lease**: Time-bounded exclusivity granted to a worker on a claimed task. Expired tasks become reclaimable by other workers.
+- **Signal**: An asynchronous message sent from external callers to a running workflow instance.

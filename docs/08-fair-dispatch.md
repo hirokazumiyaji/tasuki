@@ -1,29 +1,30 @@
-# 公平ディスパッチ（Fair Dispatch）
+# Fair Dispatch
 
-単一の巨大なワークフローが短時間に大量のアクティビティタスクを発行すると、同一キューの他のワークフローのタスクが後回しになる（Head-of-Line Blocking）。
-`ClaimRequest.MaxPerInstance` は、1 回の claim バッチにおけるインスタンスごとのタスク数に上限を付け、この偏りを抑える。
+[English] | [日本語](ja/08-fair-dispatch.md)
 
-## 動作
+When a single large workflow spawns a burst of activity tasks in a short time window, it can monopolize the queue and delay tasks belonging to other workflows (Head-of-Line Blocking).  
+`ClaimRequest.MaxPerInstance` places an upper bound on the number of tasks claimable per workflow instance in a single claim batch, preventing starvation.
 
-既定の claim は `visible_at` 順（FIFO）でタスクを返す。
-`MaxPerInstance` を設定すると、FIFO 順を保ったままインスタンスごとに最大 N 件までを取得し、上限を超えたタスクは次回のポーリングに残る。
+## Mechanics
+
+By default, task claims return tasks in order of `visible_at` (FIFO).  
+Setting `MaxPerInstance` preserves FIFO ordering while enforcing that at most $N$ tasks from any single instance are returned in a given batch. Additional tasks from that instance remain in the queue for subsequent polling ticks.
 
 ```text
-キュー: [flood-1, flood-2, flood-3, victim-1]   (FIFO 順)
+Queue: [flood-1, flood-2, flood-3, victim-1]   (FIFO order)
 
-Limit=3, MaxPerInstance=0 → flood-1, flood-2, flood-3   # victim は待たされる
-Limit=3, MaxPerInstance=1 → flood-1, victim-1           # victim は最初のバッチに割り込む
+Limit=3, MaxPerInstance=0 -> flood-1, flood-2, flood-3   # victim is delayed
+Limit=3, MaxPerInstance=1 -> flood-1, victim-1           # victim is admitted in the first batch
 ```
 
-上限を超えて取得できなかった分でバッチが満たされない場合でも、バッチはそのまま返る。
-残ったタスクはポーリング間隔後に再取得できるため、隔離対象のインスタンスはキュー全体の進行を止めず、自身のスループットだけが抑えられる。
+If the batch cannot be completely filled because remaining tasks belong to instances that reached their quota, the partial batch is returned immediately.  
+Because excess tasks become claimable again on the next polling tick, high-volume instances are throttled to fair concurrency without blocking queue progress for other workflows.
 
-候補は FIFO 順のままページングして収集するため、大量のタスクの後ろに隠れた victim もバッチに割り込める。
-1 ページの幅は `FairOverfetch(limit)` で決まり、バッチが満たされるか候補を使い切るまで読み進める。
+To find runnable tasks when high-volume tasks block the queue head, candidates are scanned in FIFO order using pagination. The page window size is determined by `FairOverfetch(limit)`, scanning ahead until the batch is satisfied or candidates are exhausted.
 
-## 使い方
+## Usage
 
-ワーカー単位で設定する。
+Configure on a per-worker basis:
 
 ```go
 w := tasuki.NewWorker(b, tasuki.WorkerOptions{
@@ -32,37 +33,34 @@ w := tasuki.NewWorker(b, tasuki.WorkerOptions{
 })
 ```
 
-バックエンドを直接使う場合（バッチ処理など）は `ClaimRequest.MaxPerInstance` に同じ意味の値を渡す。
+When calling backend claim APIs directly (e.g. in custom batch executors), provide `ClaimRequest.MaxPerInstance`.
 
-対応バックエンド: PostgreSQL / MySQL / SQLite / memory。
-Spanner / DynamoDB / Firestore では未対応で、値は無視される（従来どおり FIFO）。
+Supported backends: PostgreSQL, MySQL, SQLite, in-memory.  
+*(Spanner, DynamoDB, and Firestore do not currently support fair dispatch; the parameter is ignored and claims fall back to standard FIFO).*
 
-## 高負荷ワークフローの隔離
+## Workload Isolation Strategies
 
-公平ディスパッチは飢餓を防ぐが、隔離の第一選択はキュー分割である。重いワークフローを専用キューに振り向ければ、設定を一切変更せずに他のワークフローへの影響を zero にできる。
+While fair dispatch mitigates starvation, the primary tool for workload isolation is queue partitioning. Directing resource-intensive workflows to a dedicated queue isolates their impact entirely:
 
 ```go
-// 重いバッチ処理だけ bulk キューへ
+// Direct heavy batch workloads to the dedicated "bulk" queue
 tasuki.Start(ctx, c, BulkWorkflow, in, tasuki.WithQueue("bulk"))
 
-// 通常ワーカーと bulk ワーカーでワーカー自体を分離
+// Run separate worker pools for standard and bulk queues
 tasuki.NewWorker(b, tasuki.WorkerOptions{Queues: []string{"default"}})
 tasuki.NewWorker(b, tasuki.WorkerOptions{Queues: []string{"bulk"}, ClaimLimit: 50})
 ```
 
-キューごとの滞留は `tasuki.tasks.backlog` メトリクス（[05-observability.md](05-observability.md)）と `CountClaimableTasks` で監視でき、bulk ワーカーのオートスケール判定にそのまま使える。
+Queue backlog can be tracked per queue using the `tasuki.tasks.backlog` metric ([05-observability.md](05-observability.md)) and `CountClaimableTasks`, making it easy to drive autoscaling for bulk workers.
 
-指針として、次のように使い分ける。
+Recommended practices:
 
-- **常時重いワークフロー**：専用キューへ分離（ワーカーも分ける）
-- **たまに大きくなるワークフロー**：`MaxPerInstance` で頭打ちし、他のワークフローを守る
-- **優先度を付けたい**：キュー分離 + ワーカー数で表現する
+- **Consistently Heavy Workloads**: Separate into dedicated queues with independent worker pools.
+- **Occasionally Spiky Workloads**: Use `MaxPerInstance` on shared queues to cap burst consumption.
+- **Differentiated Priorities**: Combine queue partitioning with allocated worker capacities.
 
-## タスク単位の優先度について
+## Note on Task-Level Priority Columns
 
-タスクごとの優先度カラム（`ORDER BY priority DESC, visible_at`）も可能な設計だが、次の理由で保留している。
-
-- 優先度の付与・変更 API と、低優先度タスクの飢餓防止（エイジング）がセットで必要になる
-- 分離キュー + `MaxPerInstance` で既知のユースケースはカバーできる
-
-必要になった時点で、`NewTask` とスキーマに優先度を追加する形で導入する。
+While adding a per-task priority column (`ORDER BY priority DESC, visible_at`) is technically feasible, it is intentionally deferred:
+- Priority schemes require mechanisms to prevent starvation of low-priority tasks (aging algorithms) alongside APIs for dynamic priority adjustment.
+- Combining separate queues with `MaxPerInstance` cleanly addresses known production requirements without adding schema overhead.
