@@ -207,7 +207,7 @@ Worker は決定性違反、および未登録のワークフロー／アクテ�
 | defer 内の副作用 | defer はサスペンドのたびに実行されるため、純粋な処理のみ許す |
 
 このうち IO とゴルーチンは `*workflow.Context` の型で構造的に防げるが、`time.Now` や map の反復順は型では防げない。
-`go vet` 互換の静的解析器を提供して検出する（[04-plan.md](04-plan.md) M3）。
+`go vet` 互換の静的解析器（`analyzers/determinism`）を提供して検出する（詳細は [04-testing.md](04-testing.md)）。
 すり抜けた違反も、リプレイ時の照合が実行時に検出してインスタンスを stuck に隔離する（違反したままの前進はしない）。
 
 ## リトライとエラー
@@ -320,7 +320,7 @@ res, err := h.Result(ctx) // 新規でも既存でも同じに扱える
 ```
 
 `Handle[O].Result` はポーリング（既定 200ms 間隔）で待つ。
-通知による即時化は最適化として計画する（[04-plan.md](04-plan.md) M5）。
+通知による即時化は各バックエンドの起床機構（PostgreSQL の `NOTIFY`、DynamoDB/Firestore のプロセス間起床、他ストアのプロセス内ハブ。詳細は [02-architecture.md](02-architecture.md)）と連携して行われる。
 
 ### クエリ
 

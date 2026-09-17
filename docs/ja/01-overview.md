@@ -3,7 +3,7 @@
 [English](../01-overview.md) | 日本語
 
 本書は tasuki プロジェクトの目的、要求、非目標を定める。
-アーキテクチャは [02-architecture.md](02-architecture.md)、公開 API は [03-api.md](03-api.md)、開発プランは [04-plan.md](04-plan.md) に定める。
+アーキテクチャは [02-architecture.md](02-architecture.md)、公開 API は [03-api.md](03-api.md)、テスト戦略とリスク対策は [04-testing.md](04-testing.md) に定める。
 
 ## 目的
 
@@ -85,8 +85,7 @@ Temporal 型のサーバー構成には、導入をためらわせる要因が�
 
 ## 非目標
 
-初期リリースでは次を扱わない。
-多くは将来の拡張候補であり、[04-plan.md](04-plan.md) の将来候補に挙げる。
+以下は意図的に対象外（非目標）とする。
 
 - 複数言語 SDK（Go 専用とする）
 - マルチテナントの namespace、認証認可

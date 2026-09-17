@@ -3,7 +3,7 @@
 [English] | [日本語](ja/01-overview.md)
 
 This document defines the goals, requirements, and non-goals of the tasuki project.  
-The architecture is defined in [02-architecture.md](02-architecture.md), public APIs in [03-api.md](03-api.md), and the development plan in [04-plan.md](04-plan.md).
+The architecture is defined in [02-architecture.md](02-architecture.md), public APIs in [03-api.md](03-api.md), and the testing strategy in [04-testing.md](04-testing.md).
 
 ## Goals
 

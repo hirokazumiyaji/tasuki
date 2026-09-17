@@ -14,7 +14,7 @@ Pluggable backend storage interface with PostgreSQL as the reference implementat
 
 - **M4 (Backend Expansion)** complete. PostgreSQL, SQLite, MySQL / MariaDB / TiDB, Spanner, DynamoDB, and Firestore are verified against compliance and chaos test suites.
 - **M5 (Performance & Scaling)** and **M6 (Expressiveness & Operability)** are implemented, including Query, Signal deduplication, Worker incompatible Nack, SearchAttributes, Memo, LocalActivity, StartToClose Timeout, Synchronous Update, and SignalBatch.
-- **Quality Sprint** completed (split CI matrix, test coverage reporting, test suite fill, and documentation freshness). See [docs/04-plan.md](docs/04-plan.md).
+- **Quality Sprint** completed (split CI matrix, test coverage reporting, test suite fill, and documentation freshness). See [docs/04-testing.md](docs/04-testing.md).
 - **Benchmark Foundation**: `go run ./cmd/bench` (memory / postgres / sqlite).
 - **Wakeup & Notification**: PostgreSQL Worker wakes on `LISTEN`/`NOTIFY` (channel `tasuki_tasks`), keeping `PollInterval` as fallback and cadence for timers/schedules. memory, sqlite, mysql, and spanner share in-process wakeups within the same `Backend` (`backend/hub`). DynamoDB uses `wf_wake` (Streams enabled) + wake item polling, and Firestore uses `wf_notify` document snapshots for cross-process wakeups (all notifications are hints; correctness is guaranteed by Claim / GetInstance).
 - **Terminal Result Notification**: Client `Result` wakes up on workflow termination via postgres (`tasuki_terminal`), hub, or cross-process channels.
@@ -192,7 +192,7 @@ Observability guide: [docs/05-observability.md](docs/05-observability.md)
 | [docs/01-overview.md](docs/01-overview.md) | Goals, requirements, non-goals, comparison with existing products, terminology |
 | [docs/02-architecture.md](docs/02-architecture.md) | Execution model, exactly-once state transition protocol, data model, notifications & wakeups |
 | [docs/03-api.md](docs/03-api.md) | Public API, code examples, determinism constraints, test support |
-| [docs/04-plan.md](docs/04-plan.md) | Milestones, testing strategy, risks and mitigations |
+| [docs/04-testing.md](docs/04-testing.md) | Testing strategy, verification methodologies, risks and mitigations |
 | [docs/05-observability.md](docs/05-observability.md) | Logging, OpenTelemetry metrics, troubleshooting guide |
 | [docs/06-bench-baseline.md](docs/06-bench-baseline.md) | Benchmark baseline measurements and reproduction guide |
 | [docs/07-retention.md](docs/07-retention.md) | Data retention and purging of completed instances |
