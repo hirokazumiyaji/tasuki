@@ -13,7 +13,7 @@ Temporal のような「リトライ、タイマー、状態永続化を自分�
 
 M4（バックエンド拡充）完了。PostgreSQL / SQLite / MySQL・MariaDB・TiDB / Spanner / DynamoDB / Firestore が適合・カオス可能な状態。
 M5（性能と拡張）と M6（Query / Signal dedupe / Nack / SearchAttributes / Memo / LocalActivity / StartToClose / Update / SignalBatch など）は実装済。
-品質スプリント（CI マトリクス・カバレッジ計測・ドキュメント整備）完了。詳細は [docs/ja/04-plan.md](docs/ja/04-plan.md)。
+品質スプリント（CI マトリクス・カバレッジ計測・ドキュメント整備）完了。詳細は [docs/ja/04-testing.md](docs/ja/04-testing.md)。
 M5 のベンチマーク基盤: `go run ./cmd/bench`（memory / postgres / sqlite）。
 PostgreSQL Worker は `LISTEN`/`NOTIFY`（チャネル `tasuki_tasks`）で起床し、`PollInterval` はフォールバックおよびタイマー／スケジュール用。memory / sqlite / mysql / spanner は同一 `Backend` 内のプロセス内 wakeup（`backend/hub`）。DynamoDB は `wf_wake`（Streams 有効）＋ wake アイテムポーリング、Firestore は `wf_notify` の Snapshot で**プロセスをまたいだ**起床もできる（いずれも hint。正しさは Claim / GetInstance）。
 Client の `Result` は postgres（`tasuki_terminal`）および他ストア（hub / 上記 cross-process 経路）で終端時に起床できる。
@@ -187,7 +187,7 @@ go test ./chaos/ -timeout 5m
 | [docs/ja/01-overview.md](docs/ja/01-overview.md) | 目的、要求、非目標、既存プロダクト比較、用語 |
 | [docs/ja/02-architecture.md](docs/ja/02-architecture.md) | 実行モデル、exactly-once 状態遷移プロトコル、データモデル、通知・起床機構 |
 | [docs/ja/03-api.md](docs/ja/03-api.md) | 公開 API、コード例、決定性の制約、テスト支援 |
-| [docs/ja/04-plan.md](docs/ja/04-plan.md) | マイルストーン、テスト戦略、リスク |
+| [docs/ja/04-testing.md](docs/ja/04-testing.md) | テスト戦略、検証手法、リスクと対策 |
 | [docs/ja/05-observability.md](docs/ja/05-observability.md) | ログと OpenTelemetry メトリクス、トラブルシューティング |
 | [docs/ja/06-bench-baseline.md](docs/ja/06-bench-baseline.md) | ベンチマーク基準測定結果と測定手順 |
 | [docs/ja/07-retention.md](docs/ja/07-retention.md) | 完了済みインスタンスのデータ保持と削除（Retention） |
