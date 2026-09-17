@@ -1,36 +1,39 @@
 # tasuki
 
-Go アプリケーションに組み込んで使う durable workflow engine。
-名前は駅伝の襷（tasuki）から。走者から走者へ襷を引き継いで長い距離を走り切るように、ワーカーからワーカーへ実行を引き継いでワークフローを完走させる。
+English | [日本語](README.ja.md)
 
-Temporal のような「リトライ、タイマー、状態永続化を自分で書かず、ワークフローをコードとして書く」体験を、専用サーバーなしで提供する。
-エンジンはライブラリとしてアプリケーションプロセス内で動き、永続化はアプリケーションが持つデータストアに相乗りする。
-バックエンドはインターフェースで差し替え可能で、参照実装は PostgreSQL、対応対象に MySQL / MariaDB、SQLite、Spanner、TiDB、DynamoDB、Firestore を含む。
+A durable workflow engine designed to be embedded directly into Go applications.  
+The name comes from the Japanese *tasuki* (襷)—the sash passed from runner to runner in ekiden relay races. Just as runners hand off the tasuki to carry their team across long distances, workers hand over execution state to complete workflows across process restarts and crashes.
 
-## ステータス
+tasuki provides a Temporal-like developer experience—writing business workflows as standard code without manually building retries, timers, or state persistence—without requiring a dedicated server cluster.  
+The engine runs as an in-process library within your application, and persistence co-locates directly on the application's existing data store. Zero additional infrastructure is needed.
 
-M4（バックエンド拡充）完了。PostgreSQL / SQLite / MySQL·MariaDB·TiDB / Spanner / DynamoDB / Firestore が適合・カオス可能な状態。
-M5（性能と拡張）と M6（Query / Signal dedupe / Nack / SearchAttributes / Memo / LocalActivity / StartToClose / Update / SignalBatch など）は実装済。
-現在は品質スプリント（CI マトリクス・カバレッジ計測・ドキュメント鮮度）。詳細は [docs/superpowers/specs/2026-07-29-quality-sprint-design.md](docs/superpowers/specs/2026-07-29-quality-sprint-design.md)。
-M5 のベンチマーク基盤: `go run ./cmd/bench`（memory / postgres / sqlite）。
-PostgreSQL Worker は `LISTEN`/`NOTIFY`（チャネル `tasuki_tasks`）で起床し、`PollInterval` はフォールバックおよびタイマー／スケジュール用。memory / sqlite / mysql / spanner は同一 `Backend` 内のプロセス内 wakeup（`backend/hub`）。DynamoDB は `wf_wake`（Streams 有効）＋ wake アイテムポーリング、Firestore は `wf_notify` の Snapshot で**プロセスをまたいだ**起床もできる（いずれも hint。正しさは Claim / GetInstance）。
-Client の `Result` は postgres（`tasuki_terminal`）および他ストア（hub / 上記 cross-process 経路）で終端時に起床できる。
-Worker はインスタンスごとの sticky ジャーナルキャッシュ（`next_seq` 照合、差分は `GetJournal`）でフル履歴の再読を減らす。
-tasuki は各 workflow instance を durable actor として扱い、journal replay モデルを維持する。
-ジャーナル件数が `JournalWarnThreshold`（既定 10000、負数で無効）以上のとき Worker は Warn ログとメトリクスを出す。長寿命ワークフローは `workflow.ContinueAsNew` で履歴を打ち切る（[docs/02-architecture.md](docs/02-architecture.md)、[docs/03-api.md](docs/03-api.md)）。
-長時間アクティビティは `activity.RecordHeartbeat` でリース延長と進捗記録ができ、リトライ時に `GetHeartbeatDetails` で取り出せる。
-アクティビティの 1 試行上限は `workflow.WithStartToCloseTimeout`（超過は通常失敗としてリトライ対象）。
-ワークフローの読み取り専用問い合わせは `workflow.SetQueryHandler` と `tasuki.Query`（Worker 同一プロセス）で行う。
-実行中ワークフローへの同期 Update は `workflow.SetUpdateHandler` と `tasuki.Update`（任意 `WithUpdateID`）。
-`Client.Signal` は `WithDedupeID` でインスタンス単位の再送冪等にできる。
-同一インスタンスへの一括送信は `Client.SignalBatch`（原子的。item ごとの任意 dedupe）。
-ローリング中に旧 Worker が新履歴を扱えない場合はタスクを Nack し、新 Worker が拾えるようにする（`IncompatibleRetryDelay`）。
-検索属性は `WithSearchAttributes`（Start）と `workflow.UpsertSearchAttributes` で付け、`Client.List` の完全一致フィルタで絞り込める。
-メモは `WithMemo` / `workflow.UpsertMemo` で付け、Get で見える表示用注釈（List フィルタには使わない）。
-短い同一 Worker 実行は `workflow.ExecuteLocal`（アクティビティタスクキューなし・リトライなし。結果はジャーナルに記録）。
-ペイロードの at-rest 暗号化は `codec.Encrypted`（AES-256-GCM、鍵ローテーション対応。Worker の `Codec` と Client の `WithCodec` に設定）。
+Pluggable backend storage interface with PostgreSQL as the reference implementation, and support for MySQL / MariaDB, SQLite, Spanner, TiDB, DynamoDB, and Firestore.
 
-## クイックスタート
+## Status
+
+- **M4 (Backend Expansion)** complete. PostgreSQL, SQLite, MySQL / MariaDB / TiDB, Spanner, DynamoDB, and Firestore are verified against compliance and chaos test suites.
+- **M5 (Performance & Scaling)** and **M6 (Expressiveness & Operability)** are implemented, including Query, Signal deduplication, Worker incompatible Nack, SearchAttributes, Memo, LocalActivity, StartToClose Timeout, Synchronous Update, and SignalBatch.
+- **Quality Sprint** completed (split CI matrix, test coverage reporting, test suite fill, and documentation freshness). See [docs/04-plan.md](docs/04-plan.md).
+- **Benchmark Foundation**: `go run ./cmd/bench` (memory / postgres / sqlite).
+- **Wakeup & Notification**: PostgreSQL Worker wakes on `LISTEN`/`NOTIFY` (channel `tasuki_tasks`), keeping `PollInterval` as fallback and cadence for timers/schedules. memory, sqlite, mysql, and spanner share in-process wakeups within the same `Backend` (`backend/hub`). DynamoDB uses `wf_wake` (Streams enabled) + wake item polling, and Firestore uses `wf_notify` document snapshots for cross-process wakeups (all notifications are hints; correctness is guaranteed by Claim / GetInstance).
+- **Terminal Result Notification**: Client `Result` wakes up on workflow termination via postgres (`tasuki_terminal`), hub, or cross-process channels.
+- **Sticky Journal Cache**: Worker uses an in-memory sticky journal cache per instance (matching `next_seq`, diff reads via `GetJournal`) to eliminate full history re-reads on replay.
+- **Durable Actor Model**: tasuki models each workflow instance as a durable actor while retaining the deterministic journal replay execution model.
+- **Journal Growth Warning**: Worker emits a Warn log and metric when journal event count reaches or exceeds `JournalWarnThreshold` (default 10,000; negative disables). Long-running workflows should reset history using `workflow.ContinueAsNew` ([docs/02-architecture.md](docs/02-architecture.md), [docs/03-api.md](docs/03-api.md)).
+- **Activity Heartbeats**: Long-running activities can record progress and extend leases via `activity.RecordHeartbeat`, retrieved on retry with `GetHeartbeatDetails`.
+- **Start-To-Close Timeout**: Activity single-attempt execution time limit is set via `workflow.WithStartToCloseTimeout` (exceeding it is treated as a regular failure eligible for retry).
+- **Workflow Query**: Read-only queries to workflows are handled with `workflow.SetQueryHandler` and `tasuki.Query` (same Worker process).
+- **Workflow Update**: Synchronous request-response updates to running workflows use `workflow.SetUpdateHandler` and `tasuki.Update` (supports optional `WithUpdateID` for idempotency).
+- **Signal Deduplication**: `Client.Signal` supports `WithDedupeID` for instance-scoped idempotent resends.
+- **Signal Batching**: Atomic bulk signals to a single instance via `Client.SignalBatch` (with optional per-item dedupe ID).
+- **Incompatible Worker Nack**: During rolling deployments, if an older worker encounters an unrecognized journal event or unregistered workflow/activity, it Nacks the task so a newer worker can pick it up (`IncompatibleRetryDelay`).
+- **Search Attributes**: String attributes attached via `WithSearchAttributes` (Start) and `workflow.UpsertSearchAttributes` (runtime) allow exact-match filtering in `Client.List`.
+- **Memos**: Annotations attached via `WithMemo` / `workflow.UpsertMemo` provide visible metadata in `Get` (not filtered in `List`).
+- **Local Activity**: Synchronous execution within the same Worker process via `workflow.ExecuteLocal` (no task queue, no retry; results recorded in journal).
+- **Payload Encryption**: At-rest payload encryption via `codec.Encrypted` (AES-256-GCM with key rotation; configured on Worker `Codec` and Client `WithCodec`).
+
+## Quickstart
 
 PostgreSQL:
 
@@ -48,7 +51,7 @@ export TASUKI_MYSQL_DSN='tasuki:tasuki@tcp(localhost:3306)/tasuki?parseTime=true
 go run ./examples/m4-mysql/
 ```
 
-TiDB（`backend/mysql` を流用）:
+TiDB (uses `backend/mysql`):
 
 ```bash
 docker compose up -d tidb
@@ -57,7 +60,7 @@ export TASUKI_MYSQL_DSN="$TASUKI_TIDB_DSN"
 go run ./examples/m4-mysql/
 ```
 
-Spanner（Emulator）:
+Spanner (Emulator):
 
 ```bash
 docker compose up -d spanner
@@ -66,7 +69,7 @@ export TASUKI_SPANNER_DSN=projects/tasuki/instances/tasuki/databases/tasuki
 go run ./examples/m4-spanner/
 ```
 
-DynamoDB（Local）:
+DynamoDB (Local):
 
 ```bash
 docker compose up -d dynamodb
@@ -75,7 +78,7 @@ export AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local AWS_REGION=us-east-1
 go run ./examples/m4-dynamodb/
 ```
 
-Firestore（Emulator）:
+Firestore (Emulator):
 
 ```bash
 docker compose up -d firestore
@@ -84,37 +87,39 @@ export TASUKI_FIRESTORE_PROJECT=tasuki
 go run ./examples/m4-firestore/
 ```
 
-SQLite（追加インフラ不要）:
+SQLite (no external infrastructure required):
 
 ```bash
 go run ./examples/m3-sqlite/
 ```
 
-決定性解析:
+Determinism Static Analysis:
 
 ```bash
 go run ./analyzers/determinism/cmd/determinism -- ./...
 ```
 
-## 閲覧 UI（contrib）
+## Web UI (contrib)
 
-インスタンス一覧・ジャーナルビューア。詳細ページでは running インスタンスを Cancel / Terminate / Signal できる（Cancel・Terminate は確認チェック、Signal は name + JSON。いずれも CSRF。Cancel は協調キャンセル、Terminate は即時終了）。
+Instance list and journal viewer. The details page allows running instances to be Canceled, Terminated, or Signaled (Cancel and Terminate require confirmation checkboxes; Signal accepts name + JSON payload; all are CSRF-protected. Cancel is cooperative cancellation, Terminate is immediate termination).
 
-既定は loopback（`127.0.0.1:8080`）のみで待ち受け、HTTP タイムアウト付き（ReadHeader 5s / Read 10s / Write 15s / Idle 60s）。外部公開はトークン必須。無認証の外部公開は `--allow-unauthenticated-external` の明示 opt-in が必要（危険）:
+By default, the UI listens only on loopback (`127.0.0.1:8080`) with defensive HTTP timeouts (ReadHeader 5s / Read 10s / Write 15s / Idle 60s). Exposing externally requires an authentication token. Unauthenticated external exposure requires explicit `--allow-unauthenticated-external` opt-in (dangerous):
 
 ```bash
 go run ./contrib/ui/cmd/tasuki-ui -backend=memory -addr=127.0.0.1:8080
 export TASUKI_UI_TOKEN='change-me'
 go run ./contrib/ui/cmd/tasuki-ui -backend=memory -addr=127.0.0.1:8080 -token="$TASUKI_UI_TOKEN"
 # open http://127.0.0.1:8080
-# 外部公開（認証付き）
+
+# External exposure (with token auth)
 go run ./contrib/ui/cmd/tasuki-ui -backend=memory -addr=0.0.0.0:8080 -token="$TASUKI_UI_TOKEN"
-# 共有デプロイ例（TLS 終端 + 認証）: リバースプロキシで TLS を終端し、UI は loopback + token で起動する
-# Caddy 例:
+
+# Shared deployment example (TLS termination + token auth): terminate TLS at a reverse proxy, run UI on loopback + token
+# Caddy example:
 # example.com {
 #   reverse_proxy 127.0.0.1:8080
 # }
-# TASUKI_UI_TOKEN='...' go run ./contrib/ui/cmd/tasuki-ui -backend=postgres -addr=127.0.0.1:8080 -token="$TASUKI_UI_TOKEN"
+
 docker compose up -d postgres
 export TASUKI_POSTGRES_DSN='postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable'
 go run -tags tasuki_all ./contrib/ui/cmd/tasuki-ui -backend=postgres -addr=127.0.0.1:8080 -token="$TASUKI_UI_TOKEN"
@@ -136,35 +141,36 @@ export TASUKI_FIRESTORE_PROJECT=tasuki
 go run -tags tasuki_all ./contrib/ui/cmd/tasuki-ui -backend=firestore -addr=127.0.0.1:8080 -token="$TASUKI_UI_TOKEN"
 ```
 
-## ベンチマーク
+## Benchmarks
 
-E2E スループット（投入開始→全完了の完走インスタンス数 / 秒）と遅延分布（p50/p95/p99）を測る。
-既定で既存データを削除しない（`--reset` + `TASUKI_ALLOW_RESET=1` の明示指定のみ削除）。同一ストアでの繰り返しは `--run-id` で分離される:
+Measures end-to-end throughput (completed instances / sec from start of submission to full completion) and latency distributions (p50 / p95 / p99).  
+By default, benchmarks do not delete existing data (only deleted with `--reset` + `TASUKI_ALLOW_RESET=1`). Repetitive runs on the same store are isolated via `--run-id`:
 
 ```bash
 go run ./cmd/bench -backend=memory -instances=200 -workers=4
 go run ./cmd/bench -backend=memory -instances=200 -workers=4 -claim-limit=50 -activity-concurrency=8 -workflow-concurrency=8
 go run ./cmd/bench -backend=memory -instances=200 -workers=4 -scenario=mixed -run-id=try1
 go run ./cmd/bench -backend=memory -instances=50 -workers=2 -scenario=long-history
-# 破壊的リセット（対象を確認して明示指定）
+
+# Destructive reset (verify target store first)
 TASUKI_ALLOW_RESET=1 go run ./cmd/bench -backend=memory -instances=200 -workers=4 --reset
+
 docker compose up -d postgres
 export TASUKI_POSTGRES_DSN='postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable'
 go run -tags tasuki_all ./cmd/bench -backend=postgres -instances=200 -workers=4
+
 export TASUKI_SQLITE_PATH=./bench.db
 go run -tags tasuki_all ./cmd/bench -backend=sqlite -instances=200 -workers=4
 ```
 
-`WorkerOptions.ClaimLimit`（デフォルト 10）で 1 tick あたりの Claim 件数を変えられる。bench では `-claim-limit`。
+- `WorkerOptions.ClaimLimit` (default 10) controls the number of tasks claimed per tick (via `-claim-limit` in bench).
+- In all stores, multiple workflow advancements within a tick can be batched into `CommitAdvancements` (DynamoDB falls back sequentially when exceeding 100 TransactWrite items).
+- `WorkerOptions.ActivityConcurrency` (default 1) controls concurrency for claimed activities (`-activity-concurrency` in bench).
+- `WorkerOptions.WorkflowConcurrency` (default 1) controls concurrency for claimed workflows (the same instance is always serialized within a process; `-workflow-concurrency` in bench).
 
-全ストアで 1 tick 内の複数ワークフロー前進を `CommitAdvancements` にまとめられる（DynamoDB は TransactWrite 100 件超で逐次フォールバック）。
-`WorkerOptions.ActivityConcurrency`（デフォルト 1）で Claim 済み activity の並列度を変えられる。bench では `-activity-concurrency`。
-`WorkerOptions.WorkflowConcurrency`（デフォルト 1）で Claim 済み workflow の並列度を変えられる（同一 instance はプロセス内で直列）。bench では `-workflow-concurrency`。
+Baseline results and measurement notes: [docs/06-bench-baseline.md](docs/06-bench-baseline.md).
 
-詳細は [docs/superpowers/specs/2026-07-24-m5-bench-design.md](docs/superpowers/specs/2026-07-24-m5-bench-design.md)。
-基準メモ: [docs/06-bench-baseline.md](docs/06-bench-baseline.md)。
-
-テスト:
+## Tests
 
 ```bash
 go test ./... -race
@@ -177,28 +183,19 @@ cd backend/sqlite && go test ./...
 go test ./chaos/ -timeout 5m
 ```
 
-観測性: [docs/05-observability.md](docs/05-observability.md)
+Observability guide: [docs/05-observability.md](docs/05-observability.md)
 
-## 設計ドキュメント
+## Design Documents
 
-| 文書 | 内容 |
+| Document | Description |
 |---|---|
-| [docs/01-overview.md](docs/01-overview.md) | 目的、要求、非目標、既存プロダクト比較、用語 |
-| [docs/02-architecture.md](docs/02-architecture.md) | 実行モデル、exactly-once 状態遷移プロトコル、データモデル |
-| [docs/03-api.md](docs/03-api.md) | 公開 API、コード例、決定性の制約、テスト支援 |
-| [docs/04-plan.md](docs/04-plan.md) | マイルストーン、テスト戦略、リスク |
-| [docs/05-observability.md](docs/05-observability.md) | ログと OpenTelemetry メトリクス |
-| [docs/07-retention.md](docs/07-retention.md) | 完了済みインスタンスの削除（Retention） |
-| [docs/08-fair-dispatch.md](docs/08-fair-dispatch.md) | 公平ディスパッチと高負荷ワークフローの隔離 |
-| [docs/superpowers/plans/2026-07-23-m0-execution-model.md](docs/superpowers/plans/2026-07-23-m0-execution-model.md) | M0 実装プラン |
-| [docs/superpowers/plans/2026-07-23-m1-postgres-backend.md](docs/superpowers/plans/2026-07-23-m1-postgres-backend.md) | M1 実装プラン |
-| [docs/superpowers/plans/2026-07-23-m2-expressiveness.md](docs/superpowers/plans/2026-07-23-m2-expressiveness.md) | M2 実装プラン |
-| [docs/superpowers/plans/2026-07-23-m3-operability.md](docs/superpowers/plans/2026-07-23-m3-operability.md) | M3 実装プラン |
-| [docs/superpowers/plans/2026-07-23-m4-mysql-backend.md](docs/superpowers/plans/2026-07-23-m4-mysql-backend.md) | M4 MySQL 実装プラン |
-| [docs/superpowers/plans/2026-07-23-m4-tidb.md](docs/superpowers/plans/2026-07-23-m4-tidb.md) | M4 TiDB 検証プラン |
-| [docs/superpowers/specs/2026-07-23-m4-spanner-design.md](docs/superpowers/specs/2026-07-23-m4-spanner-design.md) | M4 Spanner 設計 |
-| [docs/superpowers/plans/2026-07-23-m4-spanner.md](docs/superpowers/plans/2026-07-23-m4-spanner.md) | M4 Spanner 実装プラン |
-| [docs/superpowers/specs/2026-07-23-m4-dynamodb-design.md](docs/superpowers/specs/2026-07-23-m4-dynamodb-design.md) | M4 DynamoDB 設計 |
-| [docs/superpowers/plans/2026-07-23-m4-dynamodb.md](docs/superpowers/plans/2026-07-23-m4-dynamodb.md) | M4 DynamoDB 実装プラン |
-| [docs/superpowers/specs/2026-07-23-m4-firestore-design.md](docs/superpowers/specs/2026-07-23-m4-firestore-design.md) | M4 Firestore 設計 |
-| [docs/superpowers/plans/2026-07-23-m4-firestore.md](docs/superpowers/plans/2026-07-23-m4-firestore.md) | M4 Firestore 実装プラン |
+| [docs/01-overview.md](docs/01-overview.md) | Goals, requirements, non-goals, comparison with existing products, terminology |
+| [docs/02-architecture.md](docs/02-architecture.md) | Execution model, exactly-once state transition protocol, data model, notifications & wakeups |
+| [docs/03-api.md](docs/03-api.md) | Public API, code examples, determinism constraints, test support |
+| [docs/04-plan.md](docs/04-plan.md) | Milestones, testing strategy, risks and mitigations |
+| [docs/05-observability.md](docs/05-observability.md) | Logging, OpenTelemetry metrics, troubleshooting guide |
+| [docs/06-bench-baseline.md](docs/06-bench-baseline.md) | Benchmark baseline measurements and reproduction guide |
+| [docs/07-retention.md](docs/07-retention.md) | Data retention and purging of completed instances |
+| [docs/08-fair-dispatch.md](docs/08-fair-dispatch.md) | Fair dispatch and isolation of high-volume workflows |
+| [docs/09-limits.md](docs/09-limits.md) | Backend atomicity budgets and limits |
+| [docs/10-modules.md](docs/10-modules.md) | Go module layout, versioning, and publishing guidelines |

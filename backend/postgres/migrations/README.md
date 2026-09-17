@@ -1,40 +1,42 @@
-# PostgreSQL マイグレーション
+# PostgreSQL Migrations
 
-tasuki のスキーマはバージョニングされたマイグレーションファイルで管理する。
+English | [日本語](README.ja.md)
+
+tasuki's database schema is managed using versioned migration files.
 
 ```
 migrations/
-├── 000001_init.up.sql            基本テーブルとインデックス
-├── 000001_init.down.sql          全テーブルの DROP
-├── 000002_vacuum_tuning.up.sql   autovacuum / fillfactor 設定
-└── 000002_vacuum_tuning.down.sql 設定のリセット
+├── 000001_init.up.sql            Base tables and indexes
+├── 000001_init.down.sql          DROP all tables
+├── 000002_vacuum_tuning.up.sql   autovacuum / fillfactor tuning
+└── 000002_vacuum_tuning.down.sql Reset tuning settings
 ```
 
-命名規則は `<6桁バージョン>_<名前>.up.sql` / `.down.sql`。ファイル名は辞書順 = 適用順になる。
+The naming convention is `<6-digit-version>_<name>.up.sql` / `.down.sql`. Lexicographical file name order determines application order.
 
-## `Migrate()` の動作
+## `Migrate()` Behavior
 
-`postgres.Backend.Migrate(ctx)` は次を行う。
+`postgres.Backend.Migrate(ctx)` performs the following steps:
 
-1. 適用記録テーブル `tasuki_schema_migrations` を作成する。
-2. 未適用のマイグレーションをバージョン順にトランザクション内で適用し、同じトランザクションで記録行を INSERT する。
-3. 適用済みバージョンはスキップする。呼び出しは冪等で、並行呼び出しも安全（バージョン主キーによる原子的 claim）。
+1. Creates the tracking table `tasuki_schema_migrations`.
+2. Applies unapplied migrations in version order within a transaction, and inserts a tracking record in the same transaction.
+3. Skips already applied versions. The call is idempotent and safe to invoke concurrently across multiple processes (atomic claim via primary key on version).
 
-旧来の `schema.sql`（累積・冪等な 1 ファイル）で作成済みのデータベースは、`wf_instances` の存在を検出してバージョン 1 として記録し、以降の差分だけを適用する。
+Databases previously provisioned with the legacy cumulative `schema.sql` are detected by the presence of `wf_instances`, recorded as version 1, and only subsequent diffs are applied.
 
-補助 API:
+Auxiliary APIs:
 
-| API | 用途 |
+| API | Purpose |
 |---|---|
-| `postgres.LatestSchemaVersion()` | このビルドが埋め込む最新バージョン |
-| `b.SchemaVersion(ctx)` | 適用済みの最大バージョン（未マイグレーションは 0） |
-| `b.ValidateSchema(ctx)` | 必要テーブルの存在確認（未マイグレーション時のフェイルセーフ） |
+| `postgres.LatestSchemaVersion()` | Returns the latest schema version embedded in this build |
+| `b.SchemaVersion(ctx)` | Returns the maximum applied version (0 if not migrated) |
+| `b.ValidateSchema(ctx)` | Verifies that required tables exist (failsafe against unmigrated databases) |
 
-Worker は起動時に `ValidateSchema` を自動で呼ぶ（`WorkerOptions.DisableSchemaValidation` で無効化）。テーブルが足りない場合はポーリングループを起動せずエラーログを出す。
+Workers automatically invoke `ValidateSchema` on startup (can be disabled via `WorkerOptions.DisableSchemaValidation`). If required tables are missing, the worker logs an error and avoids starting the polling loop.
 
-## 外部ツールとの併用
+## Using with External Tools
 
-マイグレーションファイルはプレーンな SQL なので、既存ツールからそのまま使える。アプリ起動時の自動マイグレーションを外したい場合（権限分離・ゼロダウンタイムデプロイ）は、CD パイプラインでツールに適用させ、`tasuki_schema_migrations` も同じトランザクションで記録すれば `Migrate()` は差分なしで冪等に動く。
+Because migration files are plain SQL, they can be used directly with existing migration tools. If you prefer to disable automatic runtime migrations (e.g. for privilege separation or zero-downtime deployment pipelines), apply migrations via your CD tool and insert the corresponding row into `tasuki_schema_migrations` in the same transaction. `Migrate()` will then act as an idempotent no-op.
 
 ### golang-migrate
 
@@ -43,7 +45,7 @@ migrate -path backend/postgres/migrations \
   -database 'postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable' up
 ```
 
-`migrate` 自身の `schema_migrations` テーブルでバージョン管理する。tasuki 側 `Migrate()` を併用する場合は、`Migrate()` の記録（`tasuki_schema_migrations`）とツール側の記録がずれないよう、どちらか一方を適用元に決めておく。
+`golang-migrate` manages versions in its own `schema_migrations` table. When using both `golang-migrate` and tasuki's `Migrate()`, designate one tool as the single source of truth to avoid mismatched version state.
 
 ### goose
 
@@ -52,7 +54,7 @@ goose -dir backend/postgres/migrations postgres \
   'postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable' up
 ```
 
-注釈（`-- +goose Up`）のないファイルは全体が Up 扱いになるため、Down は `goose down` ではなくファイルを直接実行する運用でもよい。ツール独自のアノテーションを追記して使う構成も可能。
+Files without annotations (`-- +goose Up`) are treated as Up in their entirety. For Down operations, running the down SQL file directly or adding goose annotations is recommended.
 
 ### Atlas
 
@@ -61,8 +63,8 @@ atlas migrate apply --dir file://backend/postgres/migrations \
   --url 'postgres://tasuki:tasuki@localhost:5432/tasuki?sslmode=disable'
 ```
 
-## 新しいマイグレーションの追加
+## Adding New Migrations
 
-1. `000003_<名前>.up.sql` / `.down.sql` を追加する。バージョンは必ず増分。
-2. `.up.sql` は idempotent に書かなくてよい（適用は 1 回きり、失敗時はトランザクションでロールバックされる）。ただし `CREATE TABLE IF NOT EXISTS` のような冪等 DDL にしておくと、旧 schema.sql から移行したデータベースとの差異が吸収しやすい。
-3. テストは実 PostgreSQL に対して `go test ./...`（`TASUKI_POSTGRES_DSN` 必須）で検証する。
+1. Add `000003_<name>.up.sql` / `.down.sql`. Versions must always be monotonically incrementing.
+2. `.up.sql` does not strictly need to be idempotent (it runs only once and rolls back on failure in a transaction), but using idempotent DDL like `CREATE TABLE IF NOT EXISTS` helps bridge differences with databases migrated from older setups.
+3. Validate against a real PostgreSQL instance with `go test ./...` (requires `TASUKI_POSTGRES_DSN`).

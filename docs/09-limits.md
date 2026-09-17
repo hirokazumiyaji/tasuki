@@ -1,42 +1,46 @@
-# Backend limits and budgets
+# Backend Limits and Budgets
 
-各バックエンドの原子性予算と上限超過時の挙動。
+[English] | [日本語](ja/09-limits.md)
 
-## MaxAdvancementEffects
+Atomicity budgets per storage backend and behavior when operation limits are exceeded.
 
-`backend.Capabilities.MaxAdvancementEffects` は 1 回の workflow advancement で原子的にコミットできる操作数の目安。0 は無制限（memory/postgres/mysql/sqlite/spanner）。
+## `MaxAdvancementEffects`
 
-| Backend | 値 | 根拠 |
+`backend.Capabilities.MaxAdvancementEffects` indicates the maximum number of state transition effects that can be committed atomically in a single workflow advancement. A value of 0 indicates unlimited (applicable to in-memory, PostgreSQL, MySQL, SQLite, and Spanner).
+
+| Backend | Limit | Rationale |
 |---|---|---|
-| DynamoDB | 80 | `TransactWriteItems` 上限 100 に対する安全マージン（instance CAS 1 + task delete 1 + 予備 18） |
-| Firestore | 400 | トランザクション 500 に対するマージン |
-| others | 0（無制限） | 単一 SQL トランザクションで原子確保 |
+| DynamoDB | 80 | Safety margin against the 100-item `TransactWriteItems` limit (instance CAS 1 + task delete 1 + 18 reserved buffer) |
+| Firestore | 400 | Safety margin against the 500-operation transaction limit |
+| Others | 0 (unlimited) | Atomicity guaranteed by single SQL transaction |
 
-操作数の数え方（DynamoDB 換算）:
+Operation Count Calculation (DynamoDB equivalent):
 
 ```
 2 (instance CAS + task delete)
 + len(NewEvents) (journal puts)
 + len(ActivityTasks) (task puts)
 + len(Timers)
-+ len(DrainedInbox) (inbox deletes; ingested は NewEvents に含まれるため inbox 1 件あたり計 2)
-+ 3*len(Children) (instance/journal/task)
++ len(DrainedInbox) (inbox deletes; ingested events are counted in NewEvents, totaling 2 ops per inbox event)
++ 3 * len(Children) (child instance, journal event, task)
 + (ParentNotify ? 1 : 0)
 ```
 
-## Fanout の前進方式
+## Fanout Advancement Strategy
 
-`suspended` advancement が予算を超える場合、Worker は新規 commands の prefix のみをコミットし、残りを次 tick の replay に委ねる（journal と task の整合性を保つため中間不整合を作らない）。`EnsureWorkflowTask` で即時フォローアップを確保する。フォローアップは可能な限り同一トランザクション内で原子的に確保する（DynamoDB は singleton タスク行の in-place 更新、Firestore/SQL は同一トランザクション内の upsert）。そのためコミット→ensure の隙間でクラッシュしても残 replay が失われることはない。activity 完了時にもフォローアップが発生するため、前進は止まらない。
+When a suspended workflow advancement exceeds the configured budget, the Worker commits only the prefix of new commands that fits within the budget, deferring the remainder to the next turn's replay. This ensures intermediate states remain strictly consistent between the journal and task tables.
 
-- 50 件の `ExecuteAsync` fanout（DynamoDB 換算 102 ops）は 2 回程度に分割して完了する。
-- 100 件も同様に分割して完了する（再起動しても scheduled event と task が重複しない。journal の `attribute_not_exists` 条件と replay の prefix 一致で冪等）。
-- `inbox`/`timer`/`child` 混在時も同じ式で計算する。inbox drain 単体で予算を超える場合は drain を縮小できず診断エラーにする（`MaxPerInstance` や inbox バッチを見直す）。
+An immediate follow-up workflow task is guaranteed via `EnsureWorkflowTask`, committed atomically within the same transaction where supported (e.g. in-place singleton task updates on DynamoDB; upserts in Firestore/SQL). Even if the process crashes immediately after committing, no deferred replay commands are lost, and upcoming activity completions trigger follow-up turns to keep execution moving forward.
 
-## 永続的に収まらない単一操作
+- A fan-out of 50 `ExecuteAsync` calls (~102 DynamoDB operations) is split across approximately 2 commits.
+- A fan-out of 100 calls is similarly split across turns without duplicating scheduled events or tasks (idempotency is guaranteed by journal `attribute_not_exists` conditions and prefix matching during replay).
+- In mixed workloads with inbox, timer, and child operations, the same formula applies. If undrained inbox messages alone exceed the budget, the drain cannot be truncated and triggers a diagnostic error (adjust `MaxPerInstance` or inbox batch sizes).
 
-- terminal を含む advancement が予算を超える場合は切り詰めず診断エラーにする（例: `tasuki: terminal advancement needs 120 ops, budget 80`）。Worker は terminal turn（完了・失敗・ContinueAsNew・stuck）も事前に検証する。fanout を 1 tick あたりに収まる粒度に分割するか、子ワークフローに分割する。
-- `SendToInboxBatch` が予算超の場合は `ErrBatchTooLarge` を返す（`InboxBatchLimit` = `MaxAdvancementEffects/4`、無制限時は 100）。
+## Operations Exceeding Budgets
 
-## Scan コストの限界（DynamoDB）
+- If an advancement containing a terminal transition (completed, failed, canceled, continued_as_new, or stuck) exceeds the budget, it cannot be truncated and returns a diagnostic error (e.g., `tasuki: terminal advancement needs 120 ops, budget 80`). Workers validate terminal turns in advance. Workflows must structure fan-outs to fit within single-tick budgets or delegate large batches to child workflows.
+- If `SendToInboxBatch` exceeds the budget, it returns `ErrBatchTooLarge` (`InboxBatchLimit` = `MaxAdvancementEffects / 4`, or 100 when unlimited).
 
-`ListInstances` は Scan ベースのため、一致件数 M に対するソートは `O(M log M)`（標準ソート）に改善済みだが、Scan 自体の読み取りコスト（全件読み・RCU）は残る。小さい `Limit` でも全件 Scan が発生するため、大量件数の一覧表示は運用で避ける（フィルタ + 別途索引設計が必要な場合は測定に基づき別途設計）。
+## Scan Costs and Considerations (DynamoDB)
+
+`ListInstances` in DynamoDB performs table scans. While sorting over $M$ matching instances is optimized to $O(M \log M)$ in-memory, the underlying scan consumes read capacity units (RCU) across the entire table. Even requests with small `Limit` parameters scan underlying items. Avoid frequent full-table list queries in large-scale production DynamoDB deployments without dedicated secondary indexes.

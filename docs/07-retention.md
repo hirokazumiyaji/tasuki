@@ -1,6 +1,8 @@
-# データ保持（Retention）
+# Data Retention
 
-長期運用では、完了済みワークフローインスタンスとそのジャーナルが蓄積し、ストレージを圧迫する。`Backend.PurgeInstances` は終端に達したインスタンスとその依存データを一括削除するための運用インターフェースである。
+[English] | [日本語](ja/07-retention.md)
+
+In long-running production systems, completed workflow instances and their journals accumulate over time, consuming storage. `Backend.PurgeInstances` provides an administrative interface to bulk-delete terminated instances and their associated data.
 
 ## API
 
@@ -8,62 +10,62 @@
 n, err := backend.PurgeInstances(ctx, olderThan time.Duration, statuses []string, limit int) (int, error)
 ```
 
-引数の意味は次のとおり。
+Parameters:
 
-- **olderThan**：完了時刻が `now - olderThan` より前であるインスタンスだけを対象にする。
-- **statuses**：対象とする終端ステータス。空（nil）のときは既定値として `{completed, failed, terminated, canceled}` を使う。`continued` も指定できる。
-- **limit**：1 回の呼び出しで削除するインスタンス数の上限。0 以下なら `backend.DefaultPurgeLimit`（1000）を使う。
+- **`olderThan`**: Only instances whose completion timestamp is older than `now - olderThan` are eligible for deletion.
+- **`statuses`**: Target terminal statuses to purge. If empty (nil), defaults to `{completed, failed, terminated, canceled}`. `continued` can also be specified.
+- **`limit`**: Maximum number of instances to delete in a single invocation. If $\le 0$, defaults to `backend.DefaultPurgeLimit` (1000).
 
-戻り値の `n` は実際に削除したインスタンス数である。
+The return value `n` is the number of instances successfully deleted.
 
-実行中（`running`）、および `stuck` のインスタンスは削除対象にならない。これらのステータスを `statuses` に渡すとエラーになる。誤ったステータス名で稼働中のワークフローを消す事故を防ぐための仕様である。
+Active instances (`running` and `stuck`) are strictly excluded from deletion. Passing these active statuses in `statuses` returns an error, preventing accidental deletion of active workflows due to misconfiguration.
 
-## 削除されるデータ
+## Deleted Data
 
-1 インスタンスあたり、次の行がすべて削除される。
+For each purged instance, all corresponding rows/items are removed:
 
-| テーブル | 内容 |
+| Table / Collection | Description |
 |---|---|
-| `wf_instances` | インスタンス本体 |
-| `wf_journal` | 実行履歴イベント |
-| `wf_inbox` | 未処理シグナルなどの inbox |
-| `wf_tasks` | 残留タスク（遅れて到着した activity 完了など） |
-| `wf_timers` | 未来に発火する予定だったタイマー |
-| `wf_signal_dedupe` | シグナル重複排除キー |
+| `wf_instances` | Core instance state and metadata |
+| `wf_journal` | Historical execution journal events |
+| `wf_inbox` | Pending inbox messages and signals |
+| `wf_tasks` | Lingering tasks (e.g. late-arriving activity completions) |
+| `wf_timers` | Timers scheduled for future firing |
+| `wf_signal_dedupe` | Signal deduplication keys |
 
-SQL 系バックエンド（PostgreSQL / MySQL / SQLite / Spanner）は 1 トランザクションで削除する。トランザクションの途中で失敗した場合、そのバッチ全体がロールバックされる。
+SQL-based backends (PostgreSQL, MySQL, SQLite, Spanner) execute purges within a single transaction per batch. If a batch fails midway, all changes in that batch are rolled back.
 
-DynamoDB と Firestore はテーブル間トランザクションを持たないため、1 インスタンス単位のベストエフォート削除になる。削除の途中で失敗すると、そのインスタンスには関連行が一部残る可能性がある。残余は再実行では回収されない（対象から外れるため）。厳密さが必要な場合は、削除前にアーカイブへ退避する方式を推奨する。
+Because DynamoDB and Firestore lack multi-table distributed transactions across disparate entities, purges are performed on a best-effort, per-instance basis. If an operation fails midway, orphan rows may remain for that instance. If strict cleanup is required in document stores, archiving data prior to purging is recommended.
 
-## 運用パターン
+## Operational Pattern
 
-Purge は専用ジョブから周期的に呼ぶことを想定している。ワーカーのループに入れず、cron や別プロセスで走らせる。
+`PurgeInstances` should be executed periodically from a dedicated background job or cron process, separated from worker execution loops:
 
 ```go
 func retentionLoop(ctx context.Context, b backend.Backend) error {
-	ticker := time.NewTicker(time.Hour)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			for {
-				n, err := b.PurgeInstances(ctx, 30*24*time.Hour, nil, backend.DefaultPurgeLimit)
-				if err != nil {
-					return err
-				}
-				if n < backend.DefaultPurgeLimit {
-					break // 対象を拭い切った
-				}
-			}
-		}
-	}
+    ticker := time.NewTicker(time.Hour)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case <-ticker.C:
+            for {
+                n, err := b.PurgeInstances(ctx, 30*24*time.Hour, nil, backend.DefaultPurgeLimit)
+                if err != nil {
+                    return err
+                }
+                if n < backend.DefaultPurgeLimit {
+                    break // All eligible instances have been purged
+                }
+            }
+        }
+    }
 }
 ```
 
-戻り値が上限と等しい間は対象が残っている。同じ呼び出しを繰り返して段階的に削除する。
+As long as `n == limit`, more eligible instances remain. Repeat the call in batches to prevent transaction timeouts or lock saturation.
 
-## 効果
+## Impact
 
-完了済みインスタンスを定期的に落とすことで、`wf_instances`・`wf_journal` のサイズとインデックスサイズが伸び続けない。`ListInstances` や参照系クエリの性能はテーブルサイズに依存するため、保持期間の設定は監視とセットで行う。テーブルサイズの監視については [05-observability.md](05-observability.md) を参照。
+Regularly purging terminated instances prevents `wf_instances` and `wf_journal` tables and their indexes from expanding indefinitely. Because query performance for operations like `ListInstances` depends on table cardinality, retention policies should be calibrated alongside storage monitoring (see [05-observability.md](05-observability.md)).

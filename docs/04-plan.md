@@ -1,141 +1,134 @@
-# 開発プラン
+# Development Plan
 
-本書はマイルストーン、テスト戦略、リスクを定める。
-規模の目安は 1 人で開発した場合の週数であり、見積もりではなく優先順位付けのための相対値である。
+[English] | [日本語](ja/04-plan.md)
 
-## 開発の進め方
+This document defines milestones, testing strategies, and risk mitigations for tasuki.  
+Estimates represent single-engineer effort in weeks and serve as relative prioritization weights rather than strict deadlines.
 
-- テスト駆動で進める。各マイルストーンの受入条件は自動テストとして表現し、グリーンになったことをもって完了とする。
-- 正しさの中核（状態遷移プロトコル）はバックエンド適合テストスイートに最初に落とす。インメモリと PostgreSQL から始め、バックエンドを増やすたびに同じスイートで検証する。
-- 各マイルストーンは「動くデモ」で締める。examples/ 配下に残し、ドキュメントのコード例と乖離させない。
+## Methodology
 
-## マイルストーン
+- **Test-Driven Development**: Acceptance criteria for each milestone are expressed as automated tests. A milestone is complete when its test suite is green.
+- **Protocol Verification First**: The core correctness invariants (state transition protocol) are codified into a shared backend compliance test suite, starting with in-memory and PostgreSQL, and applied to each subsequent backend.
+- **Working Demos**: Each milestone culminates in a runnable example under `examples/` to prevent documentation examples from drifting out of sync.
 
-### M0 実行モデルの検証（目安 1〜2 週）
+## Milestones
 
-最大の技術リスクである「ジャーナル再実行方式が Go で快適に書けるか」を最初に検証する。
+### M0: Execution Model Validation (~1–2 weeks)
 
-スコープ：
+Validate the highest technical risk: ensuring the journal replay execution model in Go is ergonomic and practical.
 
-- ジャーナルとリプレイの中核（コマンド照合、決定性違反検出）
-- `workflow.Context`、`Execute`、`Sleep`、`runtime.Goexit` によるサスペンド
-- インメモリバックエンドと仮想時計（wftest の原型）
+Scope:
+- Core journal and replay mechanics (command matching, determinism violation detection)
+- `*workflow.Context`, `Execute`, `Sleep`, and goroutine suspension via `runtime.Goexit`
+- In-memory backend and virtual clock (`wftest` prototype)
 
-受入条件：
+Acceptance Criteria:
+- Multi-step workflows successfully resume from partial journals (durability unit tests)
+- Determinism violations (mismatched command sequences from code edits) are quarantined as `stuck`
+- User-space `defer` and `recover` do not intercept or corrupt suspension
+- A 7-day sleep test finishes instantaneously via the virtual clock
 
-- 複数ステップのサンプルワークフローが、途中までのジャーナルを与えたリプレイで正しく再開する（durability の中核性質のユニットテスト）
-- 決定性違反（コード変更による呼び出し列の変化）が stuck として検出される
-- ワークフロー内の defer と recover がサスペンドを壊さないことのテスト
-- 7 日スリープを含むテストが仮想時計で実時間なしに完走する
+### M1: PostgreSQL Backend & Minimal Viable Product (~2–3 weeks)
 
-### M1 PostgreSQL バックエンドと実用最小（目安 2〜3 週）
+Build the minimal viable foundation capable of surviving crashes across multiple processes sharing a single database.
 
-単一の DB を共有する複数プロセスで、クラッシュに耐えて動く最小構成を作る。
+Scope:
+- Schema and migrations, state transition transactions, and `SKIP LOCKED` task claims
+- Automatic lease renewal, retries with exponential backoff, and timer execution
+- Client APIs (`Start`, `Result`, `Get`, `Terminate`) and idempotent start by instance ID
+- Graceful shutdown and shared backend compliance test suite
 
-スコープ：
+Acceptance Criteria:
+- Compliance test suite passes against both in-memory and PostgreSQL implementations (including missed-wakeup races, fencing, duplicate completion, and ignored post-terminal completions)
+- Chaos tests withstand repeated random `kill -9` signals across multiple worker processes, verifying all instances finish with correct terminal results and uncorrupted journals
+- README quickstart runs out of the box
 
-- スキーマとマイグレーション、状態遷移トランザクション、SKIP LOCKED による獲得
-- リース自動延長、リトライとバックオフ、タイマー実行
-- Client（Start、Result、Get、Terminate）と ID による冪等開始
-- graceful shutdown、バックエンド適合テストスイート
+### M2: Expressiveness (~2–3 weeks)
 
-受入条件：
+Complete the core programming model defined in [03-api.md](03-api.md).
 
-- 適合テストスイートをインメモリと PostgreSQL の両実装が通過する（起こし損ね競合、フェンシング、二重完了、終端後の完了無視を含む）
-- 複数ワーカープロセスをランダムに kill -9 し続けるカオステストで、全インスタンスが正しい結果で終端し、ジャーナルに遷移の重複や欠落がない
-- README のクイックスタートがそのまま動く
+Scope:
+- `ExecuteAsync`, `SleepAsync`, `Await`, `AwaitAll`
+- Signals, child workflows, `SideEffect`, `NewUUID`, `Now`
+- `GetVersion`, cooperative cancellation, `ContinueAsNew`, `NonRetryable`
 
-### M2 表現力（目安 2〜3 週）
+Acceptance Criteria:
+- All code examples in [03-api.md](03-api.md) compile and run in CI as documentation tests
+- Compliance test suite expands to cover signal-versus-task races, child workflow completions, and cancellation compensation
 
-[03-api.md](03-api.md) に定めた API を完成させる。
+### M3: Operability (~2–3 weeks)
 
-スコープ：
+Deliver operational tooling and developer ergonomics necessary for production readiness.
 
-- `ExecuteAsync`、`SleepAsync`、`Await`、`AwaitAll`
-- シグナル、子ワークフロー、`SideEffect`、`NewUUID`、`Now`
-- `GetVersion`、キャンセル、`ContinueAsNew`、`NonRetryable`
+Scope:
+- SQLite backend (for local development and single-process applications)
+- Cron schedules
+- OpenTelemetry metrics and structured logging (slog), with documented metric dictionaries
+- Static determinism analyzer (detecting `time.Now`, `go` statements, `rand`)
+- `List` and `GetJournal` for operational inspection; expanded `examples/`
 
-受入条件：
+Acceptance Criteria:
+- SQLite implementation passes the backend compliance test suite
+- Duplicate schedule triggering is mitigated by instance ID deduplication
+- Static analyzer detects representative violations from the determinism checklist
 
-- 03-api.md のコード例がそのままコンパイルされ動作する（ドキュメントテストとして CI に組み込む）
-- 適合テストにシグナル送信とタスク処理の競合、子の完了通知、キャンセル中の補償処理を追加して通過する
+### M4: Backend Expansion (Phased)
 
-### M3 運用性（目安 2〜3 週）
+Expand store support by adapting the compliance test suite and chaos testing to new databases:
 
-本番投入と開発体験に必要な周辺を揃える。
+1. **MySQL / MariaDB**: Lock-based claim via `FOR UPDATE SKIP LOCKED`; singleton enforced via generated column and unique index
+2. **TiDB**: Verified against MySQL backend compatibility (TSO clock)
+3. **Spanner**: First conditional-update implementation without row locking
+4. **DynamoDB**: First implementation using `Capabilities.MaxAdvancementEffects` (100-item transaction limit)
+5. **Firestore**: Document-based transactions and snapshot listeners
 
-スコープ：
+Acceptance Criteria:
+- Each backend passes the full compliance test suite and chaos testing
+- CI runs against official emulators or local instances (Docker containers for MySQL, Spanner emulator, DynamoDB Local, Firestore emulator)
 
-- SQLite バックエンド（ローカル開発、単一プロセス運用向け）
-- cron スケジュール
-- OpenTelemetry メトリクスと slog、メトリクス一覧の文書化
-- 決定性違反の静的解析器（`time.Now`、`go` 文、`rand` の検出から始める）
-- `List`、`GetJournal` による状態閲覧、examples/ の整備
+### M5: Performance & Scaling (Continuous)
 
-受入条件：
+Measurement-driven optimizations:
 
-- SQLite 実装が適合テストスイートを通過する
-- スケジュールの二重発火がインスタンス ID の重複排除で無効化されるテスト
-- 解析器が決定性制約一覧（03-api.md）の代表的な違反を検出する
+- Store notification mechanisms (PostgreSQL `LISTEN`/`NOTIFY`, DynamoDB / Firestore cross-process wakeups, in-process pub/sub hub) to eliminate polling latency *(Implemented)*
+- Batch claiming and batch advancement (`CommitAdvancements`), in-memory sticky journal cache *(Implemented)*
+- At-rest payload encryption codec, standalone web UI (`contrib/ui`) *(Implemented)*
 
-### M4 バックエンドの拡充（段階的）
+### M6: Expressiveness & Operational Extensions (Shipped)
 
-適合テストスイートとカオステストを新しいストアへ向けて回すことが作業の中心になる。
-参照実装からの距離が近い順に並べるが、順序は需要で入れ替えてよい。
+- Read-only queries (`workflow.SetQueryHandler`, `tasuki.Query`)
+- Request-response synchronous updates (`workflow.SetUpdateHandler`, `tasuki.Update`)
+- Signal deduplication (`WithDedupeID`) and batch signals (`SignalBatch`)
+- Incompatible worker Nack during rolling deployments (`IncompatibleRetryDelay`)
+- Search attributes (indexed for `List`) and memos (display metadata)
+- In-process local activities (`ExecuteLocal`) and activity start-to-close timeouts (`WithStartToCloseTimeout`)
 
-1. MySQL / MariaDB（ロック方式が使える。singleton は生成列と一意インデックスで実装する）
-2. TiDB（MySQL バックエンドの流用可否を検証する。SKIP LOCKED が使えなければ条件付き更新方式へ切り替える）
-3. Spanner（条件付き更新方式の最初の実装）
-4. DynamoDB（TransactWriteItems の 100 項目上限を Capabilities で宣言する最初の実装）
-5. Firestore
+## Testing Strategy
 
-受入条件：
-
-- 各バックエンドが適合テストスイートを通過し、そのストア上でカオステストがグリーンになる
-- CI は各ストアの公式エミュレータまたはローカル版（MySQL / MariaDB はコンテナ、Spanner エミュレータ、DynamoDB Local、Firestore エミュレータ、TiDB は tiup playground）で回す
-
-### M5 性能と拡張（継続的）
-
-測定に基づいて最適化する。数値目標はベンチマーク基盤を作ってから設定する。
-
-候補：
-
-- ストアの通知機構（PostgreSQL の LISTEN/NOTIFY、DynamoDB / Firestore の cross-process wake、他ストアのプロセス内 hub）によるポーリングレイテンシの削減（実装済）
-- 獲得と追記のバッチ化、スティッキーキャッシュ（リプレイ時のジャーナル再読の削減）（実装済）
-- 暗号化 Codec、Web UI（contrib として本体から分離）（実装済）
-
-## テスト戦略
-
-| 層 | 内容 |
+| Layer | Focus |
 |---|---|
-| 単体 | リプレイのゴールデンテスト（記録済みジャーナルに対して同じコマンド列が再生されること） |
-| 適合スイート | バックエンドの実装契約を全実装共通のテストで検証する。獲得の排他、リース失効後の再獲得、タスク削除と ensure の競合で起こし損ねが生じないこと、`next_seq` フェンシング、完了の二重実行、終端後の完了無視 |
-| カオス E2E | 複数ワーカーとランダム kill -9 の反復。終端結果とジャーナルの不変条件（遷移の重複と欠落がない）を検証する |
-| 常時 | `-race` 付きでの全テスト実行、codec とリプレイ入力の fuzz（`go test -fuzz=Fuzz ./codec ./internal/engine`） |
-| CI | PostgreSQL はコンテナで起動。SQLite とインメモリは追加インフラなしで回す。M4 で加わるバックエンドはエミュレータやローカル版で回す |
+| Unit | Golden replay tests (verifying identical command sequences are produced against recorded journals) |
+| Compliance Suite | Verifies backend implementation contracts across all stores: mutual exclusion during claims, reclaim after lease expiration, absence of missed wakeups (I1), `next_seq` fencing, duplicate completion handling |
+| Chaos E2E | Multiple concurrent workers subject to repeated random `kill -9`; verifies terminal invariants and absence of journal corruption |
+| Continuous Verification | `-race` detector enabled across all tests; fuzz testing for codec parsing and synthetic replay inputs (`go test -fuzz=Fuzz ./codec ./internal/engine`) |
+| CI Matrix | Containerized PostgreSQL, MySQL, Spanner emulator, DynamoDB Local, Firestore emulator, with SQLite and memory running without external dependencies |
 
-## リスクと対策
+## Risks and Mitigations
 
-| リスク | 影響 | 対策 |
+| Risk | Impact | Mitigation |
 |---|---|---|
-| 決定性制約の踏み外し | インスタンスの stuck 化 | `*workflow.Context` の型による構造的防止、静的解析器、実行時照合による検出と復帰手順（stuck からのリトライ）の三段構え |
-| ジャーナルの肥大 | リプレイ遅延とストアの圧迫 | 警告しきい値（実装済）・ContinueAsNew 指針（文書化）・スティッキーキャッシュ（M5） |
-| ホットインスタンス | 遷移直列化による頭打ち | 子ワークフローへの分割指針を文書化（02-architecture / 03-api、実装済）。単一インスタンスの高頻度イベント処理は適さない用途として明示する |
-| アプリ DB への負荷 | 本体機能への影響 | 別 DB や別スキーマへの分離を接続設定だけで選べるようにする。backlog メトリクス（`tasuki.tasks.backlog`、実装済）で早期に可視化する |
-| ストア固有セマンティクスの差（`ON CONFLICT` の待機、SKIP LOCKED の有無、楽観競合の中断） | 移植時の起こし損ねや排他漏れ | 保証を不変条件（I1 など）として適合テストに落とし、全バックエンドを同じスイートで検証する |
-| 書き込み件数上限の小さいストア（DynamoDB、Firestore） | 1 回の前進で書ける効果数の制限 | Capabilities で上限を宣言し、エンジンが inbox の取り込み量を制限する。超過するワークフローには分割を促すエラーを返す |
-| 権威時計のないストア | リース重複と余分な再実行の増加 | 正しさは CAS と削除の排他で時計に依存させない。時計ずれのマージンを設定可能にする |
-| 関数リネームによる非互換 | 実行中インスタンスの stuck 化 | 明示的な登録名の推奨と文書化 |
-| ペイロード構造の進化 | デコード失敗 | 互換ルール（追加のみ）の明示、Codec 差し替え |
-| アクティビティ二重実行の副作用 | 外部システムの不整合 | at-least-once を契約として明示し、`IdempotencyKey` を提供する |
+| Determinism violations | Instance stuck in execution | Three-layer defense: structural prevention via `*workflow.Context`, static analyzer, and runtime detection with operational retry |
+| Journal bloat | Replay latency and database storage pressure | Warning threshold (`JournalWarnThreshold`), `ContinueAsNew` guidelines, and in-memory sticky cache |
+| Hot instances | Throughput bottleneck from turn serialization | Architectural guidelines for child workflows and key-based sharding; explicit non-goal for high-frequency stream aggregation |
+| Database load on application DB | Performance interference with primary application | Independent schema/database configuration support; early visibility via `tasuki.tasks.backlog` metric |
+| Differences in database semantics (e.g., `ON CONFLICT` waits vs optimistic aborts) | Missed wakeups or lost exclusivity | Formulate guarantees as formal invariants (I1) and verify all backends against the shared compliance suite |
+| Low write batch limits (DynamoDB, Firestore) | Exceeding transaction operation caps | Declare limits via `Capabilities.MaxAdvancementEffects`; engine commits prefix commands and defers remaining fan-outs |
+| Lack of authoritative database clock | Premature lease expirations or extra retries | Decouple safety from clock drift using CAS and delete exclusivity; allow configurable drift margins |
+| Function rename incompatibilities | Running instances quarantined as stuck | Recommend and document explicit registration names (`tasuki.WithName`) |
+| Payload schema evolution | Deserialization failures | Document additive-only schema evolution rules; support pluggable codecs |
+| Duplicate activity execution side effects | External system inconsistency | Explicitly document at-least-once contract; provide stable `IdempotencyKey` |
 
-## 将来候補
+## Next Actions
 
-初期リリース後の候補として保持する（[01-overview.md](01-overview.md) の非目標は維持する）。
-
-（Web UI / 暗号化 Codec は M5、クエリハンドラ・シグナル重複排除・非互換 Worker の Nack・検索属性・メモ・ローカルアクティビティ・Activity StartToClose タイムアウト・Workflow Update・SignalBatch は M6 で実装済）
-
-## 次のアクション
-
-1. 品質スプリントを実施する（[quality-sprint design](superpowers/specs/2026-07-29-quality-sprint-design.md) / [plan](superpowers/plans/2026-07-29-quality-sprint.md)）
-2. 完了後、リリース準備（タグ・CHANGELOG・公開 README 整備）を検討する
+1. Continuous Quality Maintenance (maintaining CI matrix, coverage reporting, and documentation freshness)
+2. Release Preparation (semantic version tagging, CHANGELOG generation, and public README polish)
