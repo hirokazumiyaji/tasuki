@@ -51,7 +51,7 @@ func TestEncrypted_EnvelopeIsJSONWithMarker(t *testing.T) {
 	if err := json.Unmarshal(data, &env); err != nil {
 		t.Fatalf("envelope is not valid JSON: %v", err)
 	}
-	if env["tasuki_enc"] != float64(1) || env["kid"] != "k1" {
+	if env["tasuki_enc"] != float64(2) || env["kid"] != "k1" {
 		t.Fatalf("unexpected envelope: %v", env)
 	}
 	if strings.Contains(string(data), "top-secret") {
