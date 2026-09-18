@@ -16,7 +16,7 @@
 | spanner | `.../backend/spanner` | Spanner ストア |
 | sqlite | `.../backend/sqlite` | SQLite ストア |
 
-root は既定ビルドで backend サブモジュールに依存しない。`internal/backendopen` は既定で memory のみを内蔵し、他 backend は `-tags tasuki_all` ビルド（workspace 内）で登録される。examples の非 memory 系（m1/m3/m4）と `chaos/cmd/worker` も `tasuki_all` タグ付きのため、既定の `GOWORK=off go list ./...` は root のみで成功する。
+root は既定ビルドで backend サブモジュールに依存しない。`internal/backendopen` は既定で memory のみを内蔵し、他 backend は `-tags tasuki_all` ビルド（workspace 内）で登録される。examples の非 memory 系（m1/m3/m4）、`chaos` テスト、`chaos/cmd/worker` も `tasuki_all` タグ付きのため、既定の `GOWORK=off go list ./...` と `GOWORK=off go vet ./...`（テスト含む）は root のみで成功する。
 
 ## 最小 Go バージョン
 
@@ -50,5 +50,5 @@ root は既定ビルドで backend サブモジュールに依存しない。`in
 ## CI
 
 - `root` ジョブ: `go test ./...`（workspace）。
-- `gowork-check` ジョブ: `GOWORK=off GOPROXY=off go list ./...` + `GOTOOLCHAIN=local go build ./...` で独立性を検証。
+- `gowork-check` ジョブ: `GOWORK=off GOPROXY=off go list ./...` + `GOWORK=off go vet ./...`（テスト含む）+ `GOTOOLCHAIN=local go build ./...` + `GOWORK=off GOPROXY=off go mod tidy -e` の差分ゼロ検証で独立性を検証。
 - 各 backend ジョブ: 対応する `backend/<name>` ディレクトリで `go test`。
