@@ -102,10 +102,10 @@ Functions provided by the `workflow` package:
 
 | Function | Description |
 |---|---|
-| `Execute[I, O](ctx, fn, in, opts...) (O, error)` | Runs an activity and waits for completion (`WithRetry`, `WithStartToCloseTimeout`) |
+| `Execute[I, O](ctx, name, in, opts...) (O, error)` | Runs an activity and waits for completion (`WithRetry`, `WithStartToCloseTimeout`) |
 | `ExecuteLocal[I, O](ctx, name, in) (O, error)` | Executes an activity synchronously on the same worker, recording results directly in the journal (no task queue, no retry) |
-| `ExecuteAsync[I, O](ctx, fn, in, opts...) *Future[O]` | Schedules an activity asynchronously and returns a `Future` |
-| `ExecuteChild[I, O](ctx, wf, in, opts...) (O, error)` | Runs a child workflow and waits for completion (`ExecuteChildAsync` also available) |
+| `ExecuteAsync[I, O](ctx, name, in, opts...) *Future[O]` | Schedules an activity asynchronously and returns a `Future` |
+| `ExecuteChild[I, O](ctx, name, in) (O, error)` | Runs a child workflow and waits for completion (`ExecuteChildAsync[I, O](ctx, name, in) *Future[O]` also available; neither takes options) |
 | `Sleep(ctx, d) error` / `SleepUntil(ctx, t) error` | Suspends execution using a durable timer |
 | `SleepAsync(ctx, d) *Future[struct{}]` | Starts a durable timer as a `Future` (useful for Select timeouts) |
 | `Now(ctx) time.Time` | Returns the recorded current time that remains constant across replays |
@@ -131,7 +131,7 @@ Functions provided by the `workflow` package:
 
 `UpsertMemo` is similarly recorded as a command event, but memo fields are intended for display metadata and are not indexed for `List` filtering.
 
-`ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay.
+`ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay. Because the workflow task turn performs no lease extension, the invoked activity must finish within `LeaseDuration`; use `Execute` for anything longer.
 
 For long-running or looping workflows, calling `ContinueAsNew` when event counts reach thousands is strongly recommended to bound history size.
 
@@ -299,6 +299,8 @@ out, err := tasuki.Update[ReviseIn, ReviseOut](ctx, w, "order-123", "revise", in
 
 Updates enqueue an `update_requested` event to the inbox. The worker executes the registered `SetUpdateHandler`, which can invoke activities or sleep. Completed updates commit as `update_completed` events.
 
+`tasuki.Update` drives progress itself: it calls `PollOnce` on the passed worker in the caller's goroutine until the update completes, so the worker must belong to the same process (the same requirement as `tasuki.Query`).
+
 ## Registration and Naming
 
 Workflow and activity names are stored in the database and serve as matching keys during replay. By default, names are derived from function reflection (e.g., `OrderWorkflow`). In production, explicit names are recommended to safeguard against accidental refactoring breakages:
@@ -375,8 +377,11 @@ type WorkerOptions struct {
     Logger                 *slog.Logger  // Default: slog.Default()
     JournalWarnThreshold   int           // Default: 10000; negative disables
     IncompatibleRetryDelay time.Duration // Default: 5s; negative redisplays immediately
+    MaxPerInstance         int           // Default: 0 (disabled); caps tasks claimed per instance per batch
 }
 ```
+
+`MaxPerInstance` is honored only by backends with fair-dispatch support (PostgreSQL, MySQL, SQLite, in-memory). DynamoDB, Firestore, and Spanner ignore it and claim in FIFO order (see [08-fair-dispatch.md](08-fair-dispatch.md)).
 
 ## Schema Validation and Migrations
 
@@ -386,5 +391,5 @@ Workers verify database schemas at startup if the backend implements `backend.Sc
 
 Applications can explicitly trigger validation using `tasuki.ValidateSchema(ctx, backend)`.
 
-- `w.Start(ctx)` starts task polling loops asynchronously and returns immediately.
+- `w.Start(ctx)` starts task polling loops asynchronously and returns immediately. It returns no error: if schema validation fails, the worker logs an error and does not start the polling loop (disable the check with `WorkerOptions.DisableSchemaValidation`, or gate startup explicitly with `tasuki.ValidateSchema`).
 - `w.Shutdown(ctx)` gracefully halts new task acquisition, waits for in-flight tasks within the context deadline, and releases task leases so peer workers can claim them without waiting for expiration.

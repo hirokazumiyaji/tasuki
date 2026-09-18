@@ -198,6 +198,15 @@ func Sleep(ctx *Context, d time.Duration) error {
 	return nil
 }
 
+// SleepUntil schedules a durable timer that fires at the given absolute time.
+// It is a thin wrapper over Now and Sleep: the wait duration is derived as
+// t.Sub(Now(ctx)), so the deadline is recorded deterministically in the journal
+// and replays resolve identically. A deadline at or before Now records an
+// already-due timer that fires on the next tick.
+func SleepUntil(ctx *Context, t time.Time) error {
+	return Sleep(ctx, t.Sub(Now(ctx)))
+}
+
 type timerPayload struct {
 	FireAt time.Time `json:"fire_at"`
 }
