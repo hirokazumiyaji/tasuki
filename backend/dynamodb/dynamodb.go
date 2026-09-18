@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,9 +17,13 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend/hub"
 )
 
+// instanceGSIName indexes wf_tasks by instance_id so Terminate/Purge can
+// delete one instance's tasks with a Query instead of a full-table Scan.
+const instanceGSIName = "instance_gsi"
+
 // Backend is the DynamoDB implementation of backend.Backend.
 type Backend struct {
-	client *dynamodb.Client
+	client dynamoClient
 	prefix string
 	hub    *hub.Hub
 
@@ -26,6 +31,18 @@ type Backend struct {
 	// so large fleets are eventually fully visited.
 	recoverMu     sync.Mutex
 	recoverCursor map[string]types.AttributeValue
+
+	// wakeMu/wakePending/wakeTimers debounce cross-process wake writes
+	// (wf_wake UpdateItem) so bursty operations coalesce into one write.
+	wakeMu       sync.Mutex
+	wakePending  map[string]wakeEntry
+	wakeTimers   map[string]*time.Timer
+	wakeDebounce time.Duration
+}
+
+type wakeEntry struct {
+	pk         string
+	instanceID string
 }
 
 // Config holds connection options.
@@ -79,7 +96,12 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 
 func (b *Backend) Close() error { return nil }
 
-func (b *Backend) Client() *dynamodb.Client { return b.client }
+func (b *Backend) Client() *dynamodb.Client {
+	if c, ok := b.client.(*dynamodb.Client); ok {
+		return c
+	}
+	return nil
+}
 
 func (b *Backend) Prefix() string { return b.prefix }
 
@@ -151,6 +173,7 @@ func (b *Backend) Migrate(ctx context.Context) error {
 				{AttributeName: aws.String("task_pk"), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String("gsi_pk"), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String("visible_at"), AttributeType: types.ScalarAttributeTypeN},
+				{AttributeName: aws.String("instance_id"), AttributeType: types.ScalarAttributeTypeS},
 			},
 			keys: []types.KeySchemaElement{
 				{AttributeName: aws.String("task_pk"), KeyType: types.KeyTypeHash},
@@ -161,6 +184,13 @@ func (b *Backend) Migrate(ctx context.Context) error {
 					KeySchema: []types.KeySchemaElement{
 						{AttributeName: aws.String("gsi_pk"), KeyType: types.KeyTypeHash},
 						{AttributeName: aws.String("visible_at"), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+				{
+					IndexName: aws.String(instanceGSIName),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String("instance_id"), KeyType: types.KeyTypeHash},
 					},
 					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
 				},
@@ -242,6 +272,9 @@ func (b *Backend) ensureTable(ctx context.Context, d tableDef) error {
 		TableName: aws.String(d.name),
 	})
 	if err == nil {
+		if err := b.ensureMissingGSIs(ctx, d, desc); err != nil {
+			return err
+		}
 		if d.stream && (desc.Table.StreamSpecification == nil || !aws.ToBool(desc.Table.StreamSpecification.StreamEnabled)) {
 			_, uerr := b.client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
 				TableName: aws.String(d.name),
@@ -284,8 +317,104 @@ func (b *Backend) ensureTable(ctx context.Context, d tableDef) error {
 		}
 		return fmt.Errorf("dynamodb create %s: %w", d.name, err)
 	}
-	waiter := dynamodb.NewTableExistsWaiter(b.client)
-	return waiter.Wait(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(d.name)}, 60*time.Second)
+	return b.waitForTableActive(ctx, d.name)
+}
+
+// ensureMissingGSIs creates GSIs declared in d.gsi but absent from an
+// existing table (backward compat for tables created before the GSI was
+// added). Callers fall back to Scan when the GSI is still missing, so a
+// failed or pending update never breaks Terminate/Purge.
+func (b *Backend) ensureMissingGSIs(ctx context.Context, d tableDef, desc *dynamodb.DescribeTableOutput) error {
+	if len(d.gsi) == 0 || desc == nil || desc.Table == nil {
+		return nil
+	}
+	existing := map[string]bool{}
+	for _, g := range desc.Table.GlobalSecondaryIndexes {
+		existing[aws.ToString(g.IndexName)] = true
+	}
+	var updates []types.GlobalSecondaryIndexUpdate
+	for _, want := range d.gsi {
+		name := aws.ToString(want.IndexName)
+		if existing[name] {
+			continue
+		}
+		w := want
+		updates = append(updates, types.GlobalSecondaryIndexUpdate{Create: &types.CreateGlobalSecondaryIndexAction{
+			IndexName: w.IndexName, KeySchema: w.KeySchema, Projection: w.Projection,
+		}})
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	_, err := b.client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+		TableName:                    aws.String(d.name),
+		AttributeDefinitions:         d.attrs,
+		GlobalSecondaryIndexUpdates: updates,
+	})
+	if err != nil {
+		var inUse *types.ResourceInUseException
+		if errors.As(err, &inUse) {
+			return nil
+		}
+		if strings.Contains(err.Error(), "already exists") {
+			return nil
+		}
+		return fmt.Errorf("dynamodb create index %s: %w", d.name, err)
+	}
+	return b.waitForGSIsActive(ctx, d.name, d.gsi)
+}
+
+func (b *Backend) waitForTableActive(ctx context.Context, name string) error {
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		desc, err := b.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+			TableName: aws.String(name),
+		})
+		if err == nil && desc.Table != nil && desc.Table.TableStatus == types.TableStatusActive {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("dynamodb wait active %s: timeout", name)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func (b *Backend) waitForGSIsActive(ctx context.Context, name string, want []types.GlobalSecondaryIndex) error {
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		desc, err := b.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+			TableName: aws.String(name),
+		})
+		if err == nil && desc.Table != nil {
+			byName := map[string]types.IndexStatus{}
+			for _, g := range desc.Table.GlobalSecondaryIndexes {
+				byName[aws.ToString(g.IndexName)] = g.IndexStatus
+			}
+			ready := true
+			for _, w := range want {
+				if byName[aws.ToString(w.IndexName)] != types.IndexStatusActive {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("dynamodb wait index active %s: timeout", name)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 // Reset deletes all items from all tables (test helper).

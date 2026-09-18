@@ -12,6 +12,14 @@ import (
 const (
 	wakePKTasks    = "tasks"
 	wakePKTerminal = "terminal"
+
+	// defaultWakeDebounce coalesces bursty wake writes into one UpdateItem.
+	// Kept in the 10-50ms window so cross-process wake latency stays low.
+	defaultWakeDebounce = 20 * time.Millisecond
+	// wakePollBaseInterval / wakePollMaxInterval bound the quiet-time
+	// exponential backoff for cross-process wake polling.
+	wakePollBaseInterval = 100 * time.Millisecond
+	wakePollMaxInterval  = 1 * time.Second
 )
 
 func (b *Backend) Subscribe(ctx context.Context) (<-chan struct{}, error) {
@@ -61,7 +69,54 @@ func (b *Backend) notifyTerminal(instanceID string) {
 	b.touchWake(context.Background(), wakePKTerminal, instanceID)
 }
 
+func (b *Backend) wakeDebounceOrDefault() time.Duration {
+	b.wakeMu.Lock()
+	d := b.wakeDebounce
+	b.wakeMu.Unlock()
+	if d <= 0 {
+		return defaultWakeDebounce
+	}
+	return d
+}
+
+// touchWake schedules a coalesced wf_wake UpdateItem. Bursty callers
+// (CreateInstance/CompleteActivity/CommitAdvancements/ReleaseLease/
+// SendToInbox/...) collapse into a single write per debounce window.
+// Terminal wakes are keyed by instance ID so distinct completions never
+// coalesce away each other's payload (the wake item holds one id).
 func (b *Backend) touchWake(ctx context.Context, pk, instanceID string) {
+	_ = ctx
+	d := b.wakeDebounceOrDefault()
+	if d <= 0 {
+		b.writeWake(context.Background(), pk, instanceID)
+		return
+	}
+	key := pk + "\x00" + instanceID
+	b.wakeMu.Lock()
+	if b.wakePending == nil {
+		b.wakePending = make(map[string]wakeEntry)
+		b.wakeTimers = make(map[string]*time.Timer)
+	}
+	b.wakePending[key] = wakeEntry{pk: pk, instanceID: instanceID}
+	if _, ok := b.wakeTimers[key]; ok {
+		b.wakeMu.Unlock()
+		return
+	}
+	b.wakeTimers[key] = time.AfterFunc(d, func() {
+		b.wakeMu.Lock()
+		ent, ok := b.wakePending[key]
+		delete(b.wakeTimers, key)
+		delete(b.wakePending, key)
+		b.wakeMu.Unlock()
+		if !ok {
+			return
+		}
+		b.writeWake(context.Background(), ent.pk, ent.instanceID)
+	})
+	b.wakeMu.Unlock()
+}
+
+func (b *Backend) writeWake(ctx context.Context, pk, instanceID string) {
 	values := map[string]types.AttributeValue{":one": avN(1)}
 	update := "ADD n :one"
 	if instanceID != "" {
@@ -76,29 +131,48 @@ func (b *Backend) touchWake(ctx context.Context, pk, instanceID string) {
 	})
 }
 
+func nextPollInterval(cur time.Duration) time.Duration {
+	nxt := cur * 2
+	if nxt < wakePollBaseInterval {
+		nxt = wakePollBaseInterval
+	}
+	if nxt > wakePollMaxInterval {
+		nxt = wakePollMaxInterval
+	}
+	return nxt
+}
+
 func (b *Backend) pollWakeItem(ctx context.Context, pk string, onBump func(id string)) {
 	var last int64 = -1
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	interval := wakePollBaseInterval
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			out, err := b.client.GetItem(ctx, &dynamodb.GetItemInput{
 				TableName:      aws.String(b.table("wf_wake")),
 				Key:            map[string]types.AttributeValue{"pk": avS(pk)},
 				ConsistentRead: aws.Bool(true),
 			})
 			if err != nil || out.Item == nil {
+				interval = nextPollInterval(interval)
+				timer.Reset(interval)
 				continue
 			}
 			n := fromN(out.Item["n"])
 			id := fromS(out.Item["id"])
-			if last >= 0 && n > last {
-				onBump(id)
-			}
+			bumped := last >= 0 && n > last
 			last = n
+			if bumped {
+				onBump(id)
+				interval = wakePollBaseInterval
+			} else {
+				interval = nextPollInterval(interval)
+			}
+			timer.Reset(interval)
 		}
 	}
 }
