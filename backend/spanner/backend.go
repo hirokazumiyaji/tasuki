@@ -689,6 +689,9 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		}))
 	}
 	for _, at := range adv.ActivityTasks {
+		if adv.Terminal != nil {
+			break
+		}
 		payload, _ := json.Marshal(activityPayload{
 			Name:  at.Name,
 			Input: at.Input,
@@ -721,6 +724,9 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		muts = append(muts, spanner.InsertMap("wf_tasks", m))
 	}
 	for _, tm := range adv.Timers {
+		if adv.Terminal != nil {
+			break
+		}
 		muts = append(muts, spanner.InsertMap("wf_timers", map[string]any{
 			"instance_id": adv.InstanceID,
 			"seq":         tm.Seq,
@@ -742,9 +748,29 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 			return err
 		}
 		muts = append(muts, dMuts...)
+		tMuts, err := deleteTasksForInstance(ctx, txn, adv.InstanceID, adv.TaskID)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, tMuts...)
+		tmMuts, err := deleteTimersForInstance(ctx, txn, adv.InstanceID)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, tmMuts...)
+		inMuts, err := deleteInboxForInstance(ctx, txn, adv.InstanceID)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, inMuts...)
 	}
-	for _, inboxID := range adv.DrainedInbox {
-		muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{inboxID}))
+	if adv.Terminal != nil {
+		// Full inbox sweep above already removed every row; the drained
+		// deletes would be duplicates.
+	} else {
+		for _, inboxID := range adv.DrainedInbox {
+			muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{inboxID}))
+		}
 	}
 	for _, ch := range adv.Children {
 		q := ch.Queue
@@ -1024,6 +1050,20 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			if delN == 0 {
 				continue
 			}
+			instRow, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{d.instanceID}, []string{"status"})
+			if err != nil {
+				if isNotFound(err) {
+					continue
+				}
+				return err
+			}
+			var status string
+			if err := instRow.Columns(&status); err != nil {
+				return err
+			}
+			if status != "running" {
+				continue
+			}
 			seq, existed, err := readInboxSeq(ctx, txn, d.instanceID)
 			if err != nil {
 				return err
@@ -1161,6 +1201,83 @@ func deleteSignalDedupe(ctx context.Context, txn *spanner.ReadWriteTransaction, 
 			return nil, err
 		}
 		muts = append(muts, spanner.Delete("wf_signal_dedupe", spanner.Key{instanceID, dedupeID}))
+	}
+	return muts, nil
+}
+
+// deleteTasksForInstance returns deletions for every task of the instance
+// except excludeTaskID (the owned workflow task, removed separately).
+func deleteTasksForInstance(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string, excludeTaskID int64) ([]*spanner.Mutation, error) {
+	iter := txn.Query(ctx, spanner.Statement{
+		SQL:    `SELECT id FROM wf_tasks WHERE instance_id = @id`,
+		Params: map[string]any{"id": instanceID},
+	})
+	defer iter.Stop()
+	var muts []*spanner.Mutation
+	for {
+		r, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		var tid int64
+		if err := r.Columns(&tid); err != nil {
+			return nil, err
+		}
+		if tid == excludeTaskID {
+			continue
+		}
+		muts = append(muts, spanner.Delete("wf_tasks", spanner.Key{tid}))
+	}
+	return muts, nil
+}
+
+func deleteTimersForInstance(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string) ([]*spanner.Mutation, error) {
+	iter := txn.Query(ctx, spanner.Statement{
+		SQL:    `SELECT seq FROM wf_timers WHERE instance_id = @id`,
+		Params: map[string]any{"id": instanceID},
+	})
+	defer iter.Stop()
+	var muts []*spanner.Mutation
+	for {
+		r, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		var seq int64
+		if err := r.Columns(&seq); err != nil {
+			return nil, err
+		}
+		muts = append(muts, spanner.Delete("wf_timers", spanner.Key{instanceID, seq}))
+	}
+	return muts, nil
+}
+
+func deleteInboxForInstance(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string) ([]*spanner.Mutation, error) {
+	iter := txn.Query(ctx, spanner.Statement{
+		SQL:    `SELECT id FROM wf_inbox WHERE instance_id = @id`,
+		Params: map[string]any{"id": instanceID},
+	})
+	defer iter.Stop()
+	var muts []*spanner.Mutation
+	for {
+		r, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		var inboxID int64
+		if err := r.Columns(&inboxID); err != nil {
+			return nil, err
+		}
+		muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{inboxID}))
 	}
 	return muts, nil
 }

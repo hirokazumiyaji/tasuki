@@ -657,6 +657,15 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = ?`, adv.InstanceID); err != nil {
 			return err
 		}
+		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE instance_id = ? AND id <> ?`, adv.InstanceID, adv.TaskID); err != nil {
+			return err
+		}
+		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_timers WHERE instance_id = ?`, adv.InstanceID); err != nil {
+			return err
+		}
+		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_inbox WHERE instance_id = ?`, adv.InstanceID); err != nil {
+			return err
+		}
 	}
 	if len(adv.DrainedInbox) > 0 {
 		for _, inboxID := range adv.DrainedInbox {
@@ -936,6 +945,16 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			return 0, err
 		}
 		if aff == 0 {
+			continue
+		}
+		var status string
+		if err := conn.QueryRowContext(ctx, `SELECT status FROM wf_instances WHERE id = ?`, d.instanceID).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return 0, err
+		}
+		if status != "running" {
 			continue
 		}
 		_, err = conn.ExecContext(ctx, `

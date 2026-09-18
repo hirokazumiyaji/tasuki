@@ -548,7 +548,11 @@ func (b *Backend) notifyAfterAdvancements(advs []backend.Advancement) {
 	b.notifyTasks()
 	for _, adv := range advs {
 		if adv.Terminal != nil {
-			_ = b.deleteSignalDedupeForInstance(context.Background(), adv.InstanceID)
+			ctx := context.Background()
+			_ = b.deleteSignalDedupeForInstance(ctx, adv.InstanceID)
+			_ = b.deleteTasksForInstance(ctx, adv.InstanceID)
+			_ = b.deleteTimersForInstance(ctx, adv.InstanceID)
+			_ = b.deleteInboxForInstance(ctx, adv.InstanceID)
 			b.notifyTerminal(adv.InstanceID)
 		}
 	}
@@ -574,7 +578,7 @@ func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advance
 			return err
 		}
 	}
-	if adv.EnsureWorkflowTask {
+	if adv.EnsureWorkflowTask && adv.Terminal == nil {
 		// Follow-up task was refreshed atomically inside the transaction;
 		// notifyAfterAdvancements (caller) still fires task wake hints.
 		return nil
@@ -609,9 +613,15 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 		items = append(items, put(b.table("wf_journal"), journalItem(adv.InstanceID, e.Seq, e, now), "attribute_not_exists(instance_id) AND attribute_not_exists(seq)"))
 	}
 	for _, at := range adv.ActivityTasks {
+		if adv.Terminal != nil {
+			break
+		}
 		items = append(items, put(b.table("wf_tasks"), activityTaskItem(at, now), "attribute_not_exists(task_pk)"))
 	}
 	for _, tm := range adv.Timers {
+		if adv.Terminal != nil {
+			break
+		}
 		items = append(items, put(b.table("wf_timers"), timerItem(adv.InstanceID, tm, now), "attribute_not_exists(instance_id) AND attribute_not_exists(seq)"))
 	}
 	for _, id := range adv.DrainedInbox {
@@ -637,7 +647,7 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 		items = append(items, put(b.table("wf_inbox"), inboxItem(inst.ParentID, newID(), seq, ev, now), "attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
 		parentID = inst.ParentID
 	}
-	if adv.EnsureWorkflowTask {
+	if adv.EnsureWorkflowTask && adv.Terminal == nil {
 		// Truncated fanout: keep the singleton workflow task alive with an
 		// in-place refresh instead of delete + post-commit ensure. The
 		// follow-up is then part of the same atomic transaction, so no
@@ -798,11 +808,12 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 		if err != nil {
 			return count, err
 		}
+		if inst.Status != "running" {
+			continue
+		}
 		count++
-		if inst.Status == "running" {
-			if err := b.ensureWorkflowTask(ctx, id); err != nil {
-				return count, err
-			}
+		if err := b.ensureWorkflowTask(ctx, id); err != nil {
+			return count, err
 		}
 	}
 	if count > 0 {

@@ -605,6 +605,15 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 		if _, err = tx.Exec(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = $1`, adv.InstanceID); err != nil {
 			return err
 		}
+		if _, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE instance_id = $1 AND id <> $2`, adv.InstanceID, adv.TaskID); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `DELETE FROM wf_timers WHERE instance_id = $1`, adv.InstanceID); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE instance_id = $1`, adv.InstanceID); err != nil {
+			return err
+		}
 	}
 	if len(adv.DrainedInbox) > 0 {
 		_, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE id = ANY($1)`, adv.DrainedInbox)
@@ -856,6 +865,16 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			return 0, err
 		}
 		if tag.RowsAffected() == 0 {
+			continue
+		}
+		var status string
+		if err := tx.QueryRow(ctx, `SELECT status FROM wf_instances WHERE id = $1`, d.instanceID).Scan(&status); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue
+			}
+			return 0, err
+		}
+		if status != "running" {
 			continue
 		}
 		_, err = tx.Exec(ctx, `

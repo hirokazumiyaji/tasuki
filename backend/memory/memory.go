@@ -554,6 +554,17 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 		inst.failure = append([]byte(nil), adv.Terminal.Failure...)
 		inst.completedAt = b.now
 		delete(b.signalDedupe, adv.InstanceID)
+		delete(b.inbox, adv.InstanceID)
+		for tid, t := range b.tasks {
+			if t.instanceID == adv.InstanceID && tid != adv.TaskID {
+				delete(b.tasks, tid)
+			}
+		}
+		for k := range b.timers {
+			if k.instanceID == adv.InstanceID {
+				delete(b.timers, k)
+			}
+		}
 	}
 	for _, ch := range adv.Children {
 		if err := b.createInstanceLocked(ch); err != nil {
@@ -641,6 +652,9 @@ func (b *Backend) FireDueTimers(_ context.Context, limit int) (int, error) {
 			continue
 		}
 		delete(b.timers, d.key)
+		if inst.status != "running" {
+			continue
+		}
 		b.nextInbox++
 		b.inbox[d.tm.instanceID] = append(b.inbox[d.tm.instanceID], &inboxItem{
 			id: b.nextInbox,
@@ -649,9 +663,7 @@ func (b *Backend) FireDueTimers(_ context.Context, limit int) (int, error) {
 				RefSeq: d.tm.seq,
 			},
 		})
-		if inst.status == "running" {
-			b.enqueueWorkflowTaskLocked(d.tm.instanceID, inst.queue)
-		}
+		b.enqueueWorkflowTaskLocked(d.tm.instanceID, inst.queue)
 		n++
 	}
 	b.mu.Unlock()

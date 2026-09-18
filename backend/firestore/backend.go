@@ -470,6 +470,11 @@ type advancementPrep struct {
 	inst       *backend.Instance
 	hasInbox   bool
 	dedupeRefs []*gcf.DocumentRef
+	// terminalRefs holds pre-existing docs removed when the advancement
+	// completes the instance (activities, timers, inbox).
+	terminalTaskRefs  []*gcf.DocumentRef
+	terminalTimerRefs []*gcf.DocumentRef
+	terminalInboxRefs []*gcf.DocumentRef
 }
 
 func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
@@ -559,6 +564,7 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 		drained[id] = struct{}{}
 	}
 	hasInbox := false
+	var terminalInboxRefs []*gcf.DocumentRef
 	inboxIter := tx.Documents(b.col("wf_inbox").Where("instance_id", "==", adv.InstanceID))
 	for {
 		inbox, nextErr := inboxIter.Next()
@@ -572,9 +578,14 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 		if _, ok := drained[i64(inbox.Data(), "id")]; !ok {
 			hasInbox = true
 		}
+		if adv.Terminal != nil {
+			terminalInboxRefs = append(terminalInboxRefs, inbox.Ref)
+		}
 	}
 	inboxIter.Stop()
 	var dedupeRefs []*gcf.DocumentRef
+	var terminalTaskRefs []*gcf.DocumentRef
+	var terminalTimerRefs []*gcf.DocumentRef
 	if adv.Terminal != nil {
 		dIter := tx.Documents(b.col("wf_signal_dedupe").Where("instance_id", "==", adv.InstanceID))
 		for {
@@ -589,8 +600,37 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 			dedupeRefs = append(dedupeRefs, d.Ref)
 		}
 		dIter.Stop()
+		tIter := tx.Documents(b.col("wf_tasks").Where("instance_id", "==", adv.InstanceID))
+		for {
+			d, nextErr := tIter.Next()
+			if nextErr == iterator.Done {
+				break
+			}
+			if nextErr != nil {
+				tIter.Stop()
+				return advancementPrep{}, nextErr
+			}
+			if d.Ref.ID == taskRef.ID {
+				continue
+			}
+			terminalTaskRefs = append(terminalTaskRefs, d.Ref)
+		}
+		tIter.Stop()
+		tmIter := tx.Documents(b.col("wf_timers").Where("instance_id", "==", adv.InstanceID))
+		for {
+			d, nextErr := tmIter.Next()
+			if nextErr == iterator.Done {
+				break
+			}
+			if nextErr != nil {
+				tmIter.Stop()
+				return advancementPrep{}, nextErr
+			}
+			terminalTimerRefs = append(terminalTimerRefs, d.Ref)
+		}
+		tmIter.Stop()
 	}
-	return advancementPrep{instRef: instSnap.Ref, taskRef: taskRef, inst: inst, hasInbox: hasInbox, dedupeRefs: dedupeRefs}, nil
+	return advancementPrep{instRef: instSnap.Ref, taskRef: taskRef, inst: inst, hasInbox: hasInbox, dedupeRefs: dedupeRefs, terminalTaskRefs: terminalTaskRefs, terminalTimerRefs: terminalTimerRefs, terminalInboxRefs: terminalInboxRefs}, nil
 }
 
 func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancement, prep advancementPrep, now time.Time, alloc *inboxSeqAlloc) error {
@@ -626,6 +666,21 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 				return err
 			}
 		}
+		for _, ref := range prep.terminalTaskRefs {
+			if err := tx.Delete(ref); err != nil {
+				return err
+			}
+		}
+		for _, ref := range prep.terminalTimerRefs {
+			if err := tx.Delete(ref); err != nil {
+				return err
+			}
+		}
+		for _, ref := range prep.terminalInboxRefs {
+			if err := tx.Delete(ref); err != nil {
+				return err
+			}
+		}
 	}
 	for _, e := range adv.NewEvents {
 		if err := tx.Create(b.ref("wf_journal", journalID(adv.InstanceID, e.Seq)), journalDoc(adv.InstanceID, e.Seq, e, now)); err != nil {
@@ -633,19 +688,27 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 		}
 	}
 	for _, at := range adv.ActivityTasks {
+		if adv.Terminal != nil {
+			break
+		}
 		id := newID()
 		if err := tx.Create(b.ref("wf_tasks", actTaskID(id)), activityTaskDoc(at, id, now)); err != nil {
 			return err
 		}
 	}
 	for _, tm := range adv.Timers {
+		if adv.Terminal != nil {
+			break
+		}
 		if err := tx.Create(b.ref("wf_timers", journalID(adv.InstanceID, tm.Seq)), map[string]any{"instance_id": adv.InstanceID, "seq": tm.Seq, "fire_at": tm.FireAt.UTC(), "created_at": now}); err != nil {
 			return err
 		}
 	}
-	for _, id := range adv.DrainedInbox {
-		if err := tx.Delete(b.ref("wf_inbox", inboxID(adv.InstanceID, id))); err != nil {
-			return err
+	if adv.Terminal == nil {
+		for _, id := range adv.DrainedInbox {
+			if err := tx.Delete(b.ref("wf_inbox", inboxID(adv.InstanceID, id))); err != nil {
+				return err
+			}
 		}
 	}
 	for _, ch := range adv.Children {
@@ -973,8 +1036,9 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 		m := d.Data()
 		id := str(m, "instance_id")
 		seq := i64(m, "seq")
-		claimed := false
+		fired := false
 		err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+			fired = false
 			alloc := newInboxSeqAlloc()
 			s, e := tx.Get(d.Ref)
 			if isNotFound(e) {
@@ -1009,7 +1073,11 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			if e = tx.Create(b.ref("wf_inbox", inboxID(id, inbox)), inboxDoc(id, inbox, next, journal.Event{Type: journal.TypeTimerFired, RefSeq: seq}, nowUTC())); e != nil {
 				return e
 			}
-			return b.flushInboxSeqs(tx, alloc)
+			if e = b.flushInboxSeqs(tx, alloc); e != nil {
+				return e
+			}
+			fired = true
+			return nil
 		})
 		if err == backend.ErrConflict {
 			continue
@@ -1017,8 +1085,7 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 		if err != nil {
 			return n, err
 		}
-		claimed = true
-		if claimed {
+		if fired {
 			n++
 			if err = b.ensureWorkflowTask(ctx, id); err != nil {
 				return n, err
