@@ -20,7 +20,7 @@ root は既定ビルドで backend サブモジュールに依存しない。`in
 
 ## 最小 Go バージョン
 
-- 宣言: root `go 1.24`、`go.work` も `go 1.24`（CI `1.24.x` と一致）。
+- 宣言: root `go 1.24`、backend 各モジュール `go 1.24`、`go.work` も `go 1.24`（CI `1.24.x` と一致）。
 - 検証: `GOTOOLCHAIN=local go build ./...`（workspace 外の Go 1.24 環境で確認）。
 
 ## 依存バージョン
@@ -49,6 +49,9 @@ root は既定ビルドで backend サブモジュールに依存しない。`in
 
 ## CI
 
-- `root` ジョブ: `go test ./...`（workspace）。
-- `gowork-check` ジョブ: `GOWORK=off GOPROXY=off go list ./...` + `GOTOOLCHAIN=local go build ./...` で独立性を検証。
-- 各 backend ジョブ: 対応する `backend/<name>` ディレクトリで `go test`。
+- `root` ジョブ: `go test ./... -race`（workspace。fuzz の seed は単体テストとしてここで実行）。
+- `gowork-check` ジョブ: `GOWORK=off GOPROXY=off go list ./...` + `GOTOOLCHAIN=local go build ./...` で独立性を検証し、`go test -tags tasuki_all ./contrib/... ./examples/...` も実行。
+- 各 backend ジョブ: 対応する `backend/<name>` ディレクトリで `go test ./... -race`。
+- 各 chaos ジョブ: `kill -9` カオスを `-race` 付きで実行（インフラ不要の `chaos-sqlite` を含む）。
+- `lint`/`vuln` ジョブ: root と backend に `staticcheck`（必須）と参考表示の `govulncheck`。
+- `fuzz-nightly` ジョブ: nightly schedule（または手動 dispatch）のみ実行。各 codec/engine ターゲットに `-fuzz -fuzztime` 60 秒。

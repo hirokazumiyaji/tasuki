@@ -1,3 +1,5 @@
+//go:build tasuki_all
+
 package chaos_test
 
 import (
@@ -14,15 +16,13 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/tasuki"
-	"github.com/hirokazumiyaji/tasuki/backend/firestore"
+	"github.com/hirokazumiyaji/tasuki/backend/sqlite"
 )
 
-func TestChaos_KillWorkers_Firestore(t *testing.T) {
-	if os.Getenv("FIRESTORE_EMULATOR_HOST") == "" {
-		t.Skip("FIRESTORE_EMULATOR_HOST not set")
-	}
+func TestChaos_KillWorkers_SQLite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chaos-sqlite.db")
 	ctx := context.Background()
-	b, err := firestore.New(ctx, os.Getenv("TASUKI_FIRESTORE_PROJECT"))
+	b, err := sqlite.New(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,10 +34,10 @@ func TestChaos_KillWorkers_Firestore(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const nInst = 10
+	const nInst = 20
 	c := tasuki.NewClient(b)
 	for i := 0; i < nInst; i++ {
-		id := fmt.Sprintf("chaos-fs-%d", i)
+		id := fmt.Sprintf("chaos-sqlite-%d", i)
 		if _, err := tasuki.Start(ctx, c, "chaos", 0, tasuki.WithID(id)); err != nil {
 			t.Fatal(err)
 		}
@@ -45,7 +45,7 @@ func TestChaos_KillWorkers_Firestore(t *testing.T) {
 
 	_, thisFile, _, _ := runtime.Caller(0)
 	workerDir := filepath.Join(filepath.Dir(thisFile), "cmd", "worker")
-	bin := filepath.Join(t.TempDir(), "chaos-worker-fs")
+	bin := filepath.Join(t.TempDir(), "chaos-worker-sqlite")
 	build := exec.Command("go", "build", "-tags", "tasuki_all", "-o", bin, ".")
 	build.Dir = workerDir
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
@@ -58,12 +58,11 @@ func TestChaos_KillWorkers_Firestore(t *testing.T) {
 	}
 	workers := make([]*proc, 0, 3)
 	startWorker := func(i int) *proc {
-		id := fmt.Sprintf("fw-%d-%d", i, time.Now().UnixNano())
+		id := fmt.Sprintf("sw-%d-%d", i, time.Now().UnixNano())
 		cmd := exec.Command(bin)
 		cmd.Env = append(os.Environ(),
-			"TASUKI_BACKEND=firestore",
-			"FIRESTORE_EMULATOR_HOST="+os.Getenv("FIRESTORE_EMULATOR_HOST"),
-			"TASUKI_FIRESTORE_PROJECT="+envOr("TASUKI_FIRESTORE_PROJECT", "tasuki"),
+			"TASUKI_BACKEND=sqlite",
+			"TASUKI_SQLITE_PATH="+path,
 			"WORKER_ID="+id,
 		)
 		cmd.Stdout = os.Stdout
@@ -85,12 +84,12 @@ func TestChaos_KillWorkers_Firestore(t *testing.T) {
 		}
 	}()
 
-	deadline := time.Now().Add(3 * time.Minute)
+	deadline := time.Now().Add(30 * time.Second)
 	rng := rand.New(rand.NewSource(6))
 	for time.Now().Before(deadline) {
 		done := 0
 		for i := 0; i < nInst; i++ {
-			info, err := c.Get(ctx, fmt.Sprintf("chaos-fs-%d", i))
+			info, err := c.Get(ctx, fmt.Sprintf("chaos-sqlite-%d", i))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -103,19 +102,18 @@ func TestChaos_KillWorkers_Firestore(t *testing.T) {
 		if done == nInst {
 			break
 		}
-		// Kill less aggressively — Firestore emulator is contention-sensitive.
-		if rng.Intn(8) == 0 && len(workers) > 0 {
+		if rng.Intn(3) == 0 && len(workers) > 0 {
 			idx := rng.Intn(len(workers))
 			w := workers[idx]
 			_ = w.cmd.Process.Signal(syscall.SIGKILL)
 			_, _ = w.cmd.Process.Wait()
 			workers[idx] = startWorker(idx)
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	for i := 0; i < nInst; i++ {
-		id := fmt.Sprintf("chaos-fs-%d", i)
+		id := fmt.Sprintf("chaos-sqlite-%d", i)
 		info, err := c.Get(ctx, id)
 		if err != nil {
 			t.Fatal(err)

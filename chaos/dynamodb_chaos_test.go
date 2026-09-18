@@ -47,7 +47,7 @@ func TestChaos_KillWorkers_DynamoDB(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	workerDir := filepath.Join(filepath.Dir(thisFile), "cmd", "worker")
 	bin := filepath.Join(t.TempDir(), "chaos-worker-ddb")
-	build := exec.Command("go", "build", "-o", bin, ".")
+	build := exec.Command("go", "build", "-tags", "tasuki_all", "-o", bin, ".")
 	build.Dir = workerDir
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := build.CombinedOutput(); err != nil {

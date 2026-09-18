@@ -16,6 +16,7 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend/mysql"
 	"github.com/hirokazumiyaji/tasuki/backend/postgres"
 	"github.com/hirokazumiyaji/tasuki/backend/spanner"
+	"github.com/hirokazumiyaji/tasuki/backend/sqlite"
 	"github.com/hirokazumiyaji/tasuki/workflow"
 )
 
@@ -71,6 +72,16 @@ func openBackend(ctx context.Context) (backend.Backend, func()) {
 		return b, func() { _ = b.Close() }
 	case "firestore":
 		b, err := firestore.New(ctx, os.Getenv("TASUKI_FIRESTORE_PROJECT"))
+		if err != nil {
+			panic(err)
+		}
+		return b, func() { _ = b.Close() }
+	case "sqlite":
+		path := os.Getenv("TASUKI_SQLITE_PATH")
+		if path == "" {
+			panic("TASUKI_SQLITE_PATH required")
+		}
+		b, err := sqlite.New(path)
 		if err != nil {
 			panic(err)
 		}

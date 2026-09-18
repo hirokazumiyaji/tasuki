@@ -25,12 +25,14 @@ type ShipResult struct{ TrackingID string }
 type MailInput struct{ To string }
 
 func OrderWorkflow(ctx *workflow.Context, in OrderInput) (OrderResult, error) {
+	//lint:ignore S1016 struct literal mirrors docs/03-api.md snippet verbatim.
 	charge, err := workflow.Execute[ChargeInput, ChargeResult](ctx, "ChargePayment", ChargeInput{OrderID: in.OrderID},
 		workflow.WithRetry(workflow.RetryPolicy{MaxAttempts: 5}))
 	if err != nil {
 		return OrderResult{}, err
 	}
 
+	//lint:ignore S1016 struct literal mirrors docs/03-api.md snippet verbatim.
 	ship := workflow.ExecuteAsync[ShipInput, ShipResult](ctx, "ShipOrder", ShipInput{OrderID: in.OrderID})
 	mail := workflow.ExecuteAsync[MailInput, struct{}](ctx, "SendReceiptMail", MailInput{To: charge.CustomerEmail})
 	if _, err := ship.Get(ctx); err != nil {

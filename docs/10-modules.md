@@ -20,7 +20,7 @@ The root module does not depend on database drivers or cloud SDKs by default. `i
 
 ## Minimum Go Version
 
-- **Declaration**: Root `go 1.24`, `go.work` declares `go 1.24` (aligned with CI `1.24.x`).
+- **Declaration**: Root `go 1.24`, backend modules `go 1.24`, `go.work` declares `go 1.24` (aligned with CI `1.24.x`).
 - **Validation**: `GOTOOLCHAIN=local go build ./...` (verified outside workspace in a Go 1.24 environment).
 
 ## Dependency Versioning
@@ -51,6 +51,9 @@ The root module does not depend on database drivers or cloud SDKs by default. `i
 
 ## Continuous Integration (CI)
 
-- **`root` Job**: `go test ./...` across the workspace.
-- **`gowork-check` Job**: Validates root module independence via `GOWORK=off GOPROXY=off go list ./...` and `GOTOOLCHAIN=local go build ./...`.
-- **Backend Jobs**: Executes `go test ./...` in each individual `backend/<name>` directory.
+- **`root` Job**: `go test ./... -race` across the workspace (fuzz seed corpora run here as unit tests).
+- **`gowork-check` Job**: Validates root module independence via `GOWORK=off GOPROXY=off go list ./...` and `GOTOOLCHAIN=local go build ./...`; also runs `go test -tags tasuki_all ./contrib/... ./examples/...`.
+- **Backend Jobs**: Executes `go test ./... -race` in each individual `backend/<name>` directory.
+- **Chaos Jobs**: Executes the `kill -9` chaos suites with `-race`, including the zero-infrastructure `chaos-sqlite` job.
+- **`lint` / `vuln` Jobs**: `staticcheck` (hard gate) and advisory `govulncheck` over the root and backend modules.
+- **`fuzz-nightly` Job**: Runs only on the nightly schedule (or manual dispatch): 60s of `-fuzz -fuzztime` per codec/engine target.
