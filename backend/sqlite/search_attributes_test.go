@@ -1,0 +1,78 @@
+package sqlite_test
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+
+	"github.com/hirokazumiyaji/tasuki/backend"
+	"github.com/hirokazumiyaji/tasuki/backend/sqlite"
+)
+
+// Keys carrying dots, quotes, spaces, or non-ASCII must filter exactly: the
+// SQL-side predicate takes keys as bound parameters, never interpolates them
+// into a JSON path.
+func TestListInstancesSearchAttributesSpecialKeys(t *testing.T) {
+	ctx := context.Background()
+	b, err := sqlite.New(filepath.Join(t.TempDir(), "tasuki.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	attrs := map[string]string{
+		"tenant.id": `a"b'c`,
+		"sp ace":    "v",
+		"café-☃":    "snowman",
+		"plain":     "x",
+	}
+	if err := b.CreateInstance(ctx, backend.NewInstance{
+		ID: "sa-special", Name: "WF", Queue: "default", SearchAttributes: attrs,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CreateInstance(ctx, backend.NewInstance{
+		ID: "sa-other", Name: "WF", Queue: "default",
+		SearchAttributes: map[string]string{"tenant.id": "elsewhere"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for key, val := range attrs {
+		list, err := b.ListInstances(ctx, backend.InstanceFilter{
+			SearchAttributes: map[string]string{key: val},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(list) != 1 || list[0].ID != "sa-special" {
+			t.Fatalf("filter %q=%q: got %+v, want [sa-special]", key, val, list)
+		}
+	}
+	// AND over two special keys still narrows to the single row.
+	and, err := b.ListInstances(ctx, backend.InstanceFilter{
+		SearchAttributes: map[string]string{"tenant.id": `a"b'c`, "café-☃": "snowman"},
+		Limit:            10,
+	})
+	if err != nil || len(and) != 1 || and[0].ID != "sa-special" {
+		t.Fatalf("AND special keys: %+v err=%v", and, err)
+	}
+	// Wrong value for a special key matches nothing (no path-injection row).
+	miss, err := b.ListInstances(ctx, backend.InstanceFilter{
+		SearchAttributes: map[string]string{"tenant.id": `a"b'cX`},
+	})
+	if err != nil || len(miss) != 0 {
+		t.Fatalf("want empty, got %+v err=%v", miss, err)
+	}
+	// Pagination composes with the special-key filter.
+	paged, err := b.ListInstances(ctx, backend.InstanceFilter{
+		SearchAttributes: map[string]string{"plain": "x"},
+		Limit:            1,
+		Offset:           1,
+	})
+	if err != nil || len(paged) != 0 {
+		t.Fatalf("want empty second page, got %+v err=%v", paged, err)
+	}
+}
