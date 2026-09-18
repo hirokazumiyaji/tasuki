@@ -125,6 +125,12 @@ func (w *Worker) commitWorkflow(ctx context.Context, instanceID string, baseJour
 		if errors.Is(err, backend.ErrConflict) {
 			w.dropSticky(instanceID)
 		}
+		// Release the lease so a conflicted (or transiently failed) task is
+		// immediately reclaimable instead of stalling until LeaseDuration
+		// expiry. Best-effort: the task may already be gone.
+		if rerr := w.backend.ReleaseLease(ctx, adv.TaskID); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
+			w.recordStoreError(ctx, "release_lease", rerr, "task_id", adv.TaskID)
+		}
 		return err
 	}
 	w.applyStickyAfterCommit(instanceID, baseJournal, adv)
@@ -147,10 +153,17 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 			advs[i] = p.adv
 		}
 		if err := batcher.CommitAdvancements(ctx, advs); err != nil {
-			for _, p := range pending {
-				w.dropSticky(p.instanceID)
-			}
 			w.recordStoreError(ctx, "commit_workflow", err, "n", len(pending))
+			// One conflict rolls back the whole batch transaction, so fall
+			// back to per-instance commits: healthy instances still advance
+			// in this tick, and failed items release their leases inside
+			// commitWorkflow for immediate re-visibility (independent of
+			// LeaseDuration).
+			for _, p := range pending {
+				if cerr := w.commitWorkflow(ctx, p.instanceID, p.baseJournal, p.adv); cerr != nil {
+					w.recordStoreError(ctx, "commit_workflow", cerr, "instance_id", p.instanceID)
+				}
+			}
 			return
 		}
 		for _, p := range pending {

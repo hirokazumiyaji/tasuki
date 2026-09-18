@@ -348,6 +348,15 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					w.recordStoreError(ctx, "commit_workflow", herr,
 						"instance_id", t.InstanceID, "task_id", t.ID)
 					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", herr)
+					if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {
+						w.dropSticky(t.InstanceID)
+					}
+					// Release the lease so the task is immediately reclaimable
+					// instead of stalling until LeaseDuration expiry.
+					// Best-effort: the task may already be gone.
+					if rerr := w.backend.ReleaseLease(ctx, t.ID); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
+						w.recordStoreError(ctx, "release_lease", rerr, "task_id", t.ID)
+					}
 					return
 				}
 				if p != nil {
