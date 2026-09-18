@@ -292,6 +292,30 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 			return err
 		}
 		muts = append(muts, dMuts...)
+		// NOTE: instances with more child rows than one commit allows hit
+		// Spanner mutation limits here; chunked deletes are a follow-up to
+		// #299 (backendtest BulkTerminatePurge skips until then).
+		inIter := txn.Query(ctx, spanner.Statement{
+			SQL:    `SELECT id FROM wf_inbox WHERE instance_id = @id`,
+			Params: map[string]any{"id": id},
+		})
+		for {
+			r, err := inIter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				inIter.Stop()
+				return err
+			}
+			var iid int64
+			if err := r.Columns(&iid); err != nil {
+				inIter.Stop()
+				return err
+			}
+			muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{iid}))
+		}
+		inIter.Stop()
 		return txn.BufferWrite(muts)
 	})
 	if err != nil {
@@ -901,6 +925,11 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	now := nowUTC()
 	var wake bool
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// Reset per attempt: ReadWriteTransaction may retry this closure,
+		// and a stale wake (or a mutated ev.RefSeq) from an aborted attempt
+		// must not leak into the retry.
+		wake = false
+		ev := ev
 		row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{taskID},
 			[]string{"instance_id", "ref_seq", "kind"})
 		if err != nil {

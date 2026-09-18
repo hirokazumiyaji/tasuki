@@ -198,6 +198,9 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	if err := b.deleteSignalDedupeForInstance(ctx, id); err != nil {
 		return err
 	}
+	if err := b.deleteInboxForInstance(ctx, id); err != nil {
+		return err
+	}
 	b.notifyTerminal(id)
 	return nil
 }

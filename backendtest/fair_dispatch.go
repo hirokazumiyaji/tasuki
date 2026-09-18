@@ -17,6 +17,23 @@ import (
 // interleave the victims; the uncapped batch stays strict FIFO.
 func RunFairDispatch(t *testing.T, newBackend Factory) {
 	t.Helper()
+	runFairDispatch(t, newBackend)
+}
+
+// testFairDispatchGated is the Run-integrated form (#299 item 4): backends
+// that ignore MaxPerInstance (DynamoDB, Firestore, Spanner) skip loudly
+// instead of silently passing with strict-FIFO behavior (see #297).
+func testFairDispatchGated(t *testing.T, newBackend Factory) {
+	t.Helper()
+	b := newBackend(t)
+	if !b.Capabilities().SupportsFairDispatch {
+		t.Skip("fair dispatch (MaxPerInstance) not implemented by this backend (see #297)")
+	}
+	runFairDispatch(t, func(t *testing.T) backend.Backend { return b })
+}
+
+func runFairDispatch(t *testing.T, newBackend Factory) {
+	t.Helper()
 	ctx := context.Background()
 	b := newBackend(t)
 	setNow(b, time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))

@@ -104,7 +104,9 @@ func TestClient_SignalDedupeClearedOnTerminate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(st.Inbox) != 2 {
-		t.Fatalf("inbox=%d want 2 after terminate+resignal", len(st.Inbox))
+	// Terminate clears the inbox along with the dedupe tracking, so only the
+	// re-sent signal remains.
+	if len(st.Inbox) != 1 {
+		t.Fatalf("inbox=%d want 1 after terminate+resignal", len(st.Inbox))
 	}
 }

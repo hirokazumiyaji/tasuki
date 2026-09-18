@@ -8,6 +8,21 @@ import (
 
 type Capabilities struct {
 	MaxAdvancementEffects int // 0 = unlimited
+	// SupportsFairDispatch reports whether ClaimTasks honors
+	// ClaimRequest.MaxPerInstance to interleave instances.
+	// Backends without native support ignore the cap (see #297).
+	SupportsFairDispatch bool
+	// CleansTerminalState reports whether terminal transitions fully clean
+	// up: TerminateInstance and terminal CommitAdvancement remove pending
+	// tasks, timers, and inbox rows, and FireDueTimers never creates inbox
+	// rows or workflow tasks for non-running instances (see #290 #291).
+	CleansTerminalState bool
+	// SupportsBulkCleanup reports whether TerminateInstance and
+	// PurgeInstances handle instances with more child rows (inbox, dedupe,
+	// tasks, timers) than a single backend write transaction allows
+	// (Firestore ~500 writes, Spanner mutation limits) by chunking the
+	// deletes (see #299).
+	SupportsBulkCleanup bool
 }
 
 // InstanceFilter selects instances for ListInstances.

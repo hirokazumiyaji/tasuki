@@ -12,7 +12,13 @@ import (
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
-func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilities{} }
+func (b *Backend) Capabilities() backend.Capabilities {
+	return backend.Capabilities{
+		SupportsFairDispatch: true,
+		CleansTerminalState:  true,
+		SupportsBulkCleanup:  true,
+	}
+}
 
 func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
 	queue := inst.Queue
@@ -176,6 +182,7 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE instance_id = ?`, id)
 	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_timers WHERE instance_id = ?`, id)
 	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = ?`, id)
+	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_inbox WHERE instance_id = ?`, id)
 	if err := commitConn(ctx, conn); err != nil {
 		return err
 	}
@@ -671,6 +678,14 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = ?`, adv.InstanceID); err != nil {
 			return err
 		}
+		// Terminal transitions retire pending work: activity tasks must no
+		// longer be claimable and timers must never fire into the inbox.
+		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE instance_id = ?`, adv.InstanceID); err != nil {
+			return err
+		}
+		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_timers WHERE instance_id = ?`, adv.InstanceID); err != nil {
+			return err
+		}
 	}
 	if len(adv.DrainedInbox) > 0 {
 		for _, inboxID := range adv.DrainedInbox {
@@ -947,6 +962,20 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			return 0, err
 		}
 		if aff == 0 {
+			continue
+		}
+		var status string
+		if err := conn.QueryRowContext(ctx, `SELECT status FROM wf_instances WHERE id = ?`, d.instanceID).
+			Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue // orphaned timer of a purged instance
+			}
+			return 0, err
+		}
+		if status != "running" {
+			// Terminal instances consume timers silently: no inbox row,
+			// no workflow task wakeup.
+			n++
 			continue
 		}
 		_, err = conn.ExecContext(ctx, `

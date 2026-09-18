@@ -48,8 +48,10 @@ func testSignalDedupe(t *testing.T, newBackend Factory) {
 		t.Fatal(err)
 	}
 	st, _ = b.LoadWorkflow(ctx, id)
-	if len(st.Inbox) != 4 {
-		t.Fatalf("inbox=%d want 4 after terminate clears dedupe", len(st.Inbox))
+	// Terminate clears the inbox along with the dedupe tracking, so the
+	// re-send inserts exactly one row instead of being deduped.
+	if len(st.Inbox) != 1 {
+		t.Fatalf("inbox=%d want 1 after terminate clears dedupe+inbox", len(st.Inbox))
 	}
 }
 
