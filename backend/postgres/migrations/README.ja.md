@@ -9,7 +9,9 @@ migrations/
 ├── 000001_init.up.sql            基本テーブルとインデックス
 ├── 000001_init.down.sql          全テーブルの DROP
 ├── 000002_vacuum_tuning.up.sql   autovacuum / fillfactor 設定
-└── 000002_vacuum_tuning.down.sql 設定のリセット
+├── 000002_vacuum_tuning.down.sql 設定のリセット
+├── 000003_purge_search_indexes.up.sql   purge 用 (completed_at) + search_attributes 用 GIN インデックス
+└── 000003_purge_search_indexes.down.sql 上記インデックスの削除
 ```
 
 命名規則は `<6桁バージョン>_<名前>.up.sql` / `.down.sql`。ファイル名は辞書順 = 適用順になる。

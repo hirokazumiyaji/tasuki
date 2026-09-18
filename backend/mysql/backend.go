@@ -838,8 +838,8 @@ func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Du
 }
 
 // PurgeInstances deletes terminal instances and their dependent rows in one
-// transaction. Victim rows are selected FOR UPDATE so concurrent purge jobs do
-// not overlap.
+// transaction. Victim rows are selected FOR UPDATE SKIP LOCKED so concurrent
+// purge jobs make progress without blocking each other.
 func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, statuses []string, limit int) (int, error) {
 	sts, lim, err := backend.ValidatePurgeArgs(olderThan, statuses, limit)
 	if err != nil {
@@ -859,7 +859,7 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 		  AND completed_at IS NOT NULL AND completed_at <= ?
 		ORDER BY completed_at, id
 		LIMIT ?
-		FOR UPDATE`, args...)
+		FOR UPDATE SKIP LOCKED`, args...)
 		if err != nil {
 			return err
 		}

@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS wf_instances (
     created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     completed_at DATETIME(6) NULL,
-    INDEX wf_instances_visibility_idx (status, name, created_at)
+    INDEX wf_instances_visibility_idx (status, name, created_at),
+    INDEX wf_instances_completed_at_idx (completed_at)
 );
 
 CREATE TABLE IF NOT EXISTS wf_journal (

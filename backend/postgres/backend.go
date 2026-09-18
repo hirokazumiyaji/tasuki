@@ -238,6 +238,11 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // instance is still found, then claims each survivor with a visibility
 // re-check: concurrent claimants lose the race on already-leased rows (their
 // visible_at moved to the future) and simply skip.
+//
+// Candidate SELECTs take FOR UPDATE SKIP LOCKED so N workers claiming
+// concurrently never block on each other: a row locked by another claimant
+// is skipped here and re-checked at UPDATE time instead of stalling the
+// whole batch behind a lock wait (issue #294).
 func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
@@ -259,7 +264,7 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 			q += ` AND (visible_at, id) > ($3, $4)`
 			args = append(args, lastVis, lastID)
 		}
-		q += fmt.Sprintf(` ORDER BY visible_at, id LIMIT $%d`, len(args)+1)
+		q += fmt.Sprintf(` ORDER BY visible_at, id LIMIT $%d FOR UPDATE SKIP LOCKED`, len(args)+1)
 		args = append(args, pageSize)
 		rows, err := tx.Query(ctx, q, args...)
 		if err != nil {

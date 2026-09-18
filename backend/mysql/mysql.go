@@ -54,6 +54,14 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	_, _ = b.db.ExecContext(ctx, `ALTER TABLE wf_tasks ADD COLUMN heartbeat BLOB NULL`)
 	_, _ = b.db.ExecContext(ctx, `ALTER TABLE wf_instances ADD COLUMN search_attributes JSON NULL`)
 	_, _ = b.db.ExecContext(ctx, `ALTER TABLE wf_instances ADD COLUMN memo JSON NULL`)
+	// Issue #294: completed_at index for PurgeInstances. CREATE TABLE IF NOT
+	// EXISTS never retrofits databases provisioned before schema.sql gained
+	// the index, and MySQL has no CREATE INDEX IF NOT EXISTS, so attempt the
+	// DDL and tolerate "duplicate key name". Move this into a versioned
+	// migration once MySQL migration management lands (#292).
+	if _, err := b.db.ExecContext(ctx, `CREATE INDEX wf_instances_completed_at_idx ON wf_instances (completed_at)`); err != nil && !isDuplicateIndexError(err) {
+		return fmt.Errorf("mysql migrate: ensure wf_instances_completed_at_idx: %w", err)
+	}
 	return nil
 }
 

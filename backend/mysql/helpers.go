@@ -29,6 +29,14 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1062
 }
 
+// isDuplicateIndexError reports MySQL error 1061 (ER_DUP_KEYNAME): the named
+// index already exists. Used to make conditional CREATE INDEX idempotent on
+// databases provisioned before the index was added to schema.sql.
+func isDuplicateIndexError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1061
+}
+
 func beginTx(ctx context.Context, db *sql.DB) (*sql.Conn, error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
