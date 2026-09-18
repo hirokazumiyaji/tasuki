@@ -94,9 +94,15 @@ func Update[I, O any](ctx context.Context, w *Worker, instanceID, name string, i
 	ticker := time.NewTicker(w.opts.PollInterval)
 	defer ticker.Stop()
 
+	// Use a derived context for the task subscription so every exit path
+	// releases the subscriber/goroutine (and Postgres LISTEN connection)
+	// without cancelling the caller's context.
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var wake <-chan struct{}
 	if n, ok := w.backend.(backend.TaskNotifier); ok {
-		ch, err := n.Subscribe(ctx)
+		ch, err := n.Subscribe(subCtx)
 		if err == nil {
 			wake = ch
 		}

@@ -83,6 +83,13 @@ func (h *Hub) TerminalSubCount() int {
 	return len(h.terminalSubs)
 }
 
+// TaskSubCount reports current task subscribers (test hook).
+func (h *Hub) TaskSubCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.taskSubs)
+}
+
 func (h *Hub) NotifyTasks() {
 	h.mu.Lock()
 	subs := append([]*taskSub(nil), h.taskSubs...)
