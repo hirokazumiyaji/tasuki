@@ -39,12 +39,15 @@ type Worker struct {
 	// actWg tracks detached activity goroutines so Shutdown can wait for
 	// them within its grace period instead of releasing their leases early
 	// (which would let peers duplicate the execution).
-	actWg   sync.WaitGroup
-	actMu   sync.Mutex
+	actWg    sync.WaitGroup
+	actMu    sync.Mutex
 	stopping bool
 
 	recoverMu   sync.Mutex
 	lastRecover time.Time
+
+	backlogMu   sync.Mutex
+	lastBacklog time.Time
 }
 
 func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
@@ -262,6 +265,28 @@ func (w *Worker) sampleBacklog(ctx context.Context) {
 	if w.opts.Metrics == nil {
 		return
 	}
+	interval := w.opts.BacklogSampleInterval
+	if interval < 0 {
+		// Negative disables backlog sampling (avoids COUNT queries entirely).
+		return
+	}
+	if interval == 0 {
+		// Workers built without withDefaults (e.g. &Worker{} in tests)
+		// fall back to the documented default.
+		interval = 10 * time.Second
+	}
+	// Throttle COUNT queries: at most once per interval. Crash gaps and
+	// queue depth change slowly, so per-tick sampling (PollInterval default
+	// 1s, plus NOTIFY wakes) would hammer the store with 2x
+	// CountClaimableTasks per tick for no extra signal.
+	w.backlogMu.Lock()
+	since := time.Since(w.lastBacklog)
+	if since < interval && !w.lastBacklog.IsZero() {
+		w.backlogMu.Unlock()
+		return
+	}
+	w.lastBacklog = time.Now()
+	w.backlogMu.Unlock()
 	for _, kind := range []string{"workflow", "activity"} {
 		counts, err := w.backend.CountClaimableTasks(ctx, kind, w.opts.Queues)
 		if err != nil {

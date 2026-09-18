@@ -35,13 +35,14 @@ Meter Name: `github.com/hirokazumiyaji/tasuki`
 | `tasuki.workflow.terminal` | Counter | Total workflow terminal transitions |
 | `tasuki.activity.retries` | Counter | Total scheduled activity retries |
 | `tasuki.workflow.journal_warnings` | Counter | Total occurrences of journal size warnings |
-| `tasuki.tasks.backlog` | Gauge | Count of claimable tasks per queue (attributes `kind`, `queue`). Sampled on each worker polling tick |
+| `tasuki.tasks.backlog` | Gauge | Count of claimable tasks per queue (attributes `kind`, `queue`). Sampled at most once per `BacklogSampleInterval` (default 10s) |
 | `tasuki.worker.incompatible_nacks` | Counter | Total Nacked tasks due to incompatible workers (attribute `reason`) |
 | `tasuki.worker.store_errors` | Counter | Total failed store operations (attribute `op`: `fire_timers`, `claim_schedules`, `claim_workflow`, `claim_activity`, `commit_workflow`, `complete_activity`, `retry_activity`, `release_lease`, `extend_lease`, `recover_tasks`) |
 
 Configure metrics by passing `observability.NewMetrics()` to `WorkerOptions.Metrics`. When unset, metrics recording is disabled (noop).  
 If the global OpenTelemetry `MeterProvider` is not configured, the default noop meter is used.  
 The backlog gauge is only recorded when `Metrics` is configured, calling `CountClaimableTasks` to inspect database queue depth (task execution proceeds even if sampling fails).
+Sampling is throttled by `WorkerOptions.BacklogSampleInterval` (default 10s, coarser than the 1s `PollInterval` default); set a smaller positive value for fresher gauges or a negative value to disable sampling entirely.
 
 ## Alerting Criteria and Troubleshooting
 
