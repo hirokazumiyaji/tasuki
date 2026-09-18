@@ -334,14 +334,17 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		go func(t backend.Task) {
 			defer wg.Done()
 			defer func() { <-w.wfSem }()
-			// Lease extension starts immediately after claim (extendLoop
-			// runs inside handleActivity; workflows are short so no
-			// extension needed here).
 			actor := w.actorFor(t.InstanceID)
 			actor.dispatch(func() {
 				w.opts.Metrics.AddWorkflowTask(ctx, 1)
 				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
 				w.track(t.ID)
+				// Extend the workflow task lease while the turn runs so long
+				// replays and local activities cannot lose the lease to a
+				// peer (which would duplicate the execution).
+				leaseDone := make(chan struct{})
+				defer close(leaseDone)
+				go w.extendLeaseLoop(ctx, t.ID, leaseDone)
 				p, herr := w.handleWorkflow(ctx, t)
 				w.untrack(t.ID)
 				if herr != nil {
@@ -536,7 +539,7 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 		wctx.SetCodec(w.reg.codec)
 		wctx.SetSearchAttributes(state.Instance.SearchAttributes)
 		wctx.SetMemo(state.Instance.Memo)
-		w.attachLocalActivityRunner(wctx)
+		w.attachLocalActivityRunner(wctx, ctx)
 		out, err := wf.fn(wctx, state.Instance.Input)
 		if err != nil {
 			return nil, err
@@ -983,7 +986,7 @@ func (w *Worker) recordStoreError(ctx context.Context, op string, err error, att
 	w.opts.Metrics.AddStoreError(ctx, op)
 }
 
-func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context) {
+func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context, runCtx context.Context) {
 	wctx.SetLocalActivityRunner(func(name string, input []byte) (out []byte, err error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -997,7 +1000,19 @@ func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context) {
 		if err != nil {
 			return nil, err
 		}
-		return act.fn(context.Background(), input)
+		// Run with the worker turn's context so Shutdown cancels a running
+		// local activity. An optional per-invocation timeout can bound
+		// activities that ignore cancellation.
+		ctx := runCtx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		var cancel context.CancelFunc
+		if w.opts.LocalActivityTimeout > 0 {
+			ctx, cancel = context.WithTimeout(ctx, w.opts.LocalActivityTimeout)
+			defer cancel()
+		}
+		return act.fn(ctx, input)
 	})
 }
 

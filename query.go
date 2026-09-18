@@ -43,7 +43,7 @@ func Query[I, O any](ctx context.Context, w *Worker, instanceID, name string, in
 		wctx.SetCodec(w.reg.codec)
 		wctx.SetSearchAttributes(state.Instance.SearchAttributes)
 		wctx.SetMemo(state.Instance.Memo)
-		w.attachLocalActivityRunner(wctx)
+		w.attachLocalActivityRunner(wctx, ctx)
 		out, err := wf.fn(wctx, state.Instance.Input)
 		if err != nil {
 			return nil, err

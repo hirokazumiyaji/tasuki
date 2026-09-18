@@ -38,6 +38,11 @@ type WorkerOptions struct {
 	// Unreleased leases expire via lease timeout and are reclaimed by peers.
 	// <=0 defaults to 5s.
 	ShutdownReleaseTimeout time.Duration
+	// LocalActivityTimeout optionally bounds a single ExecuteLocal invocation.
+	// The worker cancels the context.Context passed to the local activity
+	// when the timeout elapses. <=0 disables the limit (default).
+	// Shutdown always cancels the context regardless of this setting.
+	LocalActivityTimeout time.Duration
 }
 
 func (o WorkerOptions) withDefaults() WorkerOptions {

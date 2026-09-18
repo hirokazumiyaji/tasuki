@@ -133,6 +133,8 @@ Functions provided by the `workflow` package:
 
 `ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay.
 
+The worker extends the workflow task lease (`ExtendLease` at half the `LeaseDuration`) while the turn runs, so long replays and local activities that exceed `LeaseDuration` are not reclaimed by a peer and executed twice. Local activities run with the worker turn's `context.Context`, so `Shutdown` cancels a running local activity; activities that ignore cancellation keep the turn (and shutdown) blocked. Set `WorkerOptions.LocalActivityTimeout` to bound a single `ExecuteLocal` invocation with a context deadline.
+
 For long-running or looping workflows, calling `ContinueAsNew` when event counts reach thousands is strongly recommended to bound history size.
 
 `Future[O]` exposes `Get(ctx) (O, error)`. All futures implement the non-generic `Awaitable` interface, allowing heterogeneous types to be awaited together in `Await`.
@@ -375,6 +377,7 @@ type WorkerOptions struct {
     Logger                 *slog.Logger  // Default: slog.Default()
     JournalWarnThreshold   int           // Default: 10000; negative disables
     IncompatibleRetryDelay time.Duration // Default: 5s; negative redisplays immediately
+    LocalActivityTimeout   time.Duration // Default: 0 (no limit); bounds one ExecuteLocal call
 }
 ```
 

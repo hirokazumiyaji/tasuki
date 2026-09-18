@@ -130,6 +130,8 @@ func main() {
 `ExecuteLocal` は `RegisterActivity` した関数をワークフロータスク内で同期実行する。
 通常の `Execute` と違いアクティビティタスクは作らず、リトライも行わない。短い・信頼できる処理向け。結果（またはエラー）は `local_activity` コマンドとしてジャーナルに残り、リプレイではランナーを呼ばない。
 
+ワーカーはタスク実行中、リース半減期ごとに `ExtendLease` でワークフロータスクのリースを延長するため、リプレイやローカル Activity の合計が `LeaseDuration` を超えても他ワーカーに奪われて二重実行にならない。ローカル Activity にはワークフローターンの `context.Context` を渡すため、`Shutdown` でキャンセルできる（コンテキストを無視する処理はターンとシャットダウンを塞ぎ続ける）。1 回の `ExecuteLocal` を期限で区切りたい場合は `WorkerOptions.LocalActivityTimeout` を設定する。
+
 長寿命・ループするワークフローは、イベント数が数千〜1万付近になったら `ContinueAsNew` で履歴を打ち切ることを推奨する（既定の警告しきい値と揃える）。警告自体は実行を止めない。
 
 `Future[O]` は `Get(ctx) (O, error)` を持つ。
@@ -438,6 +440,7 @@ type WorkerOptions struct {
     Logger               *slog.Logger  // 既定 slog.Default()
     JournalWarnThreshold int           // 0 → 既定 10000。負数で無効。超過時は Warn + メトリクスのみ
     IncompatibleRetryDelay time.Duration // 0 → 既定 5s。負数で即時再可視。非互換 Nack 後の hidden 時間
+    LocalActivityTimeout time.Duration // 既定 0（無制限）。1 回の ExecuteLocal を期限で区切る
 }
 ```
 
