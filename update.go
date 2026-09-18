@@ -31,6 +31,13 @@ func WithUpdateID(id string) UpdateOption {
 
 // Update sends a named update to a running workflow and waits for the handler result.
 // The Worker must have the workflow registered (same process model as Query).
+//
+// Update only enqueues the request and waits for completion: it never runs
+// worker ticks on the caller goroutine, so unrelated workflow or activity
+// tasks are never executed by the caller. Progress is driven by a started
+// Worker loop, so the Worker must be started (w.Start) for Update to complete.
+// Tests that need deterministic progress without a background loop should
+// drive ticks explicitly with w.PollOnce from test code.
 func Update[I, O any](ctx context.Context, w *Worker, instanceID, name string, in I, opts ...UpdateOption) (O, error) {
 	var zero O
 	var o updateOptions
@@ -103,8 +110,10 @@ func Update[I, O any](ctx context.Context, w *Worker, instanceID, name string, i
 	}
 
 	for {
-		w.PollOnce(ctx)
-
+		// NOTE: do not call PollOnce here. PollOnce claims and synchronously
+		// executes activity tasks, which would run unrelated activities on
+		// the Update caller's goroutine. Progress is driven by a started
+		// Worker loop; Update only waits for completion.
 		st, err := w.backend.LoadWorkflow(ctx, instanceID)
 		if err != nil {
 			return zero, err
