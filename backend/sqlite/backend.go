@@ -14,6 +14,8 @@ import (
 
 func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilities{} }
 
+var _ backend.SchemaValidator = (*Backend)(nil)
+
 func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
 	queue := inst.Queue
 	if queue == "" {

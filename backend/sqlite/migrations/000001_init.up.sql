@@ -1,3 +1,4 @@
+-- 000001_init: baseline tasuki schema (tables, indexes, current columns)
 -- SQLite schema for tasuki
 PRAGMA foreign_keys = ON;
 

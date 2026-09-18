@@ -29,6 +29,18 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1062
 }
 
+// isDuplicateColumnError reports whether err is a duplicate-column error
+// (MySQL error 1060). Only this class of ALTER TABLE ... ADD COLUMN failure
+// may be tolerated by Migrate; everything else (permissions, missing table,
+// syntax) must abort the migration.
+func isDuplicateColumnError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		return mysqlErr.Number == 1060
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "duplicate column")
+}
+
 func beginTx(ctx context.Context, db *sql.DB) (*sql.Conn, error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
