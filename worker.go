@@ -73,6 +73,10 @@ func (w *Worker) Start(parent context.Context) {
 			return
 		}
 	}
+	if w.opts.MaxPerInstance > 0 && !w.backend.Capabilities().FairDispatch {
+		w.opts.Logger.Warn("tasuki: MaxPerInstance is set but the backend ignores it (no fair dispatch support); claims fall back to FIFO",
+			"max_per_instance", w.opts.MaxPerInstance)
+	}
 	ctx, cancel := context.WithCancel(parent)
 	w.cancel = cancel
 	w.done = make(chan struct{})

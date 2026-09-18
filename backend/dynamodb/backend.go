@@ -16,7 +16,7 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{MaxAdvancementEffects: 80}
+	return backend.Capabilities{MaxAdvancementEffects: 80, FairDispatch: true}
 }
 
 func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
@@ -294,13 +294,11 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		if len(result) >= req.Limit {
 			break
 		}
-		out, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_tasks")), IndexName: aws.String("claim_gsi"),
-			KeyConditionExpression: aws.String("gsi_pk = :g AND visible_at <= :now"), ExpressionAttributeValues: map[string]types.AttributeValue{":g": avS(claimGSI(req.Kind, queue)), ":now": avN(timeToN(now))},
-			Limit: aws.Int32(int32(req.Limit - len(result)))})
+		cands, err := b.listClaimCandidates(ctx, req.Kind, queue, now, req.Limit-len(result), req.MaxPerInstance)
 		if err != nil {
 			return nil, err
 		}
-		for _, item := range out.Items {
+		for _, item := range cands {
 			old := fromN(item["visible_at"])
 			updated, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": item["task_pk"]},
 				UpdateExpression: aws.String("SET visible_at = :v, worker_id = :w ADD attempt :one"), ConditionExpression: aws.String("visible_at = :old"),
@@ -312,9 +310,67 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				return nil, err
 			}
 			result = append(result, decodeTask(updated.Attributes))
+			if len(result) >= req.Limit {
+				break
+			}
 		}
 	}
 	return result, nil
+}
+
+// listClaimCandidates returns FIFO-ordered claim_gsi items for one queue.
+// With maxPerInstance <= 0 it returns the first limit items; otherwise it
+// pages through the GSI (page window FairOverfetch) feeding a FairPicker, so
+// a victim hidden behind a flooding instance is still found beyond the first
+// page. Callers claim the returned items with a visible_at re-check: items
+// leased concurrently are skipped via the conditional update.
+func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, limit, maxPerInstance int) ([]map[string]types.AttributeValue, error) {
+	queryPage := func(start map[string]types.AttributeValue, pageLimit int32) (*dynamodb.QueryOutput, error) {
+		return b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_tasks")), IndexName: aws.String("claim_gsi"),
+			KeyConditionExpression: aws.String("gsi_pk = :g AND visible_at <= :now"), ExpressionAttributeValues: map[string]types.AttributeValue{":g": avS(claimGSI(kind, queue)), ":now": avN(timeToN(now))},
+			Limit: aws.Int32(pageLimit), ExclusiveStartKey: start})
+	}
+	if maxPerInstance <= 0 {
+		out, err := queryPage(nil, int32(limit))
+		if err != nil {
+			return nil, err
+		}
+		return out.Items, nil
+	}
+	pageSize := backend.FairOverfetch(limit)
+	picker := backend.NewFairPicker(limit, maxPerInstance)
+	byID := map[int64]map[string]types.AttributeValue{}
+	var start map[string]types.AttributeValue
+	for !picker.Full() {
+		out, err := queryPage(start, int32(pageSize))
+		if err != nil {
+			return nil, err
+		}
+		if len(out.Items) == 0 {
+			break
+		}
+		for _, item := range out.Items {
+			id := fromN(item["id"])
+			if _, ok := byID[id]; !ok {
+				byID[id] = item
+			}
+			if picker.Offer(backend.FairTaskRef{ID: id, InstanceID: fromS(item["instance_id"])}) {
+				break
+			}
+		}
+		if picker.Full() || out.LastEvaluatedKey == nil {
+			break
+		}
+		start = out.LastEvaluatedKey
+	}
+	picked := picker.Picked()
+	items := make([]map[string]types.AttributeValue, 0, len(picked))
+	for _, r := range picked {
+		if item, ok := byID[r.ID]; ok {
+			items = append(items, item)
+		}
+	}
+	return items, nil
 }
 
 func decodeTask(m map[string]types.AttributeValue) backend.Task {

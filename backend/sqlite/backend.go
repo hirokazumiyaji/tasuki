@@ -12,7 +12,9 @@ import (
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
-func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilities{} }
+func (b *Backend) Capabilities() backend.Capabilities {
+	return backend.Capabilities{FairDispatch: true}
+}
 
 func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
 	queue := inst.Queue

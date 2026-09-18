@@ -15,7 +15,7 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{MaxAdvancementEffects: 400}
+	return backend.Capabilities{MaxAdvancementEffects: 400, FairDispatch: true}
 }
 func (b *Backend) col(name string) *gcf.CollectionRef  { return b.client.Collection(name) }
 func (b *Backend) ref(col, id string) *gcf.DocumentRef { return b.col(col).Doc(id) }
@@ -310,16 +310,11 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		if len(out) >= req.Limit {
 			break
 		}
-		it := b.col("wf_tasks").Where("kind", "==", req.Kind).Where("queue", "==", q).Where("visible_at", "<=", now).OrderBy("visible_at", gcf.Asc).Limit(req.Limit - len(out)).Documents(ctx)
-		for {
-			d, err := it.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				it.Stop()
-				return nil, err
-			}
+		cands, err := b.listClaimCandidates(ctx, req.Kind, q, now, req.Limit-len(out), req.MaxPerInstance)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range cands {
 			old := timestamp(d.Data(), "visible_at")
 			var claimed backend.Task
 			err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
@@ -344,14 +339,83 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				continue
 			}
 			if err != nil {
-				it.Stop()
 				return nil, err
 			}
 			out = append(out, claimed)
+			if len(out) >= req.Limit {
+				break
+			}
 		}
-		it.Stop()
 	}
 	return out, nil
+}
+
+// listClaimCandidates returns FIFO-ordered task snapshots for one queue.
+// With maxPerInstance <= 0 it returns the first limit snapshots; otherwise it
+// pages through the (kind, queue, visible_at) composite index in
+// FairOverfetch windows feeding a FairPicker, so a victim hidden behind a
+// flooding instance is still found beyond the first page. The offset window
+// uses the same ordering as the plain path, so no additional composite index
+// is required. Callers claim the returned snapshots with a visible_at
+// re-check inside a transaction; concurrently leased rows conflict and are
+// skipped.
+func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, limit, maxPerInstance int) ([]*gcf.DocumentSnapshot, error) {
+	query := func(offset, pageLimit int) gcf.Query {
+		return b.col("wf_tasks").Where("kind", "==", kind).Where("queue", "==", queue).Where("visible_at", "<=", now).OrderBy("visible_at", gcf.Asc).Offset(offset).Limit(pageLimit)
+	}
+	collect := func(it *gcf.DocumentIterator) ([]*gcf.DocumentSnapshot, error) {
+		defer it.Stop()
+		var docs []*gcf.DocumentSnapshot
+		for {
+			d, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			docs = append(docs, d)
+		}
+		return docs, nil
+	}
+	if maxPerInstance <= 0 {
+		return collect(query(0, limit).Documents(ctx))
+	}
+	pageSize := backend.FairOverfetch(limit)
+	picker := backend.NewFairPicker(limit, maxPerInstance)
+	byID := map[int64]*gcf.DocumentSnapshot{}
+	offset := 0
+	for !picker.Full() {
+		docs, err := collect(query(offset, pageSize).Documents(ctx))
+		if err != nil {
+			return nil, err
+		}
+		if len(docs) == 0 {
+			break
+		}
+		for _, d := range docs {
+			m := d.Data()
+			id := i64(m, "id")
+			if _, ok := byID[id]; !ok {
+				byID[id] = d
+			}
+			if picker.Offer(backend.FairTaskRef{ID: id, InstanceID: str(m, "instance_id")}) {
+				break
+			}
+		}
+		offset += len(docs)
+		if picker.Full() || len(docs) < pageSize {
+			break
+		}
+	}
+	picked := picker.Picked()
+	docs := make([]*gcf.DocumentSnapshot, 0, len(picked))
+	for _, r := range picked {
+		if d, ok := byID[r.ID]; ok {
+			docs = append(docs, d)
+		}
+	}
+	return docs, nil
 }
 func (b *Backend) updateTask(ctx context.Context, id int64, activity bool, fields []gcf.Update) error {
 	r := b.ref("wf_tasks", actTaskID(id))

@@ -36,8 +36,20 @@ w := tasuki.NewWorker(b, tasuki.WorkerOptions{
 
 バックエンドを直接使う場合（バッチ処理など）は `ClaimRequest.MaxPerInstance` に同じ意味の値を渡す。
 
-対応バックエンド: PostgreSQL / MySQL / SQLite / memory。
-Spanner / DynamoDB / Firestore では未対応で、値は無視される（従来どおり FIFO）。
+## バックエンド対応表
+
+| バックエンド | 公平ディスパッチ | 備考 |
+|---|---|---|
+| PostgreSQL | ✅ | FIFO 候補を `FairPicker` でページング |
+| MySQL | ✅ | FIFO 候補を `FairPicker` でページング |
+| SQLite | ✅ | FIFO 候補を `FairPicker` でページング |
+| memory | ✅ | バッファした候補に `FairPick` を適用 |
+| DynamoDB | ✅ | `claim_gsi` を `FairOverfetch` 幅でページングし `FairPicker` を適用。取得時は `visible_at` の再チェック付きで claim |
+| Firestore | ✅ | `(kind, queue, visible_at)` 複合インデックスを offset 幅でページングし `FairPicker` を適用。追加インデックスは不要 |
+| Spanner | ❌ | 未対応。値は無視され FIFO になる。`Capabilities.FairDispatch` は false で、適合テストは明示 skip |
+
+未対応バックエンドでは値は無視され、従来どおり FIFO になる。
+未対応バックエンドに `MaxPerInstance > 0` を設定すると、ワーカー起動時に警告ログが出る。
 
 ## 高負荷ワークフローの隔離
 

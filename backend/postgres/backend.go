@@ -13,7 +13,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilities{} }
+func (b *Backend) Capabilities() backend.Capabilities {
+	return backend.Capabilities{FairDispatch: true}
+}
 
 // Reset truncates all workflow tables (test helper).
 func (b *Backend) Reset(ctx context.Context) error {
