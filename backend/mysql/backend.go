@@ -173,9 +173,15 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	if n == 0 {
 		return backend.ErrNotFound
 	}
-	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE instance_id = ?`, id)
-	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_timers WHERE instance_id = ?`, id)
-	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = ?`, id)
+	if _, err = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE instance_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, `DELETE FROM wf_timers WHERE instance_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = ?`, id); err != nil {
+		return err
+	}
 	if err := commitConn(ctx, conn); err != nil {
 		return err
 	}

@@ -157,9 +157,18 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	if tag.RowsAffected() == 0 {
 		return backend.ErrNotFound
 	}
-	_, _ = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE instance_id = $1`, id)
-	_, _ = tx.Exec(ctx, `DELETE FROM wf_timers WHERE instance_id = $1`, id)
-	_, _ = tx.Exec(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = $1`, id)
+	_, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE instance_id = $1`, id)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `DELETE FROM wf_timers WHERE instance_id = $1`, id)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = $1`, id)
+	if err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
