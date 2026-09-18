@@ -31,8 +31,9 @@ type WorkerOptions struct {
 	MaxPerInstance int
 	// DisableSchemaValidation skips the startup check against backends that
 	// implement backend.SchemaValidator. Validation is on by default: when the
-	// store is missing tables (e.g. migrations have not run), Start logs an
-	// error and does not launch the poll loop.
+	// store is missing tables (e.g. migrations have not run), StartWithError
+	// returns an error and the poll loop is not launched (Start logs the same
+	// error and leaves the worker stopped; see Worker.Running).
 	DisableSchemaValidation bool
 	// ShutdownReleaseTimeout bounds lease release during Shutdown.
 	// Unreleased leases expire via lease timeout and are reclaimed by peers.

@@ -62,15 +62,30 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 }
 
 func (w *Worker) Start(parent context.Context) {
+	if err := w.StartWithError(parent); err != nil {
+		w.opts.Logger.Error("tasuki: worker start failed", "error", err)
+	}
+}
+
+// StartWithError starts the worker's background polling loop and reports
+// startup failures to the caller.
+//
+// It returns an error when schema validation fails (see ValidateSchema and
+// WorkerOptions.DisableSchemaValidation) or when the worker is already
+// running (ErrWorkerAlreadyRunning). On error the worker is not started;
+// check Running to gate health checks or traffic.
+//
+// StartWithError starts polling asynchronously and returns immediately once
+// the loop is launched (it does not wait for tasks to complete).
+func (w *Worker) StartWithError(parent context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.cancel != nil {
-		return
+		return ErrWorkerAlreadyRunning
 	}
 	if !w.opts.DisableSchemaValidation {
 		if err := ValidateSchema(parent, w.backend); err != nil {
-			w.opts.Logger.Error("tasuki: schema validation failed; worker not started", "error", err)
-			return
+			return fmt.Errorf("tasuki: schema validation failed: %w", err)
 		}
 	}
 	ctx, cancel := context.WithCancel(parent)
@@ -80,6 +95,16 @@ func (w *Worker) Start(parent context.Context) {
 	w.stopping = false
 	w.actMu.Unlock()
 	go w.loop(ctx)
+	return nil
+}
+
+// Running reports whether the worker's background polling loop is started.
+// It returns false when Start has never succeeded, when schema validation
+// refused the start, or after Shutdown; use it for health checks.
+func (w *Worker) Running() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.cancel != nil
 }
 
 // ValidateSchema checks that the backend's store schema is ready for use.

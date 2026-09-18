@@ -382,9 +382,11 @@ type WorkerOptions struct {
 
 Schema migrations are managed per backend. The PostgreSQL backend uses versioned migration files under `backend/postgres/migrations/` (see the [PostgreSQL Migrations README](../backend/postgres/migrations/README.md)).
 
-Workers verify database schemas at startup if the backend implements `backend.SchemaValidator`. If required tables are missing, the worker logs an error and avoids starting the polling loop. This validation can be disabled using `WorkerOptions.DisableSchemaValidation`.
+Workers verify database schemas at startup if the backend implements `backend.SchemaValidator`. If required tables are missing, `StartWithError` returns an error and the polling loop is not launched (the legacy `Start` wrapper logs the same error and leaves the worker stopped). This validation can be disabled using `WorkerOptions.DisableSchemaValidation`.
 
 Applications can explicitly trigger validation using `tasuki.ValidateSchema(ctx, backend)`.
 
 - `w.Start(ctx)` starts task polling loops asynchronously and returns immediately.
+- `w.StartWithError(ctx)` is the same but reports startup failures (schema validation, double start via `ErrWorkerAlreadyRunning`) to the caller instead of only logging.
+- `w.Running()` reports whether the background polling loop is started (useful for health checks).
 - `w.Shutdown(ctx)` gracefully halts new task acquisition, waits for in-flight tasks within the context deadline, and releases task leases so peer workers can claim them without waiting for expiration.
