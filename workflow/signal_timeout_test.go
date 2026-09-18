@@ -63,6 +63,36 @@ func TestReceiveSignalWithTimeout_Canceled(t *testing.T) {
 	}
 }
 
+func TestReceiveSignalWithTimeout_SignalAfterTimerThenActivity(t *testing.T) {
+	// Regression for #280: timer recorded while waiting, then a signal arrives.
+	// Replay must consume the recorded timer before taking the signal, otherwise
+	// the next command mismatches with ErrDeterminismViolation (permanent Nack).
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	fireAt := now.Add(time.Hour)
+	tp, _ := json.Marshal(map[string]any{"fire_at": fireAt})
+	events := []journal.Event{
+		{Seq: 1, Type: journal.TypeWorkflowStarted, Name: "WF"},
+		{Seq: 2, Type: journal.TypeTimerCreated, Payload: tp},
+		{Seq: 3, Type: journal.TypeSignalReceived, Name: "go", Payload: []byte(`"hi"`)},
+	}
+	res := engine.RunAt(events, now, func(ctx *workflow.Context) (any, error) {
+		v, ok, err := workflow.ReceiveSignalWithTimeout[string](ctx, "go", time.Hour)
+		if err != nil || !ok || v != "hi" {
+			return nil, errors.New("want signal hi")
+		}
+		return workflow.Execute[string, string](ctx, "act", "x")
+	})
+	if res.Stuck {
+		t.Fatalf("determinism violation: %+v", res.Err)
+	}
+	if !res.Suspended {
+		t.Fatalf("want suspend waiting for activity, got %+v", res)
+	}
+	if len(res.NewCommands) != 1 || res.NewCommands[0].Type != journal.TypeActivityScheduled {
+		t.Fatalf("%+v", res.NewCommands)
+	}
+}
+
 func TestReceiveSignalWithTimeout_SignalAfterTimerScheduled(t *testing.T) {
 	// Replay: no signal at peek → schedule timer in history → signal present before timer fires.
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
