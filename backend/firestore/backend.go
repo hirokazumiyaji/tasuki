@@ -221,6 +221,11 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 }
 func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	now := nowUTC()
+	// Status flips inside a small transaction (one read + one update) so the
+	// write count never scales with the instance's task/timer/dedupe rows.
+	// Child documents are swept afterwards in paged batches: a single
+	// transaction deleting them would breach the 500-write limit once dedupe
+	// keys accumulate (DynamoDB parity: status update first, paged deletes).
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		s, err := tx.Get(b.ref("wf_instances", id))
 		if isNotFound(err) {
@@ -232,33 +237,17 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		if !s.Exists() {
 			return backend.ErrNotFound
 		}
-		var refs []*gcf.DocumentRef
-		for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe"} {
-			it := tx.Documents(b.col(col).Where("instance_id", "==", id))
-			for {
-				d, e := it.Next()
-				if e == iterator.Done {
-					break
-				}
-				if e != nil {
-					it.Stop()
-					return e
-				}
-				refs = append(refs, d.Ref)
-			}
-			it.Stop()
-		}
-		if err = tx.Update(b.ref("wf_instances", id), []gcf.Update{{Path: "status", Value: "terminated"}, {Path: "updated_at", Value: now}, {Path: "completed_at", Value: now}}); err != nil {
-			return err
-		}
-		for _, r := range refs {
-			if e := tx.Delete(r); e != nil {
-				return e
-			}
-		}
-		return nil
+		return tx.Update(b.ref("wf_instances", id), []gcf.Update{{Path: "status", Value: "terminated"}, {Path: "updated_at", Value: now}, {Path: "completed_at", Value: now}})
 	})
 	if err != nil {
+		return err
+	}
+	// Await the sweep before returning so SendToInbox with a previously seen
+	// DedupeID correctly inserts anew (conformance SignalDedupe) and claimed
+	// tasks observe no leftovers. Terminal instances are immutable, so the
+	// non-transactional sweep cannot race with advancement commits; purge
+	// reaps anything left by a failed sweep.
+	if err := b.sweepTerminateDocs(ctx, id); err != nil {
 		return err
 	}
 	b.notifyTerminal(id)
@@ -465,11 +454,10 @@ func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement
 }
 
 type advancementPrep struct {
-	instRef    *gcf.DocumentRef
-	taskRef    *gcf.DocumentRef
-	inst       *backend.Instance
-	hasInbox   bool
-	dedupeRefs []*gcf.DocumentRef
+	instRef  *gcf.DocumentRef
+	taskRef  *gcf.DocumentRef
+	inst     *backend.Instance
+	hasInbox bool
 }
 
 func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
@@ -520,6 +508,11 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	b.notifyTasks()
 	for _, adv := range advs {
 		if adv.Terminal != nil {
+			// Dedupe rows are deliberately cleaned outside the advancement
+			// transaction: a terminal commit with hundreds of dedupe keys
+			// would otherwise exceed the 500-write transaction limit.
+			// Best-effort (DynamoDB parity); leftovers are reaped by purge.
+			_ = b.sweepSignalDedupe(context.Background(), adv.InstanceID)
 			b.notifyTerminal(adv.InstanceID)
 		}
 	}
@@ -574,23 +567,7 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 		}
 	}
 	inboxIter.Stop()
-	var dedupeRefs []*gcf.DocumentRef
-	if adv.Terminal != nil {
-		dIter := tx.Documents(b.col("wf_signal_dedupe").Where("instance_id", "==", adv.InstanceID))
-		for {
-			d, nextErr := dIter.Next()
-			if nextErr == iterator.Done {
-				break
-			}
-			if nextErr != nil {
-				dIter.Stop()
-				return advancementPrep{}, nextErr
-			}
-			dedupeRefs = append(dedupeRefs, d.Ref)
-		}
-		dIter.Stop()
-	}
-	return advancementPrep{instRef: instSnap.Ref, taskRef: taskRef, inst: inst, hasInbox: hasInbox, dedupeRefs: dedupeRefs}, nil
+	return advancementPrep{instRef: instSnap.Ref, taskRef: taskRef, inst: inst, hasInbox: hasInbox}, nil
 }
 
 func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancement, prep advancementPrep, now time.Time, alloc *inboxSeqAlloc) error {
@@ -619,13 +596,6 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 	}
 	if err := tx.Update(prep.instRef, updates); err != nil {
 		return err
-	}
-	if adv.Terminal != nil {
-		for _, ref := range prep.dedupeRefs {
-			if err := tx.Delete(ref); err != nil {
-				return err
-			}
-		}
 	}
 	for _, e := range adv.NewEvents {
 		if err := tx.Create(b.ref("wf_journal", journalID(adv.InstanceID, e.Seq)), journalDoc(adv.InstanceID, e.Seq, e, now)); err != nil {

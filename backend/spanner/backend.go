@@ -229,6 +229,9 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 
 func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	now := nowUTC()
+	// Status flips in one small transaction so the mutation count never scales
+	// with the instance's task/timer/dedupe rows (DynamoDB parity). Child rows
+	// are swept afterwards in paged transactions.
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"id"})
 		if err != nil {
@@ -238,63 +241,23 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 			return err
 		}
 		_ = row
-		var muts []*spanner.Mutation
-		muts = append(muts, spanner.UpdateMap("wf_instances", map[string]any{
-			"id":           id,
-			"status":       "terminated",
-			"updated_at":   now,
-			"completed_at": now,
-		}))
-		tIter := txn.Query(ctx, spanner.Statement{
-			SQL:    `SELECT id FROM wf_tasks WHERE instance_id = @id`,
-			Params: map[string]any{"id": id},
+		return txn.BufferWrite([]*spanner.Mutation{
+			spanner.UpdateMap("wf_instances", map[string]any{
+				"id":           id,
+				"status":       "terminated",
+				"updated_at":   now,
+				"completed_at": now,
+			}),
 		})
-		for {
-			r, err := tIter.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				tIter.Stop()
-				return err
-			}
-			var tid int64
-			if err := r.Columns(&tid); err != nil {
-				tIter.Stop()
-				return err
-			}
-			muts = append(muts, spanner.Delete("wf_tasks", spanner.Key{tid}))
-		}
-		tIter.Stop()
-		tmIter := txn.Query(ctx, spanner.Statement{
-			SQL:    `SELECT seq FROM wf_timers WHERE instance_id = @id`,
-			Params: map[string]any{"id": id},
-		})
-		for {
-			r, err := tmIter.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				tmIter.Stop()
-				return err
-			}
-			var seq int64
-			if err := r.Columns(&seq); err != nil {
-				tmIter.Stop()
-				return err
-			}
-			muts = append(muts, spanner.Delete("wf_timers", spanner.Key{id, seq}))
-		}
-		tmIter.Stop()
-		dMuts, err := deleteSignalDedupe(ctx, txn, id)
-		if err != nil {
-			return err
-		}
-		muts = append(muts, dMuts...)
-		return txn.BufferWrite(muts)
 	})
 	if err != nil {
+		return err
+	}
+	// Await the sweep before returning so previously seen DedupeIDs insert
+	// anew and claimed tasks observe no leftovers. Terminal instances are
+	// immutable, so the paged sweep cannot race with advancement commits;
+	// purge reaps anything left by a failed sweep.
+	if err := b.sweepTerminateDocs(ctx, id); err != nil {
 		return err
 	}
 	b.notifyTerminal(id)
@@ -603,6 +566,10 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	b.notifyTasks()
 	for _, adv := range advs {
 		if adv.Terminal != nil {
+			// Dedupe cleanup stays out of the advancement transaction so the
+			// mutation count never scales with accumulated dedupe keys.
+			// Best-effort (DynamoDB/Firestore parity); purge reaps leftovers.
+			_ = b.sweepSignalDedupe(context.Background(), adv.InstanceID)
 			b.notifyTerminal(adv.InstanceID)
 		}
 	}
@@ -737,11 +704,8 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 			"completed_at": now,
 		}
 		muts = append(muts, spanner.UpdateMap("wf_instances", m))
-		dMuts, err := deleteSignalDedupe(ctx, txn, adv.InstanceID)
-		if err != nil {
-			return err
-		}
-		muts = append(muts, dMuts...)
+		// Dedupe keys are swept after commit (see CommitAdvancements): buffering
+		// one mutation per accumulated key would blow the commit mutation limit.
 	}
 	for _, inboxID := range adv.DrainedInbox {
 		muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{inboxID}))
@@ -1139,28 +1103,4 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	}
 	b.notifyTasks()
 	return nil
-}
-
-func deleteSignalDedupe(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string) ([]*spanner.Mutation, error) {
-	iter := txn.Query(ctx, spanner.Statement{
-		SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id`,
-		Params: map[string]any{"id": instanceID},
-	})
-	defer iter.Stop()
-	var muts []*spanner.Mutation
-	for {
-		r, err := iter.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		var dedupeID string
-		if err := r.Columns(&dedupeID); err != nil {
-			return nil, err
-		}
-		muts = append(muts, spanner.Delete("wf_signal_dedupe", spanner.Key{instanceID, dedupeID}))
-	}
-	return muts, nil
 }

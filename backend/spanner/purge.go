@@ -9,8 +9,11 @@ import (
 	"google.golang.org/api/iterator"
 )
 
-// PurgeInstances deletes terminal instances and their dependent rows inside a
-// read-write transaction.
+// PurgeInstances deletes terminal instances and their dependent rows in
+// per-instance paged transactions. A single transaction deleting every victim
+// (or one instance's full journal/inbox) would buffer one mutation per row and
+// breach the commit mutation limit, so each table is swept in
+// spannerSweepBatchSize-key pages and the instance row goes last.
 func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, statuses []string, limit int) (int, error) {
 	sts, lim, err := backend.ValidatePurgeArgs(olderThan, statuses, limit)
 	if err != nil {
@@ -18,49 +21,73 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 	}
 	cutoff := nowUTC().Add(-olderThan)
 	var ids []string
-	err = b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		ids = ids[:0]
-		iter := txn.Query(ctx, spanner.Statement{
-			SQL: `SELECT id FROM wf_instances
+	iter := b.client.Single().Query(ctx, spanner.Statement{
+		SQL: `SELECT id FROM wf_instances
 			      WHERE status IN UNNEST(@sts)
 			        AND completed_at IS NOT NULL AND completed_at <= @cutoff
 			      ORDER BY completed_at, id LIMIT @limit`,
-			Params: map[string]any{"sts": sts, "cutoff": cutoff, "limit": int64(lim)},
-		})
-		defer iter.Stop()
-		for {
-			row, err := iter.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				return err
-			}
-			var id string
-			if err := row.Column(0, &id); err != nil {
-				return err
-			}
-			ids = append(ids, id)
+		Params: map[string]any{"sts": sts, "cutoff": cutoff, "limit": int64(lim)},
+	})
+	for {
+		row, err := iter.Next()
+		if err == iterator.Done {
+			break
 		}
-		if len(ids) == 0 {
-			return nil
+		if err != nil {
+			iter.Stop()
+			return 0, err
 		}
-		for _, table := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox", "wf_journal", "wf_inbox_seq"} {
-			if _, err := txn.Update(ctx, spanner.Statement{
-				SQL:    `DELETE FROM ` + table + ` WHERE instance_id IN UNNEST(@ids)`,
-				Params: map[string]any{"ids": ids},
-			}); err != nil {
-				return err
-			}
+		var id string
+		if err := row.Column(0, &id); err != nil {
+			iter.Stop()
+			return 0, err
 		}
-		_, err := txn.Update(ctx, spanner.Statement{
-			SQL:    `DELETE FROM wf_instances WHERE id IN UNNEST(@ids)`,
-			Params: map[string]any{"ids": ids},
-		})
+		ids = append(ids, id)
+	}
+	iter.Stop()
+	purged := 0
+	for _, id := range ids {
+		if err := b.purgeOneInstance(ctx, id); err != nil {
+			return purged, err
+		}
+		purged++
+	}
+	return purged, nil
+}
+
+// purgeOneInstance removes every row of one terminal instance. Child tables go
+// first in paged sweeps, then the instance (plus its inbox-seq counter) row,
+// then a second child sweep reaps writers that committed between the first
+// sweep and the instance delete (they read wf_instances inside their own
+// transaction, so post-delete writers abort into ErrNotFound instead).
+func (b *Backend) purgeOneInstance(ctx context.Context, id string) error {
+	if err := b.deleteInstanceChildren(ctx, id); err != nil {
 		return err
+	}
+	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return txn.BufferWrite([]*spanner.Mutation{
+			spanner.Delete("wf_inbox_seq", spanner.Key{id}),
+			spanner.Delete("wf_instances", spanner.Key{id}),
+		})
 	})
 	if err != nil {
-		return 0, err
+		return err
 	}
-	return len(ids), nil
+	return b.deleteInstanceChildren(ctx, id)
+}
+
+func (b *Backend) deleteInstanceChildren(ctx context.Context, id string) error {
+	if err := b.deleteTasksForInstance(ctx, id); err != nil {
+		return err
+	}
+	if err := b.deleteTimersForInstance(ctx, id); err != nil {
+		return err
+	}
+	if err := b.sweepSignalDedupe(ctx, id); err != nil {
+		return err
+	}
+	if err := b.deleteInboxForInstance(ctx, id); err != nil {
+		return err
+	}
+	return b.deleteJournalForInstance(ctx, id)
 }

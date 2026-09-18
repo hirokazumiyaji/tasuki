@@ -767,6 +767,11 @@ func (w *Worker) attachEffects(adv *backend.Advancement, queue string, cmds []jo
 // inbox deletes + 3 per child + parent inbox + 1 task delete.
 // It mirrors backend/dynamodb buildAdvancementItems counting so workers can
 // stay within backend.Capabilities.MaxAdvancementEffects atomically.
+//
+// Signal-dedupe cleanup is deliberately excluded: Firestore/Spanner/DynamoDB
+// sweep wf_signal_dedupe outside the committing transaction in paged
+// post-commit batches (purge reaps leftovers), so terminal commits never scale
+// with accumulated dedupe rows. See docs/09-limits.md.
 func advancementOps(adv *backend.Advancement) int {
 	n := 2 + len(adv.NewEvents) + len(adv.ActivityTasks) + len(adv.Timers) + len(adv.DrainedInbox) + 3*len(adv.Children)
 	if adv.ParentNotify != nil {
