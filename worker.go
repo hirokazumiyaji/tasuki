@@ -149,16 +149,21 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 	cancel := w.cancel
 	done := w.done
 	w.cancel = nil
+	w.done = nil
 	w.mu.Unlock()
-	if cancel == nil {
+	if cancel == nil && done == nil {
 		return nil
 	}
-	cancel()
+	if cancel != nil {
+		cancel()
+	}
 	var waitErr error
-	select {
-	case <-done:
-	case <-ctx.Done():
-		waitErr = ctx.Err()
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			waitErr = ctx.Err()
+		}
 	}
 	// Mark stopping so no new detached activities start, then wait for
 	// in-flight activities within the remaining grace period. Only
