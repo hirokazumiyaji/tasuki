@@ -47,9 +47,11 @@ func TestChaos_KillWorkers_MySQL(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	workerDir := filepath.Join(filepath.Dir(thisFile), "cmd", "worker")
 	bin := filepath.Join(t.TempDir(), "chaos-worker-mysql")
-	build := exec.Command("go", "build", "-tags", "tasuki_all", "-o", bin, ".")
+	build := exec.Command("go", "build", "-race", "-tags", "tasuki_all", "-o", bin, ".")
 	build.Dir = workerDir
-	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	// Race-instrument the spawned workers too: -race on the test binary
+	// only covers the test process, while workflow execution happens here.
+	build.Env = append(os.Environ(), "CGO_ENABLED=1")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build worker: %v\n%s", err, out)
 	}
