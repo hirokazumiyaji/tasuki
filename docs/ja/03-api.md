@@ -455,7 +455,7 @@ type WorkerOptions struct {
 ```
 
 `MaxPerInstance` が効くのは fair dispatch 対応バックエンド（PostgreSQL、MySQL、SQLite、インメモリ）のみである。
-DynamoDB、Firestore、Spanner は無視して FIFO 順に claim する（[08-fair-dispatch.md](../08-fair-dispatch.md)）。
+DynamoDB、Firestore、Spanner は無視して FIFO 順に claim する（[08-fair-dispatch.md](08-fair-dispatch.md)）。
 
 決定性違反や未登録のワークフロー／アクティビティは terminal にせず Nack する（上記 Delay）。
 メトリクス `tasuki.worker.incompatible_nacks`。

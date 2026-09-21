@@ -171,6 +171,23 @@ func AsDeterminismPanic(r any) (error, bool) {
 // Sleep schedules a durable timer. If the timer has not fired in the journal, the
 // workflow goroutine suspends via runtime.Goexit.
 func Sleep(ctx *Context, d time.Duration) error {
+	return sleepAt(ctx, ctx.now.Add(d))
+}
+
+// SleepUntil schedules a durable timer that fires at the given absolute time.
+// The deadline is recorded verbatim in the journal and never passes through
+// time.Duration, so deadlines beyond the ~290-year duration range are preserved
+// instead of saturating via time.Time.Sub. A Now checkpoint is still recorded
+// first to anchor determinism and keep the journal shape
+// (now_recorded + timer_created) compatible with existing histories.
+// A deadline at or before Now records an already-due timer that fires on the
+// next tick.
+func SleepUntil(ctx *Context, t time.Time) error {
+	_ = Now(ctx)
+	return sleepAt(ctx, t)
+}
+
+func sleepAt(ctx *Context, fireAt time.Time) error {
 	// Replay an already-recorded timer before applying cancel, so command matching stays aligned.
 	if rec, ok := ctx.peekCommand(); ok && rec.Type == journal.TypeTimerCreated {
 		ev := ctx.recordOrReplay(journal.Command{Type: journal.TypeTimerCreated}, rec.Payload)
@@ -186,7 +203,7 @@ func Sleep(ctx *Context, d time.Duration) error {
 	if ctx.canceled {
 		return ErrCanceled
 	}
-	payload, err := json.Marshal(timerPayload{FireAt: ctx.now.Add(d)})
+	payload, err := json.Marshal(timerPayload{FireAt: fireAt})
 	if err != nil {
 		return err
 	}
@@ -196,15 +213,6 @@ func Sleep(ctx *Context, d time.Duration) error {
 		return nil // unreachable after Goexit
 	}
 	return nil
-}
-
-// SleepUntil schedules a durable timer that fires at the given absolute time.
-// It is a thin wrapper over Now and Sleep: the wait duration is derived as
-// t.Sub(Now(ctx)), so the deadline is recorded deterministically in the journal
-// and replays resolve identically. A deadline at or before Now records an
-// already-due timer that fires on the next tick.
-func SleepUntil(ctx *Context, t time.Time) error {
-	return Sleep(ctx, t.Sub(Now(ctx)))
 }
 
 type timerPayload struct {
