@@ -51,6 +51,7 @@ jobs:
       - name: Run govulncheck (root module)
         run: govulncheck ./...
       - name: Run govulncheck (backend modules)
+        if: always()
         run: |
           for m in backend/sqlite backend/postgres backend/mysql backend/spanner backend/dynamodb backend/firestore; do
             (cd "$m" && govulncheck ./...)
@@ -365,7 +366,7 @@ jobs:
         with:
           go-version: "1.24.x"
       - name: Chaos sqlite
-        run: go test ./chaos/ -run TestChaos_KillWorkers_SQLite -race -count=1 -timeout 5m
+        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_SQLite -race -count=1 -timeout 5m
 
   cover:
     runs-on: ubuntu-latest
