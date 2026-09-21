@@ -106,9 +106,10 @@ Flags non-deterministic calls inside workflow functions (`*workflow.Context` rec
 `os.Getenv/LookupEnv/Environ/Hostname/Getpid/Getppid/Getwd/Executable` and `os.Args`
 (pass values via inputs or activities); `sync`, `sync/atomic`, `runtime`;
 `net`, `net/http`, `os/exec` (do I/O in activities); channel operations (`select`,
-send/receive, `make(chan ...)`, use `workflow.Execute`/`ExecuteAsync` and `workflow.Await`)
+send/receive, `make(chan ...)`, `range` over channels, use `workflow.Execute`/`ExecuteAsync` and `workflow.Await`)
 and `range` over maps (iteration order is random). Closures passed to
-`workflow.SideEffect`/`NewUUID`/`SetQueryHandler`/`SetUpdateHandler` are excluded.
+`workflow.SideEffect`/`NewUUID`/`SetQueryHandler` are excluded (update handlers
+registered with `workflow.SetUpdateHandler` are scanned).
 Helpers called from workflows are not analyzed; keep them deterministic.
 
 ## Web UI (contrib)

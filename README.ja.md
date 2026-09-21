@@ -105,9 +105,9 @@ go run ./analyzers/determinism/cmd/determinism -- ./...
 `os.Getenv/LookupEnv/Environ/Hostname/Getpid/Getppid/Getwd/Executable` と `os.Args`
 （入力やアクティビティ経由で渡す）、`sync`・`sync/atomic`・`runtime`、
 `net`・`net/http`・`os/exec`（I/O はアクティビティで行う）、チャネル操作（`select`・
-送受信・`make(chan ...)` は `workflow.Execute`/`ExecuteAsync` と `workflow.Await` を使用）
+送受信・`make(chan ...)`・チャネルに対する `range` は `workflow.Execute`/`ExecuteAsync` と `workflow.Await` を使用）
 および map に対する `range`（順序がランダム）。`workflow.SideEffect`/`NewUUID`/
-`SetQueryHandler`/`SetUpdateHandler` に渡すクロージャは除外される。
+`SetQueryHandler` に渡すクロージャは除外される（`SetUpdateHandler` のハンドラは解析対象）。
 ワークフローから呼ばれるヘルパー関数は解析しないため、決定的に保つこと。
 
 ## 閲覧 UI（contrib）

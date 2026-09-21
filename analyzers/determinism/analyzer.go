@@ -23,7 +23,7 @@ Detected (inside workflow functions):
 - sync, sync/atomic, runtime package usage
 - net, net/http, os/exec package usage (do I/O in activities)
 - channel operations: select statements, channel send (ch <- v) and receive (<-ch),
-  make(chan ...) (use workflow.Execute/ExecuteAsync and workflow.Await)
+  make(chan ...) and ranging over a channel (use workflow.Execute/ExecuteAsync and workflow.Await)
 - ranging over a map (iteration order is random; collect and sort keys, or range over slices)
 
 Closures passed directly to workflow.SideEffect and workflow.SetQueryHandler are
@@ -149,10 +149,15 @@ func collectSelectorIdents(body *ast.BlockStmt) map[*ast.Ident]bool {
 	return out
 }
 
-// collectExcludedFuncLits returns FuncLit nodes passed as arguments to
+// collectExcludedFuncLits returns FuncLit nodes passed directly as arguments to
 // workflow.SideEffect/NewUUID/SetQueryHandler calls. The callee must resolve
 // to workflowPkgPath; same-named functions from other packages are not exempt.
 // Detection is by function name so aliased imports work.
+//
+// Only a FuncLit that is itself the callback argument is exempt. Nested
+// FuncLits under the argument are NOT exempt: a factory IIFE such as
+// func() func() string { ... }() executes immediately (before SideEffect or
+// SetQueryHandler runs) and must still be scanned.
 func collectExcludedFuncLits(pass *analysis.Pass, body *ast.BlockStmt) map[*ast.FuncLit]bool {
 	excluded := map[*ast.FuncLit]bool{}
 	ast.Inspect(body, func(n ast.Node) bool {
@@ -164,16 +169,25 @@ func collectExcludedFuncLits(pass *analysis.Pass, body *ast.BlockStmt) map[*ast.
 			return true
 		}
 		for _, arg := range call.Args {
-			ast.Inspect(arg, func(n ast.Node) bool {
-				if lit, ok := n.(*ast.FuncLit); ok {
-					excluded[lit] = true
-				}
-				return true
-			})
+			if lit, ok := unwrapParen(arg).(*ast.FuncLit); ok {
+				excluded[lit] = true
+			}
 		}
 		return true
 	})
 	return excluded
+}
+
+// unwrapParen strips parenthesized expressions so ((func() {...}))
+// is still recognized as a directly-passed callback.
+func unwrapParen(e ast.Expr) ast.Expr {
+	for {
+		p, ok := e.(*ast.ParenExpr)
+		if !ok {
+			return e
+		}
+		e = p.X
+	}
 }
 
 func isWorkflowFunc(pass *analysis.Pass, fn *ast.FuncDecl) bool {
@@ -302,8 +316,11 @@ func checkMapRange(pass *analysis.Pass, x *ast.RangeStmt) {
 	if !ok || tv.Type == nil {
 		return
 	}
-	if _, ok := tv.Type.Underlying().(*types.Map); ok {
+	switch tv.Type.Underlying().(type) {
+	case *types.Map:
 		pass.Reportf(x.Pos(), "ranging over a map is not allowed in workflow code; iteration order is random")
+	case *types.Chan:
+		pass.Reportf(x.Pos(), "ranging over a channel is not allowed in workflow code; use workflow.Execute/ExecuteAsync and workflow.Await")
 	}
 }
 

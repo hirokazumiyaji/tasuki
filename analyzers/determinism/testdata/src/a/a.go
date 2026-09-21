@@ -103,6 +103,13 @@ func BadMapRange(ctx *workflow.Context, _ struct{}) error {
 	return nil
 }
 
+func BadChanRange(ctx *workflow.Context, ch chan int) error {
+	for v := range ch { // want `ranging over a channel is not allowed`
+		_ = v
+	}
+	return nil
+}
+
 func OkSliceRange(ctx *workflow.Context, _ struct{}) error {
 	for _, v := range []int{1, 2} {
 		_ = v
@@ -204,6 +211,24 @@ func BadUpdateHandler(ctx *workflow.Context, _ struct{}) error {
 		_ = time.Now() // want `time.Now is not allowed`
 		return v, nil
 	})
+	return nil
+}
+
+// Factory IIFEs execute immediately to produce the callback, so their bodies
+// must still be scanned: only the FuncLit passed directly is exempt.
+func BadSideEffectFactory(ctx *workflow.Context, _ struct{}) error {
+	_, _ = workflow.SideEffect(ctx, func() func() string {
+		_ = time.Now() // want `time.Now is not allowed`
+		return func() string { return "ok" }
+	}())
+	return nil
+}
+
+func BadQueryHandlerFactory(ctx *workflow.Context, _ struct{}) error {
+	workflow.SetQueryHandler(ctx, "q", func() func(int) (int, error) {
+		_ = time.Now() // want `time.Now is not allowed`
+		return func(v int) (int, error) { return v, nil }
+	}())
 	return nil
 }
 
