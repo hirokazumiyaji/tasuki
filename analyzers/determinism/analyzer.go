@@ -26,9 +26,11 @@ Detected (inside workflow functions):
   make(chan ...) (use workflow.Execute/ExecuteAsync and workflow.Await)
 - ranging over a map (iteration order is random; collect and sort keys, or range over slices)
 
-Closures passed directly to workflow.SideEffect, workflow.NewUUID (no closure),
-workflow.SetQueryHandler, and workflow.SetUpdateHandler are excluded: they are the
-official escape hatches (or read-only handlers) and may contain non-deterministic calls.
+Closures passed directly to workflow.SideEffect and workflow.SetQueryHandler are
+excluded: they are the official escape hatch (or read-only handler) and may contain
+non-deterministic calls. workflow.NewUUID takes no closure argument. Update handlers
+(workflow.SetUpdateHandler) are NOT excluded: they are mutating, re-registered on
+every replay, and may execute workflow operations.
 
 Not detected (limitations):
 - helpers called from a workflow that internally use the above (no interprocedural analysis)
@@ -42,14 +44,19 @@ var Analyzer = &analysis.Analyzer{
 	Run:      run,
 }
 
+// workflowPkgPath is the canonical import path of the workflow package. Only
+// calls resolving to this package qualify for closure exemptions.
+const workflowPkgPath = "github.com/hirokazumiyaji/tasuki/workflow"
+
 // sideEffectHandlers are workflow APIs whose FuncLit arguments are escape
-// hatches (or handlers) and must not be scanned. Matched by selector name so
+// hatches (or handlers) and must not be scanned. The caller must additionally
+// verify the callee resolves to workflowPkgPath so that local or third-party
+// same-named functions do not evade the analyzer. Matched by selector name so
 // aliased and dot imports are also honored.
 var sideEffectHandlers = map[string]bool{
-	"SideEffect":       true,
-	"NewUUID":          true,
-	"SetQueryHandler":  true,
-	"SetUpdateHandler": true,
+	"SideEffect":      true,
+	"NewUUID":         true,
+	"SetQueryHandler": true,
 }
 
 var timeNonDeterministic = map[string]bool{
@@ -143,8 +150,9 @@ func collectSelectorIdents(body *ast.BlockStmt) map[*ast.Ident]bool {
 }
 
 // collectExcludedFuncLits returns FuncLit nodes passed as arguments to
-// workflow.SideEffect/NewUUID/SetQueryHandler/SetUpdateHandler calls.
-// Detection is by selector (or dot-imported) function name so aliased imports work.
+// workflow.SideEffect/NewUUID/SetQueryHandler calls. The callee must resolve
+// to workflowPkgPath; same-named functions from other packages are not exempt.
+// Detection is by function name so aliased imports work.
 func collectExcludedFuncLits(pass *analysis.Pass, body *ast.BlockStmt) map[*ast.FuncLit]bool {
 	excluded := map[*ast.FuncLit]bool{}
 	ast.Inspect(body, func(n ast.Node) bool {
@@ -152,7 +160,7 @@ func collectExcludedFuncLits(pass *analysis.Pass, body *ast.BlockStmt) map[*ast.
 		if !ok {
 			return true
 		}
-		if _, name := resolveCallee(pass, call); !sideEffectHandlers[name] {
+		if pkgPath, name := resolveCallee(pass, call); pkgPath != workflowPkgPath || !sideEffectHandlers[name] {
 			return true
 		}
 		for _, arg := range call.Args {
@@ -201,7 +209,7 @@ func isWorkflowContextType(pass *analysis.Pass, expr ast.Expr) bool {
 	if obj == nil || obj.Pkg() == nil {
 		return false
 	}
-	return obj.Pkg().Path() == "github.com/hirokazumiyaji/tasuki/workflow" && obj.Name() == "Context"
+	return obj.Pkg().Path() == workflowPkgPath && obj.Name() == "Context"
 }
 
 // resolveCallee maps a call to its defining package path and function name,

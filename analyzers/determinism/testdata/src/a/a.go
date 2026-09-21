@@ -199,9 +199,9 @@ func OkQueryHandler(ctx *workflow.Context, _ struct{}) error {
 	return nil
 }
 
-func OkUpdateHandler(ctx *workflow.Context, _ struct{}) error {
+func BadUpdateHandler(ctx *workflow.Context, _ struct{}) error {
 	workflow.SetUpdateHandler(ctx, "u", func(_ *workflow.Context, v int) (int, error) {
-		_ = time.Now()
+		_ = time.Now() // want `time.Now is not allowed`
 		return v, nil
 	})
 	return nil

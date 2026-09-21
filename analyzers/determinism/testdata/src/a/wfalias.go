@@ -21,9 +21,9 @@ func OkAliasQueryHandler(ctx *wf.Context, _ struct{}) error {
 	return nil
 }
 
-func OkAliasUpdateHandler(ctx *wf.Context, _ struct{}) error {
+func BadAliasUpdateHandler(ctx *wf.Context, _ struct{}) error {
 	wf.SetUpdateHandler(ctx, "u", func(_ *wf.Context, v int) (int, error) {
-		_ = time.Now()
+		_ = time.Now() // want `time.Now is not allowed`
 		return v, nil
 	})
 	return nil
