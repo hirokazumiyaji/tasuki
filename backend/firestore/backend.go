@@ -465,16 +465,10 @@ func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement
 }
 
 type advancementPrep struct {
-	instRef    *gcf.DocumentRef
-	taskRef    *gcf.DocumentRef
-	inst       *backend.Instance
-	hasInbox   bool
-	dedupeRefs []*gcf.DocumentRef
-	// terminalRefs holds pre-existing docs removed when the advancement
-	// completes the instance (activities, timers, inbox).
-	terminalTaskRefs  []*gcf.DocumentRef
-	terminalTimerRefs []*gcf.DocumentRef
-	terminalInboxRefs []*gcf.DocumentRef
+	instRef  *gcf.DocumentRef
+	taskRef  *gcf.DocumentRef
+	inst     *backend.Instance
+	hasInbox bool
 }
 
 func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
@@ -502,6 +496,20 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	})
 	if err != nil {
 		return err
+	}
+	// Terminal sweeps run before any wake hint and before terminal success
+	// is reported: accumulated rows are unbounded (the 400-effect budget
+	// only caps new effects per turn), so they are removed in paginated
+	// batches below instead of inside the 500-operation transaction. A
+	// persistent failure is surfaced rather than leaving claimable rows
+	// behind. The sweep uses a detached context so parent cancellation
+	// cannot strand survivors.
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			if err := b.cleanupTerminalDocs(context.Background(), adv.InstanceID); err != nil {
+				return err
+			}
+		}
 	}
 	for _, adv := range advs {
 		if adv.ParentNotify != nil {
@@ -563,74 +571,30 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 	for _, id := range adv.DrainedInbox {
 		drained[id] = struct{}{}
 	}
+	// hasInbox only matters for non-terminal turns (terminal turns always
+	// delete the owned workflow task). Terminal turns skip the inbox scan
+	// here entirely: accumulated rows are swept post-commit in paginated
+	// batches (cleanupTerminalDocs) so the transaction stays bounded no
+	// matter how many rows prior turns left behind.
 	hasInbox := false
-	var terminalInboxRefs []*gcf.DocumentRef
-	inboxIter := tx.Documents(b.col("wf_inbox").Where("instance_id", "==", adv.InstanceID))
-	for {
-		inbox, nextErr := inboxIter.Next()
-		if nextErr == iterator.Done {
-			break
+	if adv.Terminal == nil {
+		inboxIter := tx.Documents(b.col("wf_inbox").Where("instance_id", "==", adv.InstanceID))
+		for {
+			inbox, nextErr := inboxIter.Next()
+			if nextErr == iterator.Done {
+				break
+			}
+			if nextErr != nil {
+				inboxIter.Stop()
+				return advancementPrep{}, nextErr
+			}
+			if _, ok := drained[i64(inbox.Data(), "id")]; !ok {
+				hasInbox = true
+			}
 		}
-		if nextErr != nil {
-			inboxIter.Stop()
-			return advancementPrep{}, nextErr
-		}
-		if _, ok := drained[i64(inbox.Data(), "id")]; !ok {
-			hasInbox = true
-		}
-		if adv.Terminal != nil {
-			terminalInboxRefs = append(terminalInboxRefs, inbox.Ref)
-		}
+		inboxIter.Stop()
 	}
-	inboxIter.Stop()
-	var dedupeRefs []*gcf.DocumentRef
-	var terminalTaskRefs []*gcf.DocumentRef
-	var terminalTimerRefs []*gcf.DocumentRef
-	if adv.Terminal != nil {
-		dIter := tx.Documents(b.col("wf_signal_dedupe").Where("instance_id", "==", adv.InstanceID))
-		for {
-			d, nextErr := dIter.Next()
-			if nextErr == iterator.Done {
-				break
-			}
-			if nextErr != nil {
-				dIter.Stop()
-				return advancementPrep{}, nextErr
-			}
-			dedupeRefs = append(dedupeRefs, d.Ref)
-		}
-		dIter.Stop()
-		tIter := tx.Documents(b.col("wf_tasks").Where("instance_id", "==", adv.InstanceID))
-		for {
-			d, nextErr := tIter.Next()
-			if nextErr == iterator.Done {
-				break
-			}
-			if nextErr != nil {
-				tIter.Stop()
-				return advancementPrep{}, nextErr
-			}
-			if d.Ref.ID == taskRef.ID {
-				continue
-			}
-			terminalTaskRefs = append(terminalTaskRefs, d.Ref)
-		}
-		tIter.Stop()
-		tmIter := tx.Documents(b.col("wf_timers").Where("instance_id", "==", adv.InstanceID))
-		for {
-			d, nextErr := tmIter.Next()
-			if nextErr == iterator.Done {
-				break
-			}
-			if nextErr != nil {
-				tmIter.Stop()
-				return advancementPrep{}, nextErr
-			}
-			terminalTimerRefs = append(terminalTimerRefs, d.Ref)
-		}
-		tmIter.Stop()
-	}
-	return advancementPrep{instRef: instSnap.Ref, taskRef: taskRef, inst: inst, hasInbox: hasInbox, dedupeRefs: dedupeRefs, terminalTaskRefs: terminalTaskRefs, terminalTimerRefs: terminalTimerRefs, terminalInboxRefs: terminalInboxRefs}, nil
+	return advancementPrep{instRef: instSnap.Ref, taskRef: taskRef, inst: inst, hasInbox: hasInbox}, nil
 }
 
 func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancement, prep advancementPrep, now time.Time, alloc *inboxSeqAlloc) error {
@@ -659,28 +623,6 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 	}
 	if err := tx.Update(prep.instRef, updates); err != nil {
 		return err
-	}
-	if adv.Terminal != nil {
-		for _, ref := range prep.dedupeRefs {
-			if err := tx.Delete(ref); err != nil {
-				return err
-			}
-		}
-		for _, ref := range prep.terminalTaskRefs {
-			if err := tx.Delete(ref); err != nil {
-				return err
-			}
-		}
-		for _, ref := range prep.terminalTimerRefs {
-			if err := tx.Delete(ref); err != nil {
-				return err
-			}
-		}
-		for _, ref := range prep.terminalInboxRefs {
-			if err := tx.Delete(ref); err != nil {
-				return err
-			}
-		}
 	}
 	for _, e := range adv.NewEvents {
 		if err := tx.Create(b.ref("wf_journal", journalID(adv.InstanceID, e.Seq)), journalDoc(adv.InstanceID, e.Seq, e, now)); err != nil {
@@ -744,6 +686,61 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 		return tx.Set(prep.taskRef, workflowTaskDoc(adv.InstanceID, inst.Queue, newID(), now))
 	}
 	return tx.Delete(prep.taskRef)
+}
+
+// terminalCleanupBatchSize bounds post-commit terminal sweeps below
+// Firestore's 500-write transaction/batch limit.
+const terminalCleanupBatchSize = 400
+
+// cleanupTerminalDocs removes an instance's residual tasks, timers, inbox
+// entries and signal dedupe rows after a terminal advancement commits.
+// Accumulated rows are unbounded (the 400-effect advancement budget only
+// caps newly generated effects per turn), so deleting them inside the
+// advancement transaction can exceed Firestore's 500-operation limit and
+// leave the terminal transition permanently uncommittable. They are swept
+// here instead, paginated across batches; the owned workflow task was
+// already deleted atomically in the transaction.
+func (b *Backend) cleanupTerminalDocs(ctx context.Context, id string) error {
+	for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox"} {
+		if err := b.deleteTerminalColDocs(ctx, col, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *Backend) deleteTerminalColDocs(ctx context.Context, col, id string) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		it := b.col(col).Where("instance_id", "==", id).Limit(terminalCleanupBatchSize).Documents(ctx)
+		var refs []*gcf.DocumentRef
+		for {
+			d, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				it.Stop()
+				return err
+			}
+			refs = append(refs, d.Ref)
+		}
+		it.Stop()
+		if len(refs) == 0 {
+			return nil
+		}
+		batch := b.client.Batch()
+		for _, r := range refs {
+			batch.Delete(r)
+		}
+		if _, err := batch.Commit(ctx); err != nil {
+			return err
+		}
+	}
 }
 
 func (b *Backend) ensureWorkflowTask(ctx context.Context, instanceID string) error {

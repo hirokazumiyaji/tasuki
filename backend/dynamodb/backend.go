@@ -482,8 +482,7 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		if err := b.commitAdvancementOnce(ctx, advs[0]); err != nil {
 			return err
 		}
-		b.notifyAfterAdvancements(advs)
-		return nil
+		return b.notifyAfterAdvancements(advs)
 	}
 	var all []types.TransactWriteItem
 	var ensures []string
@@ -503,8 +502,7 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 					return err
 				}
 			}
-			b.notifyAfterAdvancements(advs)
-			return nil
+			return b.notifyAfterAdvancements(advs)
 		}
 		all = append(all, items...)
 		ensures = append(ensures, adv.InstanceID)
@@ -540,22 +538,67 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			return err
 		}
 	}
-	b.notifyAfterAdvancements(advs)
-	return nil
+	return b.notifyAfterAdvancements(advs)
 }
 
-func (b *Backend) notifyAfterAdvancements(advs []backend.Advancement) {
+func (b *Backend) notifyAfterAdvancements(advs []backend.Advancement) error {
+	// Terminal rows (tasks, timers, inbox, dedupe) cannot ride inside the
+	// 100-item advancement transaction, so they are removed post-commit.
+	// Cleanup runs before any wake hint: a surviving activity task stays
+	// claimable (claims don't filter instance status) and would execute
+	// user code after completion. Transient throttling is retried, and a
+	// persistent failure is surfaced instead of reporting terminal success
+	// with rows left behind.
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			if err := b.cleanupTerminalInstance(context.Background(), adv.InstanceID); err != nil {
+				return err
+			}
+		}
+	}
 	b.notifyTasks()
 	for _, adv := range advs {
 		if adv.Terminal != nil {
-			ctx := context.Background()
-			_ = b.deleteSignalDedupeForInstance(ctx, adv.InstanceID)
-			_ = b.deleteTasksForInstance(ctx, adv.InstanceID)
-			_ = b.deleteTimersForInstance(ctx, adv.InstanceID)
-			_ = b.deleteInboxForInstance(ctx, adv.InstanceID)
 			b.notifyTerminal(adv.InstanceID)
 		}
 	}
+	return nil
+}
+
+// cleanupTerminalInstance removes residual tasks, timers, inbox entries and
+// signal dedupe rows for a terminal instance, retrying transient failures
+// (throttling, timeouts) before terminal success is reported.
+func (b *Backend) cleanupTerminalInstance(ctx context.Context, id string) error {
+	const attempts = 5
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = b.cleanupTerminalInstanceOnce(ctx, id); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		time.Sleep(time.Duration(100*(1<<i)) * time.Millisecond)
+	}
+	return fmt.Errorf("dynamodb: terminal cleanup for %s failed after %d attempts: %w", id, attempts, err)
+}
+
+func (b *Backend) cleanupTerminalInstanceOnce(ctx context.Context, id string) error {
+	if err := b.deleteSignalDedupeForInstance(ctx, id); err != nil {
+		return err
+	}
+	if err := b.deleteTasksForInstance(ctx, id); err != nil {
+		return err
+	}
+	if err := b.deleteTimersForInstance(ctx, id); err != nil {
+		return err
+	}
+	if err := b.deleteInboxForInstance(ctx, id); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advancement) error {
