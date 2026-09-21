@@ -239,10 +239,12 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // re-check: concurrent claimants lose the race on already-leased rows (their
 // visible_at moved to the future) and simply skip.
 //
-// Candidate SELECTs take FOR UPDATE SKIP LOCKED so N workers claiming
-// concurrently never block on each other: a row locked by another claimant
-// is skipped here and re-checked at UPDATE time instead of stalling the
-// whole batch behind a lock wait (issue #294).
+// Candidate paging runs as plain SELECTs so rows the picker rejects are
+// never locked: only picker-accepted IDs are locked (SELECT ... FOR UPDATE
+// SKIP LOCKED with a visibility re-check) before the claiming UPDATEs.
+// Locking every scanned row instead would let one batch hold the whole ready
+// queue while claiming a single task, starving concurrent claimers that skip
+// locked rows (issue #294).
 func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
@@ -264,7 +266,7 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 			q += ` AND (visible_at, id) > ($3, $4)`
 			args = append(args, lastVis, lastID)
 		}
-		q += fmt.Sprintf(` ORDER BY visible_at, id LIMIT $%d FOR UPDATE SKIP LOCKED`, len(args)+1)
+		q += fmt.Sprintf(` ORDER BY visible_at, id LIMIT $%d`, len(args)+1)
 		args = append(args, pageSize)
 		rows, err := tx.Query(ctx, q, args...)
 		if err != nil {
@@ -298,8 +300,42 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 	}
 	picked := picker.Picked()
 
+	// Lock only the accepted IDs. Rows locked by a concurrent claimant are
+	// skipped here and dropped below, and rows leased since the scan fail
+	// the visibility re-check here and again at UPDATE time.
+	locked := make(map[int64]bool, len(picked))
+	if len(picked) > 0 {
+		ids := make([]int64, 0, len(picked))
+		for _, r := range picked {
+			ids = append(ids, r.ID)
+		}
+		lrows, err := tx.Query(ctx, `
+			SELECT id FROM wf_tasks
+			WHERE id = ANY($1) AND visible_at <= now()
+			FOR UPDATE SKIP LOCKED`, ids)
+		if err != nil {
+			return nil, err
+		}
+		for lrows.Next() {
+			var id int64
+			if err := lrows.Scan(&id); err != nil {
+				lrows.Close()
+				return nil, err
+			}
+			locked[id] = true
+		}
+		if err := lrows.Err(); err != nil {
+			lrows.Close()
+			return nil, err
+		}
+		lrows.Close()
+	}
+
 	var out []backend.Task
 	for _, r := range picked {
+		if !locked[r.ID] {
+			continue // locked or leased concurrently; leave for another poll
+		}
 		row := tx.QueryRow(ctx, `
 			UPDATE wf_tasks
 			SET visible_at = now() + $2::interval, attempt = attempt + 1, worker_id = $3

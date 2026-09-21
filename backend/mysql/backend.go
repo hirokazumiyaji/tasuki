@@ -293,6 +293,10 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // MaxPerInstance it pages FIFO-ordered candidates (keyset on visible_at, id)
 // through the fair picker until the batch fills, so a victim hidden behind a
 // flooding instance is still found beyond the first page.
+//
+// Candidate paging runs as plain SELECTs so rows the picker rejects are never
+// locked: only picker-accepted IDs are locked (SELECT ... FOR UPDATE SKIP
+// LOCKED with a visibility re-check) before the claiming UPDATEs.
 func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.ClaimRequest, now time.Time) ([]int64, error) {
 	if req.MaxPerInstance <= 0 {
 		query := fmt.Sprintf(`
@@ -344,8 +348,7 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 		}
 		query += `
 			ORDER BY visible_at, id
-			LIMIT ?
-			FOR UPDATE SKIP LOCKED`
+			LIMIT ?`
 		args = append(args, pageSize)
 		rows, err := conn.QueryContext(ctx, query, args...)
 		if err != nil {
@@ -378,11 +381,49 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 		}
 	}
 	picked := picker.Picked()
+	if len(picked) == 0 {
+		return nil, nil
+	}
+	// Lock only the accepted IDs. Rows locked by a concurrent claimant are
+	// skipped here and dropped below, and rows leased since the scan fail
+	// the visibility re-check here and again at UPDATE time.
 	ids := make([]int64, 0, len(picked))
 	for _, r := range picked {
 		ids = append(ids, r.ID)
 	}
-	return ids, nil
+	lockArgs := make([]any, 0, len(ids)+2)
+	for _, id := range ids {
+		lockArgs = append(lockArgs, id)
+	}
+	lockArgs = append(lockArgs, req.Kind, now)
+	lrows, err := conn.QueryContext(ctx, fmt.Sprintf(`
+		SELECT id FROM wf_tasks
+		WHERE id IN (%s) AND kind = ? AND visible_at <= ?
+		FOR UPDATE SKIP LOCKED`, inClause(len(ids))), lockArgs...)
+	if err != nil {
+		return nil, err
+	}
+	locked := make(map[int64]bool, len(ids))
+	for lrows.Next() {
+		var id int64
+		if err := lrows.Scan(&id); err != nil {
+			lrows.Close()
+			return nil, err
+		}
+		locked[id] = true
+	}
+	if err := lrows.Err(); err != nil {
+		lrows.Close()
+		return nil, err
+	}
+	lrows.Close()
+	out := make([]int64, 0, len(picked))
+	for _, r := range picked {
+		if locked[r.ID] {
+			out = append(out, r.ID)
+		}
+	}
+	return out, nil
 }
 
 func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
