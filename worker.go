@@ -89,18 +89,20 @@ func (w *Worker) StartWithError(parent context.Context) error {
 		}
 	}
 	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
 	w.cancel = cancel
-	w.done = make(chan struct{})
+	w.done = done
 	w.actMu.Lock()
 	w.stopping = false
 	w.actMu.Unlock()
-	go w.loop(ctx)
+	go w.loop(ctx, done)
 	return nil
 }
 
 // Running reports whether the worker's background polling loop is started.
 // It returns false when Start has never succeeded, when schema validation
-// refused the start, or after Shutdown; use it for health checks.
+// refused the start, after Shutdown, or after the parent context is canceled
+// and the loop has exited; use it for health checks.
 func (w *Worker) Running() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -249,8 +251,19 @@ func (w *Worker) releaseInFlight(ctx context.Context) {
 	}
 }
 
-func (w *Worker) loop(ctx context.Context) {
-	defer close(w.done)
+func (w *Worker) loop(ctx context.Context, done chan struct{}) {
+	// Clear running state when the polling loop exits (e.g. parent context
+	// canceled without Shutdown) so Running stops reporting true and a
+	// subsequent StartWithError can start a fresh loop. Only clear when this
+	// loop is still current to avoid a stale loop clearing a restart.
+	defer func() {
+		w.mu.Lock()
+		if w.done == done {
+			w.cancel = nil
+		}
+		w.mu.Unlock()
+		close(done)
+	}()
 	ticker := time.NewTicker(w.opts.PollInterval)
 	defer ticker.Stop()
 
