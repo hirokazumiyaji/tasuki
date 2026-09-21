@@ -75,7 +75,8 @@ func (r anyKeyRing) Lookup(string) ([]byte, bool) {
 // than the original must be rejected for Enc:2 (kid is AAD-bound).
 func FuzzEncryptedV2KidBinding(f *testing.F) {
 	key := bytes.Repeat([]byte{0x9}, 32)
-	c := codec.Encrypted(codec.JSON(), anyKeyRing{primary: "k1", key: key})
+	c := codec.EncryptedWithOptions(codec.JSON(), anyKeyRing{primary: "k1", key: key},
+		codec.WithWriteVersion(codec.WriteVersionV2))
 
 	f.Add("k2")
 	f.Add("tampered")
@@ -124,7 +125,7 @@ func FuzzEncryptedV2CrossRecord(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	c := codec.Encrypted(codec.JSON(), kr)
+	c := codec.EncryptedWithOptions(codec.JSON(), kr, codec.WithWriteVersion(codec.WriteVersionV2))
 
 	f.Add([]byte("alpha"), []byte("beta"))
 	f.Add([]byte("a"), []byte("a"))

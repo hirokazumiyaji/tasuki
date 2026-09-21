@@ -398,6 +398,15 @@ c := tasuki.NewClient(b, tasuki.WithCodec(enc))
 - 封筒マーカーのないペイロードは平文として読むため、既存インスタンスが残るストアでも有効化できる。
 - インスタンス ID、ワークフロー名、キュー名、時刻は暗号化されない（メタデータは平文）。
 
+封筒バージョンとローリングアップグレード: 新規書き込みは既定で `Enc:1`（nil AAD）のため、旧バイナリでも復号できる。読み取り側は `Enc:1` と `Enc:2`（鍵 ID を AAD に束縛）の両方を受け付ける。全リーダー（Worker とリプレイ用ツール）が v2 対応後にのみ、 hardened な `Enc:2` 書き込みを有効化する:
+
+```go
+encV2 := codec.EncryptedWithOptions(codec.JSON(), keys,
+    codec.WithWriteVersion(codec.WriteVersionV2))
+```
+
+手順: (1) v1 書き込みのまま v2 対応バイナリを展開、(2) 全リーダーが v2 対応後に書き込みを v2 へ切り替える。旧リーダーに v2 ペイロードを渡すと認証に失敗し、その復号エラーは incompatible-task の Nack ではなく terminal workflow failure として確定するため、既定は v1 書き込みのままにする。
+
 ## テスト支援
 
 `wftest` パッケージで、DB なし、仮想時計のユニットテストを書ける。
