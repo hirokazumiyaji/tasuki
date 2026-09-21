@@ -113,7 +113,9 @@ func WithStrict(strict bool) EncryptedOption {
 // Readers accept both versions regardless of this setting, so the safe
 // rolling-upgrade order is: (1) deploy v2-capable readers while still
 // writing V1, (2) opt into V2 writes once every reader understands v2.
-// Any other value makes Marshal fail with an unsupported-version error.
+// Any other value, including the zero value 0, makes Marshal fail with an
+// unsupported-version error. The constructor already defaults to V1, so
+// only pass WriteVersionV1 or WriteVersionV2 explicitly.
 func WithWriteVersion(v int) EncryptedOption {
 	return func(c *encryptedCodec) { c.writeVersion = v }
 }
@@ -201,7 +203,7 @@ func (c *encryptedCodec) Marshal(v any) ([]byte, error) {
 		return nil, err
 	}
 	switch c.writeVersion {
-	case 0, encV1:
+	case encV1:
 		// Default: legacy envelope readable by pre-v2 binaries.
 		return json.Marshal(envelope{Enc: encV1, KID: kid, N: nonce, CT: aead.Seal(nil, nonce, plain, nil)})
 	case encV2:
@@ -217,8 +219,11 @@ func (c *encryptedCodec) Unmarshal(data []byte, v any) error {
 		if c.strict {
 			return fmt.Errorf("codec: strict mode rejects non-envelope payload")
 		}
+		if err := c.inner.Unmarshal(data, v); err != nil {
+			return err
+		}
 		c.noteFallback()
-		return c.inner.Unmarshal(data, v)
+		return nil
 	}
 	switch env.Enc {
 	case encV2:
