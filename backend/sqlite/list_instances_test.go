@@ -21,8 +21,8 @@ func TestListInstancesQueryAppliesLimitWithSAFilter(t *testing.T) {
 	if !strings.Contains(q, "LIMIT ? OFFSET ?") {
 		t.Fatalf("SA-filtered query must carry LIMIT/OFFSET:\n%s", q)
 	}
-	if n := strings.Count(q, "->>"); n != 2 {
-		t.Fatalf("want 2 ->> predicates, got %d:\n%s", n, q)
+	if n := strings.Count(q, "json_each"); n != 2 {
+		t.Fatalf("want 2 json_each predicates, got %d:\n%s", n, q)
 	}
 	// Keys are sorted for deterministic SQL; args follow status/name pairs.
 	wantArgs := []any{"running", "running", "", "", "phase", "new", "tenant", "acme", 5, 10}
@@ -40,7 +40,7 @@ func TestListInstancesQueryAppliesLimitWithSAFilter(t *testing.T) {
 	if !strings.Contains(q, "LIMIT ? OFFSET ?") {
 		t.Fatalf("unfiltered query must carry LIMIT/OFFSET:\n%s", q)
 	}
-	if strings.Contains(q, "->>") {
+	if strings.Contains(q, "json_each") {
 		t.Fatalf("unfiltered query must not carry JSON predicates:\n%s", q)
 	}
 	if len(args) != 6 || args[4] != 100 || args[5] != 0 {

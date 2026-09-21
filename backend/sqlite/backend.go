@@ -122,10 +122,14 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 }
 
 // listInstancesQuery builds the ListInstances SELECT with SQL-side
-// SearchAttributes filtering (one `->>` equality per key, ANDed) and an
-// unconditional LIMIT/OFFSET, so filtered listings only read the requested
-// page instead of the full table. `->>` takes the key as a bound parameter,
-// so keys with dots, quotes, or other JSON-path metacharacters are safe.
+// SearchAttributes filtering (one json_each literal lookup per key, ANDed)
+// and an unconditional LIMIT/OFFSET, so filtered listings only read the
+// requested page instead of the full table. Keys are matched with plain `=`
+// against json_each.key, so unrestricted key strings — including ones that
+// look like JSON paths (`$.tenant`), or that carry dots, quotes, or
+// backslashes — are always treated as literal object keys. (`->>` cannot be
+// used here: its right operand is parsed as a JSON path when it begins with
+// `$`, so a filter for literal key `$.tenant` would read key `tenant`.)
 // A NULL search_attributes column never matches a non-empty filter.
 func listInstancesQuery(f backend.InstanceFilter) (string, []any) {
 	limit := f.Limit
@@ -140,7 +144,7 @@ func listInstancesQuery(f backend.InstanceFilter) (string, []any) {
 		  AND (? = '' OR name = ?)`
 	args := []any{f.Status, f.Status, f.Name, f.Name}
 	for _, k := range sortedSearchAttributeKeys(f.SearchAttributes) {
-		query += ` AND (COALESCE(search_attributes, '{}') ->> ?) = ?`
+		query += ` AND (EXISTS (SELECT 1 FROM json_each(COALESCE(search_attributes, '{}')) WHERE key = ? AND value = ?))`
 		args = append(args, k, f.SearchAttributes[k])
 	}
 	query += ` ORDER BY created_at, id LIMIT ? OFFSET ?`

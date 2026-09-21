@@ -9,9 +9,9 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend/sqlite"
 )
 
-// Keys carrying dots, quotes, spaces, or non-ASCII must filter exactly: the
-// SQL-side predicate takes keys as bound parameters, never interpolates them
-// into a JSON path.
+// Keys carrying dots, quotes, backslashes, spaces, non-ASCII, or a leading
+// `$` must filter exactly: the SQL-side predicate matches keys literally,
+// never interpreting them as JSON paths.
 func TestListInstancesSearchAttributesSpecialKeys(t *testing.T) {
 	ctx := context.Background()
 	b, err := sqlite.New(filepath.Join(t.TempDir(), "tasuki.db"))
@@ -27,6 +27,9 @@ func TestListInstancesSearchAttributesSpecialKeys(t *testing.T) {
 		"sp ace":    "v",
 		"café-☃":    "snowman",
 		"plain":     "x",
+		"$.tenant":  "dollar",
+		"$":         "bare",
+		`a"b\c`:     "quoted",
 	}
 	if err := b.CreateInstance(ctx, backend.NewInstance{
 		ID: "sa-special", Name: "WF", Queue: "default", SearchAttributes: attrs,
@@ -36,6 +39,13 @@ func TestListInstancesSearchAttributesSpecialKeys(t *testing.T) {
 	if err := b.CreateInstance(ctx, backend.NewInstance{
 		ID: "sa-other", Name: "WF", Queue: "default",
 		SearchAttributes: map[string]string{"tenant.id": "elsewhere"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Decoy: a literal `tenant` key must not satisfy a `$.tenant` filter.
+	if err := b.CreateInstance(ctx, backend.NewInstance{
+		ID: "sa-decoy", Name: "WF", Queue: "default",
+		SearchAttributes: map[string]string{"tenant": "dollar"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +68,20 @@ func TestListInstancesSearchAttributesSpecialKeys(t *testing.T) {
 	})
 	if err != nil || len(and) != 1 || and[0].ID != "sa-special" {
 		t.Fatalf("AND special keys: %+v err=%v", and, err)
+	}
+	// A `$.tenant` filter must match the literal key only — not the `tenant`
+	// key on the decoy row — and vice versa.
+	dollar, err := b.ListInstances(ctx, backend.InstanceFilter{
+		SearchAttributes: map[string]string{"$.tenant": "dollar"},
+	})
+	if err != nil || len(dollar) != 1 || dollar[0].ID != "sa-special" {
+		t.Fatalf("$-prefixed key filter: %+v err=%v", dollar, err)
+	}
+	bare, err := b.ListInstances(ctx, backend.InstanceFilter{
+		SearchAttributes: map[string]string{"tenant": "dollar"},
+	})
+	if err != nil || len(bare) != 1 || bare[0].ID != "sa-decoy" {
+		t.Fatalf("plain key filter must not match $-prefixed key: %+v err=%v", bare, err)
 	}
 	// Wrong value for a special key matches nothing (no path-injection row).
 	miss, err := b.ListInstances(ctx, backend.InstanceFilter{
