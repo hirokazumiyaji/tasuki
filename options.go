@@ -38,6 +38,12 @@ type WorkerOptions struct {
 	// Unreleased leases expire via lease timeout and are reclaimed by peers.
 	// <=0 defaults to 5s.
 	ShutdownReleaseTimeout time.Duration
+	// BacklogSampleInterval throttles backlog gauge sampling (2x
+	// CountClaimableTasks per sample when Metrics is set). 0 defaults to
+	// 10s (coarser than the 1s PollInterval default); negative disables
+	// sampling entirely. Set a smaller positive value (e.g. time.Second)
+	// for tests or low-traffic stores that want fresher backlog gauges.
+	BacklogSampleInterval time.Duration
 }
 
 func (o WorkerOptions) withDefaults() WorkerOptions {
@@ -81,6 +87,9 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 		o.IncompatibleRetryDelay = 5 * time.Second
 	} else if o.IncompatibleRetryDelay < 0 {
 		o.IncompatibleRetryDelay = 0
+	}
+	if o.BacklogSampleInterval == 0 {
+		o.BacklogSampleInterval = 10 * time.Second
 	}
 	return o
 }
