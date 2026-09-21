@@ -188,6 +188,7 @@ func listPageURL(status, name string, limit, offset int) string {
 // X-Request-ID is echoed back; otherwise a random one is generated.
 func ensureRequestID(w http.ResponseWriter, r *http.Request) string {
 	if id := w.Header().Get("X-Request-ID"); id != "" {
+		r.Header.Set("X-Request-ID", id)
 		return id
 	}
 	if id := r.Header.Get("X-Request-ID"); id != "" {
