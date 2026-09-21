@@ -21,6 +21,13 @@ import (
 // delete one instance's tasks with a Query instead of a full-table Scan.
 const instanceGSIName = "instance_gsi"
 
+// gsiWaitTimeout bounds the best-effort wait for a newly created GSI to
+// become ACTIVE during Migrate. Backfilling a GSI on a large table can take
+// far longer; callers fall back to Scan while the index builds, so Migrate
+// proceeds (with a warning) instead of failing once the budget is exhausted.
+// Overridden in tests.
+var gsiWaitTimeout = 60 * time.Second
+
 // Backend is the DynamoDB implementation of backend.Backend.
 type Backend struct {
 	client dynamoClient
@@ -94,7 +101,12 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 	return &Backend{client: client, prefix: cfg.Prefix, hub: hub.New()}, nil
 }
 
-func (b *Backend) Close() error { return nil }
+func (b *Backend) Close() error {
+	// Flush debounced cross-process wake writes (see flushPendingWakes);
+	// otherwise a Close within the debounce window would drop them.
+	b.flushPendingWakes()
+	return nil
+}
 
 func (b *Backend) Client() *dynamodb.Client {
 	if c, ok := b.client.(*dynamodb.Client); ok {
@@ -361,7 +373,17 @@ func (b *Backend) ensureMissingGSIs(ctx context.Context, d tableDef, desc *dynam
 		}
 		return fmt.Errorf("dynamodb create index %s: %w", d.name, err)
 	}
-	return b.waitForGSIsActive(ctx, d.name, d.gsi)
+	// Best-effort wait: GSI backfill on a large table can take far longer
+	// than gsiWaitTimeout while DynamoDB is still successfully building the
+	// index. Callers fall back to Scan until the index is ACTIVE, so a slow
+	// backfill must not fail Migrate. Only a cancelled context aborts.
+	if err := b.waitForGSIsActive(ctx, d.name, d.gsi); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		fmt.Fprintf(os.Stderr, "dynamodb: index backfill on %s still pending, continuing with Scan fallback: %v\n", d.name, err)
+	}
+	return nil
 }
 
 func (b *Backend) waitForTableActive(ctx context.Context, name string) error {
@@ -385,7 +407,7 @@ func (b *Backend) waitForTableActive(ctx context.Context, name string) error {
 }
 
 func (b *Backend) waitForGSIsActive(ctx context.Context, name string, want []types.GlobalSecondaryIndex) error {
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(gsiWaitTimeout)
 	for {
 		desc, err := b.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
 			TableName: aws.String(name),

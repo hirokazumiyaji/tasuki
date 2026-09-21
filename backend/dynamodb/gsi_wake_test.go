@@ -317,3 +317,134 @@ func TestEnsureMissingGSIs_CreatesInstanceGSIOnExistingTable(t *testing.T) {
 		t.Fatalf("created indexes = %v, want [%q]", created, instanceGSIName)
 	}
 }
+
+func TestEnsureMissingGSIs_SucceedsWhileGSIBackfilling(t *testing.T) {
+	oldTimeout := gsiWaitTimeout
+	gsiWaitTimeout = 30 * time.Millisecond
+	defer func() { gsiWaitTimeout = oldTimeout }()
+
+	f := &fakeDynamo{}
+	backfilling := &dynamodb.DescribeTableOutput{Table: &types.TableDescription{
+		TableName: aws.String("tasuki_wf_tasks"), TableStatus: types.TableStatusActive,
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndexDescription{
+			{IndexName: aws.String("claim_gsi"), IndexStatus: types.IndexStatusActive},
+			// New index never leaves CREATING: backfill outlasts the wait budget.
+			{IndexName: aws.String(instanceGSIName), IndexStatus: types.IndexStatusCreating},
+		},
+	}}
+	f.describeFn = func(_ context.Context, in *dynamodb.DescribeTableInput) (*dynamodb.DescribeTableOutput, error) {
+		return backfilling, nil
+	}
+	b := newTestBackend(f)
+	d := tableDef{
+		name: "tasuki_wf_tasks",
+		attrs: []types.AttributeDefinition{
+			{AttributeName: aws.String("task_pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("instance_id"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		gsi: []types.GlobalSecondaryIndex{
+			{
+				IndexName: aws.String(instanceGSIName),
+				KeySchema: []types.KeySchemaElement{
+					{AttributeName: aws.String("instance_id"), KeyType: types.KeyTypeHash},
+				},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
+		},
+	}
+	desc := &dynamodb.DescribeTableOutput{Table: &types.TableDescription{
+		TableName: aws.String("tasuki_wf_tasks"), TableStatus: types.TableStatusActive,
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndexDescription{
+			{IndexName: aws.String("claim_gsi"), IndexStatus: types.IndexStatusActive},
+		},
+	}}
+	// Slow backfill must not fail Migrate: callers fall back to Scan.
+	if err := b.ensureMissingGSIs(context.Background(), d, desc); err != nil {
+		t.Fatalf("ensureMissingGSIs during backfill = %v, want nil (Scan fallback covers readers)", err)
+	}
+}
+
+func TestEnsureMissingGSIs_ContextCancelStillAborts(t *testing.T) {
+	oldTimeout := gsiWaitTimeout
+	gsiWaitTimeout = time.Hour // deadline never hit; cancellation must abort
+	defer func() { gsiWaitTimeout = oldTimeout }()
+
+	f := &fakeDynamo{}
+	backfilling := &dynamodb.DescribeTableOutput{Table: &types.TableDescription{
+		TableName: aws.String("tasuki_wf_tasks"), TableStatus: types.TableStatusActive,
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndexDescription{
+			{IndexName: aws.String(instanceGSIName), IndexStatus: types.IndexStatusCreating},
+		},
+	}}
+	f.describeFn = func(_ context.Context, in *dynamodb.DescribeTableInput) (*dynamodb.DescribeTableOutput, error) {
+		return backfilling, nil
+	}
+	b := newTestBackend(f)
+	d := tableDef{
+		name: "tasuki_wf_tasks",
+		gsi: []types.GlobalSecondaryIndex{
+			{
+				IndexName: aws.String(instanceGSIName),
+				KeySchema: []types.KeySchemaElement{
+					{AttributeName: aws.String("instance_id"), KeyType: types.KeyTypeHash},
+				},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
+		},
+	}
+	desc := &dynamodb.DescribeTableOutput{Table: &types.TableDescription{
+		TableName: aws.String("tasuki_wf_tasks"), TableStatus: types.TableStatusActive,
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := b.ensureMissingGSIs(ctx, d, desc); err == nil {
+		t.Fatal("ensureMissingGSIs with cancelled context = nil, want context.Canceled")
+	}
+}
+
+func TestClose_FlushesPendingWake(t *testing.T) {
+	f := &fakeDynamo{}
+	b := newTestBackend(f)
+	// Hour-long window: the timer cannot fire on its own, so any write
+	// must come from the Close flush.
+	b.wakeDebounce = time.Hour
+	b.notifyTasks()
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := atomic.LoadInt64(&f.updateCalls); got != 1 {
+		t.Fatalf("UpdateItem calls after Close = %d, want 1 (pending wake flushed)", got)
+	}
+	// Idempotent: no pending entries left, no further writes.
+	if err := b.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if got := atomic.LoadInt64(&f.updateCalls); got != 1 {
+		t.Fatalf("UpdateItem calls after second Close = %d, want 1", got)
+	}
+}
+
+func TestClose_FlushesDistinctTerminalWakes(t *testing.T) {
+	f := &fakeDynamo{}
+	b := newTestBackend(f)
+	b.wakeDebounce = time.Hour
+	b.notifyTerminal("inst-a")
+	b.notifyTerminal("inst-b")
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := atomic.LoadInt64(&f.updateCalls); got != 2 {
+		t.Fatalf("UpdateItem calls after Close = %d, want 2 (one per instance)", got)
+	}
+}
+
+func TestClose_WithoutPendingWakeIsNoop(t *testing.T) {
+	f := &fakeDynamo{}
+	b := newTestBackend(f)
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := atomic.LoadInt64(&f.updateCalls); got != 0 {
+		t.Fatalf("UpdateItem calls = %d, want 0", got)
+	}
+}

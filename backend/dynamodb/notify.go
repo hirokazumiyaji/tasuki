@@ -131,6 +131,33 @@ func (b *Backend) writeWake(ctx context.Context, pk, instanceID string) {
 	})
 }
 
+// flushPendingWakes synchronously writes every debounced wake still waiting
+// in the current window. Called by Close so a short-lived process that exits
+// right after a mutation still delivers its cross-process wf_wake update
+// instead of dropping it with the stopped timer. Best-effort (write errors
+// are ignored, like the timer path) and idempotent: a second call finds no
+// pending entries. Wakes scheduled concurrently with the flush land in a
+// fresh window and fire on their own timer.
+func (b *Backend) flushPendingWakes() {
+	b.wakeMu.Lock()
+	pending := b.wakePending
+	timers := b.wakeTimers
+	b.wakePending = nil
+	b.wakeTimers = nil
+	b.wakeMu.Unlock()
+	for _, t := range timers {
+		t.Stop()
+	}
+	if len(pending) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, ent := range pending {
+		b.writeWake(ctx, ent.pk, ent.instanceID)
+	}
+}
+
 func nextPollInterval(cur time.Duration) time.Duration {
 	nxt := cur * 2
 	if nxt < wakePollBaseInterval {
