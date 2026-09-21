@@ -189,29 +189,69 @@ func TestMigrateLegacyWithoutBackfillColumns(t *testing.T) {
 	}
 }
 
-// TestMigratePropagatesAlterError verifies that a non-duplicate-column ALTER
-// failure (here: missing table, standing in for permission denied and other
-// fatal errors) is returned instead of silently ignored.
+// TestMigratePartialLegacyRepairsBaseline simulates a database created
+// before wf_signal_dedupe existed (baseline tables present, the later-added
+// table and backfill columns missing, no version bookkeeping): Migrate must
+// NOT stamp version 1 and skip the baseline. It runs the idempotent baseline
+// DDL to create the missing table, backfills the columns, and leaves a
+// valid schema.
+func TestMigratePartialLegacyRepairsBaseline(t *testing.T) {
+	b, ctx := newTestBackend(t)
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-signal-dedupe shape: full baseline minus the later-added table
+	// and backfill columns, with version bookkeeping wiped.
+	for _, q := range []string{
+		`DROP TABLE wf_signal_dedupe`,
+		`ALTER TABLE wf_tasks DROP COLUMN heartbeat`,
+		`ALTER TABLE wf_instances DROP COLUMN search_attributes`,
+		`ALTER TABLE wf_instances DROP COLUMN memo`,
+		`DROP TABLE tasuki_schema_migrations`,
+	} {
+		if _, err := b.DB().ExecContext(ctx, q); err != nil {
+			t.Fatalf("setup %q: %v", q, err)
+		}
+	}
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatalf("partial legacy migrate must repair the baseline, got: %v", err)
+	}
+	want, err := sqlite.LatestSchemaVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, err := b.SchemaVersion(ctx); err != nil || v != want {
+		t.Fatalf("after repair migrate: v=%d want=%d err=%v", v, want, err)
+	}
+	if err := b.ValidateSchema(ctx); err != nil {
+		t.Fatalf("want valid schema after repair, got %v", err)
+	}
+}
+
+// TestMigratePropagatesAlterError verifies that a non-duplicate-column DDL
+// failure (here: index creation against a partial table, standing in for
+// permission denied and other fatal errors) is returned instead of silently
+// ignored.
 func TestMigratePropagatesAlterError(t *testing.T) {
 	b, ctx := newTestBackend(t)
-	// Legacy-shaped DB: wf_instances exists (so Migrate stamps version 1 and
-	// skips the baseline DDL) but wf_tasks is missing, so the backfill ALTER
-	// fails with "no such table".
+	// Partial schema: wf_instances exists but with the wrong shape, so the
+	// baseline DDL (not the backfill) fails. The baseline is incomplete, so
+	// no legacy stamp may be recorded either.
 	if _, err := b.DB().ExecContext(ctx,
 		`CREATE TABLE wf_instances (id TEXT PRIMARY KEY)`); err != nil {
 		t.Fatal(err)
 	}
 	err := b.Migrate(ctx)
 	if err == nil {
-		t.Fatal("want Migrate to fail when the backfill ALTER fails, got nil")
+		t.Fatal("want Migrate to fail when the baseline DDL fails, got nil")
 	}
 	if strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		t.Fatalf("missing-table failure must not be reported as duplicate column: %v", err)
+		t.Fatalf("missing-column failure must not be reported as duplicate column: %v", err)
 	}
-	// The failed migration must not look applied: only the legacy stamp (v1)
-	// may be recorded, so a retry re-runs the backfill.
-	if v, verr := b.SchemaVersion(ctx); verr != nil || v != 1 {
-		t.Fatalf("after failed migrate: v=%d want=1 err=%v", v, verr)
+	// The failed migration must not look applied: nothing may be recorded,
+	// so a retry re-runs the baseline from scratch.
+	if v, verr := b.SchemaVersion(ctx); verr != nil || v != 0 {
+		t.Fatalf("after failed migrate: v=%d want=0 err=%v", v, verr)
 	}
 }
 

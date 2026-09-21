@@ -128,19 +128,33 @@ var migrateMu sync.Mutex
 // cross-process migrations.
 const migrateLockName = "tasuki_migrate_lock"
 
+// migrationQueryer is the statement surface Migrate needs. It is satisfied
+// by both *sql.DB and *sql.Conn; Migrate passes the lock-holding *sql.Conn
+// so bookkeeping and DDL never wait on the pool while the named lock's
+// session occupies its only slot (see P2: MaxOpenConns(1) deadlock).
+type migrationQueryer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // Migrate applies pending migrations in order, recording each version in
 // tasuki_schema_migrations. It is safe to call repeatedly.
 //
 // Databases created before versioned migrations (via the old cumulative
 // schema.sql) are detected and stamped at version 1 without re-running DDL,
-// then upgraded by any newer migrations.
+// then upgraded by any newer migrations. The stamp applies only when the
+// complete baseline is present (see baselineComplete): a partial legacy
+// schema runs the idempotent baseline DDL instead of skipping it.
 //
 // Concurrency: Migrate holds migrateMu (in-process) and a MySQL named lock
 // (cross-process) for the whole run, so a concurrent Migrate blocks instead
-// of observing a half-applied schema. Each version row is inserted only
-// after its DDL has completed, so a failure leaves no version row behind and
-// a retry simply re-runs the idempotent DDL - there is no claim row to clean
-// up, and no cleanup that could reuse a canceled context.
+// of observing a half-applied schema. Every statement runs on lockConn, the
+// session holding the named lock: with MaxOpenConns(1) that session occupies
+// the pool's only connection, so touching b.db here would wait for a
+// connection that cannot free up until Migrate returns. Each version row is
+// inserted only after its DDL has completed, so a failure leaves no version
+// row behind and a retry simply re-runs the idempotent DDL - there is no
+// claim row to clean up, and no cleanup that could reuse a canceled context.
 //
 // Column-backfill ALTERs tolerate duplicate-column errors (the column is
 // already there, e.g. the database was created by a newer schema) but every
@@ -157,7 +171,9 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	// Hold a named lock for the whole migration. A concurrent Migrate on
 	// another host blocks in GET_LOCK instead of proceeding against a
 	// half-migrated schema. The lock lives on lockConn, which is kept open
-	// until Migrate returns.
+	// until Migrate returns, and every statement below runs on lockConn:
+	// it is the session holding the named lock, and with MaxOpenConns(1)
+	// no other connection can be checked out until Migrate returns.
 	lockConn, err := b.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("mysql: acquire migration lock: %w", err)
@@ -167,7 +183,7 @@ func (b *Backend) Migrate(ctx context.Context) error {
 		return err
 	}
 	defer releaseMigrationLock(context.WithoutCancel(ctx), lockConn)
-	if _, err := b.db.ExecContext(ctx, `
+	if _, err := lockConn.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS `+migrationTableName+` (
 			version    BIGINT PRIMARY KEY,
 			applied_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
@@ -175,21 +191,26 @@ func (b *Backend) Migrate(ctx context.Context) error {
 		return fmt.Errorf("mysql: create %s: %w", migrationTableName, err)
 	}
 
-	// Legacy databases have the schema but no version bookkeeping. Their
-	// content matches the old cumulative schema.sql, which is equivalent to
-	// version 1; stamp it instead of re-running DDL.
+	// Legacy databases have the schema but no version bookkeeping. Stamp
+	// version 1 only when the complete baseline is present. A database
+	// from before wf_signal_dedupe (or any other baseline table) was
+	// introduced has wf_instances but is missing tables; stamping it
+	// would skip the baseline DDL that creates them (migration 2 only
+	// adds columns), leaving ValidateSchema to reject the database at
+	// startup. An incomplete baseline falls through to the normal path,
+	// whose idempotent CREATE TABLE IF NOT EXISTS repairs it.
 	var applied int64
-	if err := b.db.QueryRowContext(ctx,
+	if err := lockConn.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM `+migrationTableName).Scan(&applied); err != nil {
 		return fmt.Errorf("mysql: read %s: %w", migrationTableName, err)
 	}
 	if applied == 0 {
-		exists, err := tableExists(ctx, b.db, "wf_instances")
+		complete, err := baselineComplete(ctx, lockConn)
 		if err != nil {
 			return err
 		}
-		if exists {
-			if _, err := b.db.ExecContext(ctx,
+		if complete {
+			if _, err := lockConn.ExecContext(ctx,
 				`INSERT IGNORE INTO `+migrationTableName+` (version) VALUES (1)`); err != nil {
 				return fmt.Errorf("mysql: stamp legacy schema: %w", err)
 			}
@@ -197,21 +218,38 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	}
 
 	for _, m := range migs {
-		if err := b.applyMigration(ctx, m); err != nil {
+		if err := applyMigration(ctx, lockConn, m); err != nil {
 			return fmt.Errorf("mysql: migration %06d_%s: %w", m.version, m.name, err)
 		}
 	}
 	return nil
 }
 
+// baselineComplete reports whether every table created by the baseline
+// migration exists. Only then may a legacy database without version
+// bookkeeping be stamped as version 1.
+func baselineComplete(ctx context.Context, q migrationQueryer) (bool, error) {
+	for _, t := range requiredTables {
+		exists, err := tableExists(ctx, q, t)
+		if err != nil {
+			return false, err
+		}
+		if !exists {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // applyMigration runs the migration DDL first and records the version only
 // after the DDL has completed. Callers hold the migration lock (migrateMu +
-// the MySQL named lock), so by the time another Migrate observes the version
-// row, the schema it describes is complete. A failed migration inserts
-// nothing, so the next Migrate retries the DDL instead of skipping it.
-func (b *Backend) applyMigration(ctx context.Context, m migration) error {
+// the MySQL named lock) and pass the lock-holding connection, so by the time
+// another Migrate observes the version row, the schema it describes is
+// complete. A failed migration inserts nothing, so the next Migrate retries
+// the DDL instead of skipping it.
+func applyMigration(ctx context.Context, q migrationQueryer, m migration) error {
 	var applied int64
-	if err := b.db.QueryRowContext(ctx,
+	if err := q.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM `+migrationTableName+` WHERE version = ?`, m.version).Scan(&applied); err != nil {
 		return err
 	}
@@ -219,14 +257,14 @@ func (b *Backend) applyMigration(ctx context.Context, m migration) error {
 		return nil // already applied
 	}
 	for _, stmt := range splitSQL(m.up) {
-		if _, err := b.db.ExecContext(ctx, stmt); err != nil {
+		if _, err := q.ExecContext(ctx, stmt); err != nil {
 			if isAddColumn(stmt) && isDuplicateColumnError(err) {
 				continue // already backfilled; keep going
 			}
 			return fmt.Errorf("mysql migrate: %w\nstmt: %s", err, stmt)
 		}
 	}
-	if _, err := b.db.ExecContext(ctx,
+	if _, err := q.ExecContext(ctx,
 		`INSERT INTO `+migrationTableName+` (version) VALUES (?)`, m.version); err != nil {
 		if isUniqueViolation(err) {
 			return nil // another migrator completed the same DDL first
@@ -256,9 +294,9 @@ func releaseMigrationLock(ctx context.Context, conn *sql.Conn) {
 	_, _ = conn.ExecContext(ctx, `SELECT RELEASE_LOCK(?)`, migrateLockName)
 }
 
-func tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
+func tableExists(ctx context.Context, q migrationQueryer, table string) (bool, error) {
 	var n int64
-	if err := db.QueryRowContext(ctx,
+	if err := q.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?`,
 		table).Scan(&n); err != nil {
 		return false, fmt.Errorf("mysql: check table %s: %w", table, err)

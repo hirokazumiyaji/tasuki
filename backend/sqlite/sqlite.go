@@ -133,7 +133,9 @@ var migrateMu sync.Mutex
 //
 // Databases created before versioned migrations (via the old cumulative
 // schema.sql) are detected and stamped at version 1 without re-running DDL,
-// then upgraded by any newer migrations.
+// then upgraded by any newer migrations. The stamp applies only when the
+// complete baseline is present (see baselineComplete): a partial legacy
+// schema runs the idempotent baseline DDL instead of skipping it.
 //
 // Concurrency: each migration runs inside a single BEGIN IMMEDIATE
 // transaction that checks the version, runs the DDL, and records the version
@@ -161,20 +163,25 @@ func (b *Backend) Migrate(ctx context.Context) error {
 		return fmt.Errorf("sqlite: create %s: %w", migrationTableName, err)
 	}
 
-	// Legacy databases have the schema but no version bookkeeping. Their
-	// content matches the old cumulative schema.sql, which is equivalent to
-	// version 1; stamp it instead of re-running DDL.
+	// Legacy databases have the schema but no version bookkeeping. Stamp
+	// version 1 only when the complete baseline is present. A database
+	// from before wf_signal_dedupe (or any other baseline table) was
+	// introduced has wf_instances but is missing tables; stamping it
+	// would skip the baseline DDL that creates them (migration 2 only
+	// adds columns), leaving ValidateSchema to reject the database at
+	// startup. An incomplete baseline falls through to the normal path,
+	// whose idempotent CREATE TABLE IF NOT EXISTS repairs it.
 	var applied int64
 	if err := b.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM `+migrationTableName).Scan(&applied); err != nil {
 		return fmt.Errorf("sqlite: read %s: %w", migrationTableName, err)
 	}
 	if applied == 0 {
-		exists, err := tableExists(ctx, b.db, "wf_instances")
+		complete, err := baselineComplete(ctx, b.db)
 		if err != nil {
 			return err
 		}
-		if exists {
+		if complete {
 			if _, err := b.db.ExecContext(ctx,
 				`INSERT OR IGNORE INTO `+migrationTableName+` (version) VALUES (1)`); err != nil {
 				return fmt.Errorf("sqlite: stamp legacy schema: %w", err)
@@ -188,6 +195,22 @@ func (b *Backend) Migrate(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// baselineComplete reports whether every table created by the baseline
+// migration exists. Only then may a legacy database without version
+// bookkeeping be stamped as version 1.
+func baselineComplete(ctx context.Context, db *sql.DB) (bool, error) {
+	for _, t := range requiredTables {
+		exists, err := tableExists(ctx, db, t)
+		if err != nil {
+			return false, err
+		}
+		if !exists {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // applyMigration runs the migration inside one write transaction: it checks

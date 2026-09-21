@@ -34,6 +34,9 @@ func isUniqueViolation(err error) bool {
 // may be tolerated by Migrate; everything else (permissions, missing table,
 // syntax) must abort the migration.
 func isDuplicateColumnError(err error) bool {
+	if err == nil {
+		return false
+	}
 	var mysqlErr *mysql.MySQLError
 	if errors.As(err, &mysqlErr) {
 		return mysqlErr.Number == 1060
