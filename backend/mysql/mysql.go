@@ -119,12 +119,28 @@ func (b *Backend) Close() error {
 
 func (b *Backend) DB() *sql.DB { return b.db }
 
+// migrateMu serializes Migrate within this process so concurrent callers
+// never interleave migration steps. Cross-process exclusion uses the MySQL
+// named lock migrateLockName, held for the whole run.
+var migrateMu sync.Mutex
+
+// migrateLockName is the MySQL named lock (GET_LOCK/RELEASE_LOCK) guarding
+// cross-process migrations.
+const migrateLockName = "tasuki_migrate_lock"
+
 // Migrate applies pending migrations in order, recording each version in
 // tasuki_schema_migrations. It is safe to call repeatedly.
 //
 // Databases created before versioned migrations (via the old cumulative
 // schema.sql) are detected and stamped at version 1 without re-running DDL,
 // then upgraded by any newer migrations.
+//
+// Concurrency: Migrate holds migrateMu (in-process) and a MySQL named lock
+// (cross-process) for the whole run, so a concurrent Migrate blocks instead
+// of observing a half-applied schema. Each version row is inserted only
+// after its DDL has completed, so a failure leaves no version row behind and
+// a retry simply re-runs the idempotent DDL - there is no claim row to clean
+// up, and no cleanup that could reuse a canceled context.
 //
 // Column-backfill ALTERs tolerate duplicate-column errors (the column is
 // already there, e.g. the database was created by a newer schema) but every
@@ -135,6 +151,22 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	migrateMu.Lock()
+	defer migrateMu.Unlock()
+
+	// Hold a named lock for the whole migration. A concurrent Migrate on
+	// another host blocks in GET_LOCK instead of proceeding against a
+	// half-migrated schema. The lock lives on lockConn, which is kept open
+	// until Migrate returns.
+	lockConn, err := b.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("mysql: acquire migration lock: %w", err)
+	}
+	defer lockConn.Close()
+	if err := acquireMigrationLock(ctx, lockConn); err != nil {
+		return err
+	}
+	defer releaseMigrationLock(context.WithoutCancel(ctx), lockConn)
 	if _, err := b.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS `+migrationTableName+` (
 			version    BIGINT PRIMARY KEY,
@@ -172,21 +204,18 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	return nil
 }
 
-// applyMigration claims the version first (atomic via PK conflict with
-// INSERT IGNORE), then runs the DDL. MySQL DDL commits implicitly, so a
-// failed migration drops its claim row (best effort): without this the
-// failure would look applied and never be retried.
+// applyMigration runs the migration DDL first and records the version only
+// after the DDL has completed. Callers hold the migration lock (migrateMu +
+// the MySQL named lock), so by the time another Migrate observes the version
+// row, the schema it describes is complete. A failed migration inserts
+// nothing, so the next Migrate retries the DDL instead of skipping it.
 func (b *Backend) applyMigration(ctx context.Context, m migration) error {
-	res, err := b.db.ExecContext(ctx,
-		`INSERT IGNORE INTO `+migrationTableName+` (version) VALUES (?)`, m.version)
-	if err != nil {
+	var applied int64
+	if err := b.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM `+migrationTableName+` WHERE version = ?`, m.version).Scan(&applied); err != nil {
 		return err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
+	if applied > 0 {
 		return nil // already applied
 	}
 	for _, stmt := range splitSQL(m.up) {
@@ -194,12 +223,37 @@ func (b *Backend) applyMigration(ctx context.Context, m migration) error {
 			if isAddColumn(stmt) && isDuplicateColumnError(err) {
 				continue // already backfilled; keep going
 			}
-			_, _ = b.db.ExecContext(ctx,
-				`DELETE FROM `+migrationTableName+` WHERE version = ?`, m.version)
 			return fmt.Errorf("mysql migrate: %w\nstmt: %s", err, stmt)
 		}
 	}
+	if _, err := b.db.ExecContext(ctx,
+		`INSERT INTO `+migrationTableName+` (version) VALUES (?)`, m.version); err != nil {
+		if isUniqueViolation(err) {
+			return nil // another migrator completed the same DDL first
+		}
+		return err
+	}
 	return nil
+}
+
+// acquireMigrationLock blocks until the named migration lock is held on conn.
+// GET_LOCK returns 1 on success, 0 on timeout, and NULL on error.
+func acquireMigrationLock(ctx context.Context, conn *sql.Conn) error {
+	var got sql.NullInt64
+	if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?, 30)`, migrateLockName).Scan(&got); err != nil {
+		return fmt.Errorf("mysql: acquire migration lock: %w", err)
+	}
+	if !got.Valid || got.Int64 != 1 {
+		return fmt.Errorf("mysql: acquire migration lock %q: timed out (another migrator holds it)", migrateLockName)
+	}
+	return nil
+}
+
+// releaseMigrationLock releases the named migration lock. The caller passes a
+// non-canceled context so the lock is released even when Migrate's context
+// was canceled.
+func releaseMigrationLock(ctx context.Context, conn *sql.Conn) {
+	_, _ = conn.ExecContext(ctx, `SELECT RELEASE_LOCK(?)`, migrateLockName)
 }
 
 func tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
@@ -245,9 +299,20 @@ var requiredTables = []string{
 	"wf_tasks", "wf_timers", "wf_schedules",
 }
 
+// requiredColumns are columns added by post-baseline migrations. A database
+// whose tables all exist but which lacks one of these columns predates the
+// backfill migration: ordinary reads and writes would fail, so validation
+// must fail too instead of reporting a healthy schema.
+var requiredColumns = [][2]string{
+	{"wf_tasks", "heartbeat"},
+	{"wf_instances", "search_attributes"},
+	{"wf_instances", "memo"},
+}
+
 // ValidateSchema implements backend.SchemaValidator. It checks that every
-// required table exists in the current database; missing tables are reported
-// together in one error.
+// required table exists in the current database and that every required
+// column is present; missing tables or columns are reported together in one
+// error.
 func (b *Backend) ValidateSchema(ctx context.Context) error {
 	args := make([]any, 0, len(requiredTables))
 	for _, t := range requiredTables {
@@ -280,6 +345,22 @@ func (b *Backend) ValidateSchema(ctx context.Context) error {
 	if len(missing) > 0 {
 		return fmt.Errorf("mysql: schema is missing tables %s; run Migrate (or your migration tool) first",
 			strings.Join(missing, ", "))
+	}
+	var missingCols []string
+	for _, c := range requiredColumns {
+		var n int64
+		if err := b.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
+			c[0], c[1]).Scan(&n); err != nil {
+			return fmt.Errorf("mysql: validate schema: %w", err)
+		}
+		if n == 0 {
+			missingCols = append(missingCols, c[0]+"."+c[1])
+		}
+	}
+	if len(missingCols) > 0 {
+		return fmt.Errorf("mysql: schema is missing columns %s; run Migrate (or your migration tool) first",
+			strings.Join(missingCols, ", "))
 	}
 	return nil
 }

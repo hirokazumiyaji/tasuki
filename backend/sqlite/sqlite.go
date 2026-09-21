@@ -122,12 +122,25 @@ func (b *Backend) Close() error {
 	return b.db.Close()
 }
 
+// migrateMu serializes Migrate within this process so concurrent callers
+// never interleave migration steps. Cross-process exclusion comes from the
+// BEGIN IMMEDIATE write transaction each migration holds while it runs its
+// DDL and records its version atomically.
+var migrateMu sync.Mutex
+
 // Migrate applies pending migrations in order, recording each version in
 // tasuki_schema_migrations. It is safe to call repeatedly.
 //
 // Databases created before versioned migrations (via the old cumulative
 // schema.sql) are detected and stamped at version 1 without re-running DDL,
 // then upgraded by any newer migrations.
+//
+// Concurrency: each migration runs inside a single BEGIN IMMEDIATE
+// transaction that checks the version, runs the DDL, and records the version
+// before committing, so a concurrent Migrate never observes a version whose
+// schema is still incomplete. A failed migration rolls its transaction back
+// (with a non-canceled context, so cancellation cannot leave the version
+// marked as applied) and the next Migrate retries the DDL.
 //
 // Column-backfill ALTERs tolerate duplicate-column errors (the column is
 // already there, e.g. the database was created by a newer schema) but every
@@ -138,6 +151,8 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	migrateMu.Lock()
+	defer migrateMu.Unlock()
 	if _, err := b.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS `+migrationTableName+` (
 			version    INTEGER PRIMARY KEY,
@@ -175,32 +190,56 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	return nil
 }
 
-// applyMigration claims the version first (atomic via PK conflict with
-// INSERT OR IGNORE), then runs the DDL. A failed migration drops its claim
-// row (best effort) so the failure is retried instead of looking applied.
+// applyMigration runs the migration inside one write transaction: it checks
+// whether the version is already applied, runs the DDL, and records the
+// version before committing. The version therefore becomes visible only
+// together with its completed schema, and a failure (or cancellation) rolls
+// everything back so the next Migrate retries instead of skipping.
 func (b *Backend) applyMigration(ctx context.Context, m migration) error {
-	res, err := b.db.ExecContext(ctx,
-		`INSERT OR IGNORE INTO `+migrationTableName+` (version) VALUES (?)`, m.version)
+	conn, err := beginImmediate(ctx, b.db)
 	if err != nil {
 		return err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
+	// Roll back with a non-canceled context so a canceled caller cannot
+	// leave the write transaction (or its lock) behind.
+	cleanup := context.WithoutCancel(ctx)
+	committed := false
+	defer func() {
+		if !committed {
+			rollbackConn(cleanup, conn)
+		}
+	}()
+	var applied int64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM `+migrationTableName+` WHERE version = ?`, m.version).Scan(&applied); err != nil {
 		return err
 	}
-	if n == 0 {
+	if applied > 0 {
+		if err := commitConn(cleanup, conn); err != nil {
+			return err
+		}
+		committed = true
 		return nil // already applied
 	}
 	for _, stmt := range splitSQL(m.up) {
-		if _, err := b.db.ExecContext(ctx, stmt); err != nil {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			if isAddColumn(stmt) && isDuplicateColumnError(err) {
 				continue // already backfilled; keep going
 			}
-			_, _ = b.db.ExecContext(ctx,
-				`DELETE FROM `+migrationTableName+` WHERE version = ?`, m.version)
 			return fmt.Errorf("sqlite migrate: %w\nstmt: %s", err, stmt)
 		}
 	}
+	if _, err := conn.ExecContext(cleanup,
+		`INSERT INTO `+migrationTableName+` (version) VALUES (?)`, m.version); err != nil {
+		if isUniqueViolation(err) {
+			return nil // another migrator completed the same DDL first
+		}
+		return err
+	}
+	if err := commitConn(cleanup, conn); err != nil {
+		return err
+	}
+	committed = true
 	return nil
 }
 
@@ -261,8 +300,19 @@ var requiredTables = []string{
 	"wf_tasks", "wf_timers", "wf_schedules",
 }
 
+// requiredColumns are columns added by post-baseline migrations. A database
+// whose tables all exist but which lacks one of these columns predates the
+// backfill migration: ordinary reads and writes would fail, so validation
+// must fail too instead of reporting a healthy schema.
+var requiredColumns = [][2]string{
+	{"wf_tasks", "heartbeat"},
+	{"wf_instances", "search_attributes"},
+	{"wf_instances", "memo"},
+}
+
 // ValidateSchema implements backend.SchemaValidator. It checks that every
-// required table exists; missing tables are reported together in one error.
+// required table exists and that every required column is present; missing
+// tables or columns are reported together in one error.
 func (b *Backend) ValidateSchema(ctx context.Context) error {
 	args := make([]any, 0, len(requiredTables))
 	for _, t := range requiredTables {
@@ -295,6 +345,23 @@ func (b *Backend) ValidateSchema(ctx context.Context) error {
 	if len(missing) > 0 {
 		return fmt.Errorf("sqlite: schema is missing tables %s; run Migrate (or your migration tool) first",
 			strings.Join(missing, ", "))
+	}
+	var missingCols []string
+	for _, c := range requiredColumns {
+		var name string
+		err := b.db.QueryRowContext(ctx,
+			`SELECT name FROM pragma_table_info(?) WHERE name = ?`, c[0], c[1]).Scan(&name)
+		if err == sql.ErrNoRows {
+			missingCols = append(missingCols, c[0]+"."+c[1])
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("sqlite: validate schema: %w", err)
+		}
+	}
+	if len(missingCols) > 0 {
+		return fmt.Errorf("sqlite: schema is missing columns %s; run Migrate (or your migration tool) first",
+			strings.Join(missingCols, ", "))
 	}
 	return nil
 }
