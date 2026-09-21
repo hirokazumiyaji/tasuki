@@ -297,6 +297,13 @@ func (w *Worker) availableSlots(sem chan struct{}) int {
 }
 
 func (w *Worker) tickWorkflows(ctx context.Context) {
+	if ctx.Err() != nil {
+		// Worker lifecycle ended (Shutdown): never start new turns on a
+		// canceled tick. Without this, the loop's wake/ticker select can
+		// win over ctx.Done and re-claim a just-released turn for another
+		// round of work after shutdown began.
+		return
+	}
 	avail := w.availableSlots(w.wfSem)
 	if avail <= 0 {
 		return
@@ -320,6 +327,12 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 	var wg sync.WaitGroup
 	var pendingMu sync.Mutex
 	var pending []pendingWorkflowCommit
+	// leaseDones stays open until the batch commit finishes: a task is only
+	// deleted by flushWorkflowCommits after every sibling turn completes, so
+	// stopping renewal at handleWorkflow return would let a finished task's
+	// lease expire while a slow sibling still runs (peer reclaim + duplicate
+	// execution). Renewal also stops early via ctx on shutdown.
+	var leaseDones []chan struct{}
 	for _, t := range wtasks {
 		// Reserve a slot before dispatch so Claim never over-subscribes and
 		// lease extension starts without semaphore wait.
@@ -330,8 +343,10 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 			_ = w.backend.ReleaseLease(ctx, t.ID)
 			continue
 		}
+		leaseDone := make(chan struct{})
+		leaseDones = append(leaseDones, leaseDone)
 		wg.Add(1)
-		go func(t backend.Task) {
+		go func(t backend.Task, leaseDone chan struct{}) {
 			defer wg.Done()
 			defer func() { <-w.wfSem }()
 			actor := w.actorFor(t.InstanceID)
@@ -342,12 +357,20 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 				// Extend the workflow task lease while the turn runs so long
 				// replays and local activities cannot lose the lease to a
 				// peer (which would duplicate the execution).
-				leaseDone := make(chan struct{})
-				defer close(leaseDone)
 				go w.extendLeaseLoop(ctx, t.ID, leaseDone)
 				p, herr := w.handleWorkflow(ctx, t)
 				w.untrack(t.ID)
 				if herr != nil {
+					if errors.Is(herr, errTurnAbandoned) ||
+						(ctx.Err() != nil && isCancellationError(herr)) {
+						// Worker lifecycle ended mid-turn: abandon the turn
+						// and release the lease promptly so a peer retries
+						// instead of committing shutdown as a failure.
+						w.opts.Logger.Debug("workflow turn abandoned on shutdown",
+							"instance_id", t.InstanceID, "task_id", t.ID)
+						w.releaseWorkflowLease(t.ID)
+						return
+					}
 					w.recordStoreError(ctx, "commit_workflow", herr,
 						"instance_id", t.InstanceID, "task_id", t.ID)
 					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", herr)
@@ -359,15 +382,21 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					pendingMu.Unlock()
 				}
 			})
-		}(t)
+		}(t, leaseDone)
 	}
 	wg.Wait()
 	w.flushWorkflowCommits(ctx, pending)
+	for _, ch := range leaseDones {
+		close(ch)
+	}
 	w.evictIdleInstanceLocks(time.Now())
 	w.evictIdleSticky(time.Now())
 }
 
 func (w *Worker) tickActivities(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	avail := w.availableSlots(w.actSem)
 	if avail <= 0 {
 		return
@@ -424,6 +453,9 @@ func (w *Worker) tickActivities(ctx context.Context) {
 // tickActivitiesSync is the PollOnce path: claim and run activities to
 // completion before returning for deterministic single-threaded tests.
 func (w *Worker) tickActivitiesSync(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	avail := w.availableSlots(w.actSem)
 	if avail <= 0 {
 		return
@@ -469,6 +501,33 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 		}(t)
 	}
 	wg.Wait()
+}
+
+// errTurnAbandoned marks a workflow turn canceled by the worker lifecycle
+// (Shutdown) whose error derives from that cancellation. The turn must be
+// abandoned — lease released, nothing committed — instead of persisting the
+// shutdown as a terminal workflow failure.
+var errTurnAbandoned = errors.New("tasuki: workflow turn abandoned on shutdown")
+
+// isCancellationError reports context lifecycle errors. workflow.ErrCanceled
+// (user-requested cancellation) is deliberately excluded: it is a legitimate
+// terminal outcome, unlike Shutdown-induced context.Canceled.
+func isCancellationError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// releaseWorkflowLease releases a task lease with a detached context so the
+// release survives worker shutdown (the tick context is already canceled).
+func (w *Worker) releaseWorkflowLease(taskID int64) {
+	timeout := w.opts.ShutdownReleaseTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	relCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := w.backend.ReleaseLease(relCtx, taskID); err != nil {
+		w.recordStoreError(context.Background(), "release_lease", err, "task_id", taskID)
+	}
 }
 
 func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWorkflowCommit, error) {
@@ -644,6 +703,12 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 		p := pending()
 		p.adv = adv
 		return p, nil
+	}
+	if res.Err != nil && !errors.Is(res.Err, workflow.ErrCanceled) && ctx.Err() != nil && isCancellationError(res.Err) {
+		// Shutdown canceled the turn and a cooperative local activity
+		// propagated context.Canceled: abandon the turn so a peer retries
+		// instead of committing the shutdown as a terminal failure.
+		return nil, errTurnAbandoned
 	}
 	if res.Err != nil && errors.Is(res.Err, workflow.ErrCanceled) {
 		adv.NewEvents = append(adv.NewEvents, journal.Event{
@@ -1001,18 +1066,52 @@ func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context, runCtx contex
 			return nil, err
 		}
 		// Run with the worker turn's context so Shutdown cancels a running
-		// local activity. An optional per-invocation timeout can bound
-		// activities that ignore cancellation.
+		// local activity.
 		ctx := runCtx
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		var cancel context.CancelFunc
-		if w.opts.LocalActivityTimeout > 0 {
-			ctx, cancel = context.WithTimeout(ctx, w.opts.LocalActivityTimeout)
-			defer cancel()
+		timeout := w.opts.LocalActivityTimeout
+		if timeout <= 0 {
+			return act.fn(ctx, input)
 		}
-		return act.fn(ctx, input)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		// Enforce the timeout outside the call: an activity that ignores
+		// cancellation (or blocks in a non-context-aware operation) cannot
+		// hold the turn, lease renewal, and Shutdown hostage. The late
+		// result is discarded; the underlying call keeps running until it
+		// returns, so local activities should still respect ctx to avoid
+		// wasted work after a timeout.
+		type callResult struct {
+			out []byte
+			err error
+		}
+		done := make(chan callResult, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					w.opts.Logger.Warn("local activity panic recovered",
+						"activity", name, "panic", fmt.Sprint(r))
+					done <- callResult{nil, fmt.Errorf("activity panic: %v", r)}
+				}
+			}()
+			o, e := act.fn(ctx, input)
+			select {
+			case done <- callResult{o, e}:
+			default: // turn already moved on (timeout/shutdown); drop late result
+			}
+		}()
+		select {
+		case r := <-done:
+			return r.out, r.err
+		case <-ctx.Done():
+			if runCtx != nil && runCtx.Err() != nil {
+				return nil, runCtx.Err()
+			}
+			return nil, fmt.Errorf("local activity %q timeout after %s: %w",
+				name, timeout, context.DeadlineExceeded)
+		}
 	})
 }
 

@@ -38,9 +38,11 @@ type WorkerOptions struct {
 	// Unreleased leases expire via lease timeout and are reclaimed by peers.
 	// <=0 defaults to 5s.
 	ShutdownReleaseTimeout time.Duration
-	// LocalActivityTimeout optionally bounds a single ExecuteLocal invocation.
-	// The worker cancels the context.Context passed to the local activity
-	// when the timeout elapses. <=0 disables the limit (default).
+	// LocalActivityTimeout bounds a single ExecuteLocal invocation. The bound
+	// is enforced outside the activity call, so even an activity that ignores
+	// cancellation returns a deadline error on time (its late result is
+	// discarded; the underlying call keeps running until it returns).
+	// <=0 disables the limit (default).
 	// Shutdown always cancels the context regardless of this setting.
 	LocalActivityTimeout time.Duration
 }
