@@ -99,5 +99,15 @@ func (p *FairPicker) Offer(ref FairTaskRef) bool {
 // Full reports whether the batch has been filled.
 func (p *FairPicker) Full() bool { return len(p.picked) >= p.limit }
 
+// Seed records already-secured selections so a refill pass keeps the
+// per-instance cap across rounds: a fresh picker for the remaining slots is
+// seeded with the rows locked (postgres: claimed) by earlier passes, and the
+// candidate scan continues past the dropped rows.
+func (p *FairPicker) Seed(refs []FairTaskRef) {
+	for _, r := range refs {
+		p.counts[r.InstanceID]++
+	}
+}
+
 // Picked returns the fair selection gathered so far, in FIFO order.
 func (p *FairPicker) Picked() []FairTaskRef { return p.picked }

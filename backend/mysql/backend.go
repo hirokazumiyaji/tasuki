@@ -292,7 +292,10 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // selectClaimCandidates returns the ids to claim in one batch. With
 // MaxPerInstance it pages FIFO-ordered candidates (keyset on visible_at, id)
 // through the fair picker until the batch fills, so a victim hidden behind a
-// flooding instance is still found beyond the first page.
+// flooding instance is still found beyond the first page. Rows the picker
+// accepts but a concurrent claimer locks first are dropped and refilled from
+// later candidates, so the batch never comes back empty while claimable
+// tasks remain.
 //
 // Candidate paging runs as plain SELECTs so rows the picker rejects are never
 // locked: only picker-accepted IDs are locked (SELECT ... FOR UPDATE SKIP
@@ -328,100 +331,121 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 	}
 
 	pageSize := backend.FairOverfetch(req.Limit)
-	picker := backend.NewFairPicker(req.Limit, req.MaxPerInstance)
 	prefix := fmt.Sprintf(`
 		SELECT id, instance_id, visible_at FROM wf_tasks
 		WHERE kind = ? AND visible_at <= ? AND queue IN (%s)`, inClause(len(req.Queues)))
 	first := true
 	var lastVis time.Time
 	var lastID int64
-	for !picker.Full() {
-		query := prefix
-		args := make([]any, 0, 2+len(req.Queues)+4)
-		args = append(args, req.Kind, now)
-		for _, q := range req.Queues {
-			args = append(args, q)
-		}
-		if !first {
-			query += ` AND (visible_at > ? OR (visible_at = ? AND id > ?))`
-			args = append(args, lastVis, lastVis, lastID)
-		}
-		query += `
-			ORDER BY visible_at, id
-			LIMIT ?`
-		args = append(args, pageSize)
-		rows, err := conn.QueryContext(ctx, query, args...)
-		if err != nil {
-			return nil, err
-		}
-		full := false
-		page := 0
-		for rows.Next() {
-			var r backend.FairTaskRef
-			var vis time.Time
-			if err := rows.Scan(&r.ID, &r.InstanceID, &vis); err != nil {
+	// A concurrent fair claimer may lock every row picked below between the
+	// plain-SELECT scan and the SKIP LOCKED lock step. Lock-skipped rows are
+	// dropped, and the scan continues past them (keyset on visible_at, id),
+	// refilling the batch from later candidates, so a claim never returns
+	// empty while claimable tasks remain behind contended head rows. Rows
+	// accepted so far seed each refill pass, keeping the per-instance cap
+	// across passes.
+	var accepted []backend.FairTaskRef
+	exhausted := false
+	for len(accepted) < req.Limit && !exhausted {
+		picker := backend.NewFairPicker(req.Limit-len(accepted), req.MaxPerInstance)
+		picker.Seed(accepted)
+		for !picker.Full() {
+			query := prefix
+			args := make([]any, 0, 2+len(req.Queues)+4)
+			args = append(args, req.Kind, now)
+			for _, q := range req.Queues {
+				args = append(args, q)
+			}
+			if !first {
+				query += ` AND (visible_at > ? OR (visible_at = ? AND id > ?))`
+				args = append(args, lastVis, lastVis, lastID)
+			}
+			query += `
+				ORDER BY visible_at, id
+				LIMIT ?`
+			args = append(args, pageSize)
+			rows, err := conn.QueryContext(ctx, query, args...)
+			if err != nil {
+				return nil, err
+			}
+			full := false
+			page := 0
+			for rows.Next() {
+				var r backend.FairTaskRef
+				var vis time.Time
+				if err := rows.Scan(&r.ID, &r.InstanceID, &vis); err != nil {
+					rows.Close()
+					return nil, err
+				}
+				page++
+				first = false
+				lastVis, lastID = vis, r.ID
+				if picker.Offer(r) {
+					full = true
+					break
+				}
+			}
+			if err := rows.Err(); err != nil {
 				rows.Close()
 				return nil, err
 			}
-			page++
-			first = false
-			lastVis, lastID = vis, r.ID
-			if picker.Offer(r) {
-				full = true
+			rows.Close()
+			if full || page < pageSize {
 				break
 			}
 		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		rows.Close()
-		if full || page < pageSize {
+		// The paging loop only stops short of a full picker at the end of
+		// the queue; a full picker may still have unscanned rows behind it.
+		exhausted = !picker.Full()
+		picked := picker.Picked()
+		if len(picked) == 0 {
 			break
 		}
-	}
-	picked := picker.Picked()
-	if len(picked) == 0 {
-		return nil, nil
-	}
-	// Lock only the accepted IDs. Rows locked by a concurrent claimant are
-	// skipped here and dropped below, and rows leased since the scan fail
-	// the visibility re-check here and again at UPDATE time.
-	ids := make([]int64, 0, len(picked))
-	for _, r := range picked {
-		ids = append(ids, r.ID)
-	}
-	lockArgs := make([]any, 0, len(ids)+2)
-	for _, id := range ids {
-		lockArgs = append(lockArgs, id)
-	}
-	lockArgs = append(lockArgs, req.Kind, now)
-	lrows, err := conn.QueryContext(ctx, fmt.Sprintf(`
-		SELECT id FROM wf_tasks
-		WHERE id IN (%s) AND kind = ? AND visible_at <= ?
-		FOR UPDATE SKIP LOCKED`, inClause(len(ids))), lockArgs...)
-	if err != nil {
-		return nil, err
-	}
-	locked := make(map[int64]bool, len(ids))
-	for lrows.Next() {
-		var id int64
-		if err := lrows.Scan(&id); err != nil {
+		// Lock only the accepted IDs. Rows locked by a concurrent claimant
+		// are skipped here and refilled above, and rows leased since the
+		// scan fail the visibility re-check here and again at UPDATE time.
+		ids := make([]int64, 0, len(picked))
+		for _, r := range picked {
+			ids = append(ids, r.ID)
+		}
+		lockArgs := make([]any, 0, len(ids)+2)
+		for _, id := range ids {
+			lockArgs = append(lockArgs, id)
+		}
+		lockArgs = append(lockArgs, req.Kind, now)
+		lrows, err := conn.QueryContext(ctx, fmt.Sprintf(`
+			SELECT id FROM wf_tasks
+			WHERE id IN (%s) AND kind = ? AND visible_at <= ?
+			FOR UPDATE SKIP LOCKED`, inClause(len(ids))), lockArgs...)
+		if err != nil {
+			return nil, err
+		}
+		locked := make(map[int64]bool, len(ids))
+		for lrows.Next() {
+			var id int64
+			if err := lrows.Scan(&id); err != nil {
+				lrows.Close()
+				return nil, err
+			}
+			locked[id] = true
+		}
+		if err := lrows.Err(); err != nil {
 			lrows.Close()
 			return nil, err
 		}
-		locked[id] = true
-	}
-	if err := lrows.Err(); err != nil {
 		lrows.Close()
-		return nil, err
-	}
-	lrows.Close()
-	out := make([]int64, 0, len(picked))
-	for _, r := range picked {
-		if locked[r.ID] {
-			out = append(out, r.ID)
+		for _, r := range picked {
+			if locked[r.ID] {
+				accepted = append(accepted, r)
+			}
 		}
+	}
+	if len(accepted) == 0 {
+		return nil, nil
+	}
+	out := make([]int64, 0, len(accepted))
+	for _, r := range accepted {
+		out = append(out, r.ID)
 	}
 	return out, nil
 }

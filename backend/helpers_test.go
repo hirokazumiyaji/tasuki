@@ -122,6 +122,18 @@ func TestFairPick(t *testing.T) {
 	if got := ids(p.Picked()); got != "AB" {
 		t.Fatalf("early-stop: %q", got)
 	}
+	// A refill pass seeded with already-secured rows keeps the per-instance
+	// cap across passes: A is already at cap 1, so only B may be added.
+	q := backend.NewFairPicker(2, 1)
+	q.Seed(p.Picked()[:1])
+	for _, r := range mk("AAB") {
+		if q.Offer(r) {
+			break
+		}
+	}
+	if got := ids(q.Picked()); got != "B" {
+		t.Fatalf("seeded refill: %q", got)
+	}
 	if of := backend.FairOverfetch(1); of < 64 || of <= 1 {
 		t.Fatalf("overfetch %d", of)
 	}
