@@ -102,7 +102,12 @@ func (b *Backend) touchWake(ctx context.Context, pk, instanceID string) {
 		b.wakeMu.Unlock()
 		return
 	}
+	// Track the pending callback so Close can wait for a timer that
+	// fires at the debounce boundary: such a callback removes its entry
+	// before Close snapshots the maps, so the flush alone would miss it.
+	b.wakeWG.Add(1)
 	b.wakeTimers[key] = time.AfterFunc(d, func() {
+		defer b.wakeWG.Done()
 		b.wakeMu.Lock()
 		ent, ok := b.wakePending[key]
 		delete(b.wakeTimers, key)
@@ -137,7 +142,9 @@ func (b *Backend) writeWake(ctx context.Context, pk, instanceID string) {
 // instead of dropping it with the stopped timer. Best-effort (write errors
 // are ignored, like the timer path) and idempotent: a second call finds no
 // pending entries. Wakes scheduled concurrently with the flush land in a
-// fresh window and fire on their own timer.
+// fresh window and fire on their own timer. A timer callback that fired at
+// the boundary (entry already removed, writeWake still in flight) is waited
+// on via wakeWG so Close never returns before its write completes.
 func (b *Backend) flushPendingWakes() {
 	b.wakeMu.Lock()
 	pending := b.wakePending
@@ -146,16 +153,23 @@ func (b *Backend) flushPendingWakes() {
 	b.wakeTimers = nil
 	b.wakeMu.Unlock()
 	for _, t := range timers {
-		t.Stop()
+		if t.Stop() {
+			// Callback will never run; balance the Add from touchWake.
+			// A false return means the callback already started (or
+			// finished) and its own Done balances the Add.
+			b.wakeWG.Done()
+		}
 	}
-	if len(pending) == 0 {
-		return
+	if len(pending) != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for _, ent := range pending {
+			b.writeWake(ctx, ent.pk, ent.instanceID)
+		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for _, ent := range pending {
-		b.writeWake(ctx, ent.pk, ent.instanceID)
-	}
+	// Wait for boundary callbacks whose entries were removed before the
+	// snapshot above but whose writes had not yet completed.
+	b.wakeWG.Wait()
 }
 
 func nextPollInterval(cur time.Duration) time.Duration {

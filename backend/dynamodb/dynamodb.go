@@ -41,10 +41,14 @@ type Backend struct {
 
 	// wakeMu/wakePending/wakeTimers debounce cross-process wake writes
 	// (wf_wake UpdateItem) so bursty operations coalesce into one write.
+	// wakeWG tracks in-flight debounce timer callbacks so Close can wait
+	// for a callback that already removed its entry but has not yet
+	// finished writeWake.
 	wakeMu       sync.Mutex
 	wakePending  map[string]wakeEntry
 	wakeTimers   map[string]*time.Timer
 	wakeDebounce time.Duration
+	wakeWG       sync.WaitGroup
 }
 
 type wakeEntry struct {
@@ -358,9 +362,40 @@ func (b *Backend) ensureMissingGSIs(ctx context.Context, d tableDef, desc *dynam
 	if len(updates) == 0 {
 		return nil
 	}
+	// UpdateTable with a GSI create accepts attribute definitions only
+	// for the new index key attributes. Passing the full table
+	// definitions (e.g. task_pk, gsi_pk, visible_at when only
+	// instance_gsi is added) is rejected as unused, so build the
+	// definitions from the new indexes' key schemas, resolving types
+	// from the table definition.
+	attrType := make(map[string]types.ScalarAttributeType, len(d.attrs))
+	for _, a := range d.attrs {
+		attrType[aws.ToString(a.AttributeName)] = a.AttributeType
+	}
+	var attrDefs []types.AttributeDefinition
+	seen := make(map[string]bool, len(updates))
+	for _, u := range updates {
+		if u.Create == nil {
+			continue
+		}
+		for _, k := range u.Create.KeySchema {
+			name := aws.ToString(k.AttributeName)
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			t, ok := attrType[name]
+			if !ok {
+				t = types.ScalarAttributeTypeS
+			}
+			attrDefs = append(attrDefs, types.AttributeDefinition{
+				AttributeName: aws.String(name), AttributeType: t,
+			})
+		}
+	}
 	_, err := b.client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
 		TableName:                    aws.String(d.name),
-		AttributeDefinitions:         d.attrs,
+		AttributeDefinitions:         attrDefs,
 		GlobalSecondaryIndexUpdates: updates,
 	})
 	if err != nil {

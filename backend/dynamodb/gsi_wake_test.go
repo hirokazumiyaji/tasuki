@@ -37,6 +37,10 @@ type fakeDynamo struct {
 	createInputs  map[string]*dynamodb.CreateTableInput
 	updateInputs  []*dynamodb.UpdateTableInput
 	describeCalls int64
+
+	// updateGate, when non-nil, blocks UpdateItem until closed: a test
+	// hook to hold a wake write in flight across Close.
+	updateGate chan struct{}
 }
 
 func (f *fakeDynamo) DescribeTable(ctx context.Context, in *dynamodb.DescribeTableInput, _ ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error) {
@@ -95,6 +99,9 @@ func (f *fakeDynamo) DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInpu
 }
 func (f *fakeDynamo) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
 	atomic.AddInt64(&f.updateCalls, 1)
+	if f.updateGate != nil {
+		<-f.updateGate
+	}
 	return &dynamodb.UpdateItemOutput{}, nil
 }
 func (f *fakeDynamo) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, _ ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
@@ -316,6 +323,13 @@ func TestEnsureMissingGSIs_CreatesInstanceGSIOnExistingTable(t *testing.T) {
 	if len(created) != 1 || created[0] != instanceGSIName {
 		t.Fatalf("created indexes = %v, want [%q]", created, instanceGSIName)
 	}
+	// UpdateTable must carry definitions only for the new index keys:
+	// DynamoDB rejects unrelated definitions (e.g. task_pk) as unused.
+	defs := f.updateInputs[0].AttributeDefinitions
+	if len(defs) != 1 || aws.ToString(defs[0].AttributeName) != "instance_id" ||
+		defs[0].AttributeType != types.ScalarAttributeTypeS {
+		t.Fatalf("AttributeDefinitions = %+v, want only [{instance_id S}]", defs)
+	}
 }
 
 func TestEnsureMissingGSIs_SucceedsWhileGSIBackfilling(t *testing.T) {
@@ -446,5 +460,43 @@ func TestClose_WithoutPendingWakeIsNoop(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&f.updateCalls); got != 0 {
 		t.Fatalf("UpdateItem calls = %d, want 0", got)
+	}
+}
+
+func TestClose_WaitsForInflightWakeCallback(t *testing.T) {
+	gate := make(chan struct{})
+	f := &fakeDynamo{updateGate: gate}
+	b := newTestBackend(f)
+	b.wakeDebounce = time.Millisecond
+	b.notifyTasks()
+	// Wait until the timer callback has entered writeWake: its entry is
+	// already removed from the pending maps while the write is blocked
+	// on the gate. This is the debounce-boundary state where the old
+	// flush saw an empty snapshot and returned early.
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt64(&f.updateCalls) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for wake callback to start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	closed := make(chan struct{})
+	go func() {
+		_ = b.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while a wake callback write was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(gate)
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return after the in-flight wake write completed")
+	}
+	if got := atomic.LoadInt64(&f.updateCalls); got != 1 {
+		t.Fatalf("UpdateItem calls = %d, want 1", got)
 	}
 }
