@@ -45,7 +45,7 @@ w := tasuki.NewWorker(b, tasuki.WorkerOptions{
 | SQLite | ✅ | FIFO 候補を `FairPicker` でページング |
 | memory | ✅ | バッファした候補に `FairPick` を適用 |
 | DynamoDB | ✅ | `claim_gsi` を `FairOverfetch` 幅でページングし `FairPicker` を適用。取得時は `visible_at` の再チェック付きで claim |
-| Firestore | ✅ | `(kind, queue, visible_at)` 複合インデックスを offset 幅でページングし `FairPicker` を適用。追加インデックスは不要 |
+| Firestore | ✅ | `(kind, queue, visible_at)` 複合インデックスを `(visible_at, __name__)` カーソル幅でページングし共有 `FairPicker` を適用。追加インデックスは不要 |
 | Spanner | ❌ | 未対応。値は無視され FIFO になる。`Capabilities.FairDispatch` は false で、適合テストは明示 skip |
 
 未対応バックエンドでは値は無視され、従来どおり FIFO になる。

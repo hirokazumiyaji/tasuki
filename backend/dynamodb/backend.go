@@ -290,11 +290,20 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 	}
 	now, visible := nowUTC(), nowUTC().Add(req.Lease)
 	result := []backend.Task{}
+	// Share one picker across queues so MaxPerInstance caps the whole claim
+	// batch, not each queue independently.
+	var picker *backend.FairPicker
+	if req.MaxPerInstance > 0 {
+		picker = backend.NewFairPicker(req.Limit, req.MaxPerInstance)
+	}
 	for _, queue := range req.Queues {
 		if len(result) >= req.Limit {
 			break
 		}
-		cands, err := b.listClaimCandidates(ctx, req.Kind, queue, now, req.Limit-len(result), req.MaxPerInstance)
+		if picker != nil && picker.Full() {
+			break
+		}
+		cands, err := b.listClaimCandidates(ctx, req.Kind, queue, now, req.Limit-len(result), picker)
 		if err != nil {
 			return nil, err
 		}
@@ -319,26 +328,27 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 }
 
 // listClaimCandidates returns FIFO-ordered claim_gsi items for one queue.
-// With maxPerInstance <= 0 it returns the first limit items; otherwise it
-// pages through the GSI (page window FairOverfetch) feeding a FairPicker, so
-// a victim hidden behind a flooding instance is still found beyond the first
-// page. Callers claim the returned items with a visible_at re-check: items
-// leased concurrently are skipped via the conditional update.
-func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, limit, maxPerInstance int) ([]map[string]types.AttributeValue, error) {
+// With a nil picker it returns the first remaining items; otherwise it pages
+// through the GSI (page window FairOverfetch) feeding the shared picker, so a
+// victim hidden behind a flooding instance is still found beyond the first
+// page. The picker is shared across the outer queue loop in ClaimTasks so the
+// per-instance cap applies to the whole claim batch. Callers claim the
+// returned items with a visible_at re-check: items leased concurrently are
+// skipped via the conditional update.
+func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker) ([]map[string]types.AttributeValue, error) {
 	queryPage := func(start map[string]types.AttributeValue, pageLimit int32) (*dynamodb.QueryOutput, error) {
 		return b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_tasks")), IndexName: aws.String("claim_gsi"),
 			KeyConditionExpression: aws.String("gsi_pk = :g AND visible_at <= :now"), ExpressionAttributeValues: map[string]types.AttributeValue{":g": avS(claimGSI(kind, queue)), ":now": avN(timeToN(now))},
 			Limit: aws.Int32(pageLimit), ExclusiveStartKey: start})
 	}
-	if maxPerInstance <= 0 {
-		out, err := queryPage(nil, int32(limit))
+	if picker == nil {
+		out, err := queryPage(nil, int32(remaining))
 		if err != nil {
 			return nil, err
 		}
 		return out.Items, nil
 	}
-	pageSize := backend.FairOverfetch(limit)
-	picker := backend.NewFairPicker(limit, maxPerInstance)
+	pageSize := backend.FairOverfetch(remaining)
 	byID := map[int64]map[string]types.AttributeValue{}
 	var start map[string]types.AttributeValue
 	for !picker.Full() {

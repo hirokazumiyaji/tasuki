@@ -44,7 +44,7 @@ When calling backend claim APIs directly (e.g. in custom batch executors), provi
 | SQLite | ✅ | Pages FIFO candidates through `FairPicker` |
 | In-memory | ✅ | `FairPick` over buffered candidates |
 | DynamoDB | ✅ | Pages `claim_gsi` in `FairOverfetch` windows through `FairPicker`; survivors are claimed with a `visible_at` re-check |
-| Firestore | ✅ | Pages the `(kind, queue, visible_at)` composite index with offset windows through `FairPicker`; no extra index required |
+| Firestore | ✅ | Pages the `(kind, queue, visible_at)` composite index with cursor windows over `(visible_at, __name__)` through a shared `FairPicker`; no extra index required |
 | Spanner | ❌ | `MaxPerInstance` is ignored, claims fall back to FIFO; `Capabilities.FairDispatch` is false and the conformance fair-dispatch test skips explicitly |
 
 Backends without support ignore the parameter and fall back to standard FIFO.

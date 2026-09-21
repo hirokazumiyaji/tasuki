@@ -306,11 +306,20 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 	}
 	now := nowUTC()
 	var out []backend.Task
+	// Share one picker across queues so MaxPerInstance caps the whole claim
+	// batch, not each queue independently.
+	var picker *backend.FairPicker
+	if req.MaxPerInstance > 0 {
+		picker = backend.NewFairPicker(req.Limit, req.MaxPerInstance)
+	}
 	for _, q := range req.Queues {
 		if len(out) >= req.Limit {
 			break
 		}
-		cands, err := b.listClaimCandidates(ctx, req.Kind, q, now, req.Limit-len(out), req.MaxPerInstance)
+		if picker != nil && picker.Full() {
+			break
+		}
+		cands, err := b.listClaimCandidates(ctx, req.Kind, q, now, req.Limit-len(out), picker)
 		if err != nil {
 			return nil, err
 		}
@@ -351,18 +360,20 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 }
 
 // listClaimCandidates returns FIFO-ordered task snapshots for one queue.
-// With maxPerInstance <= 0 it returns the first limit snapshots; otherwise it
-// pages through the (kind, queue, visible_at) composite index in
-// FairOverfetch windows feeding a FairPicker, so a victim hidden behind a
-// flooding instance is still found beyond the first page. The offset window
-// uses the same ordering as the plain path, so no additional composite index
-// is required. Callers claim the returned snapshots with a visible_at
-// re-check inside a transaction; concurrently leased rows conflict and are
-// skipped.
-func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, limit, maxPerInstance int) ([]*gcf.DocumentSnapshot, error) {
-	query := func(offset, pageLimit int) gcf.Query {
-		return b.col("wf_tasks").Where("kind", "==", kind).Where("queue", "==", queue).Where("visible_at", "<=", now).OrderBy("visible_at", gcf.Asc).Offset(offset).Limit(pageLimit)
-	}
+// With a nil picker it returns the first remaining snapshots; otherwise it
+// pages through the (kind, queue, visible_at, __name__) composite index in
+// FairOverfetch windows feeding the shared picker, so a victim hidden behind
+// a flooding instance is still found beyond the first page. Pages advance
+// with a document cursor over (visible_at, __name__) ordering — each query
+// fetches only its own window instead of reprocessing all preceding
+// documents, and concurrently leased rows do not shift later pages the way
+// offsets do. The DocumentID tie-breaker keeps the order deterministic when
+// tasks share the same visible_at. The picker is shared across the outer
+// queue loop in ClaimTasks so the per-instance cap applies to the whole claim
+// batch. Callers claim the returned snapshots with a visible_at re-check
+// inside a transaction; concurrently leased rows conflict and are skipped.
+func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker) ([]*gcf.DocumentSnapshot, error) {
+	base := b.col("wf_tasks").Where("kind", "==", kind).Where("queue", "==", queue).Where("visible_at", "<=", now).OrderBy("visible_at", gcf.Asc).OrderBy(gcf.DocumentID, gcf.Asc)
 	collect := func(it *gcf.DocumentIterator) ([]*gcf.DocumentSnapshot, error) {
 		defer it.Stop()
 		var docs []*gcf.DocumentSnapshot
@@ -378,15 +389,18 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		}
 		return docs, nil
 	}
-	if maxPerInstance <= 0 {
-		return collect(query(0, limit).Documents(ctx))
+	if picker == nil {
+		return collect(base.Limit(remaining).Documents(ctx))
 	}
-	pageSize := backend.FairOverfetch(limit)
-	picker := backend.NewFairPicker(limit, maxPerInstance)
+	pageSize := backend.FairOverfetch(remaining)
 	byID := map[int64]*gcf.DocumentSnapshot{}
-	offset := 0
+	var cursor *gcf.DocumentSnapshot
 	for !picker.Full() {
-		docs, err := collect(query(offset, pageSize).Documents(ctx))
+		q := base.Limit(pageSize)
+		if cursor != nil {
+			q = q.StartAfter(cursor)
+		}
+		docs, err := collect(q.Documents(ctx))
 		if err != nil {
 			return nil, err
 		}
@@ -403,7 +417,7 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 				break
 			}
 		}
-		offset += len(docs)
+		cursor = docs[len(docs)-1]
 		if picker.Full() || len(docs) < pageSize {
 			break
 		}
