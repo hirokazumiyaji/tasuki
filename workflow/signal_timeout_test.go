@@ -93,6 +93,41 @@ func TestReceiveSignalWithTimeout_SignalAfterTimerThenActivity(t *testing.T) {
 	}
 }
 
+func TestReceiveSignalWithTimeout_ImmediateSignalThenSleep(t *testing.T) {
+	// Regression for Codex P1 on #310: when the signal was already present on
+	// the first execution, this wait records no timer, so the next recorded
+	// timer_created belongs to the following Sleep. Replay must not consume
+	// that later timer as this wait's timer; otherwise the following Sleep
+	// emits a fresh command and suspends instead of completing.
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	tp, _ := json.Marshal(map[string]any{"fire_at": now.Add(time.Hour)})
+	events := []journal.Event{
+		{Seq: 1, Type: journal.TypeWorkflowStarted, Name: "WF"},
+		{Seq: 2, Type: journal.TypeSignalReceived, Name: "go", Payload: []byte(`"hi"`)},
+		{Seq: 3, Type: journal.TypeTimerCreated, Payload: tp},
+		{Seq: 4, Type: journal.TypeTimerFired, RefSeq: 3},
+	}
+	res := engine.RunAt(events, now, func(ctx *workflow.Context) (any, error) {
+		v, ok, err := workflow.ReceiveSignalWithTimeout[string](ctx, "go", time.Hour)
+		if err != nil || !ok || v != "hi" {
+			return nil, errors.New("want signal hi")
+		}
+		if err := workflow.Sleep(ctx, time.Hour); err != nil {
+			return nil, err
+		}
+		return v, nil
+	})
+	if res.Stuck || res.Suspended || res.Err != nil {
+		t.Fatalf("want complete, got %+v (err=%v)", res, res.Err)
+	}
+	if res.Result != "hi" {
+		t.Fatalf("got %v", res.Result)
+	}
+	if len(res.NewCommands) != 0 {
+		t.Fatalf("want no new commands, got %+v", res.NewCommands)
+	}
+}
+
 func TestReceiveSignalWithTimeout_SignalAfterTimerScheduled(t *testing.T) {
 	// Replay: no signal at peek → schedule timer in history → signal present before timer fires.
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
