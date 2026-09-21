@@ -119,7 +119,11 @@ func (w *Worker) loadWorkflowState(ctx context.Context, instanceID string) (*bac
 	return head, nil
 }
 
-func (w *Worker) commitWorkflow(ctx context.Context, instanceID string, baseJournal []journal.Event, adv backend.Advancement) error {
+func (w *Worker) commitWorkflow(ctx context.Context, task backend.Task, baseJournal []journal.Event, adv backend.Advancement) error {
+	instanceID := task.InstanceID
+	if instanceID == "" {
+		instanceID = adv.InstanceID
+	}
 	err := w.backend.CommitAdvancement(ctx, adv)
 	if err != nil {
 		if errors.Is(err, backend.ErrConflict) {
@@ -127,8 +131,11 @@ func (w *Worker) commitWorkflow(ctx context.Context, instanceID string, baseJour
 		}
 		// Release the lease so a conflicted (or transiently failed) task is
 		// immediately reclaimable instead of stalling until LeaseDuration
-		// expiry. Best-effort: the task may already be gone.
-		if rerr := w.backend.ReleaseLease(ctx, adv.TaskID); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
+		// expiry. Best-effort: the task may already be gone. The release
+		// carries the claim token (kind/instance for WF# routing, worker +
+		// attempt fencing) so a stale worker never clears a peer's fresh
+		// lease after a reclaim race.
+		if rerr := w.backend.ReleaseLease(ctx, task); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
 			w.recordStoreError(ctx, "release_lease", rerr, "task_id", adv.TaskID)
 		}
 		return err
@@ -141,6 +148,10 @@ type pendingWorkflowCommit struct {
 	instanceID  string
 	baseJournal []journal.Event
 	adv         backend.Advancement
+	// task is the claimed workflow task (ownership token for fenced lease
+	// release on commit failure). Older call sites may leave it zero; the
+	// release then falls back to adv-derived routing without fencing.
+	task backend.Task
 }
 
 func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWorkflowCommit) {
@@ -160,7 +171,7 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 			// commitWorkflow for immediate re-visibility (independent of
 			// LeaseDuration).
 			for _, p := range pending {
-				if cerr := w.commitWorkflow(ctx, p.instanceID, p.baseJournal, p.adv); cerr != nil {
+				if cerr := w.commitWorkflow(ctx, w.taskForCommit(p), p.baseJournal, p.adv); cerr != nil {
 					w.recordStoreError(ctx, "commit_workflow", cerr, "instance_id", p.instanceID)
 				}
 			}
@@ -172,9 +183,24 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 		return
 	}
 	for _, p := range pending {
-		if err := w.commitWorkflow(ctx, p.instanceID, p.baseJournal, p.adv); err != nil {
+		if err := w.commitWorkflow(ctx, w.taskForCommit(p), p.baseJournal, p.adv); err != nil {
 			w.recordStoreError(ctx, "commit_workflow", err, "instance_id", p.instanceID)
 		}
+	}
+}
+
+// taskForCommit resolves the fenced release token for a pending commit.
+// Production paths (handleWorkflow) populate p.task; legacy/test paths that
+// only set adv fall back to an adv-derived task (workflow routing without
+// ownership fencing).
+func (w *Worker) taskForCommit(p pendingWorkflowCommit) backend.Task {
+	if p.task.ID != 0 || p.task.InstanceID != "" {
+		return p.task
+	}
+	return backend.Task{
+		ID:         p.adv.TaskID,
+		Kind:       "workflow",
+		InstanceID: p.instanceID,
 	}
 }
 

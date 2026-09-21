@@ -69,7 +69,7 @@ func TestSQLite_LeaseHeartbeatReleaseRetry(t *testing.T) {
 	if err := b.RecordHeartbeat(ctx, aid, 2*time.Second, []byte(`{"n":1}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.ReleaseLease(ctx, aid); err != nil {
+	if err := b.ReleaseLease(ctx, acts[0]); err != nil {
 		t.Fatal(err)
 	}
 	acts2, err := b.ClaimTasks(ctx, backend.ClaimRequest{

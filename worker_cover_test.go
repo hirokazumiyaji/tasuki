@@ -127,7 +127,7 @@ func TestCommitWorkflow_ConflictDropsSticky(t *testing.T) {
 	if err != nil || len(tasks) != 1 {
 		t.Fatalf("%v", err)
 	}
-	err = w.commitWorkflow(ctx, "cf1", st.Journal, backend.Advancement{
+	err = w.commitWorkflow(ctx, tasks[0], st.Journal, backend.Advancement{
 		InstanceID:  "cf1",
 		TaskID:      tasks[0].ID,
 		ExpectedSeq: st.NextSeq - 1, // stale
@@ -168,6 +168,7 @@ func TestFlushWorkflowCommits_Batch(t *testing.T) {
 		pending = append(pending, pendingWorkflowCommit{
 			instanceID:  tsk.InstanceID,
 			baseJournal: st.Journal,
+			task:        tsk,
 			adv: backend.Advancement{
 				InstanceID:  tsk.InstanceID,
 				TaskID:      tsk.ID,
@@ -277,6 +278,7 @@ func TestFlushWorkflowCommits_BatchConflictDropsSticky(t *testing.T) {
 		pending = append(pending, pendingWorkflowCommit{
 			instanceID:  id,
 			baseJournal: st.Journal,
+			task:        tsk,
 			adv: backend.Advancement{
 				InstanceID:  id,
 				TaskID:      tsk.ID,

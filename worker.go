@@ -23,7 +23,7 @@ type Worker struct {
 	mu       sync.Mutex
 	cancel   context.CancelFunc
 	done     chan struct{}
-	inFlight map[int64]struct{}
+	inFlight map[int64]backend.Task
 
 	stickyMu sync.Mutex
 	sticky   map[string]stickyEntry
@@ -53,7 +53,7 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		backend:  b,
 		opts:     opts,
 		reg:      newRegistry(opts.Codec),
-		inFlight: map[int64]struct{}{},
+		inFlight: map[int64]backend.Task{},
 		sticky:   map[string]stickyEntry{},
 		instLock: map[string]*workflowActor{},
 		wfSem:    make(chan struct{}, opts.WorkflowConcurrency),
@@ -182,9 +182,9 @@ func (w *Worker) trackActivity() (done func(), ok bool) {
 	return w.actWg.Done, true
 }
 
-func (w *Worker) track(taskID int64) {
+func (w *Worker) track(t backend.Task) {
 	w.mu.Lock()
-	w.inFlight[taskID] = struct{}{}
+	w.inFlight[t.ID] = t
 	w.mu.Unlock()
 }
 
@@ -196,24 +196,27 @@ func (w *Worker) untrack(taskID int64) {
 
 func (w *Worker) releaseInFlight(ctx context.Context) {
 	w.mu.Lock()
-	ids := make([]int64, 0, len(w.inFlight))
-	for id := range w.inFlight {
-		ids = append(ids, id)
+	tasks := make([]backend.Task, 0, len(w.inFlight))
+	for _, t := range w.inFlight {
+		tasks = append(tasks, t)
 	}
-	w.inFlight = map[int64]struct{}{}
+	w.inFlight = map[int64]backend.Task{}
 	w.mu.Unlock()
-	for _, id := range ids {
+	for _, t := range tasks {
 		select {
 		case <-ctx.Done():
 			w.opts.Logger.Warn("shutdown lease release timed out",
-				"released", 0, "remaining", len(ids), "error", ctx.Err())
+				"released", 0, "remaining", len(tasks), "error", ctx.Err())
 			w.opts.Metrics.AddStoreError(context.Background(), "release_lease")
 			return
 		default:
 		}
-		if err := w.backend.ReleaseLease(ctx, id); err != nil {
+		// Fenced by the tracked claim token: if the task was reclaimed by
+		// a peer while shutting down, the backend reports ErrNotFound and
+		// the fresh lease is left intact.
+		if err := w.backend.ReleaseLease(ctx, t); err != nil && !errors.Is(err, backend.ErrNotFound) {
 			w.opts.Logger.Warn("shutdown lease release failed",
-				"task_id", id, "error", err)
+				"task_id", t.ID, "error", err)
 			w.opts.Metrics.AddStoreError(context.Background(), "release_lease")
 			select {
 			case <-ctx.Done():
@@ -327,7 +330,9 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		case w.wfSem <- struct{}{}:
 		default:
 			// No slot: make the task visible again promptly for peers.
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			// Fenced on the just-claimed token, so this only releases our
+			// own claim.
+			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
 		wg.Add(1)
@@ -341,7 +346,7 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 			actor.dispatch(func() {
 				w.opts.Metrics.AddWorkflowTask(ctx, 1)
 				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
-				w.track(t.ID)
+				w.track(t)
 				p, herr := w.handleWorkflow(ctx, t)
 				w.untrack(t.ID)
 				if herr != nil {
@@ -353,8 +358,10 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					}
 					// Release the lease so the task is immediately reclaimable
 					// instead of stalling until LeaseDuration expiry.
-					// Best-effort: the task may already be gone.
-					if rerr := w.backend.ReleaseLease(ctx, t.ID); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
+					// Best-effort: the task may already be gone. Fenced on
+					// the claim token so a slow handler that lost its lease
+					// to a peer never clears the peer's fresh lease.
+					if rerr := w.backend.ReleaseLease(ctx, t); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
 						w.recordStoreError(ctx, "release_lease", rerr, "task_id", t.ID)
 					}
 					return
@@ -395,7 +402,7 @@ func (w *Worker) tickActivities(ctx context.Context) {
 		select {
 		case w.actSem <- struct{}{}:
 		default:
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
 		// Lease extension starts in the handler goroutine immediately,
@@ -404,12 +411,12 @@ func (w *Worker) tickActivities(ctx context.Context) {
 		w.opts.Metrics.AddActivityTask(ctx, 1)
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
-		w.track(t.ID)
+		w.track(t)
 		done, ok := w.trackActivity()
 		if !ok {
 			w.untrack(t.ID)
 			<-w.actSem
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
 		go func(t backend.Task) {
@@ -452,14 +459,14 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 		select {
 		case w.actSem <- struct{}{}:
 		default:
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
 		wg.Add(1)
 		w.opts.Metrics.AddActivityTask(ctx, 1)
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
-		w.track(t.ID)
+		w.track(t)
 		done, global := w.trackActivity()
 		go func(t backend.Task) {
 			defer wg.Done()
@@ -586,6 +593,7 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 			instanceID:  t.InstanceID,
 			baseJournal: state.Journal,
 			adv:         adv,
+			task:        t,
 		}
 	}
 

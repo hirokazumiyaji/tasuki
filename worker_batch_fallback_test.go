@@ -34,7 +34,7 @@ func TestCommitWorkflow_ConflictReleasesLease(t *testing.T) {
 	if err != nil || len(tasks) != 1 {
 		t.Fatalf("claim: %v n=%d", err, len(tasks))
 	}
-	err = w.commitWorkflow(ctx, "rl1", st.Journal, backend.Advancement{
+	err = w.commitWorkflow(ctx, tasks[0], st.Journal, backend.Advancement{
 		InstanceID:  "rl1",
 		TaskID:      tasks[0].ID,
 		ExpectedSeq: st.NextSeq - 1, // stale → ErrConflict

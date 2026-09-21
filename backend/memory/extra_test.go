@@ -139,7 +139,7 @@ func TestMemory_ReleaseLease(t *testing.T) {
 	tasks, _ := b.ClaimTasks(ctx, backend.ClaimRequest{
 		Kind: "workflow", Queues: []string{"default"}, Limit: 1, Lease: time.Minute, WorkerID: "w1",
 	})
-	if err := b.ReleaseLease(ctx, tasks[0].ID); err != nil {
+	if err := b.ReleaseLease(ctx, tasks[0]); err != nil {
 		t.Fatal(err)
 	}
 	// Another worker can claim immediately
