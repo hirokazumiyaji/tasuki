@@ -223,6 +223,12 @@ func (w *Worker) execContext(fallback context.Context) context.Context {
 	return fallback
 }
 
+// defaultCommitTimeout bounds detached result commits during normal
+// operation. It is independent of ShutdownReleaseTimeout (which only bounds
+// shutdown lease cleanup) so a short shutdown-only value cannot cancel
+// ordinary commits.
+const defaultCommitTimeout = 30 * time.Second
+
 // commitContext returns a store-commit context detached from execution
 // cancellation with a bounded timeout. Result commits (Complete/Retry/fail)
 // must never use the canceled loop/execution ctx: pgx Begin on a canceled
@@ -231,10 +237,23 @@ func (w *Worker) execContext(fallback context.Context) context.Context {
 // suppressed by the caller checking execution ctx cancellation first.
 // Call it immediately before each result operation: creating it at handler
 // entry lets the timeout expire during long activity execution.
+//
+// The bound is CommitTimeout during normal operation and
+// ShutdownReleaseTimeout once Shutdown has begun (when commits racing
+// shutdown must fit the shutdown budget so Shutdown stays predictable).
 func (w *Worker) commitContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	timeout := w.opts.ShutdownReleaseTimeout
+	timeout := w.opts.CommitTimeout
 	if timeout <= 0 {
-		timeout = 5 * time.Second
+		timeout = defaultCommitTimeout
+	}
+	w.actMu.Lock()
+	stopping := w.stopping
+	w.actMu.Unlock()
+	if stopping {
+		timeout = w.opts.ShutdownReleaseTimeout
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
 	}
 	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
@@ -249,6 +268,40 @@ func (w *Worker) untrack(taskID int64) {
 	w.mu.Lock()
 	delete(w.inFlight, taskID)
 	w.mu.Unlock()
+}
+
+// claimReleaseOwnership atomically removes taskID from the in-flight set,
+// reporting whether this caller still owned it. Shutdown's releaseInFlight
+// and the handler's shutdown-release path both funnel through in-flight
+// ownership so only one of them releases a given lease: an activity that
+// ignores cancellation and returns after Shutdown already released (and a
+// peer re-claimed) its lease must not ReleaseLease again, since backend
+// leases are keyed by task ID alone and a second release would clear the
+// peer's fresh lease and enable duplicate execution.
+func (w *Worker) claimReleaseOwnership(taskID int64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, ok := w.inFlight[taskID]; !ok {
+		return false
+	}
+	delete(w.inFlight, taskID)
+	return true
+}
+
+// releaseContext returns a live store-call context for best-effort lease
+// releases on tick paths, detached from poll/execution cancellation and
+// bounded by ShutdownReleaseTimeout. Tasks rejected by trackActivity after
+// a concurrent Shutdown starts are already untracked (so releaseInFlight
+// cannot cover them) while the poll ctx may already be canceled, which
+// context-aware stores reject; a detached context keeps the release
+// effective so the task becomes claimable immediately instead of waiting
+// out the full lease.
+func (w *Worker) releaseContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := w.opts.ShutdownReleaseTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
 
 func (w *Worker) releaseInFlight(ctx context.Context) {
@@ -384,7 +437,12 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		case w.wfSem <- struct{}{}:
 		default:
 			// No slot: make the task visible again promptly for peers.
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			// Detached: the poll ctx may be canceled by a concurrent
+			// Shutdown, and the task was never tracked (releaseInFlight
+			// cannot cover it).
+			relCtx, relCancel := w.releaseContext(ctx)
+			_ = w.backend.ReleaseLease(relCtx, t.ID)
+			relCancel()
 			continue
 		}
 		wg.Add(1)
@@ -447,7 +505,11 @@ func (w *Worker) tickActivities(ctx context.Context) {
 		select {
 		case w.actSem <- struct{}{}:
 		default:
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			// Detached (see releaseContext): the poll ctx may be canceled
+			// by a concurrent Shutdown and the task was never tracked.
+			relCtx, relCancel := w.releaseContext(ctx)
+			_ = w.backend.ReleaseLease(relCtx, t.ID)
+			relCancel()
 			continue
 		}
 		// Lease extension starts in the handler goroutine immediately,
@@ -461,7 +523,13 @@ func (w *Worker) tickActivities(ctx context.Context) {
 		if !ok {
 			w.untrack(t.ID)
 			<-w.actSem
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			// Detached: Shutdown already canceled the poll ctx and this ID
+			// is untracked, so releaseInFlight cannot cover it; a canceled
+			// ctx would make context-aware stores reject the release and
+			// stall the task until lease expiry.
+			relCtx, relCancel := w.releaseContext(ctx)
+			_ = w.backend.ReleaseLease(relCtx, t.ID)
+			relCancel()
 			continue
 		}
 		go func(t backend.Task) {
@@ -506,7 +574,11 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 		select {
 		case w.actSem <- struct{}{}:
 		default:
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			// Detached (see releaseContext): the poll ctx may be canceled
+			// by a concurrent Shutdown and the task was never tracked.
+			relCtx, relCancel := w.releaseContext(ctx)
+			_ = w.backend.ReleaseLease(relCtx, t.ID)
+			relCancel()
 			continue
 		}
 		wg.Add(1)
@@ -939,9 +1011,13 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 
 	// Grace already expired before we started: don't execute, release for a peer.
 	if ctx.Err() != nil {
-		commitCtx, commitCancel := w.commitContext(ctx)
-		_ = w.backend.ReleaseLease(commitCtx, t.ID)
-		commitCancel()
+		// Only the in-flight owner releases: Shutdown's releaseInFlight
+		// may have already released (and a peer re-claimed) this lease.
+		if w.claimReleaseOwnership(t.ID) {
+			commitCtx, commitCancel := w.commitContext(ctx)
+			_ = w.backend.ReleaseLease(commitCtx, t.ID)
+			commitCancel()
+		}
 		return ctx.Err()
 	}
 
@@ -993,9 +1069,14 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	// attempt or record a timeout failure for a Shutdown-caused cancel.
 	// Release with a fresh detached commit ctx so a peer retries promptly.
 	if ctx.Err() != nil {
-		commitCtx, commitCancel := w.commitContext(ctx)
-		_ = w.backend.ReleaseLease(commitCtx, t.ID)
-		commitCancel()
+		// Only the in-flight owner releases (see claimReleaseOwnership):
+		// releasing a lease Shutdown already handed to a peer would clear
+		// the peer's lease and enable duplicate execution.
+		if w.claimReleaseOwnership(t.ID) {
+			commitCtx, commitCancel := w.commitContext(ctx)
+			_ = w.backend.ReleaseLease(commitCtx, t.ID)
+			commitCancel()
+		}
 		return ctx.Err()
 	}
 	if runCtx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {

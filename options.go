@@ -38,6 +38,14 @@ type WorkerOptions struct {
 	// Unreleased leases expire via lease timeout and are reclaimed by peers.
 	// <=0 defaults to 5s.
 	ShutdownReleaseTimeout time.Duration
+	// CommitTimeout bounds detached result commits (CompleteActivity,
+	// RetryActivity, activity failure records, workflow advancement flush)
+	// during normal operation. It is independent of ShutdownReleaseTimeout
+	// so a short shutdown-only bound (e.g. 50ms) cannot cancel ordinary
+	// commits and force re-execution. Once Shutdown has begun, commits
+	// racing shutdown are instead bounded by ShutdownReleaseTimeout to keep
+	// shutdown predictable. <=0 defaults to 30s.
+	CommitTimeout time.Duration
 }
 
 func (o WorkerOptions) withDefaults() WorkerOptions {
