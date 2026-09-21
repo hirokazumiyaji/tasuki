@@ -299,6 +299,8 @@ out, err := tasuki.Update[ReviseIn, ReviseOut](ctx, w, "order-123", "revise", in
 
 Updates enqueue an `update_requested` event to the inbox. The worker executes the registered `SetUpdateHandler`, which can invoke activities or sleep. Completed updates commit as `update_completed` events.
 
+`Update` only enqueues the request and waits for completion: it never claims or executes workflow/activity tasks on the caller goroutine, so unrelated activities are never run by the caller. Progress is driven by a started Worker loop (`w.Start(ctx)`) in the same process, which `Update` requires in order to complete. For deterministic tests without a background loop, drive progress explicitly with `w.PollOnce(ctx)` from test code instead of relying on `Update`.
+
 ## Registration and Naming
 
 Workflow and activity names are stored in the database and serve as matching keys during replay. By default, names are derived from function reflection (e.g., `OrderWorkflow`). In production, explicit names are recommended to safeguard against accidental refactoring breakages:
