@@ -349,6 +349,10 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		return out.Items, nil
 	}
 	pageSize := backend.FairOverfetch(remaining)
+	// seen tracks every examined ID (cheap) for dedup; byID retains full
+	// payloads only for picker-accepted candidates so rejected backlog
+	// scanned past an over-quota flood does not accumulate in memory.
+	seen := map[int64]struct{}{}
 	byID := map[int64]map[string]types.AttributeValue{}
 	var start map[string]types.AttributeValue
 	for !picker.Full() {
@@ -361,10 +365,16 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		}
 		for _, item := range out.Items {
 			id := fromN(item["id"])
-			if _, ok := byID[id]; !ok {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			before := len(picker.Picked())
+			full := picker.Offer(backend.FairTaskRef{ID: id, InstanceID: fromS(item["instance_id"])})
+			if len(picker.Picked()) > before {
 				byID[id] = item
 			}
-			if picker.Offer(backend.FairTaskRef{ID: id, InstanceID: fromS(item["instance_id"])}) {
+			if full {
 				break
 			}
 		}

@@ -393,6 +393,10 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		return collect(base.Limit(remaining).Documents(ctx))
 	}
 	pageSize := backend.FairOverfetch(remaining)
+	// seen tracks every examined ID (cheap) for dedup; byID retains
+	// snapshots only for picker-accepted candidates so rejected backlog
+	// scanned past an over-quota flood does not accumulate in memory.
+	seen := map[int64]struct{}{}
 	byID := map[int64]*gcf.DocumentSnapshot{}
 	var cursor *gcf.DocumentSnapshot
 	for !picker.Full() {
@@ -410,10 +414,16 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		for _, d := range docs {
 			m := d.Data()
 			id := i64(m, "id")
-			if _, ok := byID[id]; !ok {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			before := len(picker.Picked())
+			full := picker.Offer(backend.FairTaskRef{ID: id, InstanceID: str(m, "instance_id")})
+			if len(picker.Picked()) > before {
 				byID[id] = d
 			}
-			if picker.Offer(backend.FairTaskRef{ID: id, InstanceID: str(m, "instance_id")}) {
+			if full {
 				break
 			}
 		}
