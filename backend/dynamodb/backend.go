@@ -311,10 +311,42 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, decodeTask(updated.Attributes))
+			t := decodeTask(updated.Attributes)
+			// The terminal transition commits the instance update before
+			// its residual rows are swept, so a poll overlapping that
+			// window can lease a task whose workflow already completed.
+			// Deleting the row afterwards cannot recall it
+			// (tickActivities invokes user code immediately), so verify
+			// the owning instance is still running before handing the
+			// task out. A residual task of a terminal instance is
+			// dropped best-effort here; the terminal sweep removes
+			// whatever remains.
+			running, err := b.instanceRunning(ctx, t.InstanceID)
+			if err != nil {
+				return nil, err
+			}
+			if !running {
+				_, _ = b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": item["task_pk"]}})
+				continue
+			}
+			result = append(result, t)
 		}
 	}
 	return result, nil
+}
+
+// instanceRunning reports whether the instance still accepts work (status
+// "running"). A missing instance is treated as terminal: its tasks are
+// residue the terminal sweep owns.
+func (b *Backend) instanceRunning(ctx context.Context, id string) (bool, error) {
+	inst, err := b.GetInstance(ctx, id)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return inst.Status == "running", nil
 }
 
 func decodeTask(m map[string]types.AttributeValue) backend.Task {
@@ -544,11 +576,11 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 func (b *Backend) notifyAfterAdvancements(advs []backend.Advancement) error {
 	// Terminal rows (tasks, timers, inbox, dedupe) cannot ride inside the
 	// 100-item advancement transaction, so they are removed post-commit.
-	// Cleanup runs before any wake hint: a surviving activity task stays
-	// claimable (claims don't filter instance status) and would execute
-	// user code after completion. Transient throttling is retried, and a
-	// persistent failure is surfaced instead of reporting terminal success
-	// with rows left behind.
+	// Cleanup runs before any wake hint so survivors are removed promptly;
+	// claims additionally verify the owning instance is still running to
+	// close the overlap window (the instance update commits before this
+	// sweep). Transient throttling is retried, and a persistent failure is
+	// surfaced instead of reporting terminal success with rows left behind.
 	for _, adv := range advs {
 		if adv.Terminal != nil {
 			if err := b.cleanupTerminalInstance(context.Background(), adv.InstanceID); err != nil {

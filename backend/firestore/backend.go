@@ -3,6 +3,7 @@ package firestore
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"time"
 
@@ -322,7 +323,12 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 			}
 			old := timestamp(d.Data(), "visible_at")
 			var claimed backend.Task
+			skipped := false
 			err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+				// The transaction function may run more than once; reset
+				// per-attempt outcome state on entry.
+				claimed = backend.Task{}
+				skipped = false
 				s, e := tx.Get(d.Ref)
 				if isNotFound(e) {
 					return backend.ErrConflict
@@ -334,11 +340,27 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 					return backend.ErrConflict
 				}
 				m := s.Data()
-				claimed = decodeTask(m)
-				claimed.Attempt++
-				claimed.VisibleAt = now.Add(req.Lease)
-				claimed.WorkerID = req.WorkerID
-				return tx.Update(d.Ref, []gcf.Update{{Path: "visible_at", Value: claimed.VisibleAt}, {Path: "worker_id", Value: req.WorkerID}, {Path: "attempt", Value: int64(claimed.Attempt)}})
+				// The terminal transaction commits the instance update
+				// before its residual rows are swept, so a poll landing in
+				// that window can observe a task whose workflow already
+				// completed. Handing it out would execute user code after
+				// completion (the later sweep cannot recall it), so verify
+				// the owning instance is still running inside the same
+				// transaction. A residual task of a terminal instance is
+				// deleted here; the post-commit sweep removes the rest.
+				instSnap, e := tx.Get(b.ref("wf_instances", str(m, "instance_id")))
+				if e != nil && !isNotFound(e) {
+					return e
+				}
+				if e == nil && instSnap.Exists() && str(instSnap.Data(), "status") == "running" {
+					claimed = decodeTask(m)
+					claimed.Attempt++
+					claimed.VisibleAt = now.Add(req.Lease)
+					claimed.WorkerID = req.WorkerID
+					return tx.Update(d.Ref, []gcf.Update{{Path: "visible_at", Value: claimed.VisibleAt}, {Path: "worker_id", Value: req.WorkerID}, {Path: "attempt", Value: int64(claimed.Attempt)}})
+				}
+				skipped = true
+				return tx.Delete(d.Ref)
 			})
 			if err == backend.ErrConflict {
 				continue
@@ -346,6 +368,9 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 			if err != nil {
 				it.Stop()
 				return nil, err
+			}
+			if skipped {
+				continue
 			}
 			out = append(out, claimed)
 		}
@@ -506,7 +531,7 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	// cannot strand survivors.
 	for _, adv := range advs {
 		if adv.Terminal != nil {
-			if err := b.cleanupTerminalDocs(context.Background(), adv.InstanceID); err != nil {
+			if err := b.cleanupTerminalDocsWithRetry(context.Background(), adv.InstanceID); err != nil {
 				return err
 			}
 		}
@@ -691,6 +716,30 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 // terminalCleanupBatchSize bounds post-commit terminal sweeps below
 // Firestore's 500-write transaction/batch limit.
 const terminalCleanupBatchSize = 400
+
+// cleanupTerminalDocsWithRetry removes an instance's residual rows after a
+// terminal advancement commits, retrying transient failures (cleanup query
+// or batch.Commit errors) before terminal success is reported. The terminal
+// transaction already committed, so a failure here cannot be recovered by
+// retrying the advancement (its sequence was consumed and there is no later
+// sweep) — the idempotent sweep itself is retried instead, mirroring the
+// DynamoDB implementation.
+func (b *Backend) cleanupTerminalDocsWithRetry(ctx context.Context, id string) error {
+	const attempts = 5
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = b.cleanupTerminalDocs(ctx, id); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		time.Sleep(time.Duration(100*(1<<i)) * time.Millisecond)
+	}
+	return fmt.Errorf("firestore: terminal cleanup for %s failed after %d attempts: %w", id, attempts, err)
+}
 
 // cleanupTerminalDocs removes an instance's residual tasks, timers, inbox
 // entries and signal dedupe rows after a terminal advancement commits.
