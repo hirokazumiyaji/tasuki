@@ -247,7 +247,11 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	// tasks observe no leftovers. Terminal instances are immutable, so the
 	// non-transactional sweep cannot race with advancement commits; purge
 	// reaps anything left by a failed sweep.
+	// The status flip above already committed, so subscribers must wake even
+	// when the sweep fails: GetInstance permanently reports terminated while
+	// a skipped notifyTerminal would leave waiters asleep until a retry.
 	if err := b.sweepTerminateDocs(ctx, id); err != nil {
+		b.notifyTerminal(id)
 		return err
 	}
 	b.notifyTerminal(id)
@@ -323,6 +327,22 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 					return backend.ErrConflict
 				}
 				m := s.Data()
+				// Fence against TerminateInstance: never lease a task whose
+				// instance already left running. Reading the instance doc
+				// inside the claim transaction also conflicts with a
+				// concurrent status flip, restoring the exclusion the
+				// pre-chunk single-transaction terminate had.
+				instID := str(m, "instance_id")
+				isnap, e := tx.Get(b.ref("wf_instances", instID))
+				if isNotFound(e) {
+					return backend.ErrConflict
+				}
+				if e != nil {
+					return e
+				}
+				if !isnap.Exists() || str(isnap.Data(), "status") != "running" {
+					return backend.ErrConflict
+				}
 				claimed = decodeTask(m)
 				claimed.Attempt++
 				claimed.VisibleAt = now.Add(req.Lease)

@@ -60,6 +60,14 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 // then a second child sweep reaps writers that committed between the first
 // sweep and the instance delete (they read wf_instances inside their own
 // transaction, so post-delete writers abort into ErrNotFound instead).
+//
+// The trailing sweep is fenced on instance-ID reuse: CreateInstance may
+// recreate the same ID as soon as the instance row is gone, and an
+// unconditional second sweep would then delete the replacement's tasks,
+// timers, inbox, journal and seq rows. When the instance row reappears after
+// the delete, the second sweep is skipped so a live replacement is never
+// corrupted (at most a few straggler rows from the purged incarnation leak,
+// and they are reaped with the replacement's own purge once it is terminal).
 func (b *Backend) purgeOneInstance(ctx context.Context, id string) error {
 	if err := b.deleteInstanceChildren(ctx, id); err != nil {
 		return err
@@ -71,6 +79,11 @@ func (b *Backend) purgeOneInstance(ctx context.Context, id string) error {
 		})
 	})
 	if err != nil {
+		return err
+	}
+	if _, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"id"}); err == nil {
+		return nil
+	} else if !isNotFound(err) {
 		return err
 	}
 	return b.deleteInstanceChildren(ctx, id)

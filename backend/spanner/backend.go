@@ -257,7 +257,11 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	// anew and claimed tasks observe no leftovers. Terminal instances are
 	// immutable, so the paged sweep cannot race with advancement commits;
 	// purge reaps anything left by a failed sweep.
+	// The status flip above already committed, so subscribers must wake even
+	// when the sweep fails: GetInstance permanently reports terminated while
+	// a skipped notifyTerminal would leave waiters asleep until a retry.
 	if err := b.sweepTerminateDocs(ctx, id); err != nil {
+		b.notifyTerminal(id)
 		return err
 	}
 	b.notifyTerminal(id)
@@ -308,7 +312,7 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		out = nil
 		iter := txn.Query(ctx, spanner.Statement{
-			SQL: `SELECT id, visible_at FROM wf_tasks
+			SQL: `SELECT id, visible_at, instance_id FROM wf_tasks
 				WHERE kind = @kind AND visible_at <= @now AND queue IN UNNEST(@queues)
 				ORDER BY visible_at, id LIMIT @limit`,
 			Params: map[string]any{
@@ -316,8 +320,9 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 			},
 		})
 		type cand struct {
-			id  int64
-			vis time.Time
+			id         int64
+			vis        time.Time
+			instanceID string
 		}
 		var cands []cand
 		for {
@@ -330,7 +335,7 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				return err
 			}
 			var c cand
-			if err := row.Columns(&c.id, &c.vis); err != nil {
+			if err := row.Columns(&c.id, &c.vis, &c.instanceID); err != nil {
 				iter.Stop()
 				return err
 			}
@@ -339,6 +344,25 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		iter.Stop()
 
 		for _, c := range cands {
+			// Fence against TerminateInstance: never lease a task whose
+			// instance already left running. Reading the instance row inside
+			// the claim transaction also conflicts with a concurrent status
+			// flip, restoring the exclusion the pre-chunk single-transaction
+			// terminate had (status + task deletes committed atomically).
+			irow, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{c.instanceID}, []string{"status"})
+			if err != nil {
+				if isNotFound(err) {
+					continue
+				}
+				return err
+			}
+			var st string
+			if err := irow.Columns(&st); err != nil {
+				return err
+			}
+			if st != "running" {
+				continue
+			}
 			n, err := txn.Update(ctx, spanner.Statement{
 				SQL: `UPDATE wf_tasks SET visible_at = @vis, attempt = attempt + 1, worker_id = @wid
 					WHERE id = @id AND visible_at = @old`,

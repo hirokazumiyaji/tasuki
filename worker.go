@@ -870,6 +870,26 @@ func (w *Worker) fitAdvancementToBudget(adv *backend.Advancement, commands []jou
 }
 
 func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
+	// Fence against TerminateInstance racing ClaimTasks: a task leased just
+	// before the status flip (or before the post-commit sweep deletes it)
+	// must not run user code after the instance left running. Claim paths
+	// already filter terminated instances transactionally, but a claim can
+	// still serialize before termination; re-check here and drop the task
+	// without side effects. CompleteActivity deletes the task and discards
+	// the result for non-running instances, so this is cleanup-only; if the
+	// sweep already removed the task it reports superseded, which is also
+	// safe to ignore.
+	if inst, err := w.backend.GetInstance(ctx, t.InstanceID); err == nil {
+		if inst.Status != "running" {
+			_ = w.backend.CompleteActivity(ctx, t.ID, journal.Event{
+				Type:   journal.TypeActivityCompleted,
+				RefSeq: t.Seq,
+			})
+			return nil
+		}
+	} else if errors.Is(err, backend.ErrNotFound) {
+		return nil
+	}
 	act, err := w.reg.activity(t.Name)
 	if err != nil {
 		if errors.Is(err, ErrActivityNotRegistered) {

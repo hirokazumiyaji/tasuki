@@ -61,6 +61,17 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 		if _, err := b.ref("wf_instances", id).Delete(ctx); err != nil {
 			return purged, err
 		}
+		// Fence instance-ID reuse: CreateInstance may recreate the same ID as
+		// soon as the instance doc is gone, and an unconditional second sweep
+		// would then delete the replacement's children. When the instance doc
+		// reappears after the delete, skip the second sweep so a live
+		// replacement is never corrupted (Spanner parity).
+		if snap, err := b.ref("wf_instances", id).Get(ctx); err == nil && snap.Exists() {
+			purged++
+			continue
+		} else if err != nil && !isNotFound(err) {
+			return purged, err
+		}
 		if err := b.purgeInstanceDocs(ctx, id); err != nil {
 			return purged, err
 		}
