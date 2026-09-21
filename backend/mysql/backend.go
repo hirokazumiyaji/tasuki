@@ -686,8 +686,14 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_timers WHERE instance_id = ?`, adv.InstanceID); err != nil {
 			return err
 		}
+		// Purge the whole inbox, not just DrainedInbox: a signal committed
+		// after the worker loaded its state but before this terminal commit
+		// is never drained, and must not survive (like TerminateInstance).
+		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_inbox WHERE instance_id = ?`, adv.InstanceID); err != nil {
+			return err
+		}
 	}
-	if len(adv.DrainedInbox) > 0 {
+	if adv.Terminal == nil && len(adv.DrainedInbox) > 0 {
 		for _, inboxID := range adv.DrainedInbox {
 			_, err = conn.ExecContext(ctx, `DELETE FROM wf_inbox WHERE id = ?`, inboxID)
 			if err != nil {

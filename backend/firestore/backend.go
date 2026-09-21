@@ -7,6 +7,7 @@ import (
 	"time"
 
 	gcf "cloud.google.com/go/firestore"
+	firestorepb "cloud.google.com/go/firestore/apiv1/firestorepb"
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/journal"
 	"google.golang.org/api/iterator"
@@ -283,7 +284,17 @@ func (b *Backend) CountClaimableTasks(ctx context.Context, kind string, queues [
 		if err != nil {
 			return nil, err
 		}
-		n, _ := res["n"].(int64)
+		// The aggregation value arrives as a *firestorepb.Value, not an
+		// int64. A missing or unexpected result counts as zero.
+		var n int64
+		if v, ok := res["n"]; ok {
+			switch t := v.(type) {
+			case *firestorepb.Value:
+				n = t.GetIntegerValue()
+			case int64:
+				n = t
+			}
+		}
 		if n > 0 {
 			out[q] = n
 		}

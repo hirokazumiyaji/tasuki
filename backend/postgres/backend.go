@@ -620,8 +620,14 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 		if _, err = tx.Exec(ctx, `DELETE FROM wf_timers WHERE instance_id = $1`, adv.InstanceID); err != nil {
 			return err
 		}
+		// Purge the whole inbox, not just DrainedInbox: a signal committed
+		// after the worker loaded its state but before this terminal commit
+		// is never drained, and must not survive (like TerminateInstance).
+		if _, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE instance_id = $1`, adv.InstanceID); err != nil {
+			return err
+		}
 	}
-	if len(adv.DrainedInbox) > 0 {
+	if adv.Terminal == nil && len(adv.DrainedInbox) > 0 {
 		_, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE id = ANY($1)`, adv.DrainedInbox)
 		if err != nil {
 			return err

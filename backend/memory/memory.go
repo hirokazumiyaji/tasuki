@@ -524,8 +524,13 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 		return backend.ErrConflict
 	}
 
-	// Apply drained inbox
-	if len(adv.DrainedInbox) > 0 {
+	// Apply drained inbox. Terminal transitions purge the entire inbox:
+	// a signal committed after the worker loaded its state but before the
+	// terminal commit is never in DrainedInbox, so deleting only drained
+	// IDs would leave it behind (like TerminateInstance, drop everything).
+	if adv.Terminal != nil {
+		delete(b.inbox, adv.InstanceID)
+	} else if len(adv.DrainedInbox) > 0 {
 		drain := map[int64]struct{}{}
 		for _, id := range adv.DrainedInbox {
 			drain[id] = struct{}{}

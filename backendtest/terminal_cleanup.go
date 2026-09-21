@@ -26,6 +26,9 @@ func testTerminalCleanup(t *testing.T, newBackend Factory) {
 	t.Run("Terminate", func(t *testing.T) {
 		terminalCleanupCase(t, newBackend, false)
 	})
+	t.Run("CommitTerminalPurgesUndrainedInbox", func(t *testing.T) {
+		testTerminalCommitPurgesUndrainedInbox(t, newBackend)
+	})
 }
 
 func terminalCleanupCase(t *testing.T, newBackend Factory, viaCommit bool) {
@@ -84,6 +87,76 @@ func terminalCleanupCase(t *testing.T, newBackend Factory, viaCommit bool) {
 	}
 
 	assertNoRemnants(t, b, id, fireAt)
+}
+
+// Terminal CommitAdvancement must purge undrained inbox rows (Codex review
+// on #330).
+//
+// A signal committed after the worker loaded its state but before its
+// terminal advancement is never in DrainedInbox. The terminal commit must
+// still remove it — like TerminateInstance does — instead of leaving it
+// behind where no workflow task will ever consume it.
+func testTerminalCommitPurgesUndrainedInbox(t *testing.T, newBackend Factory) {
+	t.Helper()
+	ctx := context.Background()
+	b := newBackend(t)
+	requireTerminalCleanup(t, b)
+	setNow(b, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	id := instanceID("term-undrained-", t)
+
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 1,
+		Lease: time.Minute, WorkerID: "term-undrained",
+	})
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("claim wf: %v %#v", err, tasks)
+	}
+	// Worker loads its state (stale view of the inbox) ...
+	st, err := b.LoadWorkflow(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stale []int64
+	for _, item := range st.Inbox {
+		stale = append(stale, item.ID)
+	}
+	// ... then a signal lands before the terminal commit.
+	if err := b.SendToInbox(ctx, id, journal.Event{Type: journal.TypeSignalReceived, Name: "late"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CommitAdvancement(ctx, backend.Advancement{
+		InstanceID:   id,
+		TaskID:       tasks[0].ID,
+		ExpectedSeq:  st.NextSeq,
+		DrainedInbox: stale,
+		Terminal:     &backend.TerminalUpdate{Status: "completed", Result: []byte(`"ok"`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st, err = b.LoadWorkflow(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Inbox) != 0 {
+		t.Fatalf("terminal commit left %d undrained inbox rows", len(st.Inbox))
+	}
+	for _, kind := range []string{"activity", "workflow"} {
+		claimed, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+			Kind: kind, Queues: []string{"default"}, Limit: 100,
+			Lease: time.Minute, WorkerID: "term-undrained-check",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range claimed {
+			if task.InstanceID == id {
+				t.Fatalf("%s task %d survived terminal commit of %s", kind, task.ID, id)
+			}
+		}
+	}
 }
 
 // assertNoRemnants checks the terminal invariant: no claimable tasks for the
