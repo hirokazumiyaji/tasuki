@@ -65,24 +65,51 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 }
 
 func (w *Worker) Start(parent context.Context) {
+	if err := w.StartWithError(parent); err != nil {
+		w.opts.Logger.Error("tasuki: worker start failed", "error", err)
+	}
+}
+
+// StartWithError starts the worker's background polling loop and reports
+// startup failures to the caller.
+//
+// It returns an error when schema validation fails (see ValidateSchema and
+// WorkerOptions.DisableSchemaValidation) or when the worker is already
+// running (ErrWorkerAlreadyRunning). On error the worker is not started;
+// check Running to gate health checks or traffic.
+//
+// StartWithError starts polling asynchronously and returns immediately once
+// the loop is launched (it does not wait for tasks to complete).
+func (w *Worker) StartWithError(parent context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.cancel != nil {
-		return
+		return ErrWorkerAlreadyRunning
 	}
 	if !w.opts.DisableSchemaValidation {
 		if err := ValidateSchema(parent, w.backend); err != nil {
-			w.opts.Logger.Error("tasuki: schema validation failed; worker not started", "error", err)
-			return
+			return fmt.Errorf("tasuki: schema validation failed: %w", err)
 		}
 	}
 	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
 	w.cancel = cancel
-	w.done = make(chan struct{})
+	w.done = done
 	w.actMu.Lock()
 	w.stopping = false
 	w.actMu.Unlock()
-	go w.loop(ctx)
+	go w.loop(ctx, done)
+	return nil
+}
+
+// Running reports whether the worker's background polling loop is started.
+// It returns false when Start has never succeeded, when schema validation
+// refused the start, after Shutdown, or after the parent context is canceled
+// and the loop has exited; use it for health checks.
+func (w *Worker) Running() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.cancel != nil
 }
 
 // ValidateSchema checks that the backend's store schema is ready for use.
@@ -125,16 +152,21 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 	cancel := w.cancel
 	done := w.done
 	w.cancel = nil
+	w.done = nil
 	w.mu.Unlock()
-	if cancel == nil {
+	if cancel == nil && done == nil {
 		return nil
 	}
-	cancel()
+	if cancel != nil {
+		cancel()
+	}
 	var waitErr error
-	select {
-	case <-done:
-	case <-ctx.Done():
-		waitErr = ctx.Err()
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			waitErr = ctx.Err()
+		}
 	}
 	// Mark stopping so no new detached activities start, then wait for
 	// in-flight activities within the remaining grace period. Only
@@ -227,8 +259,19 @@ func (w *Worker) releaseInFlight(ctx context.Context) {
 	}
 }
 
-func (w *Worker) loop(ctx context.Context) {
-	defer close(w.done)
+func (w *Worker) loop(ctx context.Context, done chan struct{}) {
+	// Clear running state when the polling loop exits (e.g. parent context
+	// canceled without Shutdown) so Running stops reporting true and a
+	// subsequent StartWithError can start a fresh loop. Only clear when this
+	// loop is still current to avoid a stale loop clearing a restart.
+	defer func() {
+		w.mu.Lock()
+		if w.done == done {
+			w.cancel = nil
+		}
+		w.mu.Unlock()
+		close(done)
+	}()
 	ticker := time.NewTicker(w.opts.PollInterval)
 	defer ticker.Stop()
 
