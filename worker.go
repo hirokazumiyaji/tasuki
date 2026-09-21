@@ -85,10 +85,11 @@ func (w *Worker) Start(parent context.Context) {
 	w.done = make(chan struct{})
 	w.actMu.Lock()
 	w.stopping = false
-	// Detach activity execution from the poll loop ctx: loop cancellation
-	// must not abort activities still within their shutdown grace.
-	// Preserve parent values but give Shutdown its own cancel after grace.
-	w.execCtx, w.execCancel = context.WithCancel(context.WithoutCancel(parent))
+	// Execution observes the Start parent (so parent cancel still aborts
+	// activities and lease renewal) but uses its own cancel separate from
+	// the poll loop ctx, so Shutdown's immediate loop cancellation does not
+	// abort activities still within their grace.
+	w.execCtx, w.execCancel = context.WithCancel(parent)
 	w.actMu.Unlock()
 	go w.loop(ctx)
 }
@@ -210,14 +211,16 @@ func (w *Worker) trackActivity() (done func(), ok bool) {
 
 // execContext returns the execution context for detached activities.
 // It outlives the poll loop ctx across Shutdown's grace period so
-// within-grace completions remain committable.
+// within-grace completions remain committable, but it still observes the
+// Start parent cancellation so parent cancel aborts activities and lease
+// renewal.
 func (w *Worker) execContext(fallback context.Context) context.Context {
 	w.actMu.Lock()
 	defer w.actMu.Unlock()
 	if w.execCtx != nil {
 		return w.execCtx
 	}
-	return context.WithoutCancel(fallback)
+	return fallback
 }
 
 // commitContext returns a store-commit context detached from execution
@@ -226,6 +229,8 @@ func (w *Worker) execContext(fallback context.Context) context.Context {
 // ctx fails and a within-grace result would be lost until lease expiry
 // (and untracked, so not even released). Late commits after the grace are
 // suppressed by the caller checking execution ctx cancellation first.
+// Call it immediately before each result operation: creating it at handler
+// entry lets the timeout expire during long activity execution.
 func (w *Worker) commitContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	timeout := w.opts.ShutdownReleaseTimeout
 	if timeout <= 0 {
@@ -923,26 +928,35 @@ func (w *Worker) fitAdvancementToBudget(adv *backend.Advancement, commands []jou
 }
 
 func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
-	// Result commits use a context detached from execution cancellation with
-	// a bounded timeout. Shutdown cancels the poll loop ctx immediately and
-	// the execution ctx after its grace; committing with either canceled ctx
-	// (e.g. pgx Begin) fails and a within-grace result would be lost until
-	// lease expiry (and untracked, so not even released for peers).
-	commitCtx, commitCancel := w.commitContext(ctx)
-	defer commitCancel()
+	// Result commits use a bounded detached context created immediately
+	// before each result operation. Shutdown cancels the poll loop ctx
+	// immediately and the execution ctx after its grace; committing with
+	// either canceled ctx (e.g. pgx Begin) fails and a within-grace result
+	// would be lost until lease expiry (and untracked, so not even released
+	// for peers). The timeout must start after activity execution: creating
+	// it here at handler entry would let the default 5s budget expire during
+	// a long activity and reject Complete/Retry/fail with an expired ctx.
 
 	// Grace already expired before we started: don't execute, release for a peer.
 	if ctx.Err() != nil {
+		commitCtx, commitCancel := w.commitContext(ctx)
 		_ = w.backend.ReleaseLease(commitCtx, t.ID)
+		commitCancel()
 		return ctx.Err()
 	}
 
 	act, err := w.reg.activity(t.Name)
 	if err != nil {
 		if errors.Is(err, ErrActivityNotRegistered) {
-			return w.nackIncompatible(commitCtx, t, "unregistered_activity", err)
+			commitCtx, commitCancel := w.commitContext(ctx)
+			rerr := w.nackIncompatible(commitCtx, t, "unregistered_activity", err)
+			commitCancel()
+			return rerr
 		}
-		return w.failActivity(commitCtx, t, err)
+		commitCtx, commitCancel := w.commitContext(ctx)
+		rerr := w.failActivity(commitCtx, t, err)
+		commitCancel()
+		return rerr
 	}
 
 	done := make(chan struct{})
@@ -977,9 +991,11 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	out, err := w.invokeActivity(actCtx, act.fn, t.Input)
 	// Shutdown (grace expired) aborted the execution: never consume an
 	// attempt or record a timeout failure for a Shutdown-caused cancel.
-	// Release with the detached commit ctx so a peer retries promptly.
+	// Release with a fresh detached commit ctx so a peer retries promptly.
 	if ctx.Err() != nil {
+		commitCtx, commitCancel := w.commitContext(ctx)
 		_ = w.backend.ReleaseLease(commitCtx, t.ID)
+		commitCancel()
 		return ctx.Err()
 	}
 	if runCtx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
@@ -987,7 +1003,10 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	}
 	if err != nil {
 		if IsNonRetryable(err) || (t.MaxAttempts > 0 && t.Attempt >= t.MaxAttempts) {
-			return w.failActivity(commitCtx, t, err)
+			commitCtx, commitCancel := w.commitContext(ctx)
+			rerr := w.failActivity(commitCtx, t, err)
+			commitCancel()
+			return rerr
 		}
 		delay := workflow.RetryPolicy{
 			InitialInterval:    t.Retry.InitialInterval,
@@ -997,21 +1016,27 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		}.Backoff(t.Attempt)
 		w.opts.Logger.Info("activity retry",
 			"instance_id", t.InstanceID, "activity", t.Name, "attempt", t.Attempt, "delay", delay)
+		commitCtx, commitCancel := w.commitContext(ctx)
 		w.opts.Metrics.AddActivityRetry(commitCtx, 1)
 		if rerr := w.backend.RetryActivity(commitCtx, t.ID, delay); rerr != nil {
 			w.recordStoreError(commitCtx, "retry_activity", rerr, "instance_id", t.InstanceID, "activity", t.Name)
+			commitCancel()
 			return rerr
 		}
+		commitCancel()
 		return nil
 	}
+	commitCtx, commitCancel := w.commitContext(ctx)
 	if cerr := w.backend.CompleteActivity(commitCtx, t.ID, journal.Event{
 		Type:    journal.TypeActivityCompleted,
 		RefSeq:  t.Seq,
 		Payload: out,
 	}); cerr != nil {
 		w.recordStoreError(commitCtx, "complete_activity", cerr, "instance_id", t.InstanceID, "activity", t.Name)
+		commitCancel()
 		return cerr
 	}
+	commitCancel()
 	return nil
 }
 
