@@ -110,7 +110,7 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 	list, err := s.client.List(r.Context(), tasuki.InstanceFilter{
 		Status: status,
 		Name:   name,
-		Limit:  limit,
+		Limit:  limit + 1,
 		Offset: offset,
 	})
 	if err != nil {
@@ -119,14 +119,18 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 		s.render(w, r, "list.html", page, http.StatusInternalServerError)
 		return
 	}
+	hasMore := len(list) > limit
+	if hasMore {
+		list = list[:limit]
+	}
 	for _, inst := range list {
 		page.Rows = append(page.Rows, instanceRow{
 			ID: inst.ID, Name: inst.Name, Queue: inst.Queue, Status: inst.Status,
 		})
 	}
-	if len(list) == limit {
+	if hasMore {
 		page.HasMore = true
-		page.NextURL = listPageURL(status, name, limit, offset+len(list))
+		page.NextURL = listPageURL(status, name, limit, offset+limit)
 	}
 	if offset > 0 {
 		page.HasPrev = true

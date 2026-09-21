@@ -87,6 +87,42 @@ func TestHandler_ListPagination(t *testing.T) {
 	}
 }
 
+func TestHandler_ListPaginationExactMultiple(t *testing.T) {
+	b := memory.New()
+	seedInstances(t, b, 200, "exact")
+	h := ui.NewHandler(tasuki.NewClient(b))
+
+	code, body, _ := getList(t, h, "/?limit=100")
+	if code != http.StatusOK {
+		t.Fatalf("page1 status=%d", code)
+	}
+	if got := countRows(body); got != 100 {
+		t.Fatalf("page1 rows=%d want 100", got)
+	}
+	if !strings.Contains(body, "Next") {
+		t.Fatal("page1 should have Next link")
+	}
+
+	// Final full page: exactly limit rows but no further row exists,
+	// so there must be no Next link and no truncation notice.
+	code, body, _ = getList(t, h, "/?limit=100&offset=100")
+	if code != http.StatusOK {
+		t.Fatalf("page2 status=%d", code)
+	}
+	if got := countRows(body); got != 100 {
+		t.Fatalf("page2 rows=%d want 100", got)
+	}
+	if strings.Contains(body, "Next") {
+		t.Fatal("page2 should not have Next link when no further row exists")
+	}
+	if strings.Contains(body, "さらにあります") {
+		t.Fatal("page2 should not show truncation notice when no further row exists")
+	}
+	if !strings.Contains(body, "Prev") {
+		t.Fatal("page2 missing Prev link")
+	}
+}
+
 func TestHandler_ListPaginationBounds(t *testing.T) {
 	b := memory.New()
 	seedInstances(t, b, 201, "bound")
