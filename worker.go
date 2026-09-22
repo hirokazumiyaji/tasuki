@@ -327,12 +327,18 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 	var wg sync.WaitGroup
 	var pendingMu sync.Mutex
 	var pending []pendingWorkflowCommit
-	// leaseDones stays open until the batch commit finishes: a task is only
-	// deleted by flushWorkflowCommits after every sibling turn completes, so
-	// stopping renewal at handleWorkflow return would let a finished task's
-	// lease expire while a slow sibling still runs (peer reclaim + duplicate
-	// execution). Renewal also stops early via ctx on shutdown.
-	var leaseDones []chan struct{}
+	// leaseDones stays open until the batch commit finishes for tasks awaiting
+	// commit: a task is only deleted by flushWorkflowCommits after every
+	// sibling turn completes, so stopping renewal at handleWorkflow return
+	// would let a finished task's lease expire while a slow sibling still
+	// runs (peer reclaim + duplicate execution). Tasks with no pending
+	// commit (nacked, abandoned, error, or no-op) stop renewal immediately:
+	// extending a nacked task would overwrite NackTask's visible_at
+	// (IncompatibleRetryDelay) with the lease duration and delay a
+	// compatible worker. Renewal also stops early via ctx on shutdown.
+	// Each stop func closes exactly once (early per-task stop + final
+	// stop after the flush), so record one per task.
+	var renewalStops []func()
 	for _, t := range wtasks {
 		// Reserve a slot before dispatch so Claim never over-subscribes and
 		// lease extension starts without semaphore wait.
@@ -344,9 +350,11 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 			continue
 		}
 		leaseDone := make(chan struct{})
-		leaseDones = append(leaseDones, leaseDone)
+		var leaseOnce sync.Once
+		stopRenewal := func() { leaseOnce.Do(func() { close(leaseDone) }) }
+		renewalStops = append(renewalStops, stopRenewal)
 		wg.Add(1)
-		go func(t backend.Task, leaseDone chan struct{}) {
+		go func(t backend.Task, leaseDone chan struct{}, stopRenewal func()) {
 			defer wg.Done()
 			defer func() { <-w.wfSem }()
 			actor := w.actorFor(t.InstanceID)
@@ -361,6 +369,10 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 				p, herr := w.handleWorkflow(ctx, t)
 				w.untrack(t.ID)
 				if herr != nil {
+					// No commit follows: stop renewal before handling the
+					// error so ExtendLease cannot race a lease release
+					// below or overwrite a nack's visible_at.
+					stopRenewal()
 					if errors.Is(herr, errTurnAbandoned) ||
 						(ctx.Err() != nil && isCancellationError(herr)) {
 						// Worker lifecycle ended mid-turn: abandon the turn
@@ -376,18 +388,24 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", herr)
 					return
 				}
-				if p != nil {
-					pendingMu.Lock()
-					pending = append(pending, *p)
-					pendingMu.Unlock()
+				if p == nil {
+					// Nacked (unregistered/determinism mismatch) or no-op:
+					// nothing awaits commit, so stop renewal now instead
+					// of overwriting NackTask's visible_at during the wait
+					// for slower siblings.
+					stopRenewal()
+					return
 				}
+				pendingMu.Lock()
+				pending = append(pending, *p)
+				pendingMu.Unlock()
 			})
-		}(t, leaseDone)
+		}(t, leaseDone, stopRenewal)
 	}
 	wg.Wait()
 	w.flushWorkflowCommits(ctx, pending)
-	for _, ch := range leaseDones {
-		close(ch)
+	for _, stop := range renewalStops {
+		stop()
 	}
 	w.evictIdleInstanceLocks(time.Now())
 	w.evictIdleSticky(time.Now())
@@ -531,6 +549,12 @@ func (w *Worker) releaseWorkflowLease(taskID int64) {
 }
 
 func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWorkflowCommit, error) {
+	if ctx.Err() != nil {
+		// Worker lifecycle ended before the turn started: abandon so the
+		// lease is released for a peer instead of committing shutdown-driven
+		// work (including nacks) on a canceled context.
+		return nil, errTurnAbandoned
+	}
 	state, err := w.loadWorkflowState(ctx, t.InstanceID)
 	if err != nil {
 		return nil, err
@@ -626,6 +650,17 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 		}
 	}
 
+	if ctx.Err() != nil {
+		// Worker lifecycle ended mid-turn: abandon regardless of how
+		// workflow code handled the cancellation. A local activity may
+		// have observed ctx.Done but returned nil or a domain error, or
+		// the workflow may have caught the error and suspended — either
+		// way the turn must not advance. Backends such as memory ignore
+		// the canceled commit context, so any advancement built below
+		// would persist shutdown as a completion, failure, or commands.
+		return nil, errTurnAbandoned
+	}
+
 	adv := backend.Advancement{
 		InstanceID:   t.InstanceID,
 		TaskID:       t.ID,
@@ -703,12 +738,6 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 		p := pending()
 		p.adv = adv
 		return p, nil
-	}
-	if res.Err != nil && !errors.Is(res.Err, workflow.ErrCanceled) && ctx.Err() != nil && isCancellationError(res.Err) {
-		// Shutdown canceled the turn and a cooperative local activity
-		// propagated context.Canceled: abandon the turn so a peer retries
-		// instead of committing the shutdown as a terminal failure.
-		return nil, errTurnAbandoned
 	}
 	if res.Err != nil && errors.Is(res.Err, workflow.ErrCanceled) {
 		adv.NewEvents = append(adv.NewEvents, journal.Event{
