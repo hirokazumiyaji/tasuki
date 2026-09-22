@@ -481,6 +481,19 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if len(advs) == 0 {
 		return nil
 	}
+	// Reject duplicate instances up front: all reads run before any write
+	// in one transaction, so two advancements for the same instance would
+	// both pass the ExpectedSeq check and then collide creating the same
+	// journal document (AlreadyExists, not ErrConflict). Preflight keeps
+	// the batch all-or-nothing with a conflict error (see backendtest
+	// CommitAdvancementsAtomic).
+	seen := make(map[string]struct{}, len(advs))
+	for _, adv := range advs {
+		if _, dup := seen[adv.InstanceID]; dup {
+			return backend.ErrConflict
+		}
+		seen[adv.InstanceID] = struct{}{}
+	}
 	now := nowUTC()
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		// Firestore requires all reads before any writes in a transaction.

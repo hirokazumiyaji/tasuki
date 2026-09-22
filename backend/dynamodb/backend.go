@@ -481,6 +481,19 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if len(advs) == 0 {
 		return nil
 	}
+	// Reject duplicate instances up front: the batch below builds one
+	// TransactWriteItems with operations from every advancement, and
+	// DynamoDB rejects multiple operations on the same item with a
+	// ValidationException (not mapped to ErrConflict by conditional).
+	// Preflight keeps the batch all-or-nothing with a conflict error
+	// (see backendtest CommitAdvancementsAtomic).
+	seen := make(map[string]struct{}, len(advs))
+	for _, adv := range advs {
+		if _, dup := seen[adv.InstanceID]; dup {
+			return backend.ErrConflict
+		}
+		seen[adv.InstanceID] = struct{}{}
+	}
 	if len(advs) == 1 {
 		if err := b.commitAdvancementOnce(ctx, advs[0]); err != nil {
 			return err
