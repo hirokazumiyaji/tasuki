@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hirokazumiyaji/tasuki/activity"
@@ -372,6 +373,21 @@ func (w *Worker) beginResultCommit(taskID int64) bool {
 	w.opts.Logger.Debug("skipping stale activity commit; lease already released",
 		"task_id", taskID)
 	return false
+}
+
+// beginDetachedCommit transfers commit ownership (see beginResultCommit)
+// and marks a detached result commit as in flight so lease renewal stays
+// alive until the commit finishes (see extendLeaseLoop). Call it immediately
+// before creating the detached commit context: a parent cancel or
+// shutdown-grace expiry racing the commit must not stop renewal mid-commit,
+// or a commit longer than the remaining lease races a peer reclaim and the
+// task-ID-only store op clobbers the peer's task.
+func (w *Worker) beginDetachedCommit(taskID int64, committing *atomic.Bool) bool {
+	if !w.beginResultCommit(taskID) {
+		return false
+	}
+	committing.Store(true)
+	return true
 }
 
 // claimReleaseOwnership atomically removes taskID from the in-flight set,
@@ -1218,9 +1234,14 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		return rerr
 	}
 
+	// committing marks a detached result commit as in flight so lease
+	// renewal stays alive until the commit finishes (see
+	// beginDetachedCommit and extendLeaseLoop). done still closes at
+	// handler return, which is after every commit path below.
+	var committing atomic.Bool
 	done := make(chan struct{})
 	defer close(done)
-	go w.extendLeaseLoop(ctx, t.ID, done)
+	go w.extendLeaseLoop(ctx, t.ID, done, &committing)
 
 	attempt := t.Attempt
 	if attempt < 1 {
@@ -1271,7 +1292,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	}
 	if err != nil {
 		if IsNonRetryable(err) || (t.MaxAttempts > 0 && t.Attempt >= t.MaxAttempts) {
-			if !w.beginResultCommit(t.ID) {
+			if !w.beginDetachedCommit(t.ID, &committing) {
 				return ctx.Err()
 			}
 			commitCtx, commitCancel := w.commitContext(ctx)
@@ -1287,7 +1308,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		}.Backoff(t.Attempt)
 		w.opts.Logger.Info("activity retry",
 			"instance_id", t.InstanceID, "activity", t.Name, "attempt", t.Attempt, "delay", delay)
-		if !w.beginResultCommit(t.ID) {
+		if !w.beginDetachedCommit(t.ID, &committing) {
 			return ctx.Err()
 		}
 		commitCtx, commitCancel := w.commitContext(ctx)
@@ -1300,7 +1321,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		commitCancel()
 		return nil
 	}
-	if !w.beginResultCommit(t.ID) {
+	if !w.beginDetachedCommit(t.ID, &committing) {
 		return ctx.Err()
 	}
 	commitCtx, commitCancel := w.commitContext(ctx)
@@ -1395,7 +1416,7 @@ func (w *Worker) nackIncompatible(ctx context.Context, t backend.Task, reason st
 	return w.backend.NackTask(ctx, t, delay)
 }
 
-func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan struct{}) {
+func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan struct{}, committing *atomic.Bool) {
 	d := w.opts.LeaseDuration / 2
 	if d <= 0 {
 		return
@@ -1407,6 +1428,17 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan 
 		case <-done:
 			return
 		case <-ctx.Done():
+			if committing == nil || !committing.Load() {
+				return
+			}
+			// A detached result commit is in flight (see
+			// beginDetachedCommit): its commit context outlives this
+			// execution context, so keep renewing until the commit
+			// finishes (done closes when handleActivity returns).
+			// Exiting here would let a commit longer than the remaining
+			// lease race a peer reclaim, and the task-ID-only commit
+			// would then clobber the peer's task.
+			w.renewUntilDone(ctx, taskID, done, ticker)
 			return
 		case <-ticker.C:
 			if err := w.backend.ExtendLease(ctx, taskID, w.opts.LeaseDuration); err != nil {
@@ -1414,6 +1446,29 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan 
 			} else {
 				w.refreshLease(taskID)
 			}
+		}
+	}
+}
+
+// renewUntilDone keeps extending taskID with a detached context until done
+// closes. It serves a detached result commit that outlives its execution
+// context (parent cancel or shutdown-grace expiry mid-commit). Each renewal
+// is bounded by the lease duration and the commit itself is bounded by its
+// commit context, so this loop always terminates when the commit returns.
+func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, done <-chan struct{}, ticker *time.Ticker) {
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.leaseDuration())
+			err := w.backend.ExtendLease(rctx, taskID, w.opts.LeaseDuration)
+			if err != nil {
+				w.recordStoreError(rctx, "extend_lease", err, "task_id", taskID)
+			} else {
+				w.refreshLease(taskID)
+			}
+			cancel()
 		}
 	}
 }
