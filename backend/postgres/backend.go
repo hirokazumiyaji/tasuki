@@ -242,7 +242,11 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // Rows the picker accepts but a concurrent claimer locks first are dropped
 // and refilled from later candidates, so a claim never returns empty while
 // claimable tasks remain behind contended head rows. Claimed rows seed each
-// refill pass, keeping the per-instance cap across passes.
+// refill pass, keeping the per-instance cap across passes. Candidates the
+// picker rejects are carried forward as well: a rejected row can become
+// eligible once the pick that blocked it is lost (e.g. FIFO A1,A2,B1 with
+// Limit=2 and MaxPerInstance=1 picks A1,B1 and rejects A2; losing both picks
+// to concurrent locks must revisit A2 instead of resuming after B1).
 //
 // Candidate paging runs as plain SELECTs so rows the picker rejects are
 // never locked: only picker-accepted IDs are locked (SELECT ... FOR UPDATE
@@ -262,58 +266,70 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 	var lastVis time.Time
 	var lastID int64
 	var (
-		out       []backend.Task
-		claimed   []backend.FairTaskRef
-		exhausted bool
+		out     []backend.Task
+		claimed []backend.FairTaskRef
+		pending []backend.FairTaskRef
 	)
-	for len(out) < req.Limit && !exhausted {
+	for len(out) < req.Limit {
 		picker := backend.NewFairPicker(req.Limit-len(out), req.MaxPerInstance)
 		picker.Seed(claimed)
-		for !picker.Full() {
-			q := `
+		// Reconsider candidates rejected by an earlier pass first: they are
+		// FIFO-earlier than the scan cursor and may now fit under the cap
+		// once the picks that blocked them were lost to concurrent locks.
+		for _, r := range pending {
+			if picker.Full() {
+				break
+			}
+			picker.Offer(r)
+		}
+		if !picker.Full() {
+			for !picker.Full() {
+				q := `
 				SELECT id, instance_id, visible_at FROM wf_tasks
 				WHERE kind = $1 AND queue = ANY($2) AND visible_at <= now()`
-			args := []any{req.Kind, req.Queues}
-			if !first {
-				q += ` AND (visible_at, id) > ($3, $4)`
-				args = append(args, lastVis, lastID)
-			}
-			q += fmt.Sprintf(` ORDER BY visible_at, id LIMIT $%d`, len(args)+1)
-			args = append(args, pageSize)
-			rows, err := tx.Query(ctx, q, args...)
-			if err != nil {
-				return nil, err
-			}
-			full := false
-			page := 0
-			for rows.Next() {
-				var r backend.FairTaskRef
-				var vis time.Time
-				if err := rows.Scan(&r.ID, &r.InstanceID, &vis); err != nil {
+				args := []any{req.Kind, req.Queues}
+				if !first {
+					q += ` AND (visible_at, id) > ($3, $4)`
+					args = append(args, lastVis, lastID)
+				}
+				q += fmt.Sprintf(` ORDER BY visible_at, id LIMIT $%d`, len(args)+1)
+				args = append(args, pageSize)
+				rows, err := tx.Query(ctx, q, args...)
+				if err != nil {
+					return nil, err
+				}
+				full := false
+				page := 0
+				for rows.Next() {
+					var r backend.FairTaskRef
+					var vis time.Time
+					if err := rows.Scan(&r.ID, &r.InstanceID, &vis); err != nil {
+						rows.Close()
+						return nil, err
+					}
+					page++
+					first = false
+					lastVis, lastID = vis, r.ID
+					if picker.Offer(r) {
+						full = true
+						break
+					}
+				}
+				if err := rows.Err(); err != nil {
 					rows.Close()
 					return nil, err
 				}
-				page++
-				first = false
-				lastVis, lastID = vis, r.ID
-				if picker.Offer(r) {
-					full = true
+				rows.Close()
+				if full || page < pageSize {
 					break
 				}
-			}
-			if err := rows.Err(); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			rows.Close()
-			if full || page < pageSize {
-				break
 			}
 		}
 		// The paging loop only stops short of a full picker at the end of
 		// the queue; a full picker may still have unscanned rows behind it.
-		exhausted = !picker.Full()
+		scanExhausted := !picker.Full()
 		picked := picker.Picked()
+		iterRejected := picker.Rejected()
 		if len(picked) == 0 {
 			break
 		}
@@ -349,6 +365,7 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 			lrows.Close()
 		}
 
+		prevOut := len(out)
 		for _, r := range picked {
 			if !locked[r.ID] {
 				continue // locked or leased concurrently; refilled above
@@ -372,6 +389,17 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 			out = append(out, t)
 			claimed = append(claimed, r)
 		}
+		if len(out) >= req.Limit {
+			break
+		}
+		if scanExhausted {
+			// No unscanned rows remain, so the only way to make progress is
+			// to revisit rejected candidates freed by lost picks.
+			if lost := len(picked) - (len(out) - prevOut); lost == 0 || len(iterRejected) == 0 {
+				break
+			}
+		}
+		pending = iterRejected
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err

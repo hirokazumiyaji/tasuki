@@ -67,6 +67,6 @@ atlas migrate apply --dir file://backend/postgres/migrations \
 
 ## Adding New Migrations
 
-1. Add `000003_<name>.up.sql` / `.down.sql`. Versions must always be monotonically incrementing.
+1. Add `000004_<name>.up.sql` / `.down.sql`. Versions must always be monotonically incrementing.
 2. `.up.sql` does not strictly need to be idempotent (it runs only once and rolls back on failure in a transaction), but using idempotent DDL like `CREATE TABLE IF NOT EXISTS` helps bridge differences with databases migrated from older setups.
 3. Validate against a real PostgreSQL instance with `go test ./...` (requires `TASUKI_POSTGRES_DSN`).

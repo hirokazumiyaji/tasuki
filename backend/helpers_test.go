@@ -122,6 +122,9 @@ func TestFairPick(t *testing.T) {
 	if got := ids(p.Picked()); got != "AB" {
 		t.Fatalf("early-stop: %q", got)
 	}
+	if got := ids(p.Rejected()); got != "AA" {
+		t.Fatalf("rejected: %q want %q", got, "AA")
+	}
 	// A refill pass seeded with already-secured rows keeps the per-instance
 	// cap across passes: A is already at cap 1, so only B may be added.
 	q := backend.NewFairPicker(2, 1)
@@ -133,6 +136,15 @@ func TestFairPick(t *testing.T) {
 	}
 	if got := ids(q.Picked()); got != "B" {
 		t.Fatalf("seeded refill: %q", got)
+	}
+	// Losing both picks (A,B) frees the cap for the rejected A: revisiting
+	// the rejected row must yield it.
+	r := backend.NewFairPicker(2, 1)
+	for _, ref := range p.Rejected() {
+		r.Offer(ref)
+	}
+	if got := ids(r.Picked()); got != "A" {
+		t.Fatalf("revisit rejected: %q want %q", got, "A")
 	}
 	if of := backend.FairOverfetch(1); of < 64 || of <= 1 {
 		t.Fatalf("overfetch %d", of)

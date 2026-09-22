@@ -68,6 +68,7 @@ type FairPicker struct {
 	perInstance int
 	counts      map[string]int
 	picked      []FairTaskRef
+	rejected    []FairTaskRef
 }
 
 // NewFairPicker starts a fair selection of up to limit tasks with at most
@@ -84,11 +85,15 @@ func NewFairPicker(limit, perInstance int) *FairPicker {
 
 // Offer feeds one candidate in FIFO order. It reports whether the batch is
 // full after considering the candidate, so callers can stop paging early.
+// Candidates rejected by the per-instance cap are retained for Rejected, so a
+// refill pass can reconsider them if picked rows are later lost to concurrent
+// lock contention.
 func (p *FairPicker) Offer(ref FairTaskRef) bool {
 	if len(p.picked) >= p.limit {
 		return true
 	}
 	if p.counts[ref.InstanceID] >= p.perInstance {
+		p.rejected = append(p.rejected, ref)
 		return false
 	}
 	p.counts[ref.InstanceID]++
@@ -111,3 +116,9 @@ func (p *FairPicker) Seed(refs []FairTaskRef) {
 
 // Picked returns the fair selection gathered so far, in FIFO order.
 func (p *FairPicker) Picked() []FairTaskRef { return p.picked }
+
+// Rejected returns the candidates skipped by the per-instance cap, in FIFO
+// order. Callers that refill after losing picked rows to concurrent locks
+// must carry these forward: a rejected row can become eligible once the pick
+// that blocked it is lost.
+func (p *FairPicker) Rejected() []FairTaskRef { return p.rejected }
