@@ -419,7 +419,17 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		}
 		leaseDone := make(chan struct{})
 		var leaseOnce sync.Once
-		stopRenewal := func() { leaseOnce.Do(func() { close(leaseDone) }) }
+		var leaseWg sync.WaitGroup
+		leaseWg.Add(1)
+		// stopRenewal closes the renewal loop and WAITS for it to exit:
+		// closing leaseDone alone does not join extendLeaseLoop, which
+		// may be inside an ExtendLease call that would land after a
+		// NackTask below and overwrite its visible_at. Every store op
+		// after a stop therefore sees no renewal in flight.
+		stopRenewal := func() {
+			leaseOnce.Do(func() { close(leaseDone) })
+			leaseWg.Wait()
+		}
 		renewalStops = append(renewalStops, stopRenewal)
 		wg.Add(1)
 		go func(t backend.Task, leaseDone chan struct{}, stopRenewal func()) {
@@ -433,8 +443,11 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 				// Extend the workflow task lease while the turn runs so long
 				// replays and local activities cannot lose the lease to a
 				// peer (which would duplicate the execution).
-				go w.extendLeaseLoop(ctx, t.ID, leaseDone)
-				p, herr := w.handleWorkflow(ctx, t)
+				go func() {
+					defer leaseWg.Done()
+					w.extendLeaseLoop(ctx, t.ID, leaseDone)
+				}()
+				p, herr := w.handleWorkflow(ctx, t, stopRenewal)
 				w.untrack(t.ID)
 				if herr != nil {
 					// No commit follows: stop renewal before handling the
@@ -457,10 +470,11 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					return
 				}
 				if p == nil {
-					// Nacked (unregistered/determinism mismatch) or no-op:
+					// Nacked (renewal already stopped and joined inside
+					// handleWorkflow before the NackTask call) or no-op:
 					// nothing awaits commit, so stop renewal now instead
-					// of overwriting NackTask's visible_at during the wait
-					// for slower siblings.
+					// of renewing during the wait for slower siblings.
+					// The nack-path stop above makes this a no-op there.
 					stopRenewal()
 					return
 				}
@@ -616,7 +630,7 @@ func (w *Worker) releaseWorkflowLease(taskID int64) {
 	}
 }
 
-func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWorkflowCommit, error) {
+func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task, stopRenewal func()) (*pendingWorkflowCommit, error) {
 	if ctx.Err() != nil {
 		// Worker lifecycle ended before the turn started: abandon so the
 		// lease is released for a peer instead of committing shutdown-driven
@@ -634,6 +648,14 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 	wf, err := w.reg.workflow(state.Instance.Name)
 	if err != nil {
 		if errors.Is(err, ErrWorkflowNotRegistered) {
+			// Stop (and join) lease renewal BEFORE nacking: the loop
+			// may be inside ExtendLease, which would otherwise land
+			// after NackTask and overwrite its visible_at with the
+			// lease duration. stopRenewal is once-guarded, so the
+			// caller's post-return stop is a no-op.
+			if stopRenewal != nil {
+				stopRenewal()
+			}
 			return nil, w.nackIncompatible(ctx, t, "unregistered_workflow", err)
 		}
 		return nil, err
@@ -747,6 +769,11 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 
 	if res.Stuck {
 		if errors.Is(res.Err, journal.ErrDeterminismViolation) {
+			// Join renewal before nacking (see above): an in-flight
+			// ExtendLease must not overwrite the nack's visible_at.
+			if stopRenewal != nil {
+				stopRenewal()
+			}
 			return nil, w.nackIncompatible(ctx, t, "determinism", res.Err)
 		}
 		adv.NewEvents = append(adv.NewEvents, res.NewCommands...)
@@ -1201,15 +1228,40 @@ func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context, runCtx contex
 		}()
 		select {
 		case r := <-done:
-			return r.out, r.err
+			// The result may have arrived at/after the deadline with both
+			// branches ready (select then picks randomly). Resolve
+			// through the timeout re-check so a late success is never
+			// journaled after expiry.
+			return resolveLocalResult(name, r.out, r.err, ctx, runCtx, timeout)
 		case <-ctx.Done():
-			if runCtx != nil && runCtx.Err() != nil {
-				return nil, runCtx.Err()
-			}
-			return nil, fmt.Errorf("local activity %q timeout after %s: %w",
-				name, timeout, context.DeadlineExceeded)
+			return resolveLocalResult(name, nil, nil, ctx, runCtx, timeout)
 		}
 	})
+}
+
+// localResultTimeoutError builds the deadline error for one ExecuteLocal call.
+func localResultTimeoutError(name string, timeout time.Duration) error {
+	return fmt.Errorf("local activity %q timeout after %s: %w",
+		name, timeout, context.DeadlineExceeded)
+}
+
+// resolveLocalResult maps a delivered local activity result to its outcome
+// under the timeout/cancel state observed at acceptance. It is the single
+// decision point for both select branches above: when a result arrives
+// at/after the deadline, both done and ctx.Done() are ready and select
+// picks nondeterministically, so accepting the result must re-check the
+// timeout — a late success is discarded and reported as a timeout instead
+// of being journaled after expiry. Shutdown cancellations surface the turn
+// context error so the turn is abandoned rather than recorded as a local
+// timeout.
+func resolveLocalResult(name string, out []byte, actErr error, ctx, runCtx context.Context, timeout time.Duration) ([]byte, error) {
+	if ctx.Err() != nil {
+		if runCtx != nil && runCtx.Err() != nil {
+			return nil, runCtx.Err()
+		}
+		return nil, localResultTimeoutError(name, timeout)
+	}
+	return out, actErr
 }
 
 func (w *Worker) nackIncompatible(ctx context.Context, t backend.Task, reason string, cause error) error {
