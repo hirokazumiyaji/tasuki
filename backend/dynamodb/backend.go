@@ -303,29 +303,50 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		if picker != nil && picker.Full() {
 			break
 		}
-		cands, err := b.listClaimCandidates(ctx, req.Kind, queue, now, req.Limit-len(result), picker)
-		if err != nil {
-			return nil, err
-		}
-		for _, item := range cands {
-			old := fromN(item["visible_at"])
-			updated, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": item["task_pk"]},
-				UpdateExpression: aws.String("SET visible_at = :v, worker_id = :w ADD attempt :one"), ConditionExpression: aws.String("visible_at = :old"),
-				ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(visible)), ":w": avS(req.WorkerID), ":one": avN(1), ":old": avN(old)}, ReturnValues: types.ReturnValueAllNew})
-			if conditional(err) {
-				// Another worker leased this candidate first, or the GSI
-				// returned a stale entry: free its picker slot so Full
-				// below does not stop later queues from filling the batch.
-				if picker != nil {
-					picker.Release(backend.FairTaskRef{ID: fromN(item["id"]), InstanceID: fromS(item["instance_id"])})
-				}
-				continue
-			}
+		// skip holds IDs already attempted from this queue. A conflicted
+		// candidate's stale GSI image can resurface on a re-query before
+		// the index catches up, so refills must exclude attempted IDs
+		// instead of reselecting the same stale entry. It stays small:
+		// only attempted (picked) IDs are recorded, never every examined
+		// row, so it is bounded by the batch size plus conflicts.
+		skip := map[int64]struct{}{}
+		for len(result) < req.Limit && (picker == nil || !picker.Full()) {
+			cands, err := b.listClaimCandidates(ctx, req.Kind, queue, now, req.Limit-len(result), picker, skip)
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, decodeTask(updated.Attributes))
-			if len(result) >= req.Limit {
+			if len(cands) == 0 {
+				break
+			}
+			released := false
+			for _, item := range cands {
+				id := fromN(item["id"])
+				skip[id] = struct{}{}
+				old := fromN(item["visible_at"])
+				updated, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": item["task_pk"]},
+					UpdateExpression: aws.String("SET visible_at = :v, worker_id = :w ADD attempt :one"), ConditionExpression: aws.String("visible_at = :old"),
+					ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(visible)), ":w": avS(req.WorkerID), ":one": avN(1), ":old": avN(old)}, ReturnValues: types.ReturnValueAllNew})
+				if conditional(err) {
+					// Another worker leased this candidate first, or the GSI
+					// returned a stale entry: free its picker slot so Full
+					// below does not stop later candidates and queues from
+					// filling the batch, then re-query this queue for a
+					// replacement (the loop above) instead of moving on.
+					if picker != nil {
+						picker.Release(backend.FairTaskRef{ID: id, InstanceID: fromS(item["instance_id"])})
+						released = true
+					}
+					continue
+				}
+				if err != nil {
+					return nil, err
+				}
+				result = append(result, decodeTask(updated.Attributes))
+				if len(result) >= req.Limit {
+					break
+				}
+			}
+			if !released {
 				break
 			}
 		}
@@ -343,8 +364,17 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // re-attempted). Callers claim the returned items with a visible_at re-check:
 // items leased concurrently fail the conditional update, must be released
 // from the picker via Release (so Full does not stop later queues), and are
-// skipped.
-func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker) ([]map[string]types.AttributeValue, error) {
+// skipped; the caller then re-queries for replacements, passing attempted IDs
+// in skip so a stale GSI image is never reselected.
+//
+// No unbounded dedup set is kept here: pagination via LastEvaluatedKey
+// advances monotonically over the GSI partition, so each matching item is
+// visited exactly once per scan and repeats are impossible without concurrent
+// writes shifting page boundaries. The only cross-row state is byID, which
+// retains payloads solely for picker-accepted candidates (bounded by the
+// batch size) and doubles as a guard against double-offering an accepted ID
+// if a concurrent update ever surfaces a duplicate within one scan.
+func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker, skip map[int64]struct{}) ([]map[string]types.AttributeValue, error) {
 	queryPage := func(start map[string]types.AttributeValue, pageLimit int32) (*dynamodb.QueryOutput, error) {
 		return b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_tasks")), IndexName: aws.String("claim_gsi"),
 			KeyConditionExpression: aws.String("gsi_pk = :g AND visible_at <= :now"), ExpressionAttributeValues: map[string]types.AttributeValue{":g": avS(claimGSI(kind, queue)), ":now": avN(timeToN(now))},
@@ -355,17 +385,25 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		if err != nil {
 			return nil, err
 		}
-		return out.Items, nil
+		if len(skip) == 0 {
+			return out.Items, nil
+		}
+		items := out.Items[:0]
+		for _, item := range out.Items {
+			if _, ok := skip[fromN(item["id"])]; !ok {
+				items = append(items, item)
+			}
+		}
+		return items, nil
 	}
 	pageSize := backend.FairOverfetch(remaining)
-	// seen tracks every examined ID (cheap) for dedup; byID retains full
-	// payloads only for picker-accepted candidates so rejected backlog
-	// scanned past an over-quota flood does not accumulate in memory.
+	// byID retains full payloads only for picker-accepted candidates so
+	// rejected backlog scanned past an over-quota flood does not accumulate
+	// in memory.
 	// fresh counts the picks made during this call: the shared picker may
 	// already hold earlier queues' picks, which must not be re-attempted
 	// (a re-attempt would fail its own conditional update and wrongly
 	// release an already-successful claim).
-	seen := map[int64]struct{}{}
 	byID := map[int64]map[string]types.AttributeValue{}
 	fresh := len(picker.Picked())
 	var start map[string]types.AttributeValue
@@ -379,10 +417,12 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		}
 		for _, item := range out.Items {
 			id := fromN(item["id"])
-			if _, ok := seen[id]; ok {
+			if _, ok := skip[id]; ok {
 				continue
 			}
-			seen[id] = struct{}{}
+			if _, ok := byID[id]; ok {
+				continue
+			}
 			before := len(picker.Picked())
 			full := picker.Offer(backend.FairTaskRef{ID: id, InstanceID: fromS(item["instance_id"])})
 			if len(picker.Picked()) > before {
