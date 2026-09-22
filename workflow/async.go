@@ -8,6 +8,12 @@ import (
 )
 
 // ExecuteAsync schedules an activity and returns a Future without waiting.
+//
+// If the input cannot be marshaled (or the schedule payload cannot be
+// encoded), no journal command is recorded and the returned Future carries
+// the error: Get (and AwaitAll) report it, and Await treats the future as
+// immediately ready. This matches the sync Execute path, which returns the
+// Marshal error before recording anything.
 func ExecuteAsync[I, O any](ctx *Context, activityName string, in I, opts ...ExecuteOption) *Future[O] {
 	var eo executeOptions
 	for _, opt := range opts {
@@ -15,12 +21,14 @@ func ExecuteAsync[I, O any](ctx *Context, activityName string, in I, opts ...Exe
 	}
 	input, err := ctx.codec.Marshal(in)
 	if err != nil {
-		// Schedule still needs a command for determinism; use empty input on marshal failure.
-		input = []byte("null")
+		return newFailedFuture[O](err)
 	}
 	sched := ActivitySchedule{Input: input}
 	applyExecuteOptions(&sched, eo)
-	payload, _ := json.Marshal(sched)
+	payload, err := json.Marshal(sched)
+	if err != nil {
+		return newFailedFuture[O](err)
+	}
 	ev := ctx.recordOrReplay(journal.Command{
 		Type: journal.TypeActivityScheduled,
 		Name: activityName,
@@ -30,7 +38,10 @@ func ExecuteAsync[I, O any](ctx *Context, activityName string, in I, opts ...Exe
 
 // SleepAsync schedules a durable timer and returns a Future.
 func SleepAsync(ctx *Context, d time.Duration) *Future[struct{}] {
-	payload, _ := json.Marshal(timerPayload{FireAt: ctx.now.Add(d)})
+	payload, err := json.Marshal(timerPayload{FireAt: ctx.now.Add(d)})
+	if err != nil {
+		return newFailedFuture[struct{}](err)
+	}
 	ev := ctx.recordOrReplay(journal.Command{Type: journal.TypeTimerCreated}, payload)
 	return newFuture[struct{}](ev.Seq)
 }
@@ -53,6 +64,8 @@ func Await(ctx *Context, futures ...Awaitable) (int, error) {
 }
 
 // AwaitAll waits until all futures are ready, then returns the first Get error.
+// Scheduling failures (e.g. Marshal errors stored in a Future) are returned
+// as well, in argument order, before completion-payload errors.
 func AwaitAll(ctx *Context, futures ...Awaitable) error {
 	for _, f := range futures {
 		if !f.ready(ctx) {
@@ -64,6 +77,9 @@ func AwaitAll(ctx *Context, futures ...Awaitable) error {
 		}
 	}
 	for _, f := range futures {
+		if err := f.scheduleErr(); err != nil {
+			return err
+		}
 		// Type-erase Get via checking completion payload errors.
 		comp, ok := ctx.awaitCompletion(f.Seq())
 		if !ok {

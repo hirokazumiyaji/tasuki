@@ -16,7 +16,7 @@ Module hierarchy, dependencies, versioning, and publishing workflow.
 | spanner | `.../backend/spanner` | Cloud Spanner backend |
 | sqlite | `.../backend/sqlite` | SQLite backend |
 
-The root module does not depend on database drivers or cloud SDKs by default. `internal/backendopen` embeds only the in-memory backend by default; other backends are registered via `-tags tasuki_all` builds (within the multi-module workspace). Non-memory examples (`m1`, `m3`, `m4`) and `chaos/cmd/worker` are tagged with `tasuki_all`, allowing standard `GOWORK=off go list ./...` to build the root module cleanly.
+The root module does not depend on database drivers or cloud SDKs by default. `internal/backendopen` embeds only the in-memory backend by default; other backends are registered via `-tags tasuki_all` builds (within the multi-module workspace). Non-memory examples (`m1`, `m3`, `m4`), the `chaos` tests, and `chaos/cmd/worker` are tagged with `tasuki_all`, allowing standard `GOWORK=off go list ./...` and `GOWORK=off go vet ./...` (tests included) to cover the root module cleanly.
 
 ## Minimum Go Version
 
@@ -52,8 +52,8 @@ The root module does not depend on database drivers or cloud SDKs by default. `i
 ## Continuous Integration (CI)
 
 - **`root` Job**: `go test ./... -race` across the workspace (fuzz seed corpora run here as unit tests).
-- **`gowork-check` Job**: Validates root module independence via `GOWORK=off GOPROXY=off go list ./...` and `GOTOOLCHAIN=local go build ./...`; also runs `go test -tags tasuki_all ./contrib/... ./examples/...`.
+- **`gowork-check` Job**: Validates root module independence via `GOWORK=off GOPROXY=off go list ./...`, `GOWORK=off go build ./...`, `GOWORK=off go vet ./...` (tests included), `GOTOOLCHAIN=local go build ./...`, and a zero-diff check of `GOWORK=off GOPROXY=off go mod tidy -e` on `go.mod` / `go.sum`; also runs `go test -tags tasuki_all ./contrib/... ./examples/...`.
 - **Backend Jobs**: Executes `go test ./... -race` in each individual `backend/<name>` directory.
-- **Chaos Jobs**: Executes the `kill -9` chaos suites with `-race`, including the zero-infrastructure `chaos-sqlite` job.
+- **Chaos Jobs**: Executes the `kill -9` chaos suites with `-race` and `-tags tasuki_all`, including the zero-infrastructure `chaos-sqlite` job.
 - **`lint` / `vuln` Jobs**: `staticcheck` (hard gate) and advisory `govulncheck` over the root and backend modules.
 - **`fuzz-nightly` Job**: Runs only on the nightly schedule (or manual dispatch): 60s of `-fuzz -fuzztime` per codec/engine target.

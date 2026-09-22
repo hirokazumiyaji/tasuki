@@ -262,8 +262,7 @@ jobs:
         with:
           go-version: "1.24.x"
       - name: Chaos postgres
-        run: go test ./chaos/ -run 'TestChaos_KillWorkers$' -race -count=1 -timeout 5m
-
+        run: go test -tags tasuki_all ./chaos/ -run 'TestChaos_KillWorkers$' -race -count=1 -timeout 5m
   chaos-mysql:
     runs-on: ubuntu-latest
     services:
@@ -289,8 +288,7 @@ jobs:
         with:
           go-version: "1.24.x"
       - name: Chaos mysql
-        run: go test ./chaos/ -run TestChaos_KillWorkers_MySQL -race -count=1 -timeout 5m
-
+        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_MySQL -race -count=1 -timeout 5m
   chaos-spanner:
     runs-on: ubuntu-latest
     services:
@@ -315,8 +313,7 @@ jobs:
           done
           exit 1
       - name: Chaos spanner
-        run: go test ./chaos/ -run TestChaos_KillWorkers_Spanner -race -count=1 -timeout 5m
-
+        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_Spanner -race -count=1 -timeout 5m
   chaos-dynamodb:
     runs-on: ubuntu-latest
     env:
@@ -340,8 +337,7 @@ jobs:
           docker logs dynamodb || true
           exit 1
       - name: Chaos dynamodb
-        run: go test ./chaos/ -run TestChaos_KillWorkers_DynamoDB -race -count=1 -timeout 5m
-
+        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_DynamoDB -race -count=1 -timeout 5m
   chaos-firestore:
     runs-on: ubuntu-latest
     env:
@@ -364,7 +360,7 @@ jobs:
           docker logs firestore || true
           exit 1
       - name: Chaos firestore
-        run: go test ./chaos/ -run TestChaos_KillWorkers_Firestore -race -count=1 -timeout 5m
+        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_Firestore -race -count=1 -timeout 5m
 
   chaos-sqlite:
     runs-on: ubuntu-latest
@@ -432,8 +428,17 @@ jobs:
           go-version: "1.24.x"
       - name: Independent build without workspace (no hidden deps)
         run: |
-          GOWORK=off GOPROXY=off go list ./... > /dev/null
           GOWORK=off go build ./...
+          GOWORK=off GOPROXY=off go list ./... > /dev/null
+      - name: Vet without workspace including tests (no hidden deps)
+        run: GOWORK=off go vet ./...
+      - name: Verify go.mod/go.sum are tidy
+        run: |
+          # -e tolerates tasuki_all-gated workspace-only imports (backend/*),
+          # which are intentionally unresolvable outside the workspace.
+          # GOPROXY=off keeps them out instead of fetching pseudo-versions.
+          GOWORK=off GOPROXY=off go mod tidy -e
+          git diff --exit-code go.mod go.sum
       - name: Minimal Go version with local toolchain
         run: GOTOOLCHAIN=local go build ./...
       - name: Full workspace build with all backends

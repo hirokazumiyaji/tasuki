@@ -19,10 +19,20 @@ func ExecuteChild[I, O any](ctx *Context, workflowName string, in I) (O, error) 
 }
 
 // ExecuteChildAsync starts a child workflow and returns a Future.
+//
+// If the input cannot be marshaled (or the schedule payload cannot be
+// encoded), no journal command is recorded and the returned Future carries
+// the error (see ExecuteAsync for determinism reasoning).
 func ExecuteChildAsync[I, O any](ctx *Context, workflowName string, in I) *Future[O] {
-	input, _ := ctx.codec.Marshal(in)
+	input, err := ctx.codec.Marshal(in)
+	if err != nil {
+		return newFailedFuture[O](err)
+	}
 	childID := fmt.Sprintf("%s:%d", ctx.info.InstanceID, ctx.nextSeq)
-	payload, _ := json.Marshal(childPayload{ChildID: childID, Name: workflowName, Input: input})
+	payload, err := json.Marshal(childPayload{ChildID: childID, Name: workflowName, Input: input})
+	if err != nil {
+		return newFailedFuture[O](err)
+	}
 	ev := ctx.recordOrReplay(journal.Command{
 		Type: journal.TypeChildScheduled,
 		Name: workflowName,
