@@ -213,7 +213,10 @@ CREATE TABLE wf_inbox_seq (
 	if err := b.ensureSearchAttributesColumn(ctx); err != nil {
 		return err
 	}
-	return b.ensureInt64Column(ctx, "wf_inbox", "seq")
+	if err := b.ensureInt64Column(ctx, "wf_inbox", "seq"); err != nil {
+		return err
+	}
+	return b.ensureTasksInstanceIndex(ctx)
 }
 
 func (b *Backend) ensureSearchAttributesColumn(ctx context.Context) error {
@@ -243,6 +246,38 @@ func (b *Backend) ensureInt64Column(ctx context.Context, table, column string) e
 		return nil
 	}
 	return b.applyDDL(ctx, []string{fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s INT64`, table, column)})
+}
+
+// ensureTasksInstanceIndex backfills the instance_id index on wf_tasks for
+// databases created before the index existed. Terminal cleanup lists one
+// instance's tasks there; without the index that filter scans every task
+// row in the database.
+func (b *Backend) ensureTasksInstanceIndex(ctx context.Context) error {
+	exists, err := b.indexExists(ctx, "wf_tasks", "wf_tasks_instance_idx")
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	return b.applyDDL(ctx, []string{`CREATE INDEX wf_tasks_instance_idx ON wf_tasks(instance_id)`})
+}
+
+func (b *Backend) indexExists(ctx context.Context, table, index string) (bool, error) {
+	iter := b.client.Single().Query(ctx, spanner.Statement{
+		SQL: `SELECT 1 FROM INFORMATION_SCHEMA.INDEXES
+			WHERE TABLE_SCHEMA = '' AND TABLE_NAME = @table AND INDEX_NAME = @index LIMIT 1`,
+		Params: map[string]any{"table": table, "index": index},
+	})
+	defer iter.Stop()
+	_, err := iter.Next()
+	if err == iterator.Done {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (b *Backend) columnExists(ctx context.Context, table, column string) (bool, error) {

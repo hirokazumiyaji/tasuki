@@ -204,28 +204,71 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 }
 
 func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
-	if err := b.deleteTasksForInstanceByGSI(ctx, id); err == nil {
-		return nil
-	} else if !isMissingIndexError(err) {
-		return err
-	} else {
-		// Backward compat: tables created before instance_gsi existed
-		// fall back to a full-table Scan (the #321 migration backfills
-		// the index on existing tables).
-		if scanErr := b.deleteTasksForInstanceByScan(ctx, id); scanErr != nil {
-			return scanErr
+	n, err := b.deleteTasksForInstanceByGSI(ctx, id)
+	if err != nil {
+		if !isMissingIndexError(err) {
+			return err
 		}
+		// Backward compat: tables created before instance_gsi existed (or
+		// still backfilling it) fall back to a strongly-consistent
+		// full-table Scan; Migrate backfills the index on existing tables.
+		_, scanErr := b.deleteTasksForInstanceByScan(ctx, id)
+		return scanErr
+	}
+	if n > 0 {
 		return nil
 	}
+	// The GSI is eventually consistent: a sweep that runs before recent
+	// writes propagate reports zero deletions while rows still exist, and
+	// nothing revisits them afterwards (the claim-time status gate stops
+	// execution but not the leak). Confirm against strongly consistent
+	// state with one bounded Scan page. Residual guarantee: a row beyond
+	// the verification window stays until a TerminateInstance or
+	// PurgeInstances full sweep reaps it, and is never executed meanwhile.
+	return b.verifyTasksEmptyByScan(ctx, id)
+}
+
+// gsiVerifyScanLimit bounds the strongly-consistent verification Scan to a
+// single page of evaluated items: enough to catch lagged rows in ordinary
+// tables without turning every terminal completion into a fleet-wide scan.
+const gsiVerifyScanLimit = 1000
+
+// verifyTasksEmptyByScan deletes up to one page worth of the instance's tasks
+// read with ConsistentRead. It runs only when the GSI sweep reported zero
+// deletions, so the common no-task completion pays one bounded read.
+func (b *Backend) verifyTasksEmptyByScan(ctx context.Context, id string) error {
+	out, err := b.client.Scan(ctx, &dynamodb.ScanInput{
+		TableName:      aws.String(b.table("wf_tasks")),
+		Limit:          aws.Int32(gsiVerifyScanLimit),
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return err
+	}
+	for _, m := range out.Items {
+		if fromS(m["instance_id"]) != id {
+			continue
+		}
+		pk, ok := m["task_pk"]
+		if !ok {
+			continue
+		}
+		if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // deleteTasksForInstanceByGSI removes one instance's tasks via the
-// instance_gsi Query: cost is proportional to the instance's rows, not the
-// fleet's queued work. Terminal advancements create no new tasks, so rows
-// read here were written in earlier turns and the eventually-consistent
-// index has converged on them.
-func (b *Backend) deleteTasksForInstanceByGSI(ctx context.Context, id string) error {
+// instance_gsi Query and reports how many rows it deleted. The index is
+// eventually consistent, so a zero count proves nothing on its own: the
+// caller confirms it against strongly consistent state (see
+// deleteTasksForInstance). Cost stays proportional to the instance's rows,
+// not the fleet's queued work.
+func (b *Backend) deleteTasksForInstanceByGSI(ctx context.Context, id string) (int, error) {
 	var start map[string]types.AttributeValue
+	deleted := 0
 	for {
 		out, err := b.client.Query(ctx, &dynamodb.QueryInput{
 			TableName:                 aws.String(b.table("wf_tasks")),
@@ -235,7 +278,7 @@ func (b *Backend) deleteTasksForInstanceByGSI(ctx context.Context, id string) er
 			ExclusiveStartKey:         start,
 		})
 		if err != nil {
-			return err
+			return deleted, err
 		}
 		for _, m := range out.Items {
 			pk, ok := m["task_pk"]
@@ -243,19 +286,21 @@ func (b *Backend) deleteTasksForInstanceByGSI(ctx context.Context, id string) er
 				continue
 			}
 			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
-				return err
+				return deleted, err
 			}
+			deleted++
 		}
 		if out.LastEvaluatedKey == nil {
-			return nil
+			return deleted, nil
 		}
 		start = out.LastEvaluatedKey
 	}
 }
 
 // isMissingIndexError reports whether err indicates the instance_gsi index
-// does not (yet) exist on wf_tasks, in which case callers fall back to a
-// full-table Scan.
+// is not (yet) queryable on wf_tasks — absent on pre-index tables, or still
+// CREATING/backfilling after Migrate created it — in which case callers fall
+// back to a full-table Scan.
 func isMissingIndexError(err error) bool {
 	if err == nil {
 		return false
@@ -264,6 +309,13 @@ func isMissingIndexError(err error) bool {
 	if strings.Contains(msg, "specified index") ||
 		strings.Contains(msg, "no such index") ||
 		strings.Contains(msg, "unknown index") {
+		return true
+	}
+	lower := strings.ToLower(msg)
+	if strings.Contains(lower, "being created") ||
+		strings.Contains(lower, "backfill") ||
+		strings.Contains(lower, "not active") ||
+		strings.Contains(lower, "is creating") {
 		return true
 	}
 	var rnfe *types.ResourceNotFoundException
@@ -276,22 +328,24 @@ func isMissingIndexError(err error) bool {
 	return false
 }
 
-func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string) error {
+func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string) (int, error) {
 	var start map[string]types.AttributeValue
+	deleted := 0
 	for {
 		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(b.table("wf_tasks")), ExclusiveStartKey: start})
 		if err != nil {
-			return err
+			return deleted, err
 		}
 		for _, m := range out.Items {
 			if fromS(m["instance_id"]) == id {
 				if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": m["task_pk"]}}); err != nil {
-					return err
+					return deleted, err
 				}
+				deleted++
 			}
 		}
 		if out.LastEvaluatedKey == nil {
-			return nil
+			return deleted, nil
 		}
 		start = out.LastEvaluatedKey
 	}

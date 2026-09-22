@@ -7,15 +7,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// deleteTasksForInstance queries instance_gsi and falls back to a Scan only
-// when the index does not exist yet (tables predating the index, pending the
-// #321 backfill). Genuine failures must propagate instead of silently
-// degrading to a fleet-wide Scan on every terminal completion.
+// deleteTasksForInstance queries instance_gsi and falls back to a Scan when
+// the index is not queryable yet: absent on tables predating the index
+// (Migrate backfills it), or still CREATING/backfilling right after the
+// backfill. Genuine failures must propagate instead of silently degrading to
+// a fleet-wide Scan on every terminal completion.
 func TestIsMissingIndexError(t *testing.T) {
 	missing := []error{
 		errors.New("ValidationException: The table does not have the specified index: instance_gsi"),
 		errors.New("ValidationException: no such index: instance_gsi"),
 		errors.New("unknown index instance_gsi"),
+		errors.New("ValidationException: The index is being created for table: instance_gsi"),
+		errors.New("ValidationException: Index instance_gsi is being created and cannot be queried"),
+		errors.New("ValidationException: Index instance_gsi is backfilling and not active"),
 		&types.ResourceNotFoundException{Message: strPtr("Cannot do operations on a non-existent table or index: instance_gsi")},
 	}
 	for _, err := range missing {

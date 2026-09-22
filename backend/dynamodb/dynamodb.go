@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,9 +21,17 @@ import (
 // TerminateInstance can remove one instance's tasks with an instance-keyed
 // Query instead of a full-table Scan (completion cost stays proportional to
 // the instance's rows, not the fleet's queued work). Tables created before
-// this index existed fall back to Scan (see isMissingIndexError); the
-// #321 migration backfills the index on existing tables.
+// this index existed fall back to Scan (see isMissingIndexError); Migrate
+// backfills the index on existing tables (see ensureMissingGSIs).
 const instanceGSIName = "instance_gsi"
+
+// gsiBackfillWait caps how long Migrate waits for a newly created GSI to
+// become ACTIVE. Queries against a CREATING index fail, so callers keep the
+// Scan fallback (isMissingIndexError) until the index is usable; the wait
+// only avoids returning before a just-created index converges in the common
+// case. A timeout does not fail migration: correctness never depends on the
+// index (the fallback is strongly consistent).
+const gsiBackfillWait = 60 * time.Second
 
 // Backend is the DynamoDB implementation of backend.Backend.
 type Backend struct {
@@ -270,6 +279,9 @@ func (b *Backend) ensureTable(ctx context.Context, d tableDef) error {
 				return fmt.Errorf("dynamodb enable stream %s: %w", d.name, uerr)
 			}
 		}
+		if err := b.ensureMissingGSIs(ctx, d, desc); err != nil {
+			return err
+		}
 		return nil
 	}
 	var nfe *types.ResourceNotFoundException
@@ -302,6 +314,107 @@ func (b *Backend) ensureTable(ctx context.Context, d tableDef) error {
 	}
 	waiter := dynamodb.NewTableExistsWaiter(b.client)
 	return waiter.Wait(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(d.name)}, 60*time.Second)
+}
+
+// ensureMissingGSIs creates indexes from the table definition that an
+// existing table lacks (e.g. instance_gsi on wf_tasks tables created before
+// the index existed). DynamoDB allows one GSI creation per UpdateTable call,
+// so missing indexes are created sequentially with a bounded wait for ACTIVE
+// between them. A wait timeout does not fail migration: terminal cleanup
+// keeps the strongly-consistent Scan fallback until the index is usable.
+func (b *Backend) ensureMissingGSIs(ctx context.Context, d tableDef, desc *dynamodb.DescribeTableOutput) error {
+	if len(d.gsi) == 0 {
+		return nil
+	}
+	existing := make(map[string]types.IndexStatus, len(desc.Table.GlobalSecondaryIndexes))
+	for _, gsi := range desc.Table.GlobalSecondaryIndexes {
+		existing[aws.ToString(gsi.IndexName)] = gsi.IndexStatus
+	}
+	for _, want := range d.gsi {
+		name := aws.ToString(want.IndexName)
+		if status, ok := existing[name]; ok {
+			if status != types.IndexStatusActive {
+				b.waitGSIActive(ctx, d.name, name)
+			}
+			continue
+		}
+		_, uerr := b.client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+			TableName:            aws.String(d.name),
+			AttributeDefinitions: attrDefsForGSI(d.attrs, want.KeySchema),
+			GlobalSecondaryIndexUpdates: []types.GlobalSecondaryIndexUpdate{
+				{Create: &types.CreateGlobalSecondaryIndexAction{
+					IndexName:  want.IndexName,
+					KeySchema:  want.KeySchema,
+					Projection: want.Projection,
+				}},
+			},
+		})
+		if uerr != nil {
+			if isGSIAlreadyExistsError(uerr) {
+				b.waitGSIActive(ctx, d.name, name)
+				continue
+			}
+			return fmt.Errorf("dynamodb create index %s on %s: %w", name, d.name, uerr)
+		}
+		b.waitGSIActive(ctx, d.name, name)
+	}
+	return nil
+}
+
+// waitGSIActive polls DescribeTable until the index is ACTIVE or the bound
+// elapses. Only context cancellation aborts early; a timeout is a silent
+// success because callers fall back to Scan until the index is usable.
+func (b *Backend) waitGSIActive(ctx context.Context, table, index string) {
+	deadline := time.Now().Add(gsiBackfillWait)
+	for {
+		if desc, err := b.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+			TableName: aws.String(table),
+		}); err == nil {
+			for _, gsi := range desc.Table.GlobalSecondaryIndexes {
+				if aws.ToString(gsi.IndexName) == index && gsi.IndexStatus == types.IndexStatusActive {
+					return
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// attrDefsForGSI selects the attribute definitions covering a GSI key schema
+// (UpdateTable creations must declare exactly the indexed attributes).
+func attrDefsForGSI(attrs []types.AttributeDefinition, keys []types.KeySchemaElement) []types.AttributeDefinition {
+	want := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		want[aws.ToString(k.AttributeName)] = true
+	}
+	var out []types.AttributeDefinition
+	for _, a := range attrs {
+		if want[aws.ToString(a.AttributeName)] {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// isGSIAlreadyExistsError reports a lost race with another migrator creating
+// the same index (create-then-wait is idempotent across processes).
+func isGSIAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var riue *types.ResourceInUseException
+	if errors.As(err, &riue) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "already exists") || strings.Contains(msg, "being created")
 }
 
 // Reset deletes all items from all tables (test helper).

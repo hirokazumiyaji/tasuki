@@ -71,6 +71,8 @@ CREATE UNIQUE NULL_FILTERED INDEX wf_tasks_wf_singleton ON wf_tasks(wf_singleton
 
 CREATE INDEX wf_tasks_claim_idx ON wf_tasks(kind, queue, visible_at);
 
+CREATE INDEX wf_tasks_instance_idx ON wf_tasks(instance_id);
+
 CREATE TABLE wf_timers (
   instance_id STRING(255) NOT NULL,
   seq INT64 NOT NULL,

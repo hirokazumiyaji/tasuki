@@ -1317,10 +1317,13 @@ func deleteSignalDedupe(ctx context.Context, txn *spanner.ReadWriteTransaction, 
 // deleteTasksForInstance returns deletions for up to limit tasks of the
 // instance except excludeTaskID (the owned workflow task, removed
 // separately). newID never returns 0, so a sweep outside the advancement
-// passes 0 to exclude nothing.
+// passes 0 to exclude nothing. The instance_id filter is served by
+// wf_tasks_instance_idx (see schema.sql and ensureTasksInstanceIndex), so
+// cleanup cost stays proportional to the instance's rows; ORDER BY id keeps
+// the paged sweep deterministic.
 func deleteTasksForInstance(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string, excludeTaskID int64, limit int) ([]*spanner.Mutation, error) {
 	iter := txn.Query(ctx, spanner.Statement{
-		SQL:    `SELECT id FROM wf_tasks WHERE instance_id = @id LIMIT @limit`,
+		SQL:    `SELECT id FROM wf_tasks WHERE instance_id = @id ORDER BY id LIMIT @limit`,
 		Params: map[string]any{"id": instanceID, "limit": int64(limit)},
 	})
 	defer iter.Stop()
