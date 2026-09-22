@@ -25,6 +25,17 @@ type Worker struct {
 	done     chan struct{}
 	inFlight map[int64]backend.Task
 
+	// wfClaim records the local wall-clock claim time of each workflow
+	// task claimed by tickWorkflows. NackTask updates by task ID only
+	// (no worker/attempt fencing like ReleaseLease), so the delayed nack
+	// in requeueWorkflowTask must be skipped once the local lease-expiry
+	// estimate (claim time + LeaseDuration) has passed: a peer may have
+	// reclaimed the task by then, and nacking would clear the peer's
+	// fresh lease (replacing it with now+IncompatibleRetryDelay) while a
+	// third worker could claim mid-execution. Expiry reclaims naturally.
+	wfClaimMu sync.Mutex
+	wfClaim   map[int64]time.Time
+
 	stickyMu sync.Mutex
 	sticky   map[string]stickyEntry
 
@@ -54,6 +65,7 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		opts:     opts,
 		reg:      newRegistry(opts.Codec),
 		inFlight: map[int64]backend.Task{},
+		wfClaim:  map[int64]time.Time{},
 		sticky:   map[string]stickyEntry{},
 		instLock: map[string]*workflowActor{},
 		wfSem:    make(chan struct{}, opts.WorkflowConcurrency),
@@ -320,6 +332,13 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 	if len(wtasks) == 0 {
 		return
 	}
+	// Record local claim times so the delayed nack can be fenced against
+	// a reclaim race (see requeueWorkflowTask). Cleared after the flush
+	// below; entries are wall-clock only, never store time.
+	for _, t := range wtasks {
+		w.trackWfClaim(t.ID)
+	}
+	defer w.clearWfClaims(wtasks)
 	var wg sync.WaitGroup
 	var pendingMu sync.Mutex
 	var pending []pendingWorkflowCommit

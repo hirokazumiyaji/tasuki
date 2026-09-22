@@ -140,24 +140,71 @@ func (w *Worker) commitWorkflow(ctx context.Context, task backend.Task, baseJour
 	return nil
 }
 
+// trackWfClaim records the local wall-clock claim time of a workflow task.
+func (w *Worker) trackWfClaim(taskID int64) {
+	w.wfClaimMu.Lock()
+	defer w.wfClaimMu.Unlock()
+	if w.wfClaim == nil {
+		w.wfClaim = map[int64]time.Time{}
+	}
+	w.wfClaim[taskID] = time.Now()
+}
+
+// clearWfClaims drops local claim records after the tick's flush.
+func (w *Worker) clearWfClaims(tasks []backend.Task) {
+	w.wfClaimMu.Lock()
+	defer w.wfClaimMu.Unlock()
+	for _, t := range tasks {
+		delete(w.wfClaim, t.ID)
+	}
+}
+
+// wfLeaseExpired reports whether the local lease-expiry estimate for a
+// claimed workflow task has passed. Unknown IDs (direct commitWorkflow /
+// requeueWorkflowTask calls outside tickWorkflows, e.g. unit tests) report
+// false so the nack proceeds as before.
+func (w *Worker) wfLeaseExpired(taskID int64) bool {
+	w.wfClaimMu.Lock()
+	defer w.wfClaimMu.Unlock()
+	claimed, ok := w.wfClaim[taskID]
+	if !ok {
+		return false
+	}
+	lease := w.opts.LeaseDuration
+	if lease <= 0 {
+		lease = 30 * time.Second
+	}
+	return !time.Now().Before(claimed.Add(lease))
+}
+
 // requeueWorkflowTask makes a failed workflow task visible again after a
 // handleWorkflow/commit error. Contention (ErrConflict/ErrSuperseded) can
-// succeed on replay, so the lease is released immediately for fast retry.
-// Any other failure — transient store errors or deterministic
-// oversized-advancement diagnostics from checkTerminalBudget/
+// succeed on replay, so the lease is released immediately for fast retry:
+// the release carries the claim token (kind/instance for WF# routing,
+// worker + attempt fencing) so a stale worker never clears a peer's fresh
+// lease after a reclaim race. Any other failure — transient store errors or
+// deterministic oversized-advancement diagnostics from checkTerminalBudget/
 // fitAdvancementToBudget — is nacked with IncompatibleRetryDelay: every
 // ReleaseLease also emits a task notification that wakes the poll loop, so
 // an immediate release of a persistently failing task would
 // reclaim-fail-notify in a tight loop, saturating the worker and backing
-// store. The task carries the claim token (kind/instance for WF# routing,
-// worker + attempt fencing on release) so a stale worker never clears a
-// peer's fresh lease after a reclaim race. Nack failures share the
+// store. Unlike ReleaseLease, NackTask updates by task ID only, so the
+// delayed nack is additionally fenced on the local lease-expiry estimate:
+// once it has passed, a peer may have reclaimed the task and nacking would
+// clear the peer's fresh lease (replacing it with now+IncompatibleRetryDelay
+// and letting a third worker claim mid-execution). The stale worker skips
+// the nack and expiry reclaims naturally. Nack failures share the
 // release_lease store-error op label to keep the op vocabulary bounded.
 func (w *Worker) requeueWorkflowTask(ctx context.Context, t backend.Task, herr error) {
 	if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {
 		if rerr := w.backend.ReleaseLease(ctx, t); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
 			w.recordStoreError(ctx, "release_lease", rerr, "task_id", t.ID)
 		}
+		return
+	}
+	if w.wfLeaseExpired(t.ID) {
+		w.opts.Logger.Debug("skipping stale workflow nack; local lease expired",
+			"task_id", t.ID, "instance_id", t.InstanceID)
 		return
 	}
 	if rerr := w.backend.NackTask(ctx, t, w.opts.IncompatibleRetryDelay); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
