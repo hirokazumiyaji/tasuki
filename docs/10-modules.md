@@ -16,7 +16,7 @@ Module hierarchy, dependencies, versioning, and publishing workflow.
 | spanner | `.../backend/spanner` | Cloud Spanner backend |
 | sqlite | `.../backend/sqlite` | SQLite backend |
 
-The root module does not depend on database drivers or cloud SDKs by default. `internal/backendopen` embeds only the in-memory backend by default; other backends are registered via `-tags tasuki_all` builds (within the multi-module workspace). Non-memory examples (`m1`, `m3`, `m4`) and `chaos/cmd/worker` are tagged with `tasuki_all`, allowing standard `GOWORK=off go list ./...` to build the root module cleanly.
+The root module does not depend on database drivers or cloud SDKs by default. `internal/backendopen` embeds only the in-memory backend by default; other backends are registered via `-tags tasuki_all` builds (within the multi-module workspace). Non-memory examples (`m1`, `m3`, `m4`), the `chaos` tests, and `chaos/cmd/worker` are tagged with `tasuki_all`, allowing standard `GOWORK=off go list ./...` and `GOWORK=off go vet ./...` (tests included) to cover the root module cleanly.
 
 ## Minimum Go Version
 
@@ -52,5 +52,5 @@ The root module does not depend on database drivers or cloud SDKs by default. `i
 ## Continuous Integration (CI)
 
 - **`root` Job**: `go test ./...` across the workspace.
-- **`gowork-check` Job**: Validates root module independence via `GOWORK=off GOPROXY=off go list ./...` and `GOTOOLCHAIN=local go build ./...`.
+- **`gowork-check` Job**: Validates root module independence via `GOWORK=off GOPROXY=off go list ./...`, `GOWORK=off go vet ./...` (tests included), `GOTOOLCHAIN=local go build ./...`, and a zero-diff check of `GOWORK=off GOPROXY=off go mod tidy -e` on `go.mod` / `go.sum`.
 - **Backend Jobs**: Executes `go test ./...` in each individual `backend/<name>` directory.

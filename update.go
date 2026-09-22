@@ -31,6 +31,13 @@ func WithUpdateID(id string) UpdateOption {
 
 // Update sends a named update to a running workflow and waits for the handler result.
 // The Worker must have the workflow registered (same process model as Query).
+//
+// Update only enqueues the request and waits for completion: it never runs
+// worker ticks on the caller goroutine, so unrelated workflow or activity
+// tasks are never executed by the caller. Progress is driven by a started
+// Worker loop, so the Worker must be started (w.Start) for Update to complete.
+// Tests that need deterministic progress without a background loop should
+// drive ticks explicitly with w.PollOnce from test code.
 func Update[I, O any](ctx context.Context, w *Worker, instanceID, name string, in I, opts ...UpdateOption) (O, error) {
 	var zero O
 	var o updateOptions
@@ -94,17 +101,25 @@ func Update[I, O any](ctx context.Context, w *Worker, instanceID, name string, i
 	ticker := time.NewTicker(w.opts.PollInterval)
 	defer ticker.Stop()
 
+	// Use a derived context for the task subscription so every exit path
+	// releases the subscriber/goroutine (and Postgres LISTEN connection)
+	// without cancelling the caller's context.
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var wake <-chan struct{}
 	if n, ok := w.backend.(backend.TaskNotifier); ok {
-		ch, err := n.Subscribe(ctx)
+		ch, err := n.Subscribe(subCtx)
 		if err == nil {
 			wake = ch
 		}
 	}
 
 	for {
-		w.PollOnce(ctx)
-
+		// NOTE: do not call PollOnce here. PollOnce claims and synchronously
+		// executes activity tasks, which would run unrelated activities on
+		// the Update caller's goroutine. Progress is driven by a started
+		// Worker loop; Update only waits for completion.
 		st, err := w.backend.LoadWorkflow(ctx, instanceID)
 		if err != nil {
 			return zero, err

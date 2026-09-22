@@ -31,8 +31,9 @@ type WorkerOptions struct {
 	MaxPerInstance int
 	// DisableSchemaValidation skips the startup check against backends that
 	// implement backend.SchemaValidator. Validation is on by default: when the
-	// store is missing tables (e.g. migrations have not run), Start logs an
-	// error and does not launch the poll loop.
+	// store is missing tables (e.g. migrations have not run), StartWithError
+	// returns an error and the poll loop is not launched (Start logs the same
+	// error and leaves the worker stopped; see Worker.Running).
 	DisableSchemaValidation bool
 	// ShutdownReleaseTimeout bounds lease release during Shutdown.
 	// Unreleased leases expire via lease timeout and are reclaimed by peers.
@@ -46,6 +47,12 @@ type WorkerOptions struct {
 	// racing shutdown are instead bounded by ShutdownReleaseTimeout to keep
 	// shutdown predictable. <=0 defaults to 30s.
 	CommitTimeout time.Duration
+	// BacklogSampleInterval throttles backlog gauge sampling (2x
+	// CountClaimableTasks per sample when Metrics is set). 0 defaults to
+	// 10s (coarser than the 1s PollInterval default); negative disables
+	// sampling entirely. Set a smaller positive value (e.g. time.Second)
+	// for tests or low-traffic stores that want fresher backlog gauges.
+	BacklogSampleInterval time.Duration
 }
 
 func (o WorkerOptions) withDefaults() WorkerOptions {
@@ -89,6 +96,9 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 		o.IncompatibleRetryDelay = 5 * time.Second
 	} else if o.IncompatibleRetryDelay < 0 {
 		o.IncompatibleRetryDelay = 0
+	}
+	if o.BacklogSampleInterval == 0 {
+		o.BacklogSampleInterval = 10 * time.Second
 	}
 	return o
 }

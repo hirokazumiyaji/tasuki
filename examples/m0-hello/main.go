@@ -33,7 +33,9 @@ func main() {
 	w := tasuki.NewWorker(b, tasuki.WorkerOptions{PollInterval: 10 * time.Millisecond})
 	tasuki.RegisterWorkflow(w, HelloWorkflow, tasuki.WithName("hello"))
 	tasuki.RegisterActivity(w, Greet, tasuki.WithName("greet"))
-	w.Start(ctx)
+	if err := w.StartWithError(ctx); err != nil {
+		panic(err)
+	}
 	defer w.Shutdown(ctx)
 
 	c := tasuki.NewClient(b)
