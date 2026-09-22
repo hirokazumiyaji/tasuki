@@ -3,11 +3,22 @@ package firestore
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 func TestSweepBatchSizeBelowTxLimit(t *testing.T) {
 	if firestoreSweepBatchSize >= firestoreTxWriteLimit {
 		t.Fatalf("sweep batch %d must stay below tx limit %d", firestoreSweepBatchSize, firestoreTxWriteLimit)
+	}
+}
+
+func TestSignalDedupeSweepTimeoutBounded(t *testing.T) {
+	// The post-commit dedupe sweep must stay synchronous (a redelivered
+	// DedupeID inserts anew once CommitAdvancements returns) yet bounded, so
+	// a degraded store delays only cleanup while terminal notification has
+	// already fired.
+	if signalDedupeSweepTimeout <= 0 || signalDedupeSweepTimeout > 5*time.Minute {
+		t.Fatalf("signal dedupe sweep timeout %v must be a positive bound", signalDedupeSweepTimeout)
 	}
 }
 

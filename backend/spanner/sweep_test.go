@@ -3,6 +3,7 @@ package spanner
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 func TestSweepBatchSizeBounded(t *testing.T) {
@@ -10,6 +11,16 @@ func TestSweepBatchSizeBounded(t *testing.T) {
 	// instance/status mutations of a terminal commit stays tiny.
 	if spannerSweepBatchSize > 5000 {
 		t.Fatalf("sweep batch %d too large for safe commits", spannerSweepBatchSize)
+	}
+}
+
+func TestSignalDedupeSweepTimeoutBounded(t *testing.T) {
+	// The post-commit dedupe sweep must stay synchronous (a redelivered
+	// DedupeID inserts anew once CommitAdvancements returns) yet bounded, so
+	// a degraded store delays only cleanup while terminal notification has
+	// already fired.
+	if signalDedupeSweepTimeout <= 0 || signalDedupeSweepTimeout > 5*time.Minute {
+		t.Fatalf("signal dedupe sweep timeout %v must be a positive bound", signalDedupeSweepTimeout)
 	}
 }
 

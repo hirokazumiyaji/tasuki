@@ -2,15 +2,38 @@ package spanner
 
 import (
 	"context"
+	"time"
 
 	"cloud.google.com/go/spanner"
 	"google.golang.org/api/iterator"
 )
 
+// sweepGuard re-validates, once per sweep page, that a purge still owns the
+// victim incarnation it is deleting (see purge.go). Nil disables the check;
+// the terminate path passes nil because the instance row still exists there,
+// so no replacement incarnation can appear mid-sweep.
+type sweepGuard func(ctx context.Context) error
+
+// checkGuard runs the per-page fence when one is set.
+func checkGuard(ctx context.Context, guard sweepGuard) error {
+	if guard == nil {
+		return nil
+	}
+	return guard(ctx)
+}
+
 // Spanner commits cap buffered mutations (documented 20k; emulator and large
 // rows fail earlier), so terminal paths must never buffer one commit per
 // accumulated row. Sweeps delete in small paged read-write transactions.
 const spannerSweepBatchSize = 500
+
+// signalDedupeSweepTimeout bounds the best-effort post-commit dedupe sweep in
+// CommitAdvancements. The sweep runs synchronously so a redelivered DedupeID
+// inserts anew once the call returns, but a degraded store must not hold the
+// caller (or a worker slot during shutdown) behind unbounded retries: on
+// timeout the leftovers stay for purge and terminal notification has already
+// fired (it is emitted before the sweep).
+const signalDedupeSweepTimeout = 30 * time.Second
 
 // batchesNeeded reports how many sweep batches cover total rows at the given
 // batch size. It documents the chunking math behind the paged sweeps and is
@@ -72,20 +95,23 @@ func chunkInt64s(in []int64, size int) [][]int64 {
 // independent. Inbox/journal rows (if any) are left for purge: terminate never
 // owned them and they need no prompt reclaim to unblock anything.
 func (b *Backend) sweepTerminateDocs(ctx context.Context, id string) error {
-	if err := b.deleteTasksForInstance(ctx, id); err != nil {
+	if err := b.deleteTasksForInstance(ctx, id, nil); err != nil {
 		return err
 	}
-	if err := b.deleteTimersForInstance(ctx, id); err != nil {
+	if err := b.deleteTimersForInstance(ctx, id, nil); err != nil {
 		return err
 	}
-	return b.sweepSignalDedupe(ctx, id)
+	return b.sweepSignalDedupe(ctx, id, nil)
 }
 
 // sweepSignalDedupe removes an instance's dedupe keys in paged transactions.
 // Called best-effort after terminal advancements commit.
-func (b *Backend) sweepSignalDedupe(ctx context.Context, id string) error {
+func (b *Backend) sweepSignalDedupe(ctx context.Context, id string, guard sweepGuard) error {
 	for {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := checkGuard(ctx, guard); err != nil {
 			return err
 		}
 		var keys []string
@@ -132,9 +158,12 @@ func (b *Backend) sweepSignalDedupe(ctx context.Context, id string) error {
 }
 
 // deleteTasksForInstance removes wf_tasks rows for one instance in pages.
-func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
+func (b *Backend) deleteTasksForInstance(ctx context.Context, id string, guard sweepGuard) error {
 	for {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := checkGuard(ctx, guard); err != nil {
 			return err
 		}
 		var keys []int64
@@ -181,9 +210,12 @@ func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
 }
 
 // deleteTimersForInstance removes wf_timers rows for one instance in pages.
-func (b *Backend) deleteTimersForInstance(ctx context.Context, id string) error {
+func (b *Backend) deleteTimersForInstance(ctx context.Context, id string, guard sweepGuard) error {
 	for {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := checkGuard(ctx, guard); err != nil {
 			return err
 		}
 		var seqs []int64
@@ -230,9 +262,12 @@ func (b *Backend) deleteTimersForInstance(ctx context.Context, id string) error 
 }
 
 // deleteInboxForInstance removes wf_inbox rows for one instance in pages.
-func (b *Backend) deleteInboxForInstance(ctx context.Context, id string) error {
+func (b *Backend) deleteInboxForInstance(ctx context.Context, id string, guard sweepGuard) error {
 	for {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := checkGuard(ctx, guard); err != nil {
 			return err
 		}
 		var keys []int64
@@ -279,9 +314,12 @@ func (b *Backend) deleteInboxForInstance(ctx context.Context, id string) error {
 }
 
 // deleteJournalForInstance removes wf_journal rows for one instance in pages.
-func (b *Backend) deleteJournalForInstance(ctx context.Context, id string) error {
+func (b *Backend) deleteJournalForInstance(ctx context.Context, id string, guard sweepGuard) error {
 	for {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := checkGuard(ctx, guard); err != nil {
 			return err
 		}
 		var seqs []int64

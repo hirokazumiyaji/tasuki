@@ -588,13 +588,26 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		}
 	}
 	b.notifyTasks()
+	// Wake terminal subscribers before the best-effort dedupe sweep below:
+	// the terminal status already committed, and the sweep can stall on a
+	// degraded store. Terminal notification must never wait behind unbounded
+	// cleanup.
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			b.notifyTerminal(adv.InstanceID)
+		}
+	}
 	for _, adv := range advs {
 		if adv.Terminal != nil {
 			// Dedupe cleanup stays out of the advancement transaction so the
 			// mutation count never scales with accumulated dedupe keys.
 			// Best-effort (DynamoDB/Firestore parity); purge reaps leftovers.
-			_ = b.sweepSignalDedupe(context.Background(), adv.InstanceID)
-			b.notifyTerminal(adv.InstanceID)
+			// The sweep stays synchronous so a redelivered DedupeID inserts
+			// anew once this call returns, but runs under a bounded context
+			// so a stuck store delays only this cleanup, never the caller.
+			cctx, cancel := context.WithTimeout(context.Background(), signalDedupeSweepTimeout)
+			_ = b.sweepSignalDedupe(cctx, adv.InstanceID, nil)
+			cancel()
 		}
 	}
 	return nil

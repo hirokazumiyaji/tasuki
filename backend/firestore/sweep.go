@@ -2,6 +2,7 @@ package firestore
 
 import (
 	"context"
+	"time"
 
 	"google.golang.org/api/iterator"
 )
@@ -13,6 +14,20 @@ const (
 	firestoreTxWriteLimit   = 500
 	firestoreSweepBatchSize = 400
 )
+
+// signalDedupeSweepTimeout bounds the best-effort post-commit dedupe sweep in
+// CommitAdvancements. The sweep runs synchronously so a redelivered DedupeID
+// inserts anew once the call returns, but a degraded store must not hold the
+// caller (or a worker slot during shutdown) behind unbounded retries: on
+// timeout the leftovers stay for purge and terminal notification has already
+// fired (it is emitted before the sweep).
+const signalDedupeSweepTimeout = 30 * time.Second
+
+// sweepGuard re-validates, once per sweep page, that a purge still owns the
+// victim incarnation it is deleting (see purge.go). Nil disables the check;
+// the terminate path passes nil because the instance doc still exists there,
+// so no replacement incarnation can appear mid-sweep.
+type sweepGuard func(ctx context.Context) error
 
 // batchesNeeded reports how many sweep batches cover total rows at the given
 // batch size. It documents the chunking math behind the paged sweeps below
@@ -55,7 +70,7 @@ func chunkStrings(in []string, size int) [][]string {
 // is an independent non-transactional commit.
 func (b *Backend) sweepTerminateDocs(ctx context.Context, id string) error {
 	for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe"} {
-		if err := b.deleteDocsByInstance(ctx, col, id); err != nil {
+		if err := b.deleteDocsByInstance(ctx, col, id, nil); err != nil {
 			return err
 		}
 	}
@@ -65,17 +80,24 @@ func (b *Backend) sweepTerminateDocs(ctx context.Context, id string) error {
 // sweepSignalDedupe removes an instance's dedupe keys in paged batches.
 // Called best-effort after terminal advancements commit.
 func (b *Backend) sweepSignalDedupe(ctx context.Context, id string) error {
-	return b.deleteDocsByInstance(ctx, "wf_signal_dedupe", id)
+	return b.deleteDocsByInstance(ctx, "wf_signal_dedupe", id, nil)
 }
 
 // deleteDocsByInstance deletes every document in col with instance_id == id,
 // one Limit-sized batch commit at a time. The loop re-queries until a page
 // comes back empty, so arbitrarily many rows converge without ever buffering
-// them all or exceeding the write cap in one commit.
-func (b *Backend) deleteDocsByInstance(ctx context.Context, col, id string) error {
+// them all or exceeding the write cap in one commit. A purge passes a guard
+// holding the ID-reuse fence through every page; a tripped guard aborts the
+// sweep so a replacement incarnation's documents are never deleted.
+func (b *Backend) deleteDocsByInstance(ctx context.Context, col, id string, guard sweepGuard) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if guard != nil {
+			if err := guard(ctx); err != nil {
+				return err
+			}
 		}
 		it := b.col(col).Where("instance_id", "==", id).Limit(firestoreSweepBatchSize).Documents(ctx)
 		batch := b.client.Batch()
