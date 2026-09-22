@@ -105,7 +105,12 @@ func (f *fakeDynamo) DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInpu
 func (f *fakeDynamo) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
 	atomic.AddInt64(&f.updateCalls, 1)
 	if f.updateGate != nil {
-		<-f.updateGate
+		// Honor ctx like the real client: a stalled write unblocks when
+		// the caller's context times out instead of hanging forever.
+		select {
+		case <-f.updateGate:
+		case <-ctx.Done():
+		}
 	}
 	return &dynamodb.UpdateItemOutput{}, nil
 }
@@ -503,6 +508,35 @@ func TestClose_WaitsForInflightWakeCallback(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&f.updateCalls); got != 1 {
 		t.Fatalf("UpdateItem calls = %d, want 1", got)
+	}
+}
+
+// TestClose_BoundedWhenWakeWriteStalls pins the Close bound: a debounce
+// timer callback whose UpdateItem never returns (unresponsive DynamoDB)
+// must not block Close past the wake write budget.
+func TestClose_BoundedWhenWakeWriteStalls(t *testing.T) {
+	old := wakeWriteTimeout
+	wakeWriteTimeout = 50 * time.Millisecond
+	defer func() { wakeWriteTimeout = old }()
+	// Gate never closes: the wake write stalls until its context times out.
+	f := &fakeDynamo{updateGate: make(chan struct{})}
+	b := newTestBackend(f)
+	b.wakeDebounce = time.Millisecond
+	b.notifyTasks()
+	// Wait until the timer callback has entered UpdateItem.
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt64(&f.updateCalls) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for wake callback to start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	start := time.Now()
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Close blocked %v on a stalled wake write, want bounded by wakeWriteTimeout", elapsed)
 	}
 }
 

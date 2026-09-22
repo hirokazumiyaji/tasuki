@@ -22,6 +22,14 @@ const (
 	wakePollMaxInterval  = 1 * time.Second
 )
 
+// wakeWriteTimeout bounds every asynchronous wf_wake UpdateItem: the
+// debounce timer callbacks and the synchronous Close flush share this
+// budget. Timer callbacks run on their own goroutines tracked by wakeWG,
+// which Close waits on, so an unbounded callback write would block Close
+// indefinitely; the timeout keeps Close bounded even when DynamoDB stalls.
+// Overridden in tests.
+var wakeWriteTimeout = 5 * time.Second
+
 func (b *Backend) Subscribe(ctx context.Context) (<-chan struct{}, error) {
 	out := make(chan struct{}, 1)
 	hubCh, err := b.hub.Subscribe(ctx)
@@ -116,7 +124,12 @@ func (b *Backend) touchWake(ctx context.Context, pk, instanceID string) {
 		if !ok {
 			return
 		}
-		b.writeWake(context.Background(), ent.pk, ent.instanceID)
+		// Bounded write (same budget as the synchronous Close flush):
+		// Close waits on wakeWG, so an unbounded context here would let
+		// a stalled UpdateItem block Close indefinitely.
+		ctx, cancel := context.WithTimeout(context.Background(), wakeWriteTimeout)
+		defer cancel()
+		b.writeWake(ctx, ent.pk, ent.instanceID)
 	})
 	b.wakeMu.Unlock()
 }
@@ -144,7 +157,11 @@ func (b *Backend) writeWake(ctx context.Context, pk, instanceID string) {
 // pending entries. Wakes scheduled concurrently with the flush land in a
 // fresh window and fire on their own timer. A timer callback that fired at
 // the boundary (entry already removed, writeWake still in flight) is waited
-// on via wakeWG so Close never returns before its write completes.
+// on via wakeWG so Close never returns before its write completes. Every
+// write — the synchronous flush and each boundary callback — carries a
+// wakeWriteTimeout bound and the callbacks run concurrently, so Close
+// returns within roughly one budget even when DynamoDB stalls instead of
+// blocking indefinitely.
 func (b *Backend) flushPendingWakes() {
 	b.wakeMu.Lock()
 	pending := b.wakePending
@@ -161,7 +178,7 @@ func (b *Backend) flushPendingWakes() {
 		}
 	}
 	if len(pending) != 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), wakeWriteTimeout)
 		defer cancel()
 		for _, ent := range pending {
 			b.writeWake(ctx, ent.pk, ent.instanceID)

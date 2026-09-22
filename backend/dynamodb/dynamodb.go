@@ -56,7 +56,8 @@ type Backend struct {
 	// (wf_wake UpdateItem) so bursty operations coalesce into one write.
 	// wakeWG tracks in-flight debounce timer callbacks so Close can wait
 	// for a callback that already removed its entry but has not yet
-	// finished writeWake.
+	// finished writeWake. Each callback write carries a wakeWriteTimeout
+	// bound, so the wait is bounded even when DynamoDB stalls.
 	wakeMu       sync.Mutex
 	wakePending  map[string]wakeEntry
 	wakeTimers   map[string]*time.Timer
