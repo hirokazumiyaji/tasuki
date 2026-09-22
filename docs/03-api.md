@@ -299,7 +299,7 @@ out, err := tasuki.Update[ReviseIn, ReviseOut](ctx, w, "order-123", "revise", in
 
 Updates enqueue an `update_requested` event to the inbox. The worker executes the registered `SetUpdateHandler`, which can invoke activities or sleep. Completed updates commit as `update_completed` events.
 
-`tasuki.Update` drives progress itself: it calls `PollOnce` on the passed worker in the caller's goroutine until the update completes, so the worker must belong to the same process (the same requirement as `tasuki.Query`).
+`Update` only enqueues the request and waits for completion: it never claims or executes workflow/activity tasks on the caller goroutine, so unrelated activities are never run by the caller. Progress is driven by a started Worker loop (`w.Start(ctx)`) in the same process, which `Update` requires in order to complete. For deterministic tests without a background loop, drive progress explicitly with `w.PollOnce(ctx)` from test code instead of relying on `Update`.
 
 ## Registration and Naming
 
@@ -387,9 +387,11 @@ type WorkerOptions struct {
 
 Schema migrations are managed per backend. The PostgreSQL backend uses versioned migration files under `backend/postgres/migrations/` (see the [PostgreSQL Migrations README](../backend/postgres/migrations/README.md)).
 
-Workers verify database schemas at startup if the backend implements `backend.SchemaValidator`. If required tables are missing, the worker logs an error and avoids starting the polling loop. This validation can be disabled using `WorkerOptions.DisableSchemaValidation`.
+Workers verify database schemas at startup if the backend implements `backend.SchemaValidator`. If required tables are missing, `StartWithError` returns an error and the polling loop is not launched (the legacy `Start` wrapper logs the same error and leaves the worker stopped). This validation can be disabled using `WorkerOptions.DisableSchemaValidation`.
 
 Applications can explicitly trigger validation using `tasuki.ValidateSchema(ctx, backend)`.
 
-- `w.Start(ctx)` starts task polling loops asynchronously and returns immediately. It returns no error: if schema validation fails, the worker logs an error and does not start the polling loop (disable the check with `WorkerOptions.DisableSchemaValidation`, or gate startup explicitly with `tasuki.ValidateSchema`).
+- `w.Start(ctx)` starts task polling loops asynchronously and returns immediately.
+- `w.StartWithError(ctx)` is the same but reports startup failures (schema validation, double start via `ErrWorkerAlreadyRunning`) to the caller instead of only logging.
+- `w.Running()` reports whether the background polling loop is started (useful for health checks).
 - `w.Shutdown(ctx)` gracefully halts new task acquisition, waits for in-flight tasks within the context deadline, and releases task leases so peer workers can claim them without waiting for expiration.

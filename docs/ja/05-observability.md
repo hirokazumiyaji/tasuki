@@ -35,13 +35,14 @@ Meter 名: `github.com/hirokazumiyaji/tasuki`
 | `tasuki.workflow.terminal` | Counter | ワークフロー終端回数 |
 | `tasuki.activity.retries` | Counter | スケジュールしたアクティビティリトライ数 |
 | `tasuki.workflow.journal_warnings` | Counter | ジャーナル件数警告の回数 |
-| `tasuki.tasks.backlog` | Gauge | キューごとの claim 可能タスク数（属性 `kind`, `queue`）。Worker がポーリング tick ごとにサンプリング |
+| `tasuki.tasks.backlog` | Gauge | キューごとの claim 可能タスク数（属性 `kind`, `queue`）。`BacklogSampleInterval`（既定 10s）ごとに最大 1 回サンプリング |
 | `tasuki.worker.incompatible_nacks` | Counter | 非対応タスクの nack 回数（属性 `reason`） |
 | `tasuki.worker.store_errors` | Counter | ストア操作失敗数（属性 `op`: `fire_timers`, `claim_schedules`, `claim_workflow`, `claim_activity`, `commit_workflow`, `complete_activity`, `retry_activity`, `release_lease`, `extend_lease`, `recover_tasks`） |
 
 `WorkerOptions.Metrics` に `observability.NewMetrics()` の結果を渡す。未設定時は記録しない（noop）。
 グローバル `MeterProvider` が未設定なら OTel 既定の noop 実装が使われる。
 backlog Gauge は `Metrics` 設定時のみ、`CountClaimableTasks` でストア上の claim 可能件数を読む（失敗してもタスク処理は継続）。
+サンプリングは `WorkerOptions.BacklogSampleInterval`（既定 10s、`PollInterval` 既定 1s より粗い）で間引かれる。小さい正の値で頻度を上げられ、負の値で無効化できる。
 
 ## 検知条件と切り分け手順
 

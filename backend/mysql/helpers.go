@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -85,6 +86,17 @@ func inClause(n int) string {
 		parts[i] = "?"
 	}
 	return strings.Join(parts, ", ")
+}
+
+// sortedSearchAttributeKeys returns the filter keys in sorted order so the
+// generated SQL is deterministic.
+func sortedSearchAttributeKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 type activityPayload struct {

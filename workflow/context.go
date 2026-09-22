@@ -22,17 +22,26 @@ func (jsonCodec) Marshal(v any) ([]byte, error)      { return json.Marshal(v) }
 func (jsonCodec) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
 
 type Context struct {
-	events      []journal.Event
-	cmdIndex    int
-	commands    []journal.Event
-	nextSeq     int64
-	now         time.Time
-	completions map[int64]journal.Event
-	canceled    bool
-	suspended   bool
-	info            WorkflowInfo
-	consumedSignals map[int64]bool
-	codec           Codec
+	events   []journal.Event
+	cmdIndex int
+	commands []journal.Event
+	// recorded is the precomputed command subsequence of events, built once
+	// in NewContext so recordOrReplay/peekCommand index in O(1) instead of
+	// rescanning all events per command (O(N^2) replay).
+	recorded []journal.Event
+	// signals holds per-name signal queues in journal order, built once in
+	// NewContext; signalPos tracks the consumed cursor per name so
+	// takeSignal/peekSignal are O(1) amortized instead of scanning events.
+	signals          map[string][]journal.Event
+	signalPos        map[string]int
+	nextSeq          int64
+	now              time.Time
+	completions      map[int64]journal.Event
+	canceled         bool
+	suspended        bool
+	info             WorkflowInfo
+	consumedSignals  map[int64]bool
+	codec            Codec
 	queryMode        bool
 	queryInvoking    bool
 	queryHandlers    map[string]queryHandler
@@ -44,12 +53,14 @@ type Context struct {
 
 func NewContext(events []journal.Event, now time.Time) *Context {
 	ctx := &Context{
-		events:      events,
-		now:         now,
+		events:          events,
+		now:             now,
 		completions:     map[int64]journal.Event{},
 		nextSeq:         1,
 		consumedSignals: map[int64]bool{},
 		codec:           jsonCodec{},
+		signals:         map[string][]journal.Event{},
+		signalPos:       map[string]int{},
 	}
 	for _, e := range events {
 		if e.Type == journal.TypeWorkflowStarted {
@@ -60,6 +71,12 @@ func NewContext(events []journal.Event, now time.Time) *Context {
 	for _, e := range events {
 		if e.Seq >= ctx.nextSeq {
 			ctx.nextSeq = e.Seq + 1
+		}
+		if e.Type.IsCommand() {
+			ctx.recorded = append(ctx.recorded, e)
+		}
+		if e.Type == journal.TypeSignalReceived {
+			ctx.signals[e.Name] = append(ctx.signals[e.Name], e)
 		}
 		if e.Type.IsCompletion() && e.RefSeq != 0 {
 			ctx.completions[e.RefSeq] = e
@@ -98,10 +115,9 @@ func WasSuspended(c *Context) bool { return c.suspended }
 func ClearSuspended(c *Context) { c.suspended = false }
 
 func (c *Context) recordOrReplay(cmd journal.Command, payload []byte) journal.Event {
-	recordedCmds := c.recordedCommands()
-	for c.cmdIndex < len(recordedCmds) {
-		rec := recordedCmds[c.cmdIndex]
-		// Old code skips version markers it does not understand.
+	for c.cmdIndex < len(c.recorded) {
+		rec := c.recorded[c.cmdIndex]
+		// Skip version markers this call site does not understand.
 		if cmd.Type != journal.TypeVersionMarker && rec.Type == journal.TypeVersionMarker {
 			c.cmdIndex++
 			continue
@@ -132,13 +148,7 @@ func (c *Context) recordOrReplay(cmd journal.Command, payload []byte) journal.Ev
 }
 
 func (c *Context) recordedCommands() []journal.Event {
-	out := make([]journal.Event, 0)
-	for _, e := range c.events {
-		if e.Type.IsCommand() {
-			out = append(out, e)
-		}
-	}
-	return out
+	return c.recorded
 }
 
 func (c *Context) awaitCompletion(seq int64) (journal.Event, bool) {
@@ -220,39 +230,32 @@ type timerPayload struct {
 }
 
 func (c *Context) takeSignal(name string) (journal.Event, bool) {
-	for _, e := range c.events {
-		if e.Type != journal.TypeSignalReceived || e.Name != name {
-			continue
-		}
-		if c.consumedSignals[e.Seq] {
-			continue
-		}
-		c.consumedSignals[e.Seq] = true
-		return e, true
+	q := c.signals[name]
+	pos := c.signalPos[name]
+	if pos >= len(q) {
+		return journal.Event{}, false
 	}
-	return journal.Event{}, false
+	ev := q[pos]
+	c.signalPos[name] = pos + 1
+	c.consumedSignals[ev.Seq] = true
+	return ev, true
 }
 
 func (c *Context) peekSignal(name string) (journal.Event, bool) {
-	for _, e := range c.events {
-		if e.Type != journal.TypeSignalReceived || e.Name != name {
-			continue
-		}
-		if c.consumedSignals[e.Seq] {
-			continue
-		}
-		return e, true
+	q := c.signals[name]
+	pos := c.signalPos[name]
+	if pos >= len(q) {
+		return journal.Event{}, false
 	}
-	return journal.Event{}, false
+	return q[pos], true
 }
 
 func (c *Context) peekCommand() (journal.Event, bool) {
-	cmds := c.recordedCommands()
 	// skip already-handled index; also surface markers
-	if c.cmdIndex >= len(cmds) {
+	if c.cmdIndex >= len(c.recorded) {
 		return journal.Event{}, false
 	}
-	return cmds[c.cmdIndex], true
+	return c.recorded[c.cmdIndex], true
 }
 
 func (c *Context) skipCommand() {
