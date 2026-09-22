@@ -18,6 +18,38 @@ import (
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
+// waitKilledWorker reaps a chaos worker after the test deliberately
+// terminated it (SIGKILL) and fails the test if the worker instead exited
+// on its own with a nonzero status. The race detector exits with status 66
+// by default, so discarding Wait results mistakes a race self-exit for the
+// intended SIGKILL, replaces the worker, and still passes. Deliberate
+// SIGKILL/SIGTERM terminations (and a clean exit) remain accepted.
+func waitKilledWorker(t *testing.T, p *os.Process) {
+	t.Helper()
+	state, err := p.Wait()
+	if err != nil {
+		t.Errorf("wait chaos worker: %v", err)
+		return
+	}
+	if state.Success() {
+		return
+	}
+	status, ok := state.Sys().(syscall.WaitStatus)
+	if !ok {
+		t.Errorf("chaos worker exited unsuccessfully: %v", state)
+		return
+	}
+	if status.Signaled() {
+		switch status.Signal() {
+		case syscall.SIGKILL, syscall.SIGTERM:
+			return
+		}
+		t.Errorf("chaos worker killed by unexpected signal %v", status.Signal())
+		return
+	}
+	t.Errorf("chaos worker exited with status %d (race detector exits 66); not a deliberate SIGKILL", status.ExitStatus())
+}
+
 func TestChaos_KillWorkers(t *testing.T) {
 	dsn := os.Getenv("TASUKI_POSTGRES_DSN")
 	if dsn == "" {
@@ -83,7 +115,7 @@ func TestChaos_KillWorkers(t *testing.T) {
 		for _, w := range workers {
 			if w.cmd.Process != nil {
 				_ = w.cmd.Process.Kill()
-				_, _ = w.cmd.Process.Wait()
+				waitKilledWorker(t, w.cmd.Process)
 			}
 		}
 	}()
@@ -112,7 +144,7 @@ func TestChaos_KillWorkers(t *testing.T) {
 			idx := rng.Intn(len(workers))
 			w := workers[idx]
 			_ = w.cmd.Process.Signal(syscall.SIGKILL)
-			_, _ = w.cmd.Process.Wait()
+			waitKilledWorker(t, w.cmd.Process)
 			workers[idx] = startWorker(idx)
 		}
 		time.Sleep(50 * time.Millisecond)

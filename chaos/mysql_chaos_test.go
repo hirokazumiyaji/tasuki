@@ -82,7 +82,7 @@ func TestChaos_KillWorkers_MySQL(t *testing.T) {
 		for _, w := range workers {
 			if w.cmd.Process != nil {
 				_ = w.cmd.Process.Kill()
-				_, _ = w.cmd.Process.Wait()
+				waitKilledWorker(t, w.cmd.Process)
 			}
 		}
 	}()
@@ -109,7 +109,7 @@ func TestChaos_KillWorkers_MySQL(t *testing.T) {
 			idx := rng.Intn(len(workers))
 			w := workers[idx]
 			_ = w.cmd.Process.Signal(syscall.SIGKILL)
-			_, _ = w.cmd.Process.Wait()
+			waitKilledWorker(t, w.cmd.Process)
 			workers[idx] = startWorker(idx)
 		}
 		time.Sleep(50 * time.Millisecond)
