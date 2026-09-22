@@ -2,8 +2,10 @@ package mysql
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/hex"
 	"fmt"
 	"path"
 	"sort"
@@ -120,13 +122,50 @@ func (b *Backend) Close() error {
 func (b *Backend) DB() *sql.DB { return b.db }
 
 // migrateMu serializes Migrate within this process so concurrent callers
-// never interleave migration steps. Cross-process exclusion uses the MySQL
-// named lock migrateLockName, held for the whole run.
+// never interleave migration steps. Cross-process exclusion uses the
+// per-database MySQL named lock (see scopedMigrationLockName), held for the
+// whole run.
 var migrateMu sync.Mutex
 
-// migrateLockName is the MySQL named lock (GET_LOCK/RELEASE_LOCK) guarding
-// cross-process migrations.
+// migrateLockName is the base MySQL named lock (GET_LOCK/RELEASE_LOCK)
+// guarding cross-process migrations. The effective lock is scoped to the
+// selected database (see scopedMigrationLockName); the bare base is used
+// only when no default database is selected.
 const migrateLockName = "tasuki_migrate_lock"
+
+// maxMigrationLockLen is MySQL's limit for GET_LOCK names.
+const maxMigrationLockLen = 64
+
+// scopedMigrationLockName scopes the migration lock to one database so
+// migrations for unrelated databases on the same server never block each
+// other. The result always fits MySQL's 64-character GET_LOCK limit;
+// overlong database names are truncated with a hash suffix so distinct names
+// still map to distinct locks.
+func scopedMigrationLockName(dbName string) string {
+	if dbName == "" {
+		return migrateLockName
+	}
+	sanitized := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '$':
+			return r
+		default:
+			return '_'
+		}
+	}, dbName)
+	name := migrateLockName + "_" + sanitized
+	if len(name) <= maxMigrationLockLen {
+		return name
+	}
+	// Truncate with a hash suffix so distinct long names stay distinct.
+	sum := sha256.Sum256([]byte(dbName))
+	digest := hex.EncodeToString(sum[:])[:16]
+	keep := maxMigrationLockLen - len(migrateLockName) - len(digest) - 2
+	if keep < 1 {
+		return migrateLockName + "_" + digest
+	}
+	return migrateLockName + "_" + sanitized[:keep] + "_" + digest
+}
 
 // migrationQueryer is the statement surface Migrate needs. It is satisfied
 // by both *sql.DB and *sql.Conn; Migrate passes the lock-holding *sql.Conn
@@ -146,9 +185,10 @@ type migrationQueryer interface {
 // complete baseline is present (see baselineComplete): a partial legacy
 // schema runs the idempotent baseline DDL instead of skipping it.
 //
-// Concurrency: Migrate holds migrateMu (in-process) and a MySQL named lock
-// (cross-process) for the whole run, so a concurrent Migrate blocks instead
-// of observing a half-applied schema. Every statement runs on lockConn, the
+// Concurrency: Migrate holds migrateMu (in-process) and a per-database MySQL
+// named lock (cross-process) for the whole run, so a concurrent Migrate
+// blocks instead of observing a half-applied schema. Every statement runs
+// on lockConn, the
 // session holding the named lock: with MaxOpenConns(1) that session occupies
 // the pool's only connection, so touching b.db here would wait for a
 // connection that cannot free up until Migrate returns. Each version row is
@@ -168,21 +208,24 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	migrateMu.Lock()
 	defer migrateMu.Unlock()
 
-	// Hold a named lock for the whole migration. A concurrent Migrate on
-	// another host blocks in GET_LOCK instead of proceeding against a
-	// half-migrated schema. The lock lives on lockConn, which is kept open
-	// until Migrate returns, and every statement below runs on lockConn:
-	// it is the session holding the named lock, and with MaxOpenConns(1)
-	// no other connection can be checked out until Migrate returns.
+	// Hold a per-database named lock for the whole migration. A concurrent
+	// Migrate on another host targeting the same database blocks in GET_LOCK
+	// instead of proceeding against a half-migrated schema, while migrations
+	// for unrelated databases on the same server never contend. The lock
+	// lives on lockConn, which is kept open until Migrate returns, and every
+	// statement below runs on lockConn: it is the session holding the named
+	// lock, and with MaxOpenConns(1) no other connection can be checked out
+	// until Migrate returns.
 	lockConn, err := b.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("mysql: acquire migration lock: %w", err)
 	}
 	defer lockConn.Close()
-	if err := acquireMigrationLock(ctx, lockConn); err != nil {
+	lockName, err := acquireMigrationLock(ctx, lockConn)
+	if err != nil {
 		return err
 	}
-	defer releaseMigrationLock(context.WithoutCancel(ctx), lockConn)
+	defer releaseMigrationLock(context.WithoutCancel(ctx), lockConn, lockName)
 	if _, err := lockConn.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS `+migrationTableName+` (
 			version    BIGINT PRIMARY KEY,
@@ -274,24 +317,39 @@ func applyMigration(ctx context.Context, q migrationQueryer, m migration) error 
 	return nil
 }
 
-// acquireMigrationLock blocks until the named migration lock is held on conn.
+// acquireMigrationLock holds the per-database migration lock on conn for the
+// whole migration and reports the effective lock name for release. The lock
+// is scoped to the selected database (SELECT DATABASE()) so migrations for
+// unrelated databases on the same server never block each other; with no
+// database selected it falls back to the server-wide base name.
 // GET_LOCK returns 1 on success, 0 on timeout, and NULL on error.
-func acquireMigrationLock(ctx context.Context, conn *sql.Conn) error {
+func acquireMigrationLock(ctx context.Context, conn *sql.Conn) (string, error) {
+	var dbName sql.NullString
+	if err := conn.QueryRowContext(ctx, `SELECT DATABASE()`).Scan(&dbName); err != nil {
+		return "", fmt.Errorf("mysql: identify migration database: %w", err)
+	}
+	name := migrateLockName
+	if dbName.Valid && dbName.String != "" {
+		name = scopedMigrationLockName(dbName.String)
+	}
 	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?, 30)`, migrateLockName).Scan(&got); err != nil {
-		return fmt.Errorf("mysql: acquire migration lock: %w", err)
+	if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?, 30)`, name).Scan(&got); err != nil {
+		return "", fmt.Errorf("mysql: acquire migration lock: %w", err)
 	}
 	if !got.Valid || got.Int64 != 1 {
-		return fmt.Errorf("mysql: acquire migration lock %q: timed out (another migrator holds it)", migrateLockName)
+		return "", fmt.Errorf("mysql: acquire migration lock %q: timed out (another migrator holds it)", name)
 	}
-	return nil
+	return name, nil
 }
 
-// releaseMigrationLock releases the named migration lock. The caller passes a
-// non-canceled context so the lock is released even when Migrate's context
-// was canceled.
-func releaseMigrationLock(ctx context.Context, conn *sql.Conn) {
-	_, _ = conn.ExecContext(ctx, `SELECT RELEASE_LOCK(?)`, migrateLockName)
+// releaseMigrationLock releases a lock previously acquired by
+// acquireMigrationLock. The caller passes a non-canceled context so the lock
+// is released even when Migrate's context was canceled.
+func releaseMigrationLock(ctx context.Context, conn *sql.Conn, name string) {
+	if name == "" {
+		name = migrateLockName
+	}
+	_, _ = conn.ExecContext(ctx, `SELECT RELEASE_LOCK(?)`, name)
 }
 
 func tableExists(ctx context.Context, q migrationQueryer, table string) (bool, error) {

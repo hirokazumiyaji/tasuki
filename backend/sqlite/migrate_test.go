@@ -282,3 +282,32 @@ func TestValidateSchema(t *testing.T) {
 		t.Fatalf("want missing wf_timers error, got %v", err)
 	}
 }
+
+// TestValidateSchemaMissingColumns pins the required-column check: a
+// database with all seven tables but without the backfilled columns
+// (heartbeat, search_attributes, memo) must fail validation instead of
+// reporting a healthy schema whose reads and writes would fail.
+func TestValidateSchemaMissingColumns(t *testing.T) {
+	b, ctx := newTestBackend(t)
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`ALTER TABLE wf_tasks DROP COLUMN heartbeat`,
+		`ALTER TABLE wf_instances DROP COLUMN search_attributes`,
+		`ALTER TABLE wf_instances DROP COLUMN memo`,
+	} {
+		if _, err := b.DB().ExecContext(ctx, q); err != nil {
+			t.Fatalf("setup %q: %v", q, err)
+		}
+	}
+	err := b.ValidateSchema(ctx)
+	if err == nil {
+		t.Fatal("want ValidateSchema to fail when backfill columns are missing, got nil")
+	}
+	for _, col := range []string{"heartbeat", "search_attributes", "memo"} {
+		if !strings.Contains(err.Error(), col) {
+			t.Fatalf("want missing column %q named, got: %v", col, err)
+		}
+	}
+}
