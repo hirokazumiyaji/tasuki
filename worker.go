@@ -356,14 +356,11 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {
 						w.dropSticky(t.InstanceID)
 					}
-					// Release the lease so the task is immediately reclaimable
-					// instead of stalling until LeaseDuration expiry.
-					// Best-effort: the task may already be gone. Fenced on
-					// the claim token so a slow handler that lost its lease
-					// to a peer never clears the peer's fresh lease.
-					if rerr := w.backend.ReleaseLease(ctx, t); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
-						w.recordStoreError(ctx, "release_lease", rerr, "task_id", t.ID)
-					}
+					// Contention releases immediately for fast replay;
+					// anything else backs off via delayed nack so a
+					// persistently failing task does not spin the poll
+					// loop (see requeueWorkflowTask).
+					w.requeueWorkflowTask(ctx, t, herr)
 					return
 				}
 				if p != nil {

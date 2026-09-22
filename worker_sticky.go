@@ -129,19 +129,40 @@ func (w *Worker) commitWorkflow(ctx context.Context, task backend.Task, baseJour
 		if errors.Is(err, backend.ErrConflict) {
 			w.dropSticky(instanceID)
 		}
-		// Release the lease so a conflicted (or transiently failed) task is
-		// immediately reclaimable instead of stalling until LeaseDuration
-		// expiry. Best-effort: the task may already be gone. The release
-		// carries the claim token (kind/instance for WF# routing, worker +
-		// attempt fencing) so a stale worker never clears a peer's fresh
-		// lease after a reclaim race.
-		if rerr := w.backend.ReleaseLease(ctx, task); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
-			w.recordStoreError(ctx, "release_lease", rerr, "task_id", adv.TaskID)
-		}
+		// Contention releases immediately for fast replay; other commit
+		// failures back off via delayed nack (see requeueWorkflowTask) so
+		// a persistently failing task does not spin the poll loop.
+		// Best-effort: the task may already be gone.
+		w.requeueWorkflowTask(ctx, task, err)
 		return err
 	}
 	w.applyStickyAfterCommit(instanceID, baseJournal, adv)
 	return nil
+}
+
+// requeueWorkflowTask makes a failed workflow task visible again after a
+// handleWorkflow/commit error. Contention (ErrConflict/ErrSuperseded) can
+// succeed on replay, so the lease is released immediately for fast retry.
+// Any other failure — transient store errors or deterministic
+// oversized-advancement diagnostics from checkTerminalBudget/
+// fitAdvancementToBudget — is nacked with IncompatibleRetryDelay: every
+// ReleaseLease also emits a task notification that wakes the poll loop, so
+// an immediate release of a persistently failing task would
+// reclaim-fail-notify in a tight loop, saturating the worker and backing
+// store. The task carries the claim token (kind/instance for WF# routing,
+// worker + attempt fencing on release) so a stale worker never clears a
+// peer's fresh lease after a reclaim race. Nack failures share the
+// release_lease store-error op label to keep the op vocabulary bounded.
+func (w *Worker) requeueWorkflowTask(ctx context.Context, t backend.Task, herr error) {
+	if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {
+		if rerr := w.backend.ReleaseLease(ctx, t); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
+			w.recordStoreError(ctx, "release_lease", rerr, "task_id", t.ID)
+		}
+		return
+	}
+	if rerr := w.backend.NackTask(ctx, t, w.opts.IncompatibleRetryDelay); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
+		w.recordStoreError(ctx, "release_lease", rerr, "task_id", t.ID)
+	}
 }
 
 type pendingWorkflowCommit struct {
