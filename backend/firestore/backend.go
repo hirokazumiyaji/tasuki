@@ -324,7 +324,8 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 			return nil, err
 		}
 		for _, d := range cands {
-			old := timestamp(d.Data(), "visible_at")
+			m := d.Data()
+			old := timestamp(m, "visible_at")
 			var claimed backend.Task
 			err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 				s, e := tx.Get(d.Ref)
@@ -345,6 +346,12 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				return tx.Update(d.Ref, []gcf.Update{{Path: "visible_at", Value: claimed.VisibleAt}, {Path: "worker_id", Value: req.WorkerID}, {Path: "attempt", Value: int64(claimed.Attempt)}})
 			})
 			if err == backend.ErrConflict {
+				// Another worker leased this snapshot first: free its picker
+				// slot so Full below does not stop later queues from filling
+				// the batch.
+				if picker != nil {
+					picker.Release(backend.FairTaskRef{ID: i64(m, "id"), InstanceID: str(m, "instance_id")})
+				}
 				continue
 			}
 			if err != nil {
@@ -370,8 +377,11 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // offsets do. The DocumentID tie-breaker keeps the order deterministic when
 // tasks share the same visible_at. The picker is shared across the outer
 // queue loop in ClaimTasks so the per-instance cap applies to the whole claim
-// batch. Callers claim the returned snapshots with a visible_at re-check
-// inside a transaction; concurrently leased rows conflict and are skipped.
+// batch, and only snapshots picked during this call are returned (earlier
+// queues' picks are not re-attempted). Callers claim the returned snapshots
+// with a visible_at re-check inside a transaction; concurrently leased rows
+// conflict, must be released from the picker via Release (so Full does not
+// stop later queues), and are skipped.
 func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker) ([]*gcf.DocumentSnapshot, error) {
 	base := b.col("wf_tasks").Where("kind", "==", kind).Where("queue", "==", queue).Where("visible_at", "<=", now).OrderBy("visible_at", gcf.Asc).OrderBy(gcf.DocumentID, gcf.Asc)
 	collect := func(it *gcf.DocumentIterator) ([]*gcf.DocumentSnapshot, error) {
@@ -396,8 +406,13 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 	// seen tracks every examined ID (cheap) for dedup; byID retains
 	// snapshots only for picker-accepted candidates so rejected backlog
 	// scanned past an over-quota flood does not accumulate in memory.
+	// fresh counts the picks made during this call: the shared picker may
+	// already hold earlier queues' picks, which must not be re-attempted
+	// (a re-attempt would conflict with our own claim and wrongly release
+	// an already-successful pick).
 	seen := map[int64]struct{}{}
 	byID := map[int64]*gcf.DocumentSnapshot{}
+	fresh := len(picker.Picked())
 	var cursor *gcf.DocumentSnapshot
 	for !picker.Full() {
 		q := base.Limit(pageSize)
@@ -432,7 +447,7 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 			break
 		}
 	}
-	picked := picker.Picked()
+	picked := picker.Picked()[fresh:]
 	docs := make([]*gcf.DocumentSnapshot, 0, len(picked))
 	for _, r := range picked {
 		if d, ok := byID[r.ID]; ok {

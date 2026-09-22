@@ -313,6 +313,12 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				UpdateExpression: aws.String("SET visible_at = :v, worker_id = :w ADD attempt :one"), ConditionExpression: aws.String("visible_at = :old"),
 				ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(visible)), ":w": avS(req.WorkerID), ":one": avN(1), ":old": avN(old)}, ReturnValues: types.ReturnValueAllNew})
 			if conditional(err) {
+				// Another worker leased this candidate first, or the GSI
+				// returned a stale entry: free its picker slot so Full
+				// below does not stop later queues from filling the batch.
+				if picker != nil {
+					picker.Release(backend.FairTaskRef{ID: fromN(item["id"]), InstanceID: fromS(item["instance_id"])})
+				}
 				continue
 			}
 			if err != nil {
@@ -332,9 +338,12 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // through the GSI (page window FairOverfetch) feeding the shared picker, so a
 // victim hidden behind a flooding instance is still found beyond the first
 // page. The picker is shared across the outer queue loop in ClaimTasks so the
-// per-instance cap applies to the whole claim batch. Callers claim the
-// returned items with a visible_at re-check: items leased concurrently are
-// skipped via the conditional update.
+// per-instance cap applies to the whole claim batch, and only candidates
+// picked during this call are returned (earlier queues' picks are not
+// re-attempted). Callers claim the returned items with a visible_at re-check:
+// items leased concurrently fail the conditional update, must be released
+// from the picker via Release (so Full does not stop later queues), and are
+// skipped.
 func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker) ([]map[string]types.AttributeValue, error) {
 	queryPage := func(start map[string]types.AttributeValue, pageLimit int32) (*dynamodb.QueryOutput, error) {
 		return b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_tasks")), IndexName: aws.String("claim_gsi"),
@@ -352,8 +361,13 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 	// seen tracks every examined ID (cheap) for dedup; byID retains full
 	// payloads only for picker-accepted candidates so rejected backlog
 	// scanned past an over-quota flood does not accumulate in memory.
+	// fresh counts the picks made during this call: the shared picker may
+	// already hold earlier queues' picks, which must not be re-attempted
+	// (a re-attempt would fail its own conditional update and wrongly
+	// release an already-successful claim).
 	seen := map[int64]struct{}{}
 	byID := map[int64]map[string]types.AttributeValue{}
+	fresh := len(picker.Picked())
 	var start map[string]types.AttributeValue
 	for !picker.Full() {
 		out, err := queryPage(start, int32(pageSize))
@@ -383,7 +397,7 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		}
 		start = out.LastEvaluatedKey
 	}
-	picked := picker.Picked()
+	picked := picker.Picked()[fresh:]
 	items := make([]map[string]types.AttributeValue, 0, len(picked))
 	for _, r := range picked {
 		if item, ok := byID[r.ID]; ok {
