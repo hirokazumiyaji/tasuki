@@ -276,11 +276,13 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		// Reconsider candidates rejected by an earlier pass first: they are
 		// FIFO-earlier than the scan cursor and may now fit under the cap
 		// once the picks that blocked them were lost to concurrent locks.
+		offered := 0
 		for _, r := range pending {
 			if picker.Full() {
 				break
 			}
 			picker.Offer(r)
+			offered++
 		}
 		if !picker.Full() {
 			for !picker.Full() {
@@ -399,7 +401,15 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 				break
 			}
 		}
-		pending = iterRejected
+		// Preserve the unvisited tail of pending alongside this pass's
+		// rejected rows. When an offered pending candidate fills the batch
+		// the offer loop above breaks, leaving later pending rows unoffered;
+		// they are FIFO-earlier than the scan cursor and never rescanned, so
+		// keeping only iterRejected would drop claimable tasks (e.g. FIFO
+		// A1,A2,A3,B1 with Limit=2 and MaxPerInstance=1 picks A1,B1 and
+		// rejects A2,A3; claiming B1 then losing A2 to a concurrent lock
+		// must still revisit the unvisited A3).
+		pending = append(iterRejected, pending[offered:]...)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err

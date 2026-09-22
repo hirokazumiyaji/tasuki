@@ -307,3 +307,129 @@ func TestFairClaimRevisitsRejectedWhenPickedLocksLost(t *testing.T) {
 		t.Fatalf("claim = %v, want rejected A2 %d to be revisited", tasks, cands[1].id)
 	}
 }
+
+// TestFairClaimPreservesUnvisitedTail covers the issue #294 P1 follow-up:
+// FIFO A1,A2,A3,B1 with Limit=2 and MaxPerInstance=1 picks A1,B1 and rejects
+// A2,A3 on the first pass. A1 and A2 are locked by a concurrent claimer, so
+// the first pass claims only B1 and the refill pass picks the rejected A2
+// but loses it to the lock while A3 sits unvisited behind it (the pending
+// offer loop breaks once the batch fills). The unvisited A3 must be carried
+// forward alongside the pass's rejected rows; dropping it underfills the
+// batch with just B1 despite A3 being unlocked and claimable.
+func TestFairClaimPreservesUnvisitedTail(t *testing.T) {
+	dsn := dsnOrSkip(t)
+	ctx := context.Background()
+	b, err := postgres.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	const queue = "tail"
+	spawn := func(id string, activities int) {
+		t.Helper()
+		if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: queue}); err != nil {
+			t.Fatal(err)
+		}
+		wf, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+			Kind: "workflow", Queues: []string{queue}, Limit: 1,
+			Lease: time.Minute, WorkerID: "tail",
+		})
+		if err != nil || len(wf) != 1 {
+			t.Fatalf("claim wf %s: %v %#v", id, err, wf)
+		}
+		st, err := b.LoadWorkflow(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		adv := backend.Advancement{InstanceID: id, TaskID: wf[0].ID, ExpectedSeq: st.NextSeq}
+		for i := 0; i < activities; i++ {
+			seq := st.NextSeq + int64(i)
+			adv.NewEvents = append(adv.NewEvents, journal.Event{
+				Seq: seq, Type: journal.TypeActivityScheduled, Name: "step",
+			})
+			adv.ActivityTasks = append(adv.ActivityTasks, backend.NewTask{
+				Kind: "activity", Queue: queue, InstanceID: id, Name: "step",
+				Seq: seq, Input: []byte(`{}`),
+			})
+		}
+		if err := b.CommitAdvancement(ctx, adv); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// FIFO order must be A1,A2,A3,B1: the flood instance enqueues three
+	// activities before the victim enqueues one.
+	spawn("tail-A", 3)
+	spawn("tail-B", 1)
+
+	rows, err := b.Pool().Query(ctx, `
+		SELECT id, instance_id FROM wf_tasks
+		WHERE kind = 'activity' AND queue = $1
+		ORDER BY visible_at, id`, queue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type cand struct {
+		id  int64
+		ins string
+	}
+	var cands []cand
+	for rows.Next() {
+		var c cand
+		if err := rows.Scan(&c.id, &c.ins); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		cands = append(cands, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 4 || cands[0].ins != "tail-A" || cands[1].ins != "tail-A" ||
+		cands[2].ins != "tail-A" || cands[3].ins != "tail-B" {
+		t.Fatalf("FIFO order = %#v, want [tail-A tail-A tail-A tail-B]", cands)
+	}
+
+	// Blocker locks A1 (the first pick) and A2 (the refill pick), like a
+	// concurrent fair claimer that scanned the same IDs first. A3 stays
+	// unlocked but unvisited behind A2 in the pending carry.
+	btx, err := b.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer btx.Rollback(ctx)
+	if _, err := btx.Exec(ctx, `SELECT id FROM wf_tasks WHERE id = ANY($1) FOR UPDATE`, []int64{cands[0].id, cands[1].id}); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "activity", Queues: []string{queue}, Limit: 2,
+		Lease: time.Minute, WorkerID: "tail-w", MaxPerInstance: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("claimed %d tasks, want 2 (B1 plus unvisited A3)", len(tasks))
+	}
+	blocked := map[int64]bool{cands[0].id: true, cands[1].id: true}
+	for _, task := range tasks {
+		if blocked[task.ID] {
+			t.Fatalf("claimed locked task %d", task.ID)
+		}
+	}
+	want := map[int64]bool{cands[2].id: true, cands[3].id: true}
+	for _, task := range tasks {
+		delete(want, task.ID)
+	}
+	if len(want) != 0 {
+		t.Fatalf("claim = %v, want unvisited A3 %d and B1 %d", tasks, cands[2].id, cands[3].id)
+	}
+}
