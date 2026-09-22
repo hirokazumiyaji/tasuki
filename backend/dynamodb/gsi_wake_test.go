@@ -37,6 +37,7 @@ type fakeDynamo struct {
 	createInputs  map[string]*dynamodb.CreateTableInput
 	updateInputs  []*dynamodb.UpdateTableInput
 	describeCalls int64
+	updateFn      func(ctx context.Context, in *dynamodb.UpdateTableInput) (*dynamodb.UpdateTableOutput, error)
 
 	// updateGate, when non-nil, blocks UpdateItem until closed: a test
 	// hook to hold a wake write in flight across Close.
@@ -61,8 +62,12 @@ func (f *fakeDynamo) CreateTable(ctx context.Context, in *dynamodb.CreateTableIn
 }
 func (f *fakeDynamo) UpdateTable(ctx context.Context, in *dynamodb.UpdateTableInput, _ ...func(*dynamodb.Options)) (*dynamodb.UpdateTableOutput, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.updateInputs = append(f.updateInputs, in)
+	fn := f.updateFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, in)
+	}
 	return &dynamodb.UpdateTableOutput{}, nil
 }
 func (f *fakeDynamo) Scan(ctx context.Context, in *dynamodb.ScanInput, _ ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
@@ -498,5 +503,174 @@ func TestClose_WaitsForInflightWakeCallback(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&f.updateCalls); got != 1 {
 		t.Fatalf("UpdateItem calls = %d, want 1", got)
+	}
+}
+
+func TestEnsureMissingGSIs_RetriesAfterResourceInUse(t *testing.T) {
+	oldRetryTimeout := gsiUpdateRetryTimeout
+	oldRetryInterval := gsiUpdateRetryInterval
+	oldWait := gsiWaitTimeout
+	gsiUpdateRetryTimeout = 2 * time.Second
+	gsiUpdateRetryInterval = time.Millisecond
+	gsiWaitTimeout = 2 * time.Second
+	defer func() {
+		gsiUpdateRetryTimeout = oldRetryTimeout
+		gsiUpdateRetryInterval = oldRetryInterval
+		gsiWaitTimeout = oldWait
+	}()
+
+	f := &fakeDynamo{}
+	var updateCalls int64
+	f.updateFn = func(_ context.Context, _ *dynamodb.UpdateTableInput) (*dynamodb.UpdateTableOutput, error) {
+		if atomic.AddInt64(&updateCalls, 1) == 1 {
+			// Table busy with an unrelated update: index NOT created.
+			return nil, &types.ResourceInUseException{Message: aws.String("table updating")}
+		}
+		return &dynamodb.UpdateTableOutput{}, nil
+	}
+	missing := &dynamodb.DescribeTableOutput{Table: &types.TableDescription{
+		TableName: aws.String("tasuki_wf_tasks"), TableStatus: types.TableStatusActive,
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndexDescription{
+			{IndexName: aws.String("claim_gsi"), IndexStatus: types.IndexStatusActive},
+		},
+	}}
+	withInstance := &dynamodb.DescribeTableOutput{Table: &types.TableDescription{
+		TableName: aws.String("tasuki_wf_tasks"), TableStatus: types.TableStatusActive,
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndexDescription{
+			{IndexName: aws.String("claim_gsi"), IndexStatus: types.IndexStatusActive},
+			{IndexName: aws.String(instanceGSIName), IndexStatus: types.IndexStatusActive},
+		},
+	}}
+	f.describeFn = func(_ context.Context, _ *dynamodb.DescribeTableInput) (*dynamodb.DescribeTableOutput, error) {
+		if atomic.LoadInt64(&updateCalls) >= 2 {
+			return withInstance, nil
+		}
+		return missing, nil
+	}
+	b := newTestBackend(f)
+	d := tableDef{
+		name: "tasuki_wf_tasks",
+		attrs: []types.AttributeDefinition{
+			{AttributeName: aws.String("task_pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("instance_id"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		gsi: []types.GlobalSecondaryIndex{
+			{
+				IndexName: aws.String(instanceGSIName),
+				KeySchema: []types.KeySchemaElement{
+					{AttributeName: aws.String("instance_id"), KeyType: types.KeyTypeHash},
+				},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
+		},
+	}
+	desc := &dynamodb.DescribeTableOutput{Table: &types.TableDescription{
+		TableName: aws.String("tasuki_wf_tasks"), TableStatus: types.TableStatusActive,
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndexDescription{
+			{IndexName: aws.String("claim_gsi"), IndexStatus: types.IndexStatusActive},
+		},
+	}}
+	if err := b.ensureMissingGSIs(context.Background(), d, desc); err != nil {
+		t.Fatalf("ensureMissingGSIs after ResourceInUse = %v, want nil (retry then succeed)", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if got := len(f.updateInputs); got != 2 {
+		t.Fatalf("UpdateTable calls = %d, want 2 (initial ResourceInUse + retry)", got)
+	}
+}
+
+func TestEnsureMissingGSIs_ResourceInUseBudgetFallsBackToScan(t *testing.T) {
+	oldRetryTimeout := gsiUpdateRetryTimeout
+	oldRetryInterval := gsiUpdateRetryInterval
+	gsiUpdateRetryTimeout = 30 * time.Millisecond
+	gsiUpdateRetryInterval = time.Millisecond
+	defer func() {
+		gsiUpdateRetryTimeout = oldRetryTimeout
+		gsiUpdateRetryInterval = oldRetryInterval
+	}()
+
+	f := &fakeDynamo{}
+	var updateCalls int64
+	f.updateFn = func(_ context.Context, _ *dynamodb.UpdateTableInput) (*dynamodb.UpdateTableOutput, error) {
+		atomic.AddInt64(&updateCalls, 1)
+		return nil, &types.ResourceInUseException{Message: aws.String("table updating")}
+	}
+	missing := &dynamodb.DescribeTableOutput{Table: &types.TableDescription{
+		TableName: aws.String("tasuki_wf_tasks"), TableStatus: types.TableStatusActive,
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndexDescription{
+			{IndexName: aws.String("claim_gsi"), IndexStatus: types.IndexStatusActive},
+		},
+	}}
+	f.describeFn = func(_ context.Context, _ *dynamodb.DescribeTableInput) (*dynamodb.DescribeTableOutput, error) {
+		return missing, nil
+	}
+	b := newTestBackend(f)
+	d := tableDef{
+		name: "tasuki_wf_tasks",
+		attrs: []types.AttributeDefinition{
+			{AttributeName: aws.String("instance_id"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		gsi: []types.GlobalSecondaryIndex{
+			{
+				IndexName: aws.String(instanceGSIName),
+				KeySchema: []types.KeySchemaElement{
+					{AttributeName: aws.String("instance_id"), KeyType: types.KeyTypeHash},
+				},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
+		},
+	}
+	// Persistently busy table must not fail Migrate: Scan fallback covers readers.
+	if err := b.ensureMissingGSIs(context.Background(), d, missing); err != nil {
+		t.Fatalf("ensureMissingGSIs with persistent ResourceInUse = %v, want nil (Scan fallback)", err)
+	}
+	if got := atomic.LoadInt64(&updateCalls); got < 2 {
+		t.Fatalf("UpdateTable calls = %d, want >= 2 (must retry, not treat first ResourceInUse as success)", got)
+	}
+}
+
+func TestEnsureMissingGSIs_ResourceInUseRespectsCancel(t *testing.T) {
+	oldRetryTimeout := gsiUpdateRetryTimeout
+	oldRetryInterval := gsiUpdateRetryInterval
+	gsiUpdateRetryTimeout = time.Hour
+	gsiUpdateRetryInterval = time.Millisecond
+	defer func() {
+		gsiUpdateRetryTimeout = oldRetryTimeout
+		gsiUpdateRetryInterval = oldRetryInterval
+	}()
+
+	f := &fakeDynamo{}
+	f.updateFn = func(_ context.Context, _ *dynamodb.UpdateTableInput) (*dynamodb.UpdateTableOutput, error) {
+		return nil, &types.ResourceInUseException{Message: aws.String("table updating")}
+	}
+	f.describeFn = func(_ context.Context, _ *dynamodb.DescribeTableInput) (*dynamodb.DescribeTableOutput, error) {
+		return &dynamodb.DescribeTableOutput{Table: &types.TableDescription{
+			TableName: aws.String("tasuki_wf_tasks"), TableStatus: types.TableStatusUpdating,
+		}}, nil
+	}
+	b := newTestBackend(f)
+	d := tableDef{
+		name: "tasuki_wf_tasks",
+		attrs: []types.AttributeDefinition{
+			{AttributeName: aws.String("instance_id"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		gsi: []types.GlobalSecondaryIndex{
+			{
+				IndexName: aws.String(instanceGSIName),
+				KeySchema: []types.KeySchemaElement{
+					{AttributeName: aws.String("instance_id"), KeyType: types.KeyTypeHash},
+				},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
+		},
+	}
+	desc := &dynamodb.DescribeTableOutput{Table: &types.TableDescription{
+		TableName: aws.String("tasuki_wf_tasks"), TableStatus: types.TableStatusActive,
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := b.ensureMissingGSIs(ctx, d, desc); err == nil {
+		t.Fatal("ensureMissingGSIs with cancelled context = nil, want context.Canceled")
 	}
 }
