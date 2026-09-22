@@ -10,6 +10,7 @@ import (
 )
 
 // Now returns a durable timestamp recorded in the journal.
+// time.Time JSON encoding is infallible, so the marshal error is ignored.
 func Now(ctx *Context) time.Time {
 	payload, _ := json.Marshal(ctx.now.UTC())
 	ev := ctx.recordOrReplay(journal.Command{Type: journal.TypeNowRecorded}, payload)

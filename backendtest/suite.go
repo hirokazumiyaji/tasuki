@@ -42,6 +42,7 @@ func Run(t *testing.T, newBackend Factory) {
 	t.Run("InboxOrder", func(t *testing.T) { testInboxOrder(t, newBackend) })
 	t.Run("NackTask", func(t *testing.T) { testNackTask(t, newBackend) })
 	t.Run("SearchAttributes", func(t *testing.T) { testSearchAttributes(t, newBackend) })
+	t.Run("SearchAttributesPagination", func(t *testing.T) { testSearchAttributesPagination(t, newBackend) })
 	t.Run("Memo", func(t *testing.T) { testMemo(t, newBackend) })
 	t.Run("PurgeInstances", func(t *testing.T) { testPurgeInstances(t, newBackend) })
 	t.Run("TerminalCleanup", func(t *testing.T) { testTerminalCleanup(t, newBackend) })

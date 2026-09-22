@@ -945,36 +945,76 @@ func (b *Backend) RecoverOrphanedWorkflowTasks(ctx context.Context) (int, error)
 	b.recoverMu.Lock()
 	start := b.recoverCursor
 	b.recoverMu.Unlock()
-	const bound = 200
+	recovered, next, exhausted, err := b.recoverOrphanedPass(ctx, b.client, start, recoverBound)
+	if err != nil {
+		return recovered, err
+	}
+	b.recoverMu.Lock()
+	if exhausted {
+		// Full fleet visited: restart from the beginning next pass.
+		b.recoverCursor = nil
+	} else {
+		b.recoverCursor = next
+	}
+	b.recoverMu.Unlock()
+	return recovered, nil
+}
+
+// recoverBound caps how many running instances a single recovery pass checks.
+// Each check costs an inbox Query plus a task GetItem, so the bound keeps one
+// pass from monopolizing DynamoDB when the fleet is large.
+const recoverBound = 200
+
+// recoverStore is the DynamoDB subset used by orphan recovery (seam for tests).
+type recoverStore interface {
+	Scan(ctx context.Context, params *dynamodb.ScanInput, optFns ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error)
+	Query(ctx context.Context, params *dynamodb.QueryInput, optFns ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
+	GetItem(ctx context.Context, params *dynamodb.GetItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
+	PutItem(ctx context.Context, params *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
+}
+
+// recoverOrphanedPass checks up to bound running instances starting from start
+// and reports where the next pass should resume. exhausted is true only when
+// the full table was visited (caller resets the cursor to nil).
+//
+// On bound overflow the returned cursor is the key of the last checked
+// instance in the current page, so the next pass resumes mid-page. Saving the
+// page's start key instead would re-scan the same bound instances forever
+// when a single page holds more than bound running instances; saving
+// LastEvaluatedKey instead would skip the unchecked tail of the page.
+func (b *Backend) recoverOrphanedPass(ctx context.Context, store recoverStore, start map[string]types.AttributeValue, bound int) (recovered int, next map[string]types.AttributeValue, exhausted bool, err error) {
 	checked := 0
-	recovered := 0
 	for {
 		select {
 		case <-ctx.Done():
-			return recovered, ctx.Err()
+			return recovered, nil, false, ctx.Err()
 		default:
 		}
-		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{
+		out, err := store.Scan(ctx, &dynamodb.ScanInput{
 			TableName:         aws.String(b.table("wf_instances")),
 			ExclusiveStartKey: start,
 		})
 		if err != nil {
-			return recovered, err
+			return recovered, nil, false, err
 		}
+		var pageLast map[string]types.AttributeValue
 		for _, m := range out.Items {
 			if fromS(m["status"]) != "running" {
 				continue
 			}
 			if checked >= bound {
-				// Bound reached: resume from this page on the next pass.
-				b.recoverMu.Lock()
-				b.recoverCursor = start
-				b.recoverMu.Unlock()
-				return recovered, nil
+				next := start
+				if pageLast != nil {
+					next = pageLast
+				}
+				return recovered, next, false, nil
 			}
 			checked++
+			if idAv, ok := m["id"]; ok && idAv != nil {
+				pageLast = map[string]types.AttributeValue{"id": idAv}
+			}
 			id := fromS(m["id"])
-			inbox, err := b.client.Query(ctx, &dynamodb.QueryInput{
+			inbox, err := store.Query(ctx, &dynamodb.QueryInput{
 				TableName:                 aws.String(b.table("wf_inbox")),
 				KeyConditionExpression:    aws.String("instance_id = :id"),
 				ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)},
@@ -983,7 +1023,7 @@ func (b *Backend) RecoverOrphanedWorkflowTasks(ctx context.Context) (int, error)
 			if err != nil || len(inbox.Items) == 0 {
 				continue
 			}
-			tout, err := b.client.GetItem(ctx, &dynamodb.GetItemInput{
+			tout, err := store.GetItem(ctx, &dynamodb.GetItemInput{
 				TableName: aws.String(b.table("wf_tasks")),
 				Key:       map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(id))},
 			})
@@ -994,7 +1034,7 @@ func (b *Backend) RecoverOrphanedWorkflowTasks(ctx context.Context) (int, error)
 				continue
 			}
 			inst := decodeInstance(m)
-			_, err = b.client.PutItem(ctx, &dynamodb.PutItemInput{
+			_, err = store.PutItem(ctx, &dynamodb.PutItemInput{
 				TableName:           aws.String(b.table("wf_tasks")),
 				Item:                workflowTaskItem(id, inst.Queue, newID(), nowUTC()),
 				ConditionExpression: aws.String("attribute_not_exists(task_pk)"),
@@ -1004,16 +1044,12 @@ func (b *Backend) RecoverOrphanedWorkflowTasks(ctx context.Context) (int, error)
 			}
 		}
 		if out.LastEvaluatedKey == nil {
-			// Full fleet visited: restart from the beginning next pass.
-			b.recoverMu.Lock()
-			b.recoverCursor = nil
-			b.recoverMu.Unlock()
-			break
+			return recovered, nil, true, nil
 		}
 		start = out.LastEvaluatedKey
 	}
-	return recovered, nil
 }
+
 // deleteSignalDedupeForInstance pages through the instance's dedupe entries
 // (Query results larger than 1 MB arrive in pages via LastEvaluatedKey) and
 // removes each one.
