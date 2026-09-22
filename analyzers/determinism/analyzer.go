@@ -257,11 +257,21 @@ resolved:
 				return fn.Pkg().Path(), fn.Name()
 			}
 		}
-		// Fallback to the qualifier's package name (covers aliases).
+		// Fallback to the qualifier's package name (covers aliases), but
+		// only when the selected object is a function: type conversions
+		// such as net.IP(raw) or http.Header(values) select a type name,
+		// not a *types.Func, and must not be mistaken for package calls
+		// into the net branches. Anything else (including unresolvable
+		// selectors) is ignored here.
 		if pkgIdent, ok := fun.X.(*ast.Ident); ok {
 			if obj, ok := pass.TypesInfo.Uses[pkgIdent]; ok {
-				if pkgName, ok := obj.(*types.PkgName); ok {
-					return pkgName.Imported().Path(), fun.Sel.Name
+				if _, ok := obj.(*types.PkgName); ok {
+					if selObj, ok := pass.TypesInfo.Uses[fun.Sel]; ok {
+						if fn, ok := selObj.(*types.Func); ok && fn.Pkg() != nil {
+							return fn.Pkg().Path(), fn.Name()
+						}
+					}
+					return "", ""
 				}
 			}
 		}
@@ -338,16 +348,19 @@ func checkMapRange(pass *analysis.Pass, x *ast.RangeStmt) {
 	}
 }
 
-// coreRangeType resolves the range-relevant type of a range operand. A
-// generic type parameter (e.g. M in func W[M ~map[string]int](..., m M))
-// carries the constraint interface as its underlying type, so it is resolved
-// to the single underlying type shared by its constraint's type set. It
-// returns nil when no single core type exists (e.g. a mixed union), in which
-// case ranging would not compile anyway.
+// coreRangeType resolves the range-relevant type of a range operand. Named
+// types (e.g. `type M map[string]int`) never match the Map/Chan switch on
+// their own, so non-type-parameter operands are classified by their
+// underlying type. A generic type parameter (e.g. M in
+// func W[M ~map[string]int](..., m M)) carries the constraint interface as
+// its underlying type, so it is resolved to the single underlying type
+// shared by its constraint's type set. It returns nil when no single core
+// type exists (e.g. a mixed union), in which case ranging would not compile
+// anyway.
 func coreRangeType(t types.Type) types.Type {
 	tp, ok := types.Unalias(t).(*types.TypeParam)
 	if !ok {
-		return t
+		return types.Unalias(t).Underlying()
 	}
 	c := tp.Constraint()
 	if c == nil {
