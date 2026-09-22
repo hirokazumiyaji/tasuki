@@ -228,9 +228,23 @@ func isWorkflowContextType(pass *analysis.Pass, expr ast.Expr) bool {
 
 // resolveCallee maps a call to its defining package path and function name,
 // handling normal, aliased, and dot imports as well as package-level funcs
-// and methods defined in those packages.
+// and methods defined in those packages. Explicit generic instantiations
+// (IndexExpr/IndexListExpr, e.g. workflow.SideEffect[string](...) or
+// randv2.N[int](...)) are unwrapped before resolving the underlying callee.
 func resolveCallee(pass *analysis.Pass, call *ast.CallExpr) (pkgPath, funcName string) {
-	switch fun := call.Fun.(type) {
+	fun := call.Fun
+	for {
+		switch f := fun.(type) {
+		case *ast.IndexExpr:
+			fun = f.X
+		case *ast.IndexListExpr:
+			fun = f.X
+		default:
+			goto resolved
+		}
+	}
+resolved:
+	switch fun := fun.(type) {
 	case *ast.SelectorExpr:
 		// Method or package-qualified call: prefer the Func object for Sel.
 		if obj, ok := pass.TypesInfo.Uses[fun.Sel]; ok {
@@ -316,12 +330,50 @@ func checkMapRange(pass *analysis.Pass, x *ast.RangeStmt) {
 	if !ok || tv.Type == nil {
 		return
 	}
-	switch tv.Type.Underlying().(type) {
+	switch coreRangeType(tv.Type).(type) {
 	case *types.Map:
 		pass.Reportf(x.Pos(), "ranging over a map is not allowed in workflow code; iteration order is random")
 	case *types.Chan:
 		pass.Reportf(x.Pos(), "ranging over a channel is not allowed in workflow code; use workflow.Execute/ExecuteAsync and workflow.Await")
 	}
+}
+
+// coreRangeType resolves the range-relevant type of a range operand. A
+// generic type parameter (e.g. M in func W[M ~map[string]int](..., m M))
+// carries the constraint interface as its underlying type, so it is resolved
+// to the single underlying type shared by its constraint's type set. It
+// returns nil when no single core type exists (e.g. a mixed union), in which
+// case ranging would not compile anyway.
+func coreRangeType(t types.Type) types.Type {
+	tp, ok := types.Unalias(t).(*types.TypeParam)
+	if !ok {
+		return t
+	}
+	c := tp.Constraint()
+	if c == nil {
+		return nil
+	}
+	iface, ok := c.Underlying().(*types.Interface)
+	if !ok {
+		return nil
+	}
+	var core types.Type
+	for i := 0; i < iface.NumEmbeddeds(); i++ {
+		union, ok := iface.EmbeddedType(i).(*types.Union)
+		if !ok {
+			// Named or otherwise opaque constraint: core unknown.
+			return nil
+		}
+		for j := 0; j < union.Len(); j++ {
+			term := types.Unalias(union.Term(j).Type()).Underlying()
+			if core == nil {
+				core = term
+			} else if !types.Identical(core, term) {
+				return nil
+			}
+		}
+	}
+	return core
 }
 
 // checkPackageVar flags os.Args (and Stdin/Stdout/Stderr) selector accesses.
