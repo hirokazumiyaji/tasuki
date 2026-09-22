@@ -25,7 +25,12 @@ func waitForServe(t *testing.T, addr string) {
 }
 
 func TestRunWithShutdown_DrainsInFlight(t *testing.T) {
+	entered := make(chan struct{}, 1)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
 		time.Sleep(200 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -56,8 +61,12 @@ func TestRunWithShutdown_DrainsInFlight(t *testing.T) {
 		}
 		respCh <- resp
 	}()
-	time.Sleep(50 * time.Millisecond) // let the handler start
-	cancel()                          // simulate SIGTERM
+	select {
+	case <-entered: // handler is in flight; safe to initiate shutdown
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler did not start")
+	}
+	cancel() // simulate SIGTERM
 
 	select {
 	case err := <-errCh:

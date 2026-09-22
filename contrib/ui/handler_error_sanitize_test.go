@@ -110,3 +110,28 @@ func TestHandler_ListRequestIDPassthrough(t *testing.T) {
 		t.Fatalf("X-Request-ID echo=%q want test-req-1", got)
 	}
 }
+
+func TestHandler_MiddlewareRequestIDPropagated(t *testing.T) {
+	sensitive := errors.New("detail read SECRET-TOKEN-789")
+	b := &failGetBackend{Backend: memory.New(), err: sensitive}
+	inner := ui.NewHandler(tasuki.NewClient(b))
+	// Outer middleware sets the ID on the response before delegating.
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-ID", "mw-id-1")
+		inner.ServeHTTP(w, r)
+	})
+
+	r := httptest.NewRequest(http.MethodGet, "/instances/anything", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if got := w.Header().Get("X-Request-ID"); got != "mw-id-1" {
+		t.Fatalf("X-Request-ID echo=%q want mw-id-1", got)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "mw-id-1") {
+		t.Fatalf("middleware request ID not propagated to error page: %s", body)
+	}
+	if strings.Contains(body, "SECRET-TOKEN-789") {
+		t.Fatalf("raw backend error leaked to client: %s", body)
+	}
+}
