@@ -604,6 +604,13 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		}
 	}
 	for _, adv := range advs {
+		if adv.Terminal != nil {
+			// Terminal instances take no follow-up task:
+			// ensureWorkflowTaskIfInbox is a no-op for non-running
+			// instances, so skip the fallible transaction instead of
+			// risking terminal success after cleanup already ran.
+			continue
+		}
 		if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 			return ensureWorkflowTaskIfInbox(ctx, txn, adv.InstanceID)
 		}); err != nil {

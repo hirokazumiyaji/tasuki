@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -203,6 +204,79 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 }
 
 func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
+	if err := b.deleteTasksForInstanceByGSI(ctx, id); err == nil {
+		return nil
+	} else if !isMissingIndexError(err) {
+		return err
+	} else {
+		// Backward compat: tables created before instance_gsi existed
+		// fall back to a full-table Scan (the #321 migration backfills
+		// the index on existing tables).
+		if scanErr := b.deleteTasksForInstanceByScan(ctx, id); scanErr != nil {
+			return scanErr
+		}
+		return nil
+	}
+}
+
+// deleteTasksForInstanceByGSI removes one instance's tasks via the
+// instance_gsi Query: cost is proportional to the instance's rows, not the
+// fleet's queued work. Terminal advancements create no new tasks, so rows
+// read here were written in earlier turns and the eventually-consistent
+// index has converged on them.
+func (b *Backend) deleteTasksForInstanceByGSI(ctx context.Context, id string) error {
+	var start map[string]types.AttributeValue
+	for {
+		out, err := b.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:                 aws.String(b.table("wf_tasks")),
+			IndexName:                 aws.String(instanceGSIName),
+			KeyConditionExpression:    aws.String("instance_id = :id"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)},
+			ExclusiveStartKey:         start,
+		})
+		if err != nil {
+			return err
+		}
+		for _, m := range out.Items {
+			pk, ok := m["task_pk"]
+			if !ok {
+				continue
+			}
+			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
+				return err
+			}
+		}
+		if out.LastEvaluatedKey == nil {
+			return nil
+		}
+		start = out.LastEvaluatedKey
+	}
+}
+
+// isMissingIndexError reports whether err indicates the instance_gsi index
+// does not (yet) exist on wf_tasks, in which case callers fall back to a
+// full-table Scan.
+func isMissingIndexError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "specified index") ||
+		strings.Contains(msg, "no such index") ||
+		strings.Contains(msg, "unknown index") {
+		return true
+	}
+	var rnfe *types.ResourceNotFoundException
+	if errors.As(err, &rnfe) && strings.Contains(msg, instanceGSIName) {
+		return true
+	}
+	if strings.Contains(msg, instanceGSIName) && strings.Contains(strings.ToLower(msg), "index") {
+		return true
+	}
+	return false
+}
+
+func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string) error {
 	var start map[string]types.AttributeValue
 	for {
 		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(b.table("wf_tasks")), ExclusiveStartKey: start})
@@ -555,6 +629,23 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if err != nil {
 		return err
 	}
+	// Sweep terminal residue before any fallible post-commit work: the
+	// terminal status already committed, so a throttled ensure below would
+	// otherwise skip cleanup with no recovery (retrying the advancement
+	// conflicts on the consumed sequence and no later pass removes the
+	// rows). Terminal instances take no follow-up task, so they are also
+	// excluded from the ensure loop below: ensureWorkflowTask would be a
+	// no-op status-gated read for them, and a transient failure must not
+	// fail terminal success after the rows are already gone.
+	if err := b.cleanupTerminalAdvancements(context.Background(), advs); err != nil {
+		return err
+	}
+	terminal := make(map[string]bool, len(advs))
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			terminal[adv.InstanceID] = true
+		}
+	}
 	for _, id := range parentEnsures {
 		if err := b.ensureWorkflowTask(ctx, id); err != nil {
 			return err
@@ -566,6 +657,9 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		if refreshed[id] {
 			continue
 		}
+		if terminal[id] {
+			continue
+		}
 		if err := b.ensureWorkflowTask(ctx, id); err != nil {
 			return err
 		}
@@ -574,24 +668,28 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 }
 
 func (b *Backend) notifyAfterAdvancements(advs []backend.Advancement) error {
-	// Terminal rows (tasks, timers, inbox, dedupe) cannot ride inside the
-	// 100-item advancement transaction, so they are removed post-commit.
-	// Cleanup runs before any wake hint so survivors are removed promptly;
-	// claims additionally verify the owning instance is still running to
-	// close the overlap window (the instance update commits before this
-	// sweep). Transient throttling is retried, and a persistent failure is
-	// surfaced instead of reporting terminal success with rows left behind.
-	for _, adv := range advs {
-		if adv.Terminal != nil {
-			if err := b.cleanupTerminalInstance(context.Background(), adv.InstanceID); err != nil {
-				return err
-			}
-		}
-	}
+	// Terminal residue was swept before the fallible post-commit ensures
+	// (see commitAdvancementOnce and CommitAdvancements), so only wake
+	// hints remain here: task waiters first, then terminal watchers.
 	b.notifyTasks()
 	for _, adv := range advs {
 		if adv.Terminal != nil {
 			b.notifyTerminal(adv.InstanceID)
+		}
+	}
+	return nil
+}
+
+// cleanupTerminalAdvancements sweeps residual rows for every terminal
+// advancement. Callers run it immediately after the commit and before any
+// fallible post-commit work, so a throttled ensure cannot strand claimable
+// rows behind.
+func (b *Backend) cleanupTerminalAdvancements(ctx context.Context, advs []backend.Advancement) error {
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			if err := b.cleanupTerminalInstance(ctx, adv.InstanceID); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -648,12 +746,30 @@ func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advance
 	if err != nil {
 		return err
 	}
+	// Sweep terminal residue before the fallible ensures below: the
+	// terminal status already committed, so a throttled GetItem here would
+	// otherwise skip cleanup with no recovery (retrying the advancement
+	// conflicts on the consumed sequence and no later pass removes the
+	// rows).
+	if adv.Terminal != nil {
+		if err := b.cleanupTerminalInstance(context.Background(), adv.InstanceID); err != nil {
+			return err
+		}
+	}
 	if parentID != "" {
 		if err := b.ensureWorkflowTask(ctx, parentID); err != nil {
 			return err
 		}
 	}
-	if adv.EnsureWorkflowTask && adv.Terminal == nil {
+	if adv.Terminal != nil {
+		// The owned workflow task was deleted atomically in the
+		// transaction and a terminal instance takes no follow-up, so the
+		// self-ensure would be a no-op status-gated read. Skip the
+		// fallible RPC instead of risking terminal success on throttling.
+		// notifyAfterAdvancements (caller) still fires task wake hints.
+		return nil
+	}
+	if adv.EnsureWorkflowTask {
 		// Follow-up task was refreshed atomically inside the transaction;
 		// notifyAfterAdvancements (caller) still fires task wake hints.
 		return nil

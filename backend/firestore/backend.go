@@ -545,6 +545,14 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 				}
 			}
 		}
+		if adv.Terminal != nil {
+			// The owned workflow task was deleted atomically in the
+			// transaction and a terminal instance takes no follow-up, so
+			// both ensures below would be no-op status-gated reads. Skip
+			// the fallible RPCs instead of risking terminal success on a
+			// transient failure after cleanup already ran.
+			continue
+		}
 		if adv.EnsureWorkflowTask {
 			if err := b.ensureWorkflowTaskForced(ctx, adv.InstanceID); err != nil {
 				return err

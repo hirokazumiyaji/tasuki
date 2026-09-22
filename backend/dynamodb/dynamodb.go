@@ -16,6 +16,14 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend/hub"
 )
 
+// instanceGSIName indexes wf_tasks by instance_id so terminal cleanup and
+// TerminateInstance can remove one instance's tasks with an instance-keyed
+// Query instead of a full-table Scan (completion cost stays proportional to
+// the instance's rows, not the fleet's queued work). Tables created before
+// this index existed fall back to Scan (see isMissingIndexError); the
+// #321 migration backfills the index on existing tables.
+const instanceGSIName = "instance_gsi"
+
 // Backend is the DynamoDB implementation of backend.Backend.
 type Backend struct {
 	client *dynamodb.Client
@@ -151,6 +159,7 @@ func (b *Backend) Migrate(ctx context.Context) error {
 				{AttributeName: aws.String("task_pk"), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String("gsi_pk"), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String("visible_at"), AttributeType: types.ScalarAttributeTypeN},
+				{AttributeName: aws.String("instance_id"), AttributeType: types.ScalarAttributeTypeS},
 			},
 			keys: []types.KeySchemaElement{
 				{AttributeName: aws.String("task_pk"), KeyType: types.KeyTypeHash},
@@ -161,6 +170,13 @@ func (b *Backend) Migrate(ctx context.Context) error {
 					KeySchema: []types.KeySchemaElement{
 						{AttributeName: aws.String("gsi_pk"), KeyType: types.KeyTypeHash},
 						{AttributeName: aws.String("visible_at"), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+				{
+					IndexName: aws.String(instanceGSIName),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String("instance_id"), KeyType: types.KeyTypeHash},
 					},
 					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
 				},
