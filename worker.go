@@ -20,10 +20,19 @@ type Worker struct {
 	opts    WorkerOptions
 	reg     *registry
 
-	mu       sync.Mutex
-	cancel   context.CancelFunc
-	done     chan struct{}
-	inFlight map[int64]struct{}
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	done   chan struct{}
+	// inFlight tracks claimed task IDs with their local lease-expiry
+	// estimate (claim time + LeaseDuration, refreshed on each successful
+	// renewal). Backend leases are keyed by task ID alone with no
+	// ownership fencing, so the mere presence of an entry is NOT proof
+	// this worker still owns the lease: once the local expiry passes the
+	// lease may have been reclaimed by a peer and releasing by ID would
+	// clear the peer's fresh lease. Release paths must honor the expiry;
+	// result commits additionally transfer ownership out of this map
+	// before touching the store (see claimCommitOwnership).
+	inFlight map[int64]time.Time
 
 	stickyMu sync.Mutex
 	sticky   map[string]stickyEntry
@@ -60,7 +69,7 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		backend:  b,
 		opts:     opts,
 		reg:      newRegistry(opts.Codec),
-		inFlight: map[int64]struct{}{},
+		inFlight: map[int64]time.Time{},
 		sticky:   map[string]stickyEntry{},
 		instLock: map[string]*workflowActor{},
 		wfSem:    make(chan struct{}, opts.WorkflowConcurrency),
@@ -164,7 +173,10 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 	// Grace is over: abort stragglers. Activities observe execCtx cancellation
 	// and release (not retry/fail) so Shutdown never consumes an attempt.
 	// Commits that already started use a detached context (see commitContext)
-	// and are covered by the actWg wait above.
+	// and are covered by the actWg wait above. If this wait expires first,
+	// the release below still cannot hand a committing task to a peer:
+	// result commits transfer ownership out of the in-flight set before
+	// touching the store (see claimCommitOwnership).
 	if execCancel != nil {
 		execCancel()
 	}
@@ -260,7 +272,7 @@ func (w *Worker) commitContext(ctx context.Context) (context.Context, context.Ca
 
 func (w *Worker) track(taskID int64) {
 	w.mu.Lock()
-	w.inFlight[taskID] = struct{}{}
+	w.inFlight[taskID] = time.Now().Add(w.leaseDuration())
 	w.mu.Unlock()
 }
 
@@ -270,21 +282,91 @@ func (w *Worker) untrack(taskID int64) {
 	w.mu.Unlock()
 }
 
-// claimReleaseOwnership atomically removes taskID from the in-flight set,
-// reporting whether this caller still owned it. Shutdown's releaseInFlight
-// and the handler's shutdown-release path both funnel through in-flight
-// ownership so only one of them releases a given lease: an activity that
-// ignores cancellation and returns after Shutdown already released (and a
-// peer re-claimed) its lease must not ReleaseLease again, since backend
-// leases are keyed by task ID alone and a second release would clear the
-// peer's fresh lease and enable duplicate execution.
-func (w *Worker) claimReleaseOwnership(taskID int64) bool {
+// leaseDuration returns the configured lease, defaulted so a missing value
+// never yields an immediately-expired in-flight entry.
+func (w *Worker) leaseDuration() time.Duration {
+	if w.opts.LeaseDuration > 0 {
+		return w.opts.LeaseDuration
+	}
+	return 30 * time.Second
+}
+
+// refreshLease pushes a task's local lease expiry forward after a successful
+// renewal (ExtendLease/RecordHeartbeat). Unknown IDs are ignored: the task
+// already transferred to a commit or was released.
+func (w *Worker) refreshLease(taskID int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, ok := w.inFlight[taskID]; ok {
+		w.inFlight[taskID] = time.Now().Add(w.leaseDuration())
+	}
+}
+
+// claimCommitOwnership transfers taskID out of the in-flight set so a
+// concurrent Shutdown releaseInFlight cannot hand the task to a peer while
+// this worker's detached result commit is still running. It reports whether
+// this caller owned the task: false means Shutdown already released it (a
+// peer may own it now) and the caller must skip its backend commit, since a
+// task-ID-only Complete/Retry/fail would delete or reschedule the peer-owned
+// task and produce concurrent or stale execution.
+//
+// Unlike claimReleaseOwnership this is not gated on the local lease expiry:
+// discarding a result that may still be valid is worse than attempting the
+// commit, and these paths require a live execution context with active
+// renewal. Callers whose commit then fails leave the task untracked, so the
+// lease expires naturally instead of being released promptly.
+func (w *Worker) claimCommitOwnership(taskID int64) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if _, ok := w.inFlight[taskID]; !ok {
 		return false
 	}
 	delete(w.inFlight, taskID)
+	return true
+}
+
+// beginResultCommit transfers commit ownership (see claimCommitOwnership),
+// reporting whether the backend result commit may proceed. False means
+// Shutdown already released the lease to a peer: the caller must skip its
+// task-ID-only store op and return (ctx.Err() preserves shutdown/cancel
+// visibility for logging) to avoid clobbering the new owner.
+func (w *Worker) beginResultCommit(taskID int64) bool {
+	if w.claimCommitOwnership(taskID) {
+		return true
+	}
+	w.opts.Logger.Debug("skipping stale activity commit; lease already released",
+		"task_id", taskID)
+	return false
+}
+
+// claimReleaseOwnership atomically removes taskID from the in-flight set,
+// reporting whether this caller may release the lease. Shutdown's
+// releaseInFlight and the handler's shutdown-release path both funnel through
+// in-flight ownership so only one of them releases a given lease: an activity
+// that ignores cancellation and returns after Shutdown already released (and
+// a peer re-claimed) its lease must not ReleaseLease again, since backend
+// leases are keyed by task ID alone and a second release would clear the
+// peer's fresh lease and enable duplicate execution.
+//
+// Presence alone is not ownership: when the Start parent is canceled without
+// Shutdown, renewal stops but a cancel-ignoring activity can keep running
+// past LeaseDuration, letting a peer reclaim the task. A locally expired
+// lease therefore reports false (after still removing the entry) so the
+// caller does not clear a potentially peer-owned lease; the task is already
+// reclaimable via expiry.
+func (w *Worker) claimReleaseOwnership(taskID int64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	expiry, ok := w.inFlight[taskID]
+	if !ok {
+		return false
+	}
+	delete(w.inFlight, taskID)
+	if time.Now().After(expiry) {
+		w.opts.Logger.Debug("skipping lease release; local lease expired",
+			"task_id", taskID)
+		return false
+	}
 	return true
 }
 
@@ -305,12 +387,26 @@ func (w *Worker) releaseContext(ctx context.Context) (context.Context, context.C
 }
 
 func (w *Worker) releaseInFlight(ctx context.Context) {
+	now := time.Now()
 	w.mu.Lock()
 	ids := make([]int64, 0, len(w.inFlight))
-	for id := range w.inFlight {
+	for id, expiry := range w.inFlight {
+		if now.After(expiry) {
+			// Lease already expired locally: a peer may have reclaimed it,
+			// and releasing by task ID alone would clear the peer's fresh
+			// lease. Drop without releasing; expiry already makes it
+			// claimable.
+			w.opts.Logger.Debug("shutdown lease release skipped; local lease expired",
+				"task_id", id)
+			delete(w.inFlight, id)
+			continue
+		}
+		// Tasks with a result commit underway are absent: handleActivity
+		// transfers ownership out via claimCommitOwnership before touching
+		// the store, so they are never released from under their commit.
 		ids = append(ids, id)
+		delete(w.inFlight, id)
 	}
-	w.inFlight = map[int64]struct{}{}
 	w.mu.Unlock()
 	for _, id := range ids {
 		select {
@@ -1024,10 +1120,16 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	act, err := w.reg.activity(t.Name)
 	if err != nil {
 		if errors.Is(err, ErrActivityNotRegistered) {
+			if !w.beginResultCommit(t.ID) {
+				return ctx.Err()
+			}
 			commitCtx, commitCancel := w.commitContext(ctx)
 			rerr := w.nackIncompatible(commitCtx, t, "unregistered_activity", err)
 			commitCancel()
 			return rerr
+		}
+		if !w.beginResultCommit(t.ID) {
+			return ctx.Err()
 		}
 		commitCtx, commitCancel := w.commitContext(ctx)
 		rerr := w.failActivity(commitCtx, t, err)
@@ -1060,7 +1162,11 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		Codec:   w.opts.Codec,
 		Details: append([]byte(nil), t.HeartbeatDetails...),
 		Record: func(ctx context.Context, details []byte) error {
-			return w.backend.RecordHeartbeat(ctx, t.ID, w.opts.LeaseDuration, details)
+			err := w.backend.RecordHeartbeat(ctx, t.ID, w.opts.LeaseDuration, details)
+			if err == nil {
+				w.refreshLease(t.ID)
+			}
+			return err
 		},
 	})
 
@@ -1084,6 +1190,9 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	}
 	if err != nil {
 		if IsNonRetryable(err) || (t.MaxAttempts > 0 && t.Attempt >= t.MaxAttempts) {
+			if !w.beginResultCommit(t.ID) {
+				return ctx.Err()
+			}
 			commitCtx, commitCancel := w.commitContext(ctx)
 			rerr := w.failActivity(commitCtx, t, err)
 			commitCancel()
@@ -1097,6 +1206,9 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		}.Backoff(t.Attempt)
 		w.opts.Logger.Info("activity retry",
 			"instance_id", t.InstanceID, "activity", t.Name, "attempt", t.Attempt, "delay", delay)
+		if !w.beginResultCommit(t.ID) {
+			return ctx.Err()
+		}
 		commitCtx, commitCancel := w.commitContext(ctx)
 		w.opts.Metrics.AddActivityRetry(commitCtx, 1)
 		if rerr := w.backend.RetryActivity(commitCtx, t.ID, delay); rerr != nil {
@@ -1106,6 +1218,9 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		}
 		commitCancel()
 		return nil
+	}
+	if !w.beginResultCommit(t.ID) {
+		return ctx.Err()
 	}
 	commitCtx, commitCancel := w.commitContext(ctx)
 	if cerr := w.backend.CompleteActivity(commitCtx, t.ID, journal.Event{
@@ -1215,6 +1330,8 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan 
 		case <-ticker.C:
 			if err := w.backend.ExtendLease(ctx, taskID, w.opts.LeaseDuration); err != nil {
 				w.recordStoreError(ctx, "extend_lease", err, "task_id", taskID)
+			} else {
+				w.refreshLease(taskID)
 			}
 		}
 	}
