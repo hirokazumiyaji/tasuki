@@ -52,14 +52,21 @@ jobs:
         # Non-fatal on its own: the root scan currently reports known
         # findings, and a hard failure here must not skip the backend scans
         # below (job-level continue-on-error does not propagate to steps).
-        # The job still reports the aggregate status via the backend step's
-        # exit code (advisory through job-level continue-on-error).
+        # The root outcome is recorded under the `root` step id and folded
+        # into the aggregate status by the backend step below (advisory
+        # through job-level continue-on-error).
+        id: root
         continue-on-error: true
         run: govulncheck ./...
       - name: Run govulncheck (backend modules)
         if: always()
         run: |
+          # Aggregate the root scan with the backend scans. With
+          # continue-on-error the root step's conclusion is success even on
+          # failure, so steps.root.outcome must be folded in explicitly;
+          # otherwise a root-only failure would exit 0 and be discarded.
           status=0
+          if [ "${{ steps.root.outcome }}" = "failure" ]; then status=1; fi
           for m in backend/sqlite backend/postgres backend/mysql backend/spanner backend/dynamodb backend/firestore; do
             (cd "$m" && govulncheck ./...) || status=$?
           done
