@@ -13,8 +13,8 @@ import (
 	"strings"
 	"sync"
 
+	driver "github.com/go-sql-driver/mysql"
 	"github.com/hirokazumiyaji/tasuki/backend/hub"
-	_ "github.com/go-sql-driver/mysql"
 )
 
 //go:embed migrations/*.sql
@@ -98,6 +98,10 @@ func LatestSchemaVersion() (int64, error) {
 type Backend struct {
 	db  *sql.DB
 	hub *hub.Hub
+	// migrateKey identifies the target database for the in-process
+	// migration guard (see acquireMigrationProcessLock): server address +
+	// database name parsed from the DSN at New time.
+	migrateKey string
 }
 
 // New opens a connection pool. dsn example:
@@ -112,7 +116,7 @@ func New(ctx context.Context, dsn string) (*Backend, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("mysql: ping: %w", err)
 	}
-	return &Backend{db: db, hub: hub.New()}, nil
+	return &Backend{db: db, hub: hub.New(), migrateKey: migrationDBKey(dsn)}, nil
 }
 
 func (b *Backend) Close() error {
@@ -121,11 +125,73 @@ func (b *Backend) Close() error {
 
 func (b *Backend) DB() *sql.DB { return b.db }
 
-// migrateMu serializes Migrate within this process so concurrent callers
-// never interleave migration steps. Cross-process exclusion uses the
-// per-database MySQL named lock (see scopedMigrationLockName), held for the
-// whole run.
-var migrateMu sync.Mutex
+// migrationProcessLocks keys in-process migration guards by database
+// identity so migrations for unrelated databases proceed concurrently while
+// migrations for the same database never interleave migration steps. The
+// cross-process exclusion still comes from the per-database MySQL named lock
+// (see scopedMigrationLockName), held for the whole run; the in-process
+// guard only serializes goroutines sharing this process.
+var (
+	migrationProcessLocksMu sync.Mutex
+	migrationProcessLocks   = map[string]*migrationProcessLock{}
+)
+
+// migrationProcessLock is a refcounted binary semaphore. The refcount lets
+// the registry drop entries once no goroutine references the key, so the map
+// does not grow with the number of distinct databases seen.
+type migrationProcessLock struct {
+	sem  chan struct{}
+	refs int
+}
+
+// acquireMigrationProcessLock holds the in-process migration guard for key.
+// Unlike sync.Mutex.Lock it honors ctx: a canceled context returns ctx.Err()
+// instead of blocking forever behind a stuck migration. The returned release
+// must be called exactly once after a successful acquisition.
+func acquireMigrationProcessLock(ctx context.Context, key string) (release func(), err error) {
+	migrationProcessLocksMu.Lock()
+	l, ok := migrationProcessLocks[key]
+	if !ok {
+		l = &migrationProcessLock{sem: make(chan struct{}, 1)}
+		l.sem <- struct{}{}
+		migrationProcessLocks[key] = l
+	}
+	l.refs++
+	migrationProcessLocksMu.Unlock()
+	select {
+	case <-ctx.Done():
+		migrationProcessLocksMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(migrationProcessLocks, key)
+		}
+		migrationProcessLocksMu.Unlock()
+		return nil, ctx.Err()
+	case <-l.sem:
+	}
+	return func() {
+		l.sem <- struct{}{}
+		migrationProcessLocksMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(migrationProcessLocks, key)
+		}
+		migrationProcessLocksMu.Unlock()
+	}, nil
+}
+
+// migrationDBKey derives the in-process migration guard key from the DSN:
+// server address plus selected database. Unrelated databases (different
+// server or different database name) map to distinct keys; an unparseable
+// DSN falls back to a single global key (over-serializing, which is always
+// safe, instead of risking concurrent migrations on the same database).
+func migrationDBKey(dsn string) string {
+	cfg, err := driver.ParseDSN(dsn)
+	if err != nil {
+		return "mysql-default"
+	}
+	return "mysql://" + cfg.Addr + "/" + cfg.DBName
+}
 
 // migrateLockName is the base MySQL named lock (GET_LOCK/RELEASE_LOCK)
 // guarding cross-process migrations. The effective lock is scoped to the
@@ -136,35 +202,42 @@ const migrateLockName = "tasuki_migrate_lock"
 // maxMigrationLockLen is MySQL's limit for GET_LOCK names.
 const maxMigrationLockLen = 64
 
+// isLockNameSafe reports whether s uses only the MySQL GET_LOCK-safe
+// alphabet, i.e. scopedMigrationLockName can embed it verbatim. Any other
+// string must be hashed: naive sanitization maps distinct names (tenant-a
+// vs tenant_a) to the same lock.
+func isLockNameSafe(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '$':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // scopedMigrationLockName scopes the migration lock to one database so
 // migrations for unrelated databases on the same server never block each
-// other. The result always fits MySQL's 64-character GET_LOCK limit;
-// overlong database names are truncated with a hash suffix so distinct names
-// still map to distinct locks.
+// other. The mapping is injective: the original name is used verbatim when
+// it is already lock-safe and fits MySQL's 64-character GET_LOCK limit;
+// otherwise (sanitization would change the string, or the name overflows)
+// the lock is base + "_" + hex(sha256(dbName)) truncated to fit, so
+// tenant-a and tenant_a (or distinct overlong names) never share a lock.
 func scopedMigrationLockName(dbName string) string {
 	if dbName == "" {
 		return migrateLockName
 	}
-	sanitized := strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '$':
-			return r
-		default:
-			return '_'
+	if isLockNameSafe(dbName) {
+		if name := migrateLockName + "_" + dbName; len(name) <= maxMigrationLockLen {
+			return name
 		}
-	}, dbName)
-	name := migrateLockName + "_" + sanitized
-	if len(name) <= maxMigrationLockLen {
-		return name
 	}
-	// Truncate with a hash suffix so distinct long names stay distinct.
+	// Hash whenever sanitization would change the string or the length
+	// overflows. The 64-hex digest is truncated to 16 characters (64 bits):
+	// base (18) + "_" + digest (16) = 35 characters, well under the limit.
 	sum := sha256.Sum256([]byte(dbName))
-	digest := hex.EncodeToString(sum[:])[:16]
-	keep := maxMigrationLockLen - len(migrateLockName) - len(digest) - 2
-	if keep < 1 {
-		return migrateLockName + "_" + digest
-	}
-	return migrateLockName + "_" + sanitized[:keep] + "_" + digest
+	return migrateLockName + "_" + hex.EncodeToString(sum[:])[:16]
 }
 
 // migrationQueryer is the statement surface Migrate needs. It is satisfied
@@ -185,7 +258,8 @@ type migrationQueryer interface {
 // complete baseline is present (see baselineComplete): a partial legacy
 // schema runs the idempotent baseline DDL instead of skipping it.
 //
-// Concurrency: Migrate holds migrateMu (in-process) and a per-database MySQL
+// Concurrency: Migrate holds the per-database in-process guard (keyed by
+// server + database, ctx-aware) and a per-database MySQL
 // named lock (cross-process) for the whole run, so a concurrent Migrate
 // blocks instead of observing a half-applied schema. Every statement runs
 // on lockConn, the
@@ -205,8 +279,11 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	migrateMu.Lock()
-	defer migrateMu.Unlock()
+	releaseProcessLock, err := acquireMigrationProcessLock(ctx, b.migrateKey)
+	if err != nil {
+		return err
+	}
+	defer releaseProcessLock()
 
 	// Hold a per-database named lock for the whole migration. A concurrent
 	// Migrate on another host targeting the same database blocks in GET_LOCK
@@ -285,7 +362,8 @@ func baselineComplete(ctx context.Context, q migrationQueryer) (bool, error) {
 }
 
 // applyMigration runs the migration DDL first and records the version only
-// after the DDL has completed. Callers hold the migration lock (migrateMu +
+// after the DDL has completed. Callers hold the migration lock (the
+// per-database in-process guard +
 // the MySQL named lock) and pass the lock-holding connection, so by the time
 // another Migrate observes the version row, the schema it describes is
 // complete. A failed migration inserts nothing, so the next Migrate retries

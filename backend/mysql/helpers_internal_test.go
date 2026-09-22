@@ -1,8 +1,10 @@
 package mysql
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	driver "github.com/go-sql-driver/mysql"
 )
@@ -68,5 +70,92 @@ func TestScopedMigrationLockName(t *testing.T) {
 	}
 	if scopedMigrationLockName(longA) != nameA {
 		t.Fatal("long lock name must be deterministic")
+	}
+}
+
+// TestScopedMigrationLockNameInjective pins the collision fix: naive
+// sanitization maps tenant-a and tenant_a to the same lock, so any name
+// that sanitization would change must hash instead of sanitizing.
+func TestScopedMigrationLockNameInjective(t *testing.T) {
+	if scopedMigrationLockName("tenant-a") == scopedMigrationLockName("tenant_a") {
+		t.Fatal("tenant-a and tenant_a must map to distinct locks")
+	}
+	if got := scopedMigrationLockName("tenant-a"); got == migrateLockName+"_tenant_a" {
+		t.Fatalf("unsafe name must hash, got sanitized form %q", got)
+	}
+	for _, name := range []string{"my-db.v2/x", "db with spaces", strings.Repeat("a", 100)} {
+		if got := scopedMigrationLockName(name); len(got) > maxMigrationLockLen {
+			t.Fatalf("lock name %q exceeds %d characters", got, maxMigrationLockLen)
+		}
+	}
+}
+
+// TestMigrationDBKey pins the per-database in-process guard identity:
+// different databases (or servers) map to distinct keys so their
+// migrations never serialize on each other.
+func TestMigrationDBKey(t *testing.T) {
+	a := migrationDBKey("tasuki:tasuki@tcp(localhost:3306)/tasuki?parseTime=true&loc=UTC")
+	b := migrationDBKey("tasuki:tasuki@tcp(localhost:3306)/other?parseTime=true&loc=UTC")
+	if a == b {
+		t.Fatal("different databases must have different migration keys")
+	}
+	c := migrationDBKey("tasuki:tasuki@tcp(127.0.0.1:3307)/tasuki?parseTime=true&loc=UTC")
+	if a == c {
+		t.Fatal("different servers must have different migration keys")
+	}
+	if d := migrationDBKey("tasuki:tasuki@tcp(localhost:3306)/tasuki?parseTime=true&loc=UTC"); d != a {
+		t.Fatal("migration key must be deterministic")
+	}
+	if k := migrationDBKey("not a valid dsn %%%"); k == "" {
+		t.Fatal("unparseable DSN needs a fallback key")
+	}
+}
+
+// TestMigrationProcessLockPerDatabase pins the per-database in-process
+// guard: unrelated databases proceed concurrently, the same database
+// serializes, and a canceled context returns instead of blocking.
+func TestMigrationProcessLockPerDatabase(t *testing.T) {
+	ctx := context.Background()
+	relA, err := acquireMigrationProcessLock(ctx, "test-migrate-db-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unrelated database proceeds concurrently.
+	relB, err := acquireMigrationProcessLock(ctx, "test-migrate-db-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relB()
+	// Same database blocks until released.
+	acquired := make(chan func(), 1)
+	go func() {
+		rel, err := acquireMigrationProcessLock(context.Background(), "test-migrate-db-a")
+		if err != nil {
+			return
+		}
+		acquired <- rel
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("same-database lock acquired while held")
+	case <-time.After(50 * time.Millisecond):
+	}
+	relA()
+	select {
+	case rel := <-acquired:
+		rel()
+	case <-time.After(2 * time.Second):
+		t.Fatal("same-database lock not acquired after release")
+	}
+	// Canceled context does not block behind a held lock.
+	relC, err := acquireMigrationProcessLock(ctx, "test-migrate-db-c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relC()
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := acquireMigrationProcessLock(canceled, "test-migrate-db-c"); err == nil {
+		t.Fatal("canceled context must not acquire the lock")
 	}
 }

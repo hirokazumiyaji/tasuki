@@ -96,6 +96,12 @@ func LatestSchemaVersion() (int64, error) {
 type Backend struct {
 	db  *sql.DB
 	hub *hub.Hub
+	// migrateKey identifies the target database file for the in-process
+	// migration guard (see acquireMigrationProcessLock): the normalized
+	// DSN, so two handles on the same file (including the shared-cache
+	// ":memory:" database) serialize while unrelated files migrate
+	// concurrently.
+	migrateKey string
 }
 
 // New opens a SQLite database at path (use ":memory:" for ephemeral).
@@ -115,18 +121,67 @@ func New(path string) (*Backend, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite: ping: %w", err)
 	}
-	return &Backend{db: db, hub: hub.New()}, nil
+	return &Backend{db: db, hub: hub.New(), migrateKey: "sqlite://" + dsn}, nil
 }
 
 func (b *Backend) Close() error {
 	return b.db.Close()
 }
 
-// migrateMu serializes Migrate within this process so concurrent callers
-// never interleave migration steps. Cross-process exclusion comes from the
-// BEGIN IMMEDIATE write transaction each migration holds while it runs its
-// DDL and records its version atomically.
-var migrateMu sync.Mutex
+// migrationProcessLocks keys in-process migration guards by database
+// identity (the normalized DSN) so migrations for unrelated database files
+// proceed concurrently while migrations for the same file never interleave
+// migration steps. SQLite has no advisory lock, so for the same file this
+// per-database guard plus the BEGIN IMMEDIATE write transaction (which
+// serializes cross-process writers) is the whole exclusion.
+var (
+	migrationProcessLocksMu sync.Mutex
+	migrationProcessLocks   = map[string]*migrationProcessLock{}
+)
+
+// migrationProcessLock is a refcounted binary semaphore. The refcount lets
+// the registry drop entries once no goroutine references the key, so the map
+// does not grow with the number of distinct databases seen.
+type migrationProcessLock struct {
+	sem  chan struct{}
+	refs int
+}
+
+// acquireMigrationProcessLock holds the in-process migration guard for key.
+// Unlike sync.Mutex.Lock it honors ctx: a canceled context returns ctx.Err()
+// instead of blocking forever behind a stuck migration. The returned release
+// must be called exactly once after a successful acquisition.
+func acquireMigrationProcessLock(ctx context.Context, key string) (release func(), err error) {
+	migrationProcessLocksMu.Lock()
+	l, ok := migrationProcessLocks[key]
+	if !ok {
+		l = &migrationProcessLock{sem: make(chan struct{}, 1)}
+		l.sem <- struct{}{}
+		migrationProcessLocks[key] = l
+	}
+	l.refs++
+	migrationProcessLocksMu.Unlock()
+	select {
+	case <-ctx.Done():
+		migrationProcessLocksMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(migrationProcessLocks, key)
+		}
+		migrationProcessLocksMu.Unlock()
+		return nil, ctx.Err()
+	case <-l.sem:
+	}
+	return func() {
+		l.sem <- struct{}{}
+		migrationProcessLocksMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(migrationProcessLocks, key)
+		}
+		migrationProcessLocksMu.Unlock()
+	}, nil
+}
 
 // Migrate applies pending migrations in order, recording each version in
 // tasuki_schema_migrations. It is safe to call repeatedly.
@@ -153,8 +208,11 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	migrateMu.Lock()
-	defer migrateMu.Unlock()
+	migrateRelease, err := acquireMigrationProcessLock(ctx, b.migrateKey)
+	if err != nil {
+		return err
+	}
+	defer migrateRelease()
 	if _, err := b.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS `+migrationTableName+` (
 			version    INTEGER PRIMARY KEY,
