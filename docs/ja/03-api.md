@@ -350,6 +350,10 @@ inbox に `update_requested` を入れ、ワークフロータスクで `SetUpda
 ハンドラは `Execute` などでサスペンドでき、完了は `update_completed` としてジャーナルに残る。
 同じ `WithUpdateID` の再送は、完了済みなら同じ結果を返す。
 
+`Update` はリクエストの投入と完了待ちだけを行い、呼び出し元ゴルーチンでワークフロー／アクティビティタスクの取得・実行は一切行わない（無関係なアクティビティが呼び出し元で走ることはない）。
+進行は同一プロセスで起動済みの Worker ループ（`w.Start(ctx)`）が担うため、`Update` を完了させるには起動済み Worker が必要である。
+バックグラウンドループなしで決定的に進めたいテストでは、`Update` に頼らずテストコードから明示的に `w.PollOnce(ctx)` を呼んで進行させる。
+
 ## 登録と命名
 
 ワークフローとアクティビティの名前は DB に永続化され、リプレイの照合キーになる。
@@ -452,12 +456,14 @@ type WorkerOptions struct {
 ストアのスキーマ管理はバックエンドごとに行う。PostgreSQL バックエンドはバージョニングされたマイグレーションファイル（`backend/postgres/migrations/`）を持ち、詳細は [migrations の README](../../backend/postgres/migrations/README.ja.md) を参照。
 
 ストアが未マイグレーション（必要なテーブルが無い）とき、Worker は起動しない。
-`Worker.Start` は、バックエンドが `backend.SchemaValidator` を実装していれば起動前に検証し、失敗したら Error ログを出してポーリングループを起動しない。
+`Worker.StartWithError` は、バックエンドが `backend.SchemaValidator` を実装していれば起動前に検証し、失敗したらエラーを返してポーリングループを起動しない（従来の `Worker.Start` は同じエラーをログに出して停止したままになる）。
 `WorkerOptions.DisableSchemaValidation` を `true` にすると、この検証を無効化できる（自己管理でスキーマを用意する運用向け）。
 
 アプリケーション側で明示的に検証したいときは `tasuki.ValidateSchema(ctx, backend)` を使う。
 未対応バックエンドに対しては何もしない。
 
 `w.Start(ctx)` は非同期にポーラーを起動して即座に返る。
+`w.StartWithError(ctx)` も同様だが、起動失敗（スキーマ検証・二重起動 `ErrWorkerAlreadyRunning`）を呼び出し元に返す。
+`w.Running()` はポーリングループが起動中かどうかを返す（ヘルスチェック用）。
 `w.Shutdown(ctx)` は新規獲得を止め、実行中タスクの完了を ctx の期限まで待ち、未完了タスクのリースを解放（`visible_at` を現在時刻へ戻す）してから返る。
 リース解放により、他のプロセスがリース期限を待たずに引き継げる。

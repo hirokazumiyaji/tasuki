@@ -17,3 +17,7 @@ func (b *Backend) notifyTerminal(instanceID string) { b.hub.NotifyTerminal(insta
 // TerminalSubCount reports in-process terminal subscribers (test hook for
 // Result subscription-leak regression).
 func (b *Backend) TerminalSubCount() int { return b.hub.TerminalSubCount() }
+
+// TaskSubCount reports in-process task subscribers (test hook for
+// Update subscription-leak regression).
+func (b *Backend) TaskSubCount() int { return b.hub.TaskSubCount() }
