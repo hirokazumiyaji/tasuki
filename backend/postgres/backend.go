@@ -14,7 +14,11 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{FairDispatch: true}
+	return backend.Capabilities{
+		FairDispatch:        true,
+		CleansTerminalState: true,
+		SupportsBulkCleanup: true,
+	}
 }
 
 // Reset truncates all workflow tables (test helper).
@@ -168,6 +172,10 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		return err
 	}
 	_, err = tx.Exec(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = $1`, id)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE instance_id = $1`, id)
 	if err != nil {
 		return err
 	}
@@ -634,8 +642,22 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 		if _, err = tx.Exec(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = $1`, adv.InstanceID); err != nil {
 			return err
 		}
+		// Terminal transitions retire pending work: activity tasks must no
+		// longer be claimable and timers must never fire into the inbox.
+		if _, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE instance_id = $1`, adv.InstanceID); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `DELETE FROM wf_timers WHERE instance_id = $1`, adv.InstanceID); err != nil {
+			return err
+		}
+		// Purge the whole inbox, not just DrainedInbox: a signal committed
+		// after the worker loaded its state but before this terminal commit
+		// is never drained, and must not survive (like TerminateInstance).
+		if _, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE instance_id = $1`, adv.InstanceID); err != nil {
+			return err
+		}
 	}
-	if len(adv.DrainedInbox) > 0 {
+	if adv.Terminal == nil && len(adv.DrainedInbox) > 0 {
 		_, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE id = ANY($1)`, adv.DrainedInbox)
 		if err != nil {
 			return err
@@ -885,6 +907,20 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			return 0, err
 		}
 		if tag.RowsAffected() == 0 {
+			continue
+		}
+		var status string
+		if err := tx.QueryRow(ctx, `SELECT status FROM wf_instances WHERE id = $1`, d.instanceID).
+			Scan(&status); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue // orphaned timer of a purged instance
+			}
+			return 0, err
+		}
+		if status != "running" {
+			// Terminal instances consume timers silently: no inbox row,
+			// no workflow task wakeup.
+			n++
 			continue
 		}
 		_, err = tx.Exec(ctx, `

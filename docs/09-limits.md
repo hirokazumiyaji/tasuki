@@ -40,6 +40,7 @@ An immediate follow-up workflow task is guaranteed via `EnsureWorkflowTask`, com
 
 - If an advancement containing a terminal transition (completed, failed, canceled, continued_as_new, or stuck) exceeds the budget, it cannot be truncated and returns a diagnostic error (e.g., `tasuki: terminal advancement needs 120 ops, budget 80`). Workers validate terminal turns in advance. Workflows must structure fan-outs to fit within single-tick budgets or delegate large batches to child workflows.
 - If `SendToInboxBatch` exceeds the budget, it returns `ErrBatchTooLarge` (`InboxBatchLimit` = `MaxAdvancementEffects / 4`, or 100 when unlimited).
+- A combined `CommitAdvancements` batch whose total DynamoDB operations exceed the 100-item transaction limit is rejected with a sizing error before anything is applied (never partially): split the batch or reduce per-advancement fanout. Firestore/Spanner commit batches in a single transaction and fail atomically without a sequential fallback.
 
 ## Scan Costs and Considerations (DynamoDB)
 

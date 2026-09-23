@@ -292,6 +292,30 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 			return err
 		}
 		muts = append(muts, dMuts...)
+		// NOTE: instances with more child rows than one commit allows hit
+		// Spanner mutation limits here; chunked deletes are a follow-up to
+		// #299 (backendtest BulkTerminatePurge skips until then).
+		inIter := txn.Query(ctx, spanner.Statement{
+			SQL:    `SELECT id FROM wf_inbox WHERE instance_id = @id`,
+			Params: map[string]any{"id": id},
+		})
+		for {
+			r, err := inIter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				inIter.Stop()
+				return err
+			}
+			var iid int64
+			if err := r.Columns(&iid); err != nil {
+				inIter.Stop()
+				return err
+			}
+			muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{iid}))
+		}
+		inIter.Stop()
 		return txn.BufferWrite(muts)
 	})
 	if err != nil {
@@ -612,6 +636,20 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if len(advs) == 0 {
 		return nil
 	}
+	// Reject duplicate instances up front: the loop below applies every
+	// advancement in one read-write transaction with the same pre-mutation
+	// reads, so two advancements for the same instance both pass the
+	// ExpectedSeq check and then collide on the second journal insert
+	// (a native AlreadyExists commit error, not ErrConflict). Preflight
+	// keeps the batch all-or-nothing with a conflict error (see backendtest
+	// CommitAdvancementsAtomic).
+	seen := make(map[string]struct{}, len(advs))
+	for _, adv := range advs {
+		if _, dup := seen[adv.InstanceID]; dup {
+			return backend.ErrConflict
+		}
+		seen[adv.InstanceID] = struct{}{}
+	}
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		for _, adv := range advs {
 			if err := b.commitAdvancementTxn(ctx, txn, adv); err != nil {
@@ -931,6 +969,11 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	now := nowUTC()
 	var wake bool
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// Reset per attempt: ReadWriteTransaction may retry this closure,
+		// and a stale wake (or a mutated ev.RefSeq) from an aborted attempt
+		// must not leak into the retry.
+		wake = false
+		ev := ev
 		row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{taskID},
 			[]string{"instance_id", "ref_seq", "kind"})
 		if err != nil {
