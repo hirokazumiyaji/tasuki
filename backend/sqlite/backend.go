@@ -454,8 +454,20 @@ func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 }
 
 func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {
-	res, err := b.db.ExecContext(ctx, `
+	var res sql.Result
+	var err error
+	if t.WorkerID != "" {
+		// Conditional on the claim ownership token (see ReleaseLease): a
+		// stale worker whose task was reclaimed (new worker/attempt)
+		// matches zero rows and reports ErrNotFound instead of clearing
+		// the fresh lease.
+		res, err = b.db.ExecContext(ctx, `
+		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ? AND worker_id = ? AND attempt = ?`,
+			formatTime(nowUTC().Add(delay)), t.ID, t.WorkerID, t.Attempt)
+	} else {
+		res, err = b.db.ExecContext(ctx, `
 		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ?`, formatTime(nowUTC().Add(delay)), t.ID)
+	}
 	if err != nil {
 		return err
 	}

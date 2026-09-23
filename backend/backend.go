@@ -44,6 +44,13 @@ type Backend interface {
 	ReleaseLease(ctx context.Context, t Task) error
 	// NackTask clears the lease and defers visibility by delay (store clock).
 	// Used when a Worker cannot process the task (incompatible code/registry).
+	// The task carries the claim ownership token (ID, Kind, InstanceID,
+	// WorkerID, Attempt): backends nack conditionally on the token (worker +
+	// attempt, plus numeric id on WF keys) so a stale worker never clears a
+	// newer worker's lease after a reclaim race. A mismatch (reclaimed,
+	// refreshed, or already committed task) reports ErrNotFound without
+	// touching the peer lease, which callers ignore as best-effort. A zero
+	// WorkerID falls back to unconditional nack by ID for legacy callers.
 	NackTask(ctx context.Context, t Task, delay time.Duration) error
 	LoadWorkflow(ctx context.Context, instanceID string) (*WorkflowState, error)
 	// LoadWorkflowHead returns instance metadata, inbox, next_seq, and store Now without journal.

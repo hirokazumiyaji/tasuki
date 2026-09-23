@@ -445,8 +445,17 @@ func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 }
 
 func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {
-	res, err := b.db.ExecContext(ctx, `
+	var res sql.Result
+	var err error
+	if t.WorkerID != "" {
+		// Conditional on the claim ownership token (see ReleaseLease).
+		res, err = b.db.ExecContext(ctx, `
+		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ? AND worker_id = ? AND attempt = ?`,
+			nowUTC().Add(delay), t.ID, t.WorkerID, t.Attempt)
+	} else {
+		res, err = b.db.ExecContext(ctx, `
 		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ?`, nowUTC().Add(delay), t.ID)
+	}
 	if err != nil {
 		return err
 	}

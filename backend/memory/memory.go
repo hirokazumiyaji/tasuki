@@ -289,6 +289,21 @@ func (b *Backend) NackTask(_ context.Context, task backend.Task, delay time.Dura
 		b.mu.Unlock()
 		return backend.ErrNotFound
 	}
+	if task.Kind != "" && t.kind != task.Kind {
+		b.mu.Unlock()
+		return backend.ErrNotFound
+	}
+	if task.InstanceID != "" && t.instanceID != task.InstanceID {
+		b.mu.Unlock()
+		return backend.ErrNotFound
+	}
+	// Fence against a newer claim: after a lease expiry another worker
+	// reclaims the same task with a new worker/attempt, so a stale nack
+	// must not clear the fresh lease (duplicate execution).
+	if task.WorkerID != "" && (t.workerID != task.WorkerID || t.attempt != task.Attempt) {
+		b.mu.Unlock()
+		return backend.ErrNotFound
+	}
 	t.visibleAt = b.now.Add(delay)
 	t.workerID = ""
 	b.mu.Unlock()

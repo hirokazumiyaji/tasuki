@@ -188,12 +188,13 @@ func (w *Worker) wfLeaseExpired(taskID int64) bool {
 // ReleaseLease also emits a task notification that wakes the poll loop, so
 // an immediate release of a persistently failing task would
 // reclaim-fail-notify in a tight loop, saturating the worker and backing
-// store. Unlike ReleaseLease, NackTask updates by task ID only, so the
-// delayed nack is additionally fenced on the local lease-expiry estimate:
-// once it has passed, a peer may have reclaimed the task and nacking would
-// clear the peer's fresh lease (replacing it with now+IncompatibleRetryDelay
-// and letting a third worker claim mid-execution). The stale worker skips
-// the nack and expiry reclaims naturally. Nack failures share the
+// store. Unlike the fast-path precheck below, NackTask itself is fenced on
+// the claim ownership token (worker + attempt, plus numeric id on WF keys),
+// so a delayed nack that lost the check→nack race to a peer reclaim is
+// rejected by the backend with ErrNotFound without touching the peer's
+// fresh lease. The local lease-expiry estimate stays as a fast path: once
+// it has passed, a peer may have reclaimed the task, so the stale worker
+// skips the nack and expiry reclaims naturally. Nack failures share the
 // release_lease store-error op label to keep the op vocabulary bounded.
 func (w *Worker) requeueWorkflowTask(ctx context.Context, t backend.Task, herr error) {
 	if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {

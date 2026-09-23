@@ -125,3 +125,65 @@ func TestRequeueWorkflowTask_FreshNackStillBacksOff(t *testing.T) {
 		t.Fatalf("NackTask calls=%d, want 1 (fresh worker must nack with a delay)", n)
 	}
 }
+
+// TestRequeueWorkflowTask_BackendFenceHoldsInCheckNackGap covers the
+// non-atomic local-expiry precheck: the claim record is still fresh when
+// requeueWorkflowTask runs (precheck passes, NackTask IS issued), but a peer
+// reclaimed the store lease in the check→NackTask gap. NackTask itself must
+// condition on the claim token (worker + attempt), so the stale nack reports
+// ErrNotFound without touching the peer's fresh lease.
+func TestRequeueWorkflowTask_BackendFenceHoldsInCheckNackGap(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Now().UTC()
+	mem := memory.New()
+	mem.SetNow(t0)
+	store := &nackCountingBackend{Backend: mem}
+	w := NewWorker(store, WorkerOptions{
+		Queues:        []string{"default"},
+		LeaseDuration: 150 * time.Millisecond,
+	})
+
+	if err := mem.CreateInstance(ctx, backend.NewInstance{ID: "stale-nack-gap-1", Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := mem.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 1,
+		Lease: 150 * time.Millisecond, WorkerID: "w1",
+	})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: %v n=%d", err, len(claimed))
+	}
+	stale := claimed[0]
+
+	// Fresh local claim record: the precheck passes and the nack is issued.
+	w.trackWfClaim(stale.ID)
+	// But the store lease expired and a peer reclaimed with a fresh token.
+	mem.SetNow(t0.Add(10 * time.Second))
+	peer, err := mem.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 1,
+		Lease: time.Minute, WorkerID: "w2",
+	})
+	if err != nil || len(peer) != 1 {
+		t.Fatalf("peer reclaim: %v n=%d", err, len(peer))
+	}
+
+	w.requeueWorkflowTask(ctx, stale, errors.New("injected store failure"))
+
+	if n := store.nackCount(); n != 1 {
+		t.Fatalf("NackTask calls=%d, want 1 (precheck passed; the backend fence must reject it)", n)
+	}
+	// The peer lease (1m from t0+10s) must still hold past the nack delay
+	// (5s default): an unfenced stale nack would have replaced it with
+	// t0+10s+delay, making this probe claimable.
+	mem.SetNow(t0.Add(10*time.Second + w.opts.IncompatibleRetryDelay + time.Second))
+	probe, err := mem.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 1,
+		Lease: time.Minute, WorkerID: "w3",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(probe) != 0 {
+		t.Fatalf("probe claimed %d tasks, want 0 (stale nack cleared the peer lease)", len(probe))
+	}
+}

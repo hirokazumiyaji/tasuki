@@ -26,13 +26,13 @@ type Worker struct {
 	inFlight map[int64]backend.Task
 
 	// wfClaim records the local wall-clock claim time of each workflow
-	// task claimed by tickWorkflows. NackTask updates by task ID only
-	// (no worker/attempt fencing like ReleaseLease), so the delayed nack
-	// in requeueWorkflowTask must be skipped once the local lease-expiry
-	// estimate (claim time + LeaseDuration) has passed: a peer may have
-	// reclaimed the task by then, and nacking would clear the peer's
-	// fresh lease (replacing it with now+IncompatibleRetryDelay) while a
-	// third worker could claim mid-execution. Expiry reclaims naturally.
+	// task claimed by tickWorkflows. NackTask is fenced on the claim token
+	// (worker + attempt, like ReleaseLease), so a stale delayed nack in
+	// requeueWorkflowTask is rejected by the backend without touching a
+	// peer's fresh lease. The local lease-expiry estimate (claim time +
+	// LeaseDuration) stays as a fast path: once it has passed, a peer may
+	// have reclaimed the task, so the stale worker skips the nack call
+	// entirely and expiry reclaims naturally.
 	wfClaimMu sync.Mutex
 	wfClaim   map[int64]time.Time
 

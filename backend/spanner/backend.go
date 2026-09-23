@@ -508,10 +508,20 @@ func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 
 func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		n, err := txn.Update(ctx, spanner.Statement{
-			SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id`,
-			Params: map[string]any{"v": nowUTC().Add(delay), "id": t.ID},
-		})
+		var stmt spanner.Statement
+		if t.WorkerID != "" {
+			// Conditional on the claim ownership token (see ReleaseLease).
+			stmt = spanner.Statement{
+				SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id AND worker_id = @wid AND attempt = @attempt`,
+				Params: map[string]any{"v": nowUTC().Add(delay), "id": t.ID, "wid": t.WorkerID, "attempt": t.Attempt},
+			}
+		} else {
+			stmt = spanner.Statement{
+				SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id`,
+				Params: map[string]any{"v": nowUTC().Add(delay), "id": t.ID},
+			}
+		}
+		n, err := txn.Update(ctx, stmt)
 		if err != nil {
 			return err
 		}

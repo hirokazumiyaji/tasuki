@@ -384,12 +384,27 @@ func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Durat
 	if t.Kind == "workflow" {
 		pk = wfTaskPK(t.InstanceID)
 	}
+	// Fence the nack on the claim ownership token (numeric id on WF keys,
+	// worker + attempt): a stale worker whose task was reclaimed or
+	// atomically refreshed matches nothing and reports ErrNotFound instead
+	// of clearing the fresh lease.
+	values := map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(delay)))}
+	cond := "attribute_exists(task_pk)"
+	if t.Kind == "workflow" && t.InstanceID != "" && t.ID != 0 {
+		cond += " AND id = :taskid"
+		values[":taskid"] = avN(t.ID)
+	}
+	if t.WorkerID != "" {
+		cond += " AND worker_id = :wid AND attempt = :attempt"
+		values[":wid"] = avS(t.WorkerID)
+		values[":attempt"] = avN(int64(t.Attempt))
+	}
 	_, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(b.table("wf_tasks")),
-		Key:       map[string]types.AttributeValue{"task_pk": avS(pk)},
-		UpdateExpression: aws.String("SET visible_at = :v REMOVE worker_id"),
-		ConditionExpression: aws.String("attribute_exists(task_pk)"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(delay)))},
+		TableName:                 aws.String(b.table("wf_tasks")),
+		Key:                       map[string]types.AttributeValue{"task_pk": avS(pk)},
+		UpdateExpression:          aws.String("SET visible_at = :v REMOVE worker_id"),
+		ConditionExpression:       aws.String(cond),
+		ExpressionAttributeValues: values,
 	})
 	if conditional(err) {
 		return backend.ErrNotFound
