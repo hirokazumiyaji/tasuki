@@ -190,10 +190,15 @@ func Sleep(ctx *Context, d time.Duration) error {
 // instead of saturating via time.Time.Sub. A Now checkpoint is still recorded
 // first to anchor determinism and keep the journal shape
 // (now_recorded + timer_created) compatible with existing histories.
-// A deadline at or before Now records an already-due timer that fires on the
-// next tick.
+// A deadline at or before Now is clamped to Now before persisting: zero or
+// pre-year-1000 times recorded verbatim break MySQL DATETIME(6) inserts
+// (minimum year 1000) under strict mode, turning a wake into a retry. The
+// clamped timer stays already-due and fires on the next tick.
 func SleepUntil(ctx *Context, t time.Time) error {
-	_ = Now(ctx)
+	now := Now(ctx)
+	if !t.After(now) {
+		t = now
+	}
 	return sleepAt(ctx, t)
 }
 

@@ -81,7 +81,34 @@ func TestSleepUntil_PastDeadlineFiresImmediately(t *testing.T) {
 	if err := json.Unmarshal(res.NewCommands[1].Payload, &p); err != nil {
 		t.Fatal(err)
 	}
-	if !p.FireAt.Equal(target) {
-		t.Fatalf("fire_at=%v want=%v", p.FireAt, target)
+	// Already-due deadlines clamp to the workflow clock; the timer stays
+	// already-due and fires on the next tick.
+	if !p.FireAt.Equal(now) {
+		t.Fatalf("fire_at=%v want=%v", p.FireAt, now)
+	}
+}
+
+func TestSleepUntil_ZeroDeadlineClampsToNow(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	events := []journal.Event{{Seq: 1, Type: journal.TypeWorkflowStarted, Name: "WF"}}
+	res := engine.RunAt(events, now, func(ctx *workflow.Context) (any, error) {
+		return nil, workflow.SleepUntil(ctx, time.Time{})
+	})
+	if !res.Suspended {
+		t.Fatalf("want suspend: %+v", res)
+	}
+	if len(res.NewCommands) != 2 || res.NewCommands[1].Type != journal.TypeTimerCreated {
+		t.Fatalf("%+v", res.NewCommands)
+	}
+	var p struct {
+		FireAt time.Time `json:"fire_at"`
+	}
+	if err := json.Unmarshal(res.NewCommands[1].Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	// time.Time{} (year 1) would break MySQL DATETIME(6) inserts (minimum
+	// year 1000); it must clamp to now and stay already-due.
+	if !p.FireAt.Equal(now) {
+		t.Fatalf("fire_at=%v want=%v", p.FireAt, now)
 	}
 }
