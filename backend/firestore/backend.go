@@ -17,7 +17,7 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{MaxAdvancementEffects: 400, FairDispatch: true}
+	return backend.Capabilities{MaxAdvancementEffects: 400, FairDispatch: true, SweepsTerminalInbox: true}
 }
 func (b *Backend) col(name string) *gcf.CollectionRef  { return b.client.Collection(name) }
 func (b *Backend) ref(col, id string) *gcf.DocumentRef { return b.col(col).Doc(id) }

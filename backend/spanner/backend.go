@@ -12,7 +12,9 @@ import (
 	"google.golang.org/api/iterator"
 )
 
-func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilities{} }
+func (b *Backend) Capabilities() backend.Capabilities {
+	return backend.Capabilities{SweepsTerminalInbox: true}
+}
 
 // readInboxSeq returns the instance's inbox counter (0, false when unset).
 // The counter lives in wf_inbox_seq, kept off wf_instances so signal appends

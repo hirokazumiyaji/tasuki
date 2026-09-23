@@ -17,6 +17,7 @@ func (b *Backend) Capabilities() backend.Capabilities {
 		FairDispatch:        true,
 		CleansTerminalState: true,
 		SupportsBulkCleanup: true,
+		SweepsTerminalInbox: true,
 	}
 }
 
