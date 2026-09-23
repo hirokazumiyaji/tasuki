@@ -230,11 +230,14 @@ func isWorkflowContextType(pass *analysis.Pass, expr ast.Expr) bool {
 // handling normal, aliased, and dot imports as well as package-level funcs
 // and methods defined in those packages. Explicit generic instantiations
 // (IndexExpr/IndexListExpr, e.g. workflow.SideEffect[string](...) or
-// randv2.N[int](...)) are unwrapped before resolving the underlying callee.
+// randv2.N[int](...)) and parenthesized callees (ParenExpr, e.g.
+// (time.Sleep)(d)) are unwrapped before resolving the underlying callee.
 func resolveCallee(pass *analysis.Pass, call *ast.CallExpr) (pkgPath, funcName string) {
 	fun := call.Fun
 	for {
 		switch f := fun.(type) {
+		case *ast.ParenExpr:
+			fun = f.X
 		case *ast.IndexExpr:
 			fun = f.X
 		case *ast.IndexListExpr:
@@ -290,19 +293,25 @@ resolved:
 }
 
 func checkCall(pass *analysis.Pass, call *ast.CallExpr) {
-	// make(chan ...) is channel creation.
+	// make(chan ...) is channel creation, but only when make resolves to the
+	// predeclared builtin: a shadowing local or package-level func (e.g.
+	// make := func(chan int) int...; make(ch)) must not match this rule.
 	if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "make" && len(call.Args) > 0 {
-		if _, ok := call.Args[0].(*ast.ChanType); ok {
-			pass.Reportf(call.Pos(), "make(chan ...) is not allowed in workflow code; use workflow.Execute/ExecuteAsync and workflow.Await")
-			return
-		}
-		// make(chan ...) can also hide behind parentheses or a channel type
-		// parameter (make(C) with C ~chan int): resolve the argument
-		// through the type-param core type before classifying.
-		if tv, ok := pass.TypesInfo.Types[call.Args[0]]; ok && tv.Type != nil {
-			if _, ok := coreRangeType(tv.Type).(*types.Chan); ok {
-				pass.Reportf(call.Pos(), "make(chan ...) is not allowed in workflow code; use workflow.Execute/ExecuteAsync and workflow.Await")
-				return
+		if obj, ok := pass.TypesInfo.Uses[ident]; ok {
+			if _, ok := obj.(*types.Builtin); ok {
+				if _, ok := call.Args[0].(*ast.ChanType); ok {
+					pass.Reportf(call.Pos(), "make(chan ...) is not allowed in workflow code; use workflow.Execute/ExecuteAsync and workflow.Await")
+					return
+				}
+				// make(chan ...) can also hide behind parentheses or a channel type
+				// parameter (make(C) with C ~chan int): resolve the argument
+				// through the make-specific core type before classifying.
+				if tv, ok := pass.TypesInfo.Types[call.Args[0]]; ok && tv.Type != nil {
+					if _, ok := coreMakeChanType(tv.Type).(*types.Chan); ok {
+						pass.Reportf(call.Pos(), "make(chan ...) is not allowed in workflow code; use workflow.Execute/ExecuteAsync and workflow.Await")
+						return
+					}
+				}
 			}
 		}
 	}
@@ -428,6 +437,60 @@ func recvChanElem(t types.Type) (types.Type, bool) {
 		return nil, false
 	}
 	return ch.Elem(), true
+}
+
+// coreMakeChanType resolves the channel type created by make(C), where C may
+// be a channel type or a type parameter whose constraint is a channel union.
+// Unlike coreRangeType (which serves range checks and requires every union
+// member to permit receive), make accepts channels of any direction —
+// make(chan T), make(<-chan T) and make(chan<- T) all compile — so the union
+// path accepts any direction combination as long as every term is a channel
+// with an identical element type. It returns nil when C cannot create a
+// channel (e.g. a mixed channel/non-channel union), in which case make(C)
+// would not compile anyway.
+func coreMakeChanType(t types.Type) types.Type {
+	tp, ok := types.Unalias(t).(*types.TypeParam)
+	if !ok {
+		u := types.Unalias(t).Underlying()
+		if _, ok := u.(*types.Chan); ok {
+			return u
+		}
+		return nil
+	}
+	c := tp.Constraint()
+	if c == nil {
+		return nil
+	}
+	iface, ok := c.Underlying().(*types.Interface)
+	if !ok {
+		return nil
+	}
+	var terms []types.Type
+	for i := 0; i < iface.NumEmbeddeds(); i++ {
+		union, ok := iface.EmbeddedType(i).(*types.Union)
+		if !ok {
+			// Named or otherwise opaque constraint: core unknown.
+			return nil
+		}
+		for j := 0; j < union.Len(); j++ {
+			terms = append(terms, types.Unalias(union.Term(j).Type()).Underlying())
+		}
+	}
+	if len(terms) == 0 {
+		return nil
+	}
+	ch0, ok := terms[0].(*types.Chan)
+	if !ok {
+		return nil
+	}
+	elem := ch0.Elem()
+	for _, term := range terms[1:] {
+		ch, ok := term.(*types.Chan)
+		if !ok || !types.Identical(elem, ch.Elem()) {
+			return nil
+		}
+	}
+	return terms[0]
 }
 
 // checkPackageVar flags os.Args (and Stdin/Stdout/Stderr) selector accesses.

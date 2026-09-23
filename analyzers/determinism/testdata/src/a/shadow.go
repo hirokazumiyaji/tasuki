@@ -33,3 +33,12 @@ func BadLocalQueryHandler(ctx *workflow.Context, _ struct{}) error {
 	})
 	return nil
 }
+
+// A local shadowing the predeclared make builtin must not be mistaken for
+// channel creation: make(ch) here is an ordinary call.
+
+func OkShadowedMake(ctx *workflow.Context, ch chan int) error {
+	make := func(_ chan int) int { return 0 }
+	_ = make(ch)
+	return nil
+}

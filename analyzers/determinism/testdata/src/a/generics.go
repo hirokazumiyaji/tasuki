@@ -80,3 +80,21 @@ func BadUnionChanRange[C chan int | <-chan int](ctx *workflow.Context, ch C) err
 	}
 	return nil
 }
+
+// make accepts channels of any direction (make(chan T), make(<-chan T) and
+// make(chan<- T) all compile), so a channel union with send-capable members
+// still creates a native channel and must be flagged — even though the
+// range-oriented core type ignores send-only members.
+
+func BadUnionSendMakeChan[C chan int | chan<- int](ctx *workflow.Context, _ struct{}) error {
+	_ = make(C) // want `make\(chan`
+	return nil
+}
+
+// A receive-compatible channel union must keep being flagged by the make
+// check (it was already covered via the range-oriented core type).
+
+func BadUnionRecvMakeChan[C chan int | <-chan int](ctx *workflow.Context, _ struct{}) error {
+	_ = make(C) // want `make\(chan`
+	return nil
+}
