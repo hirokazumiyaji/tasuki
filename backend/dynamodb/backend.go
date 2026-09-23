@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -203,6 +204,81 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 }
 
 func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
+	if err := b.deleteTasksForInstanceByGSI(ctx, id); err == nil {
+		return nil
+	} else if !isMissingIndexError(err) {
+		return err
+	} else {
+		// Backward compat: tables created before instance_gsi existed
+		// (Migrate adds it lazily) fall back to a full-table Scan.
+		if scanErr := b.deleteTasksForInstanceByScan(ctx, id); scanErr != nil {
+			return scanErr
+		}
+		return nil
+	}
+}
+
+// deleteTasksForInstanceByGSI removes one instance's tasks via the
+// instance_gsi Query (no full-table Scan, no RCU on unrelated tasks).
+func (b *Backend) deleteTasksForInstanceByGSI(ctx context.Context, id string) error {
+	var start map[string]types.AttributeValue
+	for {
+		out, err := b.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:                 aws.String(b.table("wf_tasks")),
+			IndexName:                 aws.String(instanceGSIName),
+			KeyConditionExpression:    aws.String("instance_id = :id"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)},
+			ExclusiveStartKey:         start,
+		})
+		if err != nil {
+			return err
+		}
+		for _, m := range out.Items {
+			pk, ok := m["task_pk"]
+			if !ok {
+				continue
+			}
+			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
+				return err
+			}
+		}
+		if out.LastEvaluatedKey == nil {
+			return nil
+		}
+		start = out.LastEvaluatedKey
+	}
+}
+
+func isMissingIndexError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Typed nonexistent-index failure: unambiguous, always falls back to
+	// the full-table Scan.
+	var infe *types.IndexNotFoundException
+	if errors.As(err, &infe) {
+		return true
+	}
+	var rnfe *types.ResourceNotFoundException
+	if errors.As(err, &rnfe) {
+		return strings.Contains(err.Error(), instanceGSIName)
+	}
+	// Anything else must carry an explicit missing-index code AND phrasing.
+	// In particular a bare index-name mention (e.g. an IAM AccessDenied
+	// quoting the index ARN) must NOT fall back: that would silently turn
+	// every Terminate into perpetual full scans while hiding the config
+	// error, so unrecognized failures return false and surface.
+	lower := strings.ToLower(err.Error())
+	if !strings.Contains(lower, "validationexception") && !strings.Contains(lower, "indexnotfoundexception") {
+		return false
+	}
+	return strings.Contains(lower, "specified index") ||
+		strings.Contains(lower, "no such index") ||
+		strings.Contains(lower, "unknown index") ||
+		strings.Contains(lower, "backfill")
+}
+
+func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string) error {
 	var start map[string]types.AttributeValue
 	for {
 		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(b.table("wf_tasks")), ExclusiveStartKey: start})
