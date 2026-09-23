@@ -215,16 +215,15 @@ func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
 		_, scanErr := b.deleteTasksForInstanceByScan(ctx, id)
 		return scanErr
 	}
-	if n > 0 {
-		return nil
-	}
-	// The GSI is eventually consistent: a sweep that runs before recent
-	// writes propagate reports zero deletions while rows still exist, and
-	// nothing revisits them afterwards (the claim-time status gate stops
-	// execution but not the leak). Confirm against strongly consistent
-	// state with one bounded Scan page. Residual guarantee: a row beyond
-	// the verification window stays until a TerminateInstance or
-	// PurgeInstances full sweep reaps it, and is never executed meanwhile.
+	// The GSI is eventually consistent: a sweep can report a partial match
+	// while lagging rows are still invisible to the index, and nothing
+	// revisits them afterwards (the claim-time status gate stops execution
+	// but not the leak). Confirm against strongly consistent state with one
+	// bounded Scan page on every sweep, not just zero-row results.
+	// Residual guarantee: a row beyond the verification window stays until
+	// a TerminateInstance or PurgeInstances full sweep reaps it, and is
+	// never executed meanwhile.
+	_ = n
 	return b.verifyTasksEmptyByScan(ctx, id)
 }
 
@@ -234,8 +233,10 @@ func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
 const gsiVerifyScanLimit = 1000
 
 // verifyTasksEmptyByScan deletes up to one page worth of the instance's tasks
-// read with ConsistentRead. It runs only when the GSI sweep reported zero
-// deletions, so the common no-task completion pays one bounded read.
+// read with ConsistentRead. It runs after every GSI-based sweep — including
+// partial matches, where lagging rows are invisible to the index but present
+// in strongly consistent state — so the common no-task completion pays one
+// bounded read.
 func (b *Backend) verifyTasksEmptyByScan(ctx context.Context, id string) error {
 	out, err := b.client.Scan(ctx, &dynamodb.ScanInput{
 		TableName:      aws.String(b.table("wf_tasks")),
@@ -262,7 +263,7 @@ func (b *Backend) verifyTasksEmptyByScan(ctx context.Context, id string) error {
 
 // deleteTasksForInstanceByGSI removes one instance's tasks via the
 // instance_gsi Query and reports how many rows it deleted. The index is
-// eventually consistent, so a zero count proves nothing on its own: the
+// eventually consistent, so any count proves nothing on its own: the
 // caller confirms it against strongly consistent state (see
 // deleteTasksForInstance). Cost stays proportional to the instance's rows,
 // not the fleet's queued work.
@@ -430,20 +431,19 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		}
 		for _, item := range out.Items {
 			old := fromN(item["visible_at"])
-			updated, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": item["task_pk"]},
-				UpdateExpression: aws.String("SET visible_at = :v, worker_id = :w ADD attempt :one"), ConditionExpression: aws.String("visible_at = :old"),
-				ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(visible)), ":w": avS(req.WorkerID), ":one": avN(1), ":old": avN(old)}, ReturnValues: types.ReturnValueAllNew})
-			if conditional(err) {
-				continue
-			}
+			t, claimed, err := b.claimTaskItem(ctx, item, old, visible, req.WorkerID)
 			if err != nil {
 				return nil, err
 			}
-			t := decodeTask(updated.Attributes)
+			if !claimed {
+				continue
+			}
 			// The terminal transition commits the instance update before
 			// its residual rows are swept, so a poll overlapping that
 			// window can lease a task whose workflow already completed.
-			// Deleting the row afterwards cannot recall it
+			// The claim above already gates on instance status in the same
+			// transaction, but a terminal commit landing after it still
+			// needs a fence: deleting the row afterwards cannot recall it
 			// (tickActivities invokes user code immediately), so verify
 			// the owning instance is still running before handing the
 			// task out. A residual task of a terminal instance is
@@ -461,6 +461,129 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		}
 	}
 	return result, nil
+}
+
+// claimTaskItem leases one task row previously read from the claim GSI,
+// gating on the owning instance's status in the SAME transaction: the lease
+// Update and a ConditionCheck on the instance row (status = "running")
+// commit atomically, so a terminal commit landing between the GSI Query and
+// the claim aborts the claim instead of delivering the task to the worker.
+// It reports claimed=false when the claim lost — either a lease race with
+// another worker or a terminal (or vanished) instance — in which case the
+// task must never be handed out. Terminal residue is deleted best-effort;
+// the terminal sweep owns whatever remains.
+func (b *Backend) claimTaskItem(ctx context.Context, item map[string]types.AttributeValue, oldVisible int64, visible time.Time, workerID string) (backend.Task, bool, error) {
+	instanceID := fromS(item["instance_id"])
+	_, err := b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: claimTransactItems(b.table("wf_tasks"), b.table("wf_instances"), item["task_pk"], avS(instanceID), oldVisible, visible, workerID),
+	})
+	if err != nil {
+		if isTransactionUnsupported(err) {
+			// Stores without transaction support (some DynamoDB-compatible
+			// endpoints) fall back to the separate lease update; the
+			// post-claim status gate in ClaimTasks still fences terminal
+			// residue, only without atomicity.
+			return b.claimTaskItemLegacy(ctx, item, oldVisible, visible, workerID)
+		}
+		if conditional(err) {
+			// Either the lease moved (another worker won) or the instance
+			// left running (or was reaped). Neither case may deliver the
+			// task; the extra read only decides delete-vs-skip.
+			if running, rerr := b.instanceRunning(ctx, instanceID); rerr == nil && !running {
+				_, _ = b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": item["task_pk"]}})
+			}
+			return backend.Task{}, false, nil
+		}
+		return backend.Task{}, false, err
+	}
+	// TransactWriteItems returns no updated image, so apply the claimed
+	// lease to the queried row locally (visible_at/worker_id set verbatim,
+	// attempt incremented by the ADD :one update).
+	t := decodeTask(item)
+	t.VisibleAt = visible
+	t.WorkerID = workerID
+	t.Attempt++
+	return t, true, nil
+}
+
+// claimTransactItems builds the atomic claim transaction: a ConditionCheck
+// that the instance row still carries status "running" (a missing row fails
+// the check, matching instanceRunning's terminal treatment) plus the lease
+// Update guarded on the observed visible_at.
+func claimTransactItems(tasksTable, instancesTable string, taskPK, instanceID types.AttributeValue, oldVisible int64, visible time.Time, workerID string) []types.TransactWriteItem {
+	return []types.TransactWriteItem{
+		{ConditionCheck: &types.ConditionCheck{
+			TableName:           aws.String(instancesTable),
+			Key:                 map[string]types.AttributeValue{"id": instanceID},
+			ConditionExpression: aws.String("#s = :running"),
+			ExpressionAttributeNames: map[string]string{
+				"#s": "status",
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":running": avS("running"),
+			},
+		}},
+		{Update: &types.Update{
+			TableName:           aws.String(tasksTable),
+			Key:                 map[string]types.AttributeValue{"task_pk": taskPK},
+			UpdateExpression:    aws.String("SET visible_at = :v, worker_id = :w ADD attempt :one"),
+			ConditionExpression: aws.String("visible_at = :old"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":v":   avN(timeToN(visible)),
+				":w":   avS(workerID),
+				":one": avN(1),
+				":old": avN(oldVisible),
+			},
+		}},
+	}
+}
+
+// claimTaskItemLegacy performs the pre-transaction lease update for stores
+// without TransactWriteItems support. The caller still applies the
+// post-claim status gate as defense-in-depth.
+func (b *Backend) claimTaskItemLegacy(ctx context.Context, item map[string]types.AttributeValue, oldVisible int64, visible time.Time, workerID string) (backend.Task, bool, error) {
+	updated, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": item["task_pk"]},
+		UpdateExpression: aws.String("SET visible_at = :v, worker_id = :w ADD attempt :one"), ConditionExpression: aws.String("visible_at = :old"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(visible)), ":w": avS(workerID), ":one": avN(1), ":old": avN(oldVisible)}, ReturnValues: types.ReturnValueAllNew})
+	if conditional(err) {
+		return backend.Task{}, false, nil
+	}
+	if err != nil {
+		return backend.Task{}, false, err
+	}
+	return decodeTask(updated.Attributes), true, nil
+}
+
+// isTransactionUnsupported reports whether err indicates the endpoint does
+// not implement TransactWriteItems at all (as opposed to a transaction that
+// executed and cancelled). Executed-then-cancelled errors must never take
+// the legacy path: they already decided the claim.
+func isTransactionUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	var cancelled *types.TransactionCanceledException
+	if errors.As(err, &cancelled) {
+		return false
+	}
+	var failed *types.ConditionalCheckFailedException
+	if errors.As(err, &failed) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"unknownoperationexception",
+		"invalidaction",
+		"unrecognized",
+		"unsupported",
+		"not supported",
+		"not implemented",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // instanceRunning reports whether the instance still accepts work (status
