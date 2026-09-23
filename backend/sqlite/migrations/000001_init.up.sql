@@ -1,3 +1,4 @@
+-- 000001_init: baseline tasuki schema (tables, indexes, current columns)
 -- SQLite schema for tasuki
 PRAGMA foreign_keys = ON;
 
@@ -22,8 +23,8 @@ CREATE INDEX IF NOT EXISTS wf_instances_visibility_idx ON wf_instances (status, 
 -- PurgeInstances victim scan: WHERE status IN (...) AND completed_at IS NOT NULL
 -- AND completed_at <= ? ORDER BY completed_at, id. Leading status keeps the
 -- equality filter seekable while the range + ordering stay index-backed.
--- Re-executed by Migrate on every start, so pre-existing databases pick this
--- up without a versioned migration (see #292 for SQLite migration management).
+-- Kept here for fresh databases; pre-existing databases gain it through
+-- migration 000003 (legacy-stamped version-1 databases skip the baseline).
 CREATE INDEX IF NOT EXISTS wf_instances_completed_at_idx ON wf_instances (status, completed_at) WHERE completed_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS wf_journal (

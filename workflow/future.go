@@ -12,21 +12,42 @@ type Awaitable interface {
 	Seq() int64
 	ready(ctx *Context) bool
 	errCanceled(ctx *Context) error
+	scheduleErr() error
 }
 
 // Future holds a pending or completed durable operation.
+//
+// If scheduling fails before a command is recorded (e.g. input Marshal
+// fails), the Future carries err and no journal command is written. This
+// matches the sync Execute path, which returns the Marshal error before
+// recording anything. No command is recorded because serialization is a
+// deterministic function of (input, codec): on replay the same call fails
+// the same way, so there is nothing durable to match against. Recording a
+// command with a placeholder input (e.g. "null") would instead schedule a
+// real activity/child with the wrong input and hide codec or key errors.
 type Future[O any] struct {
 	seq int64
+	err error
 }
 
 func (f *Future[O]) Seq() int64 { return f.seq }
 
+// scheduleErr reports a scheduling-time failure (e.g. Marshal error) that
+// prevented a journal command from being recorded.
+func (f *Future[O]) scheduleErr() error { return f.err }
+
 func (f *Future[O]) ready(ctx *Context) bool {
+	if f.err != nil {
+		return true
+	}
 	_, ok := ctx.awaitCompletion(f.seq)
 	return ok
 }
 
 func (f *Future[O]) errCanceled(ctx *Context) error {
+	if f.err != nil {
+		return f.err
+	}
 	if ctx.canceled {
 		return ErrCanceled
 	}
@@ -34,8 +55,12 @@ func (f *Future[O]) errCanceled(ctx *Context) error {
 }
 
 // Get blocks (via journal replay / suspend) until the future completes.
+// A scheduling failure is returned immediately without suspending.
 func (f *Future[O]) Get(ctx *Context) (O, error) {
 	var zero O
+	if f.err != nil {
+		return zero, f.err
+	}
 	comp, ok := ctx.awaitCompletion(f.seq)
 	if !ok {
 		if ctx.canceled {
@@ -68,4 +93,10 @@ func (f *Future[O]) Get(ctx *Context) (O, error) {
 
 func newFuture[O any](seq int64) *Future[O] {
 	return &Future[O]{seq: seq}
+}
+
+// newFailedFuture returns a Future that is immediately ready with err and
+// has no journal command (Seq -1). Callers must not record a command for it.
+func newFailedFuture[O any](err error) *Future[O] {
+	return &Future[O]{seq: -1, err: err}
 }

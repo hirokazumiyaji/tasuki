@@ -36,8 +36,13 @@ func TestPurgeCompletedAtIndex(t *testing.T) {
 	}
 
 	// Retrofit path: databases provisioned before the index existed must gain
-	// it from a plain re-Migrate (no versioned migrations on SQLite yet, #292).
+	// it from Migrate. Under versioned migrations a plain re-Migrate skips
+	// already-applied versions, so simulate an unapplied 000003 by dropping
+	// the index and deleting its version row.
 	if _, err := b.DB().ExecContext(ctx, `DROP INDEX wf_instances_completed_at_idx`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.DB().ExecContext(ctx, `DELETE FROM tasuki_schema_migrations WHERE version = 3`); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.Migrate(ctx); err != nil {

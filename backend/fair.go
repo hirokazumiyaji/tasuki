@@ -155,6 +155,27 @@ func (p *FairPicker) Seed(refs []FairTaskRef) {
 	}
 }
 
+// Release removes one previously picked candidate and frees its
+// per-instance slot, so later queues can still fill the batch after a claim
+// conflict. Backends call it when a selected candidate loses a concurrent
+// claim race (the conditional update / transaction fails because another
+// worker leased the task first, or the index returned a stale entry) and the
+// candidate therefore occupies a slot without contributing to the batch. It
+// reports whether a matching entry was removed; unknown IDs are a no-op.
+func (p *FairPicker) Release(ref FairTaskRef) bool {
+	for i, r := range p.picked {
+		if r.ID != ref.ID {
+			continue
+		}
+		p.picked = append(p.picked[:i], p.picked[i+1:]...)
+		if p.counts[r.InstanceID] > 0 {
+			p.counts[r.InstanceID]--
+		}
+		return true
+	}
+	return false
+}
+
 // Picked returns the fair selection gathered so far, in FIFO order.
 func (p *FairPicker) Picked() []FairTaskRef { return p.picked }
 

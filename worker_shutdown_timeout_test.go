@@ -18,12 +18,12 @@ type fakeBlockingBackend struct {
 	releaseCh chan struct{}
 }
 
-func (f *fakeBlockingBackend) ReleaseLease(ctx context.Context, id int64) error {
+func (f *fakeBlockingBackend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-f.releaseCh:
-		return f.Backend.ReleaseLease(context.Background(), id)
+		return f.Backend.ReleaseLease(context.Background(), t)
 	}
 }
 

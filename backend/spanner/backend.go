@@ -475,12 +475,44 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 	return err
 }
 
-func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
+// fencedReleaseStatement builds the conditional release DML for the claimed
+// task generation. The attempt bind must be INT64 (Go int64): the Spanner
+// client rejects a native Go int for an INT64 column, which would fail the
+// DML and hide the task until lease expiry.
+func fencedReleaseStatement(now time.Time, t backend.Task) spanner.Statement {
+	if t.WorkerID != "" {
+		// Conditional on the claim ownership token (see sqlite backend).
+		return spanner.Statement{
+			SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id AND worker_id = @wid AND attempt = @attempt`,
+			Params: map[string]any{"v": now, "id": t.ID, "wid": t.WorkerID, "attempt": int64(t.Attempt)},
+		}
+	}
+	return spanner.Statement{
+		SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id`,
+		Params: map[string]any{"v": now, "id": t.ID},
+	}
+}
+
+// fencedNackStatement builds the conditional nack DML for the claimed task
+// generation. See fencedReleaseStatement: attempt must be int64 for INT64.
+func fencedNackStatement(now time.Time, t backend.Task, delay time.Duration) spanner.Statement {
+	if t.WorkerID != "" {
+		// Conditional on the claim ownership token (see ReleaseLease).
+		return spanner.Statement{
+			SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id AND worker_id = @wid AND attempt = @attempt`,
+			Params: map[string]any{"v": now.Add(delay), "id": t.ID, "wid": t.WorkerID, "attempt": int64(t.Attempt)},
+		}
+	}
+	return spanner.Statement{
+		SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id`,
+		Params: map[string]any{"v": now.Add(delay), "id": t.ID},
+	}
+}
+
+func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		n, err := txn.Update(ctx, spanner.Statement{
-			SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id`,
-			Params: map[string]any{"v": nowUTC(), "id": taskID},
-		})
+		stmt := fencedReleaseStatement(nowUTC(), t)
+		n, err := txn.Update(ctx, stmt)
 		if err != nil {
 			return err
 		}
@@ -498,10 +530,8 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 
 func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		n, err := txn.Update(ctx, spanner.Statement{
-			SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id`,
-			Params: map[string]any{"v": nowUTC().Add(delay), "id": t.ID},
-		})
+		stmt := fencedNackStatement(nowUTC(), t, delay)
+		n, err := txn.Update(ctx, stmt)
 		if err != nil {
 			return err
 		}

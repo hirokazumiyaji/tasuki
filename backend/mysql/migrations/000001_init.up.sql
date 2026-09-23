@@ -1,3 +1,4 @@
+-- 000001_init: baseline tasuki schema (tables, indexes, current columns)
 -- MySQL 8 schema for tasuki
 CREATE TABLE IF NOT EXISTS wf_instances (
     id           VARCHAR(255) PRIMARY KEY,
