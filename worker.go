@@ -245,7 +245,7 @@ func (w *Worker) untrack(taskID int64) {
 	w.mu.Unlock()
 }
 
-// claimWorkflowRelease atomically removes taskID from the in-flight set,
+// claimWorkflowRelease atomically removes t from the in-flight set,
 // reporting whether this caller still owns the lease and may release it.
 // Shutdown's releaseInFlight and the workflow abandon paths below both
 // funnel through in-flight ownership so only one of them releases a given
@@ -253,13 +253,29 @@ func (w *Worker) untrack(taskID int64) {
 // task, and backends match the lease by task ID/key alone, so a second
 // (late-cancel) release by the old turn would clear the peer's fresh lease
 // and let a third worker execute concurrently with the peer.
-func (w *Worker) claimWorkflowRelease(taskID int64) bool {
+//
+// Presence alone is not ownership: the entry must still carry this turn's
+// claim generation (worker + attempt, as ownsWorkflowCommit checks). A
+// restart after a shutdown timeout lets the new generation track() a new
+// attempt under the same task ID, REPLACING the old turn's entry; the old
+// turn's late release must not delete the new entry (which would make
+// ownsWorkflowCommit fail for the live turn and leave its lease untracked
+// until expiry) — and must not release the new lease. A generation
+// mismatch therefore reports false without touching the entry: the newer
+// attempt owns it now.
+func (w *Worker) claimWorkflowRelease(t backend.Task) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, ok := w.inFlight[taskID]; !ok {
+	e, ok := w.inFlight[t.ID]
+	if !ok {
 		return false
 	}
-	delete(w.inFlight, taskID)
+	if e.WorkerID != t.WorkerID || e.Attempt != t.Attempt {
+		w.opts.Logger.Debug("skipping workflow lease release; entry re-tracked by a newer attempt",
+			"instance_id", t.InstanceID, "task_id", t.ID)
+		return false
+	}
+	delete(w.inFlight, t.ID)
 	return true
 }
 
@@ -549,7 +565,7 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 						// execution by a third worker.
 						w.opts.Logger.Debug("workflow turn abandoned on shutdown",
 							"instance_id", t.InstanceID, "task_id", t.ID)
-						if w.claimWorkflowRelease(t.ID) {
+						if w.claimWorkflowRelease(t) {
 							w.releaseWorkflowLease(t)
 						} else {
 							w.opts.Logger.Debug("skipping workflow lease release; not in-flight owner",
@@ -614,7 +630,7 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 				// may have re-claimed it, and backends match the lease
 				// by ID/key alone, so an unconditional release would
 				// clear the peer's lease.
-				if w.claimWorkflowRelease(p.adv.TaskID) {
+				if w.claimWorkflowRelease(p.task) {
 					w.releaseWorkflowLease(p.task)
 				} else {
 					w.opts.Logger.Debug("skipping workflow lease release; not in-flight owner",
@@ -1411,7 +1427,18 @@ func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context, runCtx contex
 // if the deadline fired before consumption; late results go through the
 // timeout/cancel mapping in resolveLocalResult so a late success is never
 // journaled after expiry.
+//
+// Worker cancellation (runCtx: Shutdown or Start-parent cancel) wins over
+// even an on-time result. A local activity that observes the cancellation
+// but still returns a value before the deadline would otherwise be
+// accepted via its on-time timestamp, and the workflow would keep
+// executing (with side effects) until wf.fn returns — work whose
+// advancement is abandoned anyway. Returning the cancellation surfaces
+// the shutdown so the turn is abandoned promptly instead.
 func acceptLocalResult(name string, r callResult, ctx, runCtx context.Context, timeout time.Duration) ([]byte, error) {
+	if runCtx != nil && runCtx.Err() != nil {
+		return nil, runCtx.Err()
+	}
 	if localCompletedOnTime(r.completed, ctx) {
 		return r.out, r.err
 	}
