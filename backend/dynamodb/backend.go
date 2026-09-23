@@ -33,8 +33,15 @@ const dynamoTxnItemLimit = 100
 // relies on the count being exact (a drift that undercounts would push the
 // overflow into the defensive in-loop guard; a drift that overcounts only
 // rejects a batch that would have fit).
+//
+// Terminal advancements skip activity and timer effects (buildAdvancementItems
+// breaks out of both loops when adv.Terminal != nil), so the count mirrors
+// those skips: terminal counts exclude ActivityTasks and Timers.
 func advancementItemCount(adv backend.Advancement, hasParent bool) int {
-	n := 2 + len(adv.NewEvents) + len(adv.ActivityTasks) + len(adv.Timers) + len(adv.DrainedInbox) + 3*len(adv.Children)
+	n := 2 + len(adv.NewEvents) + len(adv.DrainedInbox) + 3*len(adv.Children)
+	if adv.Terminal == nil {
+		n += len(adv.ActivityTasks) + len(adv.Timers)
+	}
 	if adv.ParentNotify != nil && hasParent {
 		n++
 	}

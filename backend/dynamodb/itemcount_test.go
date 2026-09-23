@@ -47,6 +47,32 @@ func TestAdvancementItemCount(t *testing.T) {
 			backend.Advancement{EnsureWorkflowTask: true},
 			false, 2,
 		},
+		{
+			// Terminal advancements skip activity/timer effects in
+			// buildAdvancementItems, so the preflight must mirror the skip
+			// (Codex round 9 on #328): counting ignored effects falsely
+			// rejects small terminal batches as oversized.
+			"terminal skips activities and timers",
+			backend.Advancement{
+				Terminal:      &backend.TerminalUpdate{Status: "completed"},
+				ActivityTasks: []backend.NewTask{{}, {}},
+				Timers:        []backend.NewTimer{{}},
+			},
+			false, 2,
+		},
+		{
+			"terminal keeps journal/inbox/children/parent",
+			backend.Advancement{
+				Terminal:      &backend.TerminalUpdate{Status: "completed"},
+				NewEvents:     []journal.Event{{Seq: 2}},
+				ActivityTasks: []backend.NewTask{{}, {}},
+				Timers:        []backend.NewTimer{{}},
+				DrainedInbox:  []int64{7},
+				Children:      []backend.NewInstance{{}},
+				ParentNotify:  &notify,
+			},
+			true, 2 + 1 + 1 + 1*3 + 1,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
