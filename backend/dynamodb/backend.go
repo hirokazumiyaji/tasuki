@@ -19,6 +19,27 @@ func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{MaxAdvancementEffects: 80}
 }
 
+// dynamoTxnItemLimit is the DynamoDB TransactWriteItems item cap. A combined
+// CommitAdvancements batch must fit in a single transaction to stay atomic;
+// anything larger is rejected before applying (see CommitAdvancements).
+const dynamoTxnItemLimit = 100
+
+// advancementItemCount predicts the TransactWriteItems operations
+// buildAdvancementItems will emit for adv: 1 instance CAS + journal/activity/
+// timer puts + inbox deletes + 3 per child + 1 parent inbox when the instance
+// has a parent + 1 task delete/refresh. It must stay in lockstep with
+// buildAdvancementItems — the combined-batch preflight in CommitAdvancements
+// relies on the count being exact (a drift that undercounts would push the
+// overflow into the defensive in-loop guard; a drift that overcounts only
+// rejects a batch that would have fit).
+func advancementItemCount(adv backend.Advancement, hasParent bool) int {
+	n := 2 + len(adv.NewEvents) + len(adv.ActivityTasks) + len(adv.Timers) + len(adv.DrainedInbox) + 3*len(adv.Children)
+	if adv.ParentNotify != nil && hasParent {
+		n++
+	}
+	return n
+}
+
 func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
 	queue := inst.Queue
 	if queue == "" {
@@ -501,6 +522,27 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		b.notifyAfterAdvancements(advs)
 		return nil
 	}
+	// Size the combined transaction BEFORE building anything: the batch
+	// below commits as one TransactWriteItems (limit 100 items), and falling
+	// back to sequential per-advancement commits when it overflows would
+	// break atomicity — earlier advancements would stay committed while a
+	// later stale ExpectedSeq returns ErrConflict (see backendtest
+	// CommitAdvancementsAtomic case C). Oversized combined batches are
+	// rejected with a sizing error while every instance is still untouched.
+	// The preflight is read-only (instance reads for the parent-notify term)
+	// so a rejection mutates nothing, not even inbox sequence counters
+	// (which buildAdvancementItems would bump as a side effect).
+	total := 0
+	for _, adv := range advs {
+		inst, err := b.GetInstance(ctx, adv.InstanceID)
+		if err != nil {
+			return backend.ErrConflict
+		}
+		total += advancementItemCount(adv, inst.ParentID != "")
+		if total > dynamoTxnItemLimit {
+			return fmt.Errorf("dynamodb: combined batch produces %d transaction operations (limit %d; split the batch or reduce fanout; see docs/09-limits.md)", total, dynamoTxnItemLimit)
+		}
+	}
 	var all []types.TransactWriteItem
 	var ensures []string
 	// refreshed marks advancements whose workflow task was refreshed
@@ -513,14 +555,12 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		if err != nil {
 			return err
 		}
-		if len(all)+len(items) > 100 {
-			for _, a := range advs {
-				if err := b.commitAdvancementOnce(ctx, a); err != nil {
-					return err
-				}
-			}
-			b.notifyAfterAdvancements(advs)
-			return nil
+		if len(all)+len(items) > dynamoTxnItemLimit {
+			// Unreachable when the preflight above mirrors
+			// buildAdvancementItems exactly: fail closed with a sizing
+			// error rather than falling back to sequential commits that
+			// would apply the batch partially.
+			return fmt.Errorf("dynamodb: combined batch produces %d transaction operations (limit %d; split the batch or reduce fanout; see docs/09-limits.md)", len(all)+len(items), dynamoTxnItemLimit)
 		}
 		all = append(all, items...)
 		ensures = append(ensures, adv.InstanceID)
@@ -575,7 +615,7 @@ func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advance
 	if err != nil {
 		return err
 	}
-	if len(items) > 100 {
+	if len(items) > dynamoTxnItemLimit {
 		return fmt.Errorf("dynamodb: advancement produces %d transaction operations (budget %d; see docs/09-limits.md)", len(items), b.Capabilities().MaxAdvancementEffects)
 	}
 	_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
@@ -878,7 +918,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				"attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
 			metas = append(metas, meta{pi, false})
 		}
-		if len(twi) > 100 {
+		if len(twi) > dynamoTxnItemLimit {
 			return backend.ErrBatchTooLarge
 		}
 		_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: twi})
