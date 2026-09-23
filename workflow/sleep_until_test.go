@@ -2,6 +2,7 @@ package workflow_test
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -110,5 +111,45 @@ func TestSleepUntil_ZeroDeadlineClampsToNow(t *testing.T) {
 	// year 1000); it must clamp to now and stay already-due.
 	if !p.FireAt.Equal(now) {
 		t.Fatalf("fire_at=%v want=%v", p.FireAt, now)
+	}
+}
+
+func TestSleepUntil_RejectsDeadlineOutsidePortableRange(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	// 9999-12-31 23:00 -02:00 passes the clamp check and marshals fine, but
+	// normalizes to year 10000 in UTC, outside MySQL DATETIME(6) (max year
+	// 9999). It must fail fast instead of recording a timer that breaks
+	// every commit.
+	deadline := time.Date(9999, 12, 31, 23, 0, 0, 0, time.FixedZone("UTC-2", -2*60*60))
+	if got := deadline.UTC().Year(); got != 10000 {
+		t.Fatalf("setup: UTC year=%d want 10000", got)
+	}
+	events := []journal.Event{{Seq: 1, Type: journal.TypeWorkflowStarted, Name: "WF"}}
+	res := engine.RunAt(events, now, func(ctx *workflow.Context) (any, error) {
+		return nil, workflow.SleepUntil(ctx, deadline)
+	})
+	if res.Err == nil || !errors.Is(res.Err, workflow.ErrDeadlineOutOfRange) {
+		t.Fatalf("want ErrDeadlineOutOfRange, got %+v err=%v", res, res.Err)
+	}
+	for _, cmd := range res.NewCommands {
+		if cmd.Type == journal.TypeTimerCreated {
+			t.Fatalf("out-of-range deadline must not record a timer: %+v", res.NewCommands)
+		}
+	}
+}
+
+func TestSleepUntil_AcceptsMaxPortableDeadline(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	// The last UTC instant storable in MySQL DATETIME(6) must still record.
+	target := time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+	events := []journal.Event{{Seq: 1, Type: journal.TypeWorkflowStarted, Name: "WF"}}
+	res := engine.RunAt(events, now, func(ctx *workflow.Context) (any, error) {
+		return nil, workflow.SleepUntil(ctx, target)
+	})
+	if !res.Suspended || res.Err != nil {
+		t.Fatalf("want suspend, got %+v err=%v", res, res.Err)
+	}
+	if len(res.NewCommands) != 2 || res.NewCommands[1].Type != journal.TypeTimerCreated {
+		t.Fatalf("%+v", res.NewCommands)
 	}
 }

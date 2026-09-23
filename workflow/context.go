@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"encoding/json"
+	"fmt"
 	"runtime"
 	"time"
 
@@ -194,12 +195,35 @@ func Sleep(ctx *Context, d time.Duration) error {
 // pre-year-1000 times recorded verbatim break MySQL DATETIME(6) inserts
 // (minimum year 1000) under strict mode, turning a wake into a retry. The
 // clamped timer stays already-due and fires on the next tick.
+//
+// A deadline whose UTC-normalized instant falls outside the portable backend
+// range (MySQL DATETIME(6): years 1000-9999) is rejected with
+// ErrDeadlineOutOfRange instead of recorded: for example,
+// 9999-12-31 23:00 -02:00 passes the clamp check and marshals successfully,
+// but backends insert tm.FireAt.UTC() (year 10000), so every commit would fail
+// and retry indefinitely. Failing fast surfaces the bug to the developer.
 func SleepUntil(ctx *Context, t time.Time) error {
 	now := Now(ctx)
 	if !t.After(now) {
 		t = now
 	}
+	if err := checkPortableDeadline(t); err != nil {
+		return err
+	}
 	return sleepAt(ctx, t)
+}
+
+// checkPortableDeadline rejects timer deadlines whose UTC instant cannot be
+// stored by every backend. MySQL DATETIME(6) ('1000-01-01' to '9999-12-31')
+// is the narrowest timer column; other backends accept wider ranges. The
+// check runs on the UTC-normalized time because backends insert FireAt.UTC(),
+// so a local wall clock inside years 1000-9999 can still overflow (e.g.
+// 9999-12-31 23:00 -02:00 is year 10000 in UTC).
+func checkPortableDeadline(t time.Time) error {
+	if y := t.UTC().Year(); y < 1000 || y > 9999 {
+		return fmt.Errorf("%w: %s", ErrDeadlineOutOfRange, t.UTC().Format(time.RFC3339Nano))
+	}
+	return nil
 }
 
 func sleepAt(ctx *Context, fireAt time.Time) error {
