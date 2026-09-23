@@ -126,15 +126,32 @@ func chunkInt64s(in []int64, size int) [][]int64 {
 // sweepTerminateDocs removes a terminated instance's task/timer/dedupe rows in
 // paged transactions. The status flip already committed, so each batch is
 // independent. Inbox/journal rows (if any) are left for purge: terminate never
-// owned them and they need no prompt reclaim to unblock anything.
-func (b *Backend) sweepTerminateDocs(ctx context.Context, id string) error {
+// owned them and they need no prompt reclaim to unblock anything. Dedupe
+// cleanup deletes only the pre-termination non-marker keys snapshotted inside
+// the flip transaction: post-terminal sends committing after the flip survive,
+// and markers in the snapshot itself are filtered out (Codex round 8 on #327:
+// sweeping a marker while its inbox event remains duplicates the next retry).
+// Purge reaps leftovers.
+func (b *Backend) sweepTerminateDocs(ctx context.Context, id string, dedupeSnapshot []string) error {
 	if err := b.deleteTasksForInstance(ctx, id, nil, nil); err != nil {
 		return err
 	}
 	if err := b.deleteTimersForInstance(ctx, id, nil, nil); err != nil {
 		return err
 	}
-	return b.deleteAllSignalDedupe(ctx, id, nil, nil)
+	return b.sweepSignalDedupeIDs(ctx, id, nil, filterTerminateDedupeKeys(dedupeSnapshot))
+}
+
+// filterTerminateDedupeKeys keeps only the pre-termination non-marker keys of
+// a terminate snapshot (Codex round 8 on #327). Pure for unit tests.
+func filterTerminateDedupeKeys(keys []string) []string {
+	var out []string
+	for _, k := range keys {
+		if !isPostTerminalMarkerKey(k) {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // listSignalDedupeIDs returns every dedupe key currently stored for one

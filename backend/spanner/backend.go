@@ -232,6 +232,14 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	// Status flips in one small transaction so the mutation count never scales
 	// with the instance's task/timer/dedupe rows (DynamoDB parity). Child rows
 	// are swept afterwards in paged transactions.
+	// Dedupe keys are snapshotted INSIDE the flip transaction (serializable
+	// read): a post-terminal SendToInbox committing after the flip is never in
+	// the snapshot and survives the sweep, while pre-termination keys are
+	// reaped (Codex round 8 on #327: an unqualified sweep deleted
+	// post-terminal retry markers while leaving their inbox events, so the
+	// next retry re-inserted a duplicate). Markers in the snapshot itself are
+	// filtered out as well; purge reaps leftovers.
+	var dedupeSnapshot []string
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"id"})
 		if err != nil {
@@ -241,6 +249,11 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 			return err
 		}
 		_ = row
+		ids, err := querySignalDedupeIDsTx(ctx, txn, id)
+		if err != nil {
+			return err
+		}
+		dedupeSnapshot = ids
 		return txn.BufferWrite([]*spanner.Mutation{
 			spanner.UpdateMap("wf_instances", map[string]any{
 				"id":           id,
@@ -260,7 +273,7 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	// The status flip above already committed, so subscribers must wake even
 	// when the sweep fails: GetInstance permanently reports terminated while
 	// a skipped notifyTerminal would leave waiters asleep until a retry.
-	if err := b.sweepTerminateDocs(ctx, id); err != nil {
+	if err := b.sweepTerminateDocs(ctx, id, dedupeSnapshot); err != nil {
 		b.notifyTerminal(id)
 		return err
 	}
@@ -1216,40 +1229,65 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				}
 				if terminal {
 					// Retry check first: marker present means this DedupeID
-					// already inserted post-terminal.
-					_, merr := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, dedupeMarkerKey(it.DedupeID)}, []string{"dedupe_id"})
-					if merr == nil {
+					// already inserted post-terminal. All stored marker forms
+					// are probed (Codex round 8 on #327).
+					markerExists := false
+					for _, mk := range dedupeMarkerCandidates(it.DedupeID) {
+						_, merr := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, mk}, []string{"dedupe_id"})
+						if merr == nil {
+							markerExists = true
+							break
+						}
+						if !isNotFound(merr) {
+							return merr
+						}
+					}
+					if markerExists {
 						created[it.DedupeID] = true
 						continue
 					}
-					if !isNotFound(merr) {
-						return merr
-					}
 					// First post-terminal send: stamp the marker; create
-					// the base key too when absent for sweep consistency.
+					// the base key too when absent for sweep consistency (any
+					// encoding, including legacy raw rows, counts as present).
 					muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
 						"instance_id": instanceID, "dedupe_id": dedupeMarkerKey(it.DedupeID), "created_at": now,
 					}))
-					_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, dedupeKey(it.DedupeID)}, []string{"dedupe_id"})
-					if err == nil {
-						created[it.DedupeID] = true
-					} else {
+					baseExists := false
+					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
+						_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, bk}, []string{"dedupe_id"})
+						if err == nil {
+							baseExists = true
+							break
+						}
 						if !isNotFound(err) {
 							return err
 						}
+					}
+					if baseExists {
+						created[it.DedupeID] = true
+					} else {
 						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
 							"instance_id": instanceID, "dedupe_id": dedupeKey(it.DedupeID), "created_at": now,
 						}))
 						created[it.DedupeID] = true
 					}
 				} else {
-					_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, dedupeKey(it.DedupeID)}, []string{"dedupe_id"})
-					if err == nil {
+					// Probe every stored user-key form, legacy raw first (Codex
+					// round 8 on #327): pre-escape rows stored "__" IDs verbatim.
+					baseHit := false
+					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
+						_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, bk}, []string{"dedupe_id"})
+						if err == nil {
+							baseHit = true
+							break
+						}
+						if !isNotFound(err) {
+							return err
+						}
+					}
+					if baseHit {
 						created[it.DedupeID] = true
 						continue
-					}
-					if !isNotFound(err) {
-						return err
 					}
 					muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
 						"instance_id": instanceID, "dedupe_id": dedupeKey(it.DedupeID), "created_at": now,

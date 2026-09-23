@@ -2,7 +2,9 @@ package spanner
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"time"
@@ -103,6 +105,22 @@ func inboxPayload(ev journal.Event) []byte {
 	return b
 }
 
+// dedupeKeyLimit is the wf_signal_dedupe.dedupe_id STRING(255) budget.
+// Both backends share one encoding so keys behave identically and stay
+// portable (Codex round 8 on #327).
+const dedupeKeyLimit = 255
+
+const (
+	dedupeMarkerPrefix       = "__post_terminal__:"
+	dedupeHashedUserPrefix   = "__hash__:"
+	dedupeHashedMarkerPrefix = "__post_terminal__#h:"
+)
+
+func hashDedupeID(dedupeID string) string {
+	sum := sha256.Sum256([]byte(dedupeID))
+	return hex.EncodeToString(sum[:])
+}
+
 // postTerminalDedupeMarker derives the post-terminal send marker for a
 // DedupeID. Terminal sends always insert their event (round-4 lost-send
 // fix), but retries must still dedupe: the first post-terminal send creates
@@ -111,8 +129,14 @@ func inboxPayload(ev journal.Event) []byte {
 // key never does. User keys pass through escapeDedupeID on storage, so the
 // "__post_terminal__:" marker namespace can never collide with a user
 // DedupeID, however adversarial.
+//
+// Long IDs hash into a bounded marker form under the same transparency rule
+// as user keys (Codex round 8 on #327).
 func postTerminalDedupeMarker(dedupeID string) string {
-	return "__post_terminal__:" + dedupeID
+	if m := dedupeMarkerPrefix + dedupeID; len(m) <= dedupeKeyLimit {
+		return m
+	}
+	return dedupeHashedMarkerPrefix + hashDedupeID(dedupeID)
 }
 
 // escapeDedupeID encodes a user-supplied DedupeID for storage so it can never
@@ -125,11 +149,59 @@ func postTerminalDedupeMarker(dedupeID string) string {
 // "____" (escaped), while every marker starts with "__post_terminal__:"
 // ("__" followed by 'p'): the two sets are disjoint, and the encoding is
 // injective, so distinct user IDs still map to distinct keys.
+//
+// Long IDs that would exceed the STRING(255) budget hash into a bounded
+// "__hash__:" form instead (Codex round 8 on #327); the mapping applies on
+// write and lookup alike, so it stays transparent.
 func escapeDedupeID(dedupeID string) string {
+	var esc string
 	if strings.HasPrefix(dedupeID, "__") {
-		return "__" + dedupeID
+		esc = "__" + dedupeID
+	} else {
+		esc = dedupeID
 	}
-	return dedupeID
+	if len(esc) <= dedupeKeyLimit {
+		return esc
+	}
+	return dedupeHashedUserPrefix + hashDedupeID(dedupeID)
+}
+
+// isPostTerminalMarkerKey reports whether a stored wf_signal_dedupe key is a
+// post-terminal retry marker (either form). The terminate sweep uses this to
+// preserve markers (Codex round 8 on #327).
+func isPostTerminalMarkerKey(stored string) bool {
+	return strings.HasPrefix(stored, dedupeMarkerPrefix) ||
+		strings.HasPrefix(stored, dedupeHashedMarkerPrefix)
+}
+
+// dedupeKeyCandidates lists the stored user-key forms to probe on
+// dedupe-check reads, legacy raw first (Codex round 8 on #327).
+func dedupeKeyCandidates(dedupeID string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(k string) {
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	add(dedupeID)
+	if strings.HasPrefix(dedupeID, "__") {
+		add("__" + dedupeID)
+	}
+	add(escapeDedupeID(dedupeID))
+	return out
+}
+
+// dedupeMarkerCandidates lists the stored marker forms to probe on terminal
+// retry checks.
+func dedupeMarkerCandidates(dedupeID string) []string {
+	legacy := dedupeMarkerPrefix + dedupeID
+	cur := postTerminalDedupeMarker(dedupeID)
+	if legacy == cur {
+		return []string{cur}
+	}
+	return []string{legacy, cur}
 }
 
 // dedupeKey is the wf_signal_dedupe row key for a user DedupeID (escaped).

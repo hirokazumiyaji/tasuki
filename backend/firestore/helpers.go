@@ -2,7 +2,9 @@ package firestore
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"strconv"
 	"strings"
@@ -48,6 +50,32 @@ func signalDedupeMarkerID(instanceID, dedupeID string) string {
 	return instanceID + ":" + postTerminalDedupeMarker(dedupeID)
 }
 
+// dedupeKeyLimit is the Spanner wf_signal_dedupe.dedupe_id STRING(255)
+// budget. Firestore has no hard limit here, but both backends share one
+// encoding so keys behave identically and stay portable (Codex round 8 on
+// #327: a 238-255-char DedupeID plus the marker/escape prefix would otherwise
+// exceed the column on Spanner, and the "__" escape adds 2 chars on top).
+const dedupeKeyLimit = 255
+
+// dedupeMarkerPrefix prefixes every unhashed post-terminal retry marker.
+// dedupeHashedUserPrefix prefixes hashed user keys (long IDs that would
+// exceed the column budget); dedupeHashedMarkerPrefix prefixes hashed
+// markers. All hashed forms stay well under the budget (prefix + 64 hex
+// chars) and stay disjoint from every other namespace: hashed users start
+// with "__h" (vs "____" escaped, "__p" markers, and no-"__" verbatim), and
+// hashed markers start with "__post_terminal__#h:" (vs "__post_terminal__:"
+// unhashed markers).
+const (
+	dedupeMarkerPrefix       = "__post_terminal__:"
+	dedupeHashedUserPrefix   = "__hash__:"
+	dedupeHashedMarkerPrefix = "__post_terminal__#h:"
+)
+
+func hashDedupeID(dedupeID string) string {
+	sum := sha256.Sum256([]byte(dedupeID))
+	return hex.EncodeToString(sum[:])
+}
+
 // escapeDedupeID encodes a user-supplied DedupeID for storage so it can never
 // collide with an internal post-terminal marker (Codex round 6 on #327). A
 // user DedupeID of "__post_terminal__:x" used to share its document with the
@@ -59,11 +87,25 @@ func signalDedupeMarkerID(instanceID, dedupeID string) string {
 // every marker starts with "__post_terminal__:" ("__" followed by 'p'):
 // the two sets are disjoint, and the encoding is injective, so distinct user
 // IDs still map to distinct keys and normal dedupe is unaffected.
+//
+// Long IDs that would exceed the Spanner column budget (Codex round 8 on
+// #327) hash into a bounded form instead: the hashed encoding applies the
+// same mapping on write and lookup, so it stays transparent, and its "__h"
+// prefix keeps it disjoint from verbatim ("x"), escaped ("____x"), and
+// marker ("__post_terminal__:..") namespaces — including adversarial raws
+// that literally equal a hashed value (those start with "__", so they are
+// escaped away and never collide).
 func escapeDedupeID(dedupeID string) string {
+	var esc string
 	if strings.HasPrefix(dedupeID, "__") {
-		return "__" + dedupeID
+		esc = "__" + dedupeID
+	} else {
+		esc = dedupeID
 	}
-	return dedupeID
+	if len(esc) <= dedupeKeyLimit {
+		return esc
+	}
+	return dedupeHashedUserPrefix + hashDedupeID(dedupeID)
 }
 
 // postTerminalDedupeMarker derives the post-terminal send marker for a
@@ -76,8 +118,81 @@ func escapeDedupeID(dedupeID string) string {
 // pre-terminal base key never does. User keys pass through escapeDedupeID on
 // storage, so the "__post_terminal__:" marker namespace can never collide
 // with a user DedupeID, however adversarial.
+//
+// Long IDs hash into a bounded marker form under the same transparency rule
+// as user keys (Codex round 8 on #327). The hashed marker prefix differs
+// from the unhashed one so a hashed marker can never equal an unhashed
+// marker for a 64-hex-char raw ID.
 func postTerminalDedupeMarker(dedupeID string) string {
-	return "__post_terminal__:" + dedupeID
+	if m := dedupeMarkerPrefix + dedupeID; len(m) <= dedupeKeyLimit {
+		return m
+	}
+	return dedupeHashedMarkerPrefix + hashDedupeID(dedupeID)
+}
+
+// isPostTerminalMarkerKey reports whether a stored wf_signal_dedupe key is a
+// post-terminal retry marker (either hashed or unhashed form). User keys —
+// verbatim, "__"-escaped ("____.."), or hashed ("__hash__:..") — never carry
+// this prefix. The terminate sweep uses this to preserve markers (Codex
+// round 8 on #327).
+func isPostTerminalMarkerKey(stored string) bool {
+	return strings.HasPrefix(stored, dedupeMarkerPrefix) ||
+		strings.HasPrefix(stored, dedupeHashedMarkerPrefix)
+}
+
+// dedupeKeyCandidates lists the stored user-key forms to probe on
+// dedupe-check reads, legacy raw first (Codex round 8 on #327): rows written
+// before the round-6 escape stored "__"-prefixed IDs verbatim, so a lookup
+// for "__x" must probe "__x" before the current "____x", or it misses and
+// duplicates the event. Long-ID rows written between round 6 and the round-8
+// hash could also hold the over-budget escaped form on Firestore (Spanner
+// would have rejected it), so all three forms are probed. Writes always use
+// the current escapeDedupeID form.
+func dedupeKeyCandidates(dedupeID string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(k string) {
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	add(dedupeID)
+	if strings.HasPrefix(dedupeID, "__") {
+		add("__" + dedupeID)
+	}
+	add(escapeDedupeID(dedupeID))
+	return out
+}
+
+// isPostTerminalMarkerDocID reports whether a wf_signal_dedupe document ID
+// holds a post-terminal retry marker. Doc IDs are instanceID + ":" +
+// storedKey, so the stored suffix is tested (Codex round 8 on #327).
+func isPostTerminalMarkerDocID(docID, instanceID string) bool {
+	suffix := docID
+	if rest, ok := cutPrefix(docID, instanceID+":"); ok {
+		suffix = rest
+	}
+	return isPostTerminalMarkerKey(suffix)
+}
+
+func cutPrefix(s, prefix string) (string, bool) {
+	if len(s) < len(prefix) || s[:len(prefix)] != prefix {
+		return s, false
+	}
+	return s[len(prefix):], true
+}
+
+// dedupeMarkerCandidates lists the stored marker forms to probe on terminal
+// retry checks: the unhashed legacy form first, then the current
+// (possibly hashed) form. Writes always use postTerminalDedupeMarker.
+func dedupeMarkerCandidates(dedupeID string) []string {
+	legacy := dedupeMarkerPrefix + dedupeID
+	cur := postTerminalDedupeMarker(dedupeID)
+	if legacy == cur {
+		return []string{cur}
+	}
+	return []string{legacy, cur}
 }
 
 type activityPayload struct {

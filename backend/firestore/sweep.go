@@ -74,14 +74,32 @@ func chunkStrings(in []string, size int) [][]string {
 
 // sweepTerminateDocs removes the mutable child documents of a terminated
 // instance in paged batches. The status flip already committed, so each batch
-// is an independent non-transactional commit.
-func (b *Backend) sweepTerminateDocs(ctx context.Context, id string) error {
-	for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe"} {
+// is an independent non-transactional commit. Dedupe cleanup deletes only
+// the pre-termination non-marker keys snapshotted inside the flip
+// transaction: post-terminal sends committing after the flip (marker plus
+// inbox event) are absent from the snapshot and survive, and markers present
+// in the snapshot itself are filtered out (Codex round 8 on #327: sweeping a
+// marker while its inbox event remains duplicates the next retry). Purge
+// reaps leftovers.
+func (b *Backend) sweepTerminateDocs(ctx context.Context, id string, dedupeSnapshot []string) error {
+	for _, col := range []string{"wf_tasks", "wf_timers"} {
 		if err := b.deleteDocsByInstance(ctx, col, id, nil); err != nil {
 			return err
 		}
 	}
-	return nil
+	return b.sweepSignalDedupeIDs(ctx, filterTerminateDedupeDocs(dedupeSnapshot, id))
+}
+
+// filterTerminateDedupeDocs keeps only the pre-termination non-marker keys of
+// a terminate snapshot (Codex round 8 on #327). Pure for unit tests.
+func filterTerminateDedupeDocs(docIDs []string, instanceID string) []string {
+	var out []string
+	for _, docID := range docIDs {
+		if !isPostTerminalMarkerDocID(docID, instanceID) {
+			out = append(out, docID)
+		}
+	}
+	return out
 }
 
 // listSignalDedupeIDs returns the document IDs of every dedupe key

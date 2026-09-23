@@ -221,11 +221,21 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 }
 func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	now := nowUTC()
-	// Status flips inside a small transaction (one read + one update) so the
-	// write count never scales with the instance's task/timer/dedupe rows.
-	// Child documents are swept afterwards in paged batches: a single
-	// transaction deleting them would breach the 500-write limit once dedupe
-	// keys accumulate (DynamoDB parity: status update first, paged deletes).
+	// Status flips inside a small transaction so the write count never scales
+	// with the instance's task/timer/dedupe rows. Child documents are swept
+	// afterwards in paged batches: a single transaction deleting them would
+	// breach the 500-write limit once dedupe keys accumulate (DynamoDB parity:
+	// status update first, paged deletes).
+	// Dedupe keys are snapshotted INSIDE the flip transaction (read phase,
+	// before the update): the snapshot is serializable, so a post-terminal
+	// SendToInbox committing after the flip — its marker plus inbox event —
+	// is never in the snapshot and survives the sweep, while pre-termination
+	// keys are reaped (Codex round 8 on #327: an unqualified sweep deleted
+	// post-terminal retry markers while leaving their inbox events, so the
+	// next retry re-inserted a duplicate). Markers in the snapshot itself are
+	// filtered out as well (a redundant TerminateInstance after terminal
+	// sends must not strip them); purge reaps all leftovers.
+	var dedupeSnapshot []string
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		s, err := tx.Get(b.ref("wf_instances", id))
 		if isNotFound(err) {
@@ -237,6 +247,11 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		if !s.Exists() {
 			return backend.ErrNotFound
 		}
+		ids, err := listSignalDedupeIDsTx(tx, b.col("wf_signal_dedupe"), id)
+		if err != nil {
+			return err
+		}
+		dedupeSnapshot = ids
 		return tx.Update(b.ref("wf_instances", id), []gcf.Update{{Path: "status", Value: "terminated"}, {Path: "updated_at", Value: now}, {Path: "completed_at", Value: now}})
 	})
 	if err != nil {
@@ -250,7 +265,7 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	// The status flip above already committed, so subscribers must wake even
 	// when the sweep fails: GetInstance permanently reports terminated while
 	// a skipped notifyTerminal would leave waiters asleep until a retry.
-	if err := b.sweepTerminateDocs(ctx, id); err != nil {
+	if err := b.sweepTerminateDocs(ctx, id, dedupeSnapshot); err != nil {
 		b.notifyTerminal(id)
 		return err
 	}
@@ -402,10 +417,13 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 					// slot so Full below does not stop later candidates and
 					// queues from filling the batch, then re-query this queue
 					// for a replacement (the loop above) instead of moving on.
+					// The refill flag is set even without a picker (Codex round
+					// 8 on #327): a default nil-picker claim must also loop to
+					// fill Limit instead of returning undersized after one pass.
 					if picker != nil {
 						picker.Release(backend.FairTaskRef{ID: id, InstanceID: str(m, "instance_id")})
-						released = true
 					}
+					released = true
 					continue
 				}
 				if err != nil {
@@ -416,11 +434,13 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 					// so Full does not stop later candidates and queues
 					// from filling the batch, then re-query this queue
 					// for a replacement (the loop above) instead of
-					// moving on.
+					// moving on. The refill flag is set even without a picker
+					// (Codex round 8 on #327): deleting a stale task must loop
+					// until Limit is filled or candidates are exhausted.
 					if picker != nil {
 						picker.Release(backend.FairTaskRef{ID: id, InstanceID: str(m, "instance_id")})
-						released = true
 					}
+					released = true
 					continue
 				}
 				out = append(out, claimed)
@@ -437,8 +457,9 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 }
 
 // listClaimCandidates returns FIFO-ordered task snapshots for one queue.
-// With a nil picker it returns the first remaining snapshots; otherwise it
-// pages through the (kind, queue, visible_at, __name__) composite index in
+// With a nil picker it pages the (kind, queue, visible_at, __name__)
+// composite index Limit-at-a-time, advancing with the caller's cursor across
+// refills; otherwise it pages the same index in
 // FairOverfetch windows feeding the shared picker, so a victim hidden behind
 // a flooding instance is still found beyond the first page. Pages advance
 // with a document cursor over (visible_at, __name__) ordering — each query
@@ -495,9 +516,13 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		return docs, nil
 	}
 	if picker == nil {
-		// Single-pass path: the caller never refills without a picker
-		// (refills follow a conflict Release), so cursor is always nil
-		// here; it is threaded only for signature symmetry.
+		// Nil-picker path pages with the same (visible_at, __name__) cursor
+		// the caller threads across refills (Codex round 8 on #327): without
+		// it a refill after deleting a terminal task would re-fetch the same
+		// head window on every pass (one poll per stale row with big
+		// backlogs) instead of advancing. The resume point is the last
+		// FETCHED document and exhaustion is a short page, mirroring the
+		// picker path.
 		q := base.Limit(remaining)
 		if cursor != nil {
 			q = q.StartAfter(cursor)
@@ -506,8 +531,13 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		if err != nil {
 			return nil, cursor, false, err
 		}
+		if len(docs) == 0 {
+			return nil, cursor, true, nil
+		}
+		next := docs[len(docs)-1]
+		exhausted := len(docs) < remaining
 		if len(skip) == 0 {
-			return docs, nil, false, nil
+			return docs, next, exhausted, nil
 		}
 		kept := docs[:0]
 		for _, d := range docs {
@@ -515,7 +545,7 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 				kept = append(kept, d)
 			}
 		}
-		return kept, nil, false, nil
+		return kept, next, exhausted, nil
 	}
 	pageSize := backend.FairOverfetch(remaining)
 	// byID retains snapshots only for picker-accepted candidates so
@@ -1165,27 +1195,41 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			}
 			if terminal {
 				// Retry check first: a marker means this DedupeID already
-				// inserted post-terminal, so dedupe the retry.
-				mref := b.ref("wf_signal_dedupe", signalDedupeMarkerID(instanceID, it.DedupeID))
-				msnap, merr := tx.Get(mref)
-				if merr != nil && !isNotFound(merr) {
-					return merr
+				// inserted post-terminal, so dedupe the retry. All stored
+				// marker forms are probed (Codex round 8 on #327).
+				markerExists := false
+				for _, mk := range dedupeMarkerCandidates(it.DedupeID) {
+					msnap, merr := tx.Get(b.ref("wf_signal_dedupe", instanceID+":"+mk))
+					if merr != nil && !isNotFound(merr) {
+						return merr
+					}
+					if merr == nil && msnap.Exists() {
+						markerExists = true
+						break
+					}
 				}
-				if merr == nil && msnap.Exists() {
+				if markerExists {
 					created[it.DedupeID] = true
 					skip[i] = true
 					continue
 				}
 				// First post-terminal send: insert + stamp the marker.
 				// Create the base key too when absent for sweep/purge
-				// consistency; an existing base key is kept as is.
-				dref := b.ref("wf_signal_dedupe", signalDedupeID(instanceID, it.DedupeID))
-				snap, err := tx.Get(dref)
-				if err != nil && !isNotFound(err) {
-					return err
+				// consistency; an existing base key (any encoding, including
+				// legacy raw rows) is kept as is.
+				baseExists := false
+				for _, bk := range dedupeKeyCandidates(it.DedupeID) {
+					snap, err := tx.Get(b.ref("wf_signal_dedupe", instanceID+":"+bk))
+					if err != nil && !isNotFound(err) {
+						return err
+					}
+					if err == nil && snap.Exists() {
+						baseExists = true
+						break
+					}
 				}
 				created[it.DedupeID] = true
-				if err == nil && snap.Exists() {
+				if baseExists {
 					createMarker[i] = true
 					continue
 				}
@@ -1193,12 +1237,20 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				createMarker[i] = true
 				continue
 			}
-			dref := b.ref("wf_signal_dedupe", signalDedupeID(instanceID, it.DedupeID))
-			snap, err := tx.Get(dref)
-			if err != nil && !isNotFound(err) {
-				return err
+			// Probe every stored user-key form, legacy raw first (Codex round 8
+			// on #327): pre-escape rows stored "__" IDs verbatim.
+			baseHit := false
+			for _, bk := range dedupeKeyCandidates(it.DedupeID) {
+				snap, err := tx.Get(b.ref("wf_signal_dedupe", instanceID+":"+bk))
+				if err != nil && !isNotFound(err) {
+					return err
+				}
+				if err == nil && snap.Exists() {
+					baseHit = true
+					break
+				}
 			}
-			if err == nil && snap.Exists() {
+			if baseHit {
 				created[it.DedupeID] = true
 				skip[i] = true
 				continue
