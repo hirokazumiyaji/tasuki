@@ -872,8 +872,16 @@ func (w *Worker) attachEffects(adv *backend.Advancement, queue string, cmds []jo
 // inbox deletes + 3 per child + parent inbox + 1 task delete.
 // It mirrors backend/dynamodb buildAdvancementItems counting so workers can
 // stay within backend.Capabilities.MaxAdvancementEffects atomically.
+// Terminal advancements skip activity and timer effects (buildAdvancementItems
+// breaks out of both loops when adv.Terminal != nil), so the estimate mirrors
+// those skips: terminal counts exclude ActivityTasks and Timers. The estimate
+// must never underestimate the backend count (an undercount would push a real
+// over-limit transaction into a commit-time failure instead of a diagnostic).
 func advancementOps(adv *backend.Advancement) int {
-	n := 2 + len(adv.NewEvents) + len(adv.ActivityTasks) + len(adv.Timers) + len(adv.DrainedInbox) + 3*len(adv.Children)
+	n := 2 + len(adv.NewEvents) + len(adv.DrainedInbox) + 3*len(adv.Children)
+	if adv.Terminal == nil {
+		n += len(adv.ActivityTasks) + len(adv.Timers)
+	}
 	if adv.ParentNotify != nil {
 		n++
 	}
