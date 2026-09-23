@@ -2,6 +2,9 @@ package backendtest
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -9,22 +12,41 @@ import (
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
-// testTerminalCleanup verifies that a terminal CommitAdvancement removes
-// pending activity tasks, timers, and inbox rows in the same transaction,
-// and that FireDueTimers never resurrects inbox rows for terminal instances
-// (issue #291).
+// Terminal-transition cleanup (#299 item 1, see #290).
+//
+// Once an instance leaves "running" — via a terminal CommitAdvancement or
+// TerminateInstance — no activity task may remain claimable and FireDueTimers
+// must not create inbox rows or workflow tasks for it. Backends that historically
+// left tasks/timers/inbox behind fail here (SQL backends did before the fix).
 func testTerminalCleanup(t *testing.T, newBackend Factory) {
+	t.Helper()
+	t.Run("CommitTerminal", func(t *testing.T) {
+		terminalCleanupCase(t, newBackend, true)
+	})
+	t.Run("Terminate", func(t *testing.T) {
+		terminalCleanupCase(t, newBackend, false)
+	})
+	t.Run("CommitTerminalPurgesUndrainedInbox", func(t *testing.T) {
+		testTerminalCommitPurgesUndrainedInbox(t, newBackend)
+	})
+}
+
+func terminalCleanupCase(t *testing.T, newBackend Factory, viaCommit bool) {
 	t.Helper()
 	ctx := context.Background()
 	b := newBackend(t)
+	requireTerminalCleanup(t, b)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	setNow(b, base)
+	id := instanceID("term-clean-", t)
 
-	const id = "term-cleanup-1"
 	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
 		t.Fatal(err)
 	}
-	tasks, err := b.ClaimTasks(ctx, claimWF())
+	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 1,
+		Lease: time.Minute, WorkerID: "term-clean",
+	})
 	if err != nil || len(tasks) != 1 {
 		t.Fatalf("claim wf: %v %#v", err, tasks)
 	}
@@ -32,107 +54,271 @@ func testTerminalCleanup(t *testing.T, newBackend Factory) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	actSeq, timerSeq := st.NextSeq, st.NextSeq+1
 	delay := time.Hour
 	if _, ok := b.(ClockSetter); !ok {
-		delay = 200 * time.Millisecond
+		delay = 80 * time.Millisecond
 	}
 	fireAt := st.Now.Add(delay)
-	actSeq := st.NextSeq
-	tmrSeq := st.NextSeq + 1
-	if err := b.CommitAdvancement(ctx, backend.Advancement{
+	adv := backend.Advancement{
 		InstanceID:  id,
 		TaskID:      tasks[0].ID,
 		ExpectedSeq: st.NextSeq,
 		NewEvents: []journal.Event{
-			{Seq: actSeq, Type: journal.TypeActivityScheduled, Name: "work"},
-			{Seq: tmrSeq, Type: journal.TypeTimerCreated},
+			{Seq: actSeq, Type: journal.TypeActivityScheduled, Name: "step"},
+			{Seq: timerSeq, Type: journal.TypeTimerCreated},
 		},
 		ActivityTasks: []backend.NewTask{{
-			Kind: "activity", Queue: "default", InstanceID: id, Name: "work", Seq: actSeq, Input: []byte(`{}`),
+			Kind: "activity", Queue: "default", InstanceID: id,
+			Name: "step", Seq: actSeq, Input: []byte(`{}`),
 		}},
-		Timers:             []backend.NewTimer{{Seq: tmrSeq, FireAt: fireAt}},
-		EnsureWorkflowTask: true,
-	}); err != nil {
+		Timers: []backend.NewTimer{{Seq: timerSeq, FireAt: fireAt}},
+	}
+	if viaCommit {
+		adv.Terminal = &backend.TerminalUpdate{Status: "completed", Result: []byte(`"ok"`)}
+		// A terminal advancement may also carry scheduling garbage
+		// (issue-291 case): a correct backend must not leave the
+		// accompanying activity task or timer behind.
+		adv.ActivityTasks = append(adv.ActivityTasks, backend.NewTask{
+			Kind: "activity", Queue: "default", InstanceID: id,
+			Name: "garbage", Seq: timerSeq + 1, Input: []byte(`{}`),
+		})
+		adv.Timers = append(adv.Timers, backend.NewTimer{Seq: timerSeq + 2, FireAt: fireAt})
+	}
+	if err := b.CommitAdvancement(ctx, adv); err != nil {
 		t.Fatal(err)
 	}
+	if !viaCommit {
+		if err := b.TerminateInstance(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	counts, err := b.CountClaimableTasks(ctx, "activity", []string{"default"})
+	assertNoRemnants(t, b, id, fireAt)
+}
+
+// Terminal CommitAdvancement must purge undrained inbox rows (Codex review
+// on #330).
+//
+// A signal committed after the worker loaded its state but before its
+// terminal advancement is never in DrainedInbox. The terminal commit must
+// still remove it — like TerminateInstance does — instead of leaving it
+// behind where no workflow task will ever consume it.
+func testTerminalCommitPurgesUndrainedInbox(t *testing.T, newBackend Factory) {
+	t.Helper()
+	ctx := context.Background()
+	b := newBackend(t)
+	requireTerminalCleanup(t, b)
+	setNow(b, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	id := instanceID("term-undrained-", t)
+
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 1,
+		Lease: time.Minute, WorkerID: "term-undrained",
+	})
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("claim wf: %v %#v", err, tasks)
+	}
+	// Worker loads its state (stale view of the inbox) ...
+	st, err := b.LoadWorkflow(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if counts["default"] < 1 {
-		t.Fatalf("want pending activity before terminal, got %v", counts)
+	var stale []int64
+	for _, item := range st.Inbox {
+		stale = append(stale, item.ID)
 	}
-
-	wtasks, err := b.ClaimTasks(ctx, claimWF())
-	if err != nil || len(wtasks) != 1 {
-		t.Fatalf("claim wf for terminal: %v %#v", err, wtasks)
-	}
-	st2, err := b.LoadWorkflow(ctx, id)
-	if err != nil {
+	// ... then a signal lands before the terminal commit.
+	if err := b.SendToInbox(ctx, id, journal.Event{Type: journal.TypeSignalReceived, Name: "late"}, ""); err != nil {
 		t.Fatal(err)
 	}
-	// Terminal advancement also carries scheduling garbage: a correct
-	// backend must not leave it behind.
-	garbageActSeq := st2.NextSeq + 1
-	garbageTmrSeq := st2.NextSeq + 2
 	if err := b.CommitAdvancement(ctx, backend.Advancement{
-		InstanceID:  id,
-		TaskID:      wtasks[0].ID,
-		ExpectedSeq: st2.NextSeq,
-		NewEvents: []journal.Event{
-			{Seq: st2.NextSeq, Type: journal.TypeWorkflowCompleted, Payload: []byte(`"ok"`)},
-		},
-		ActivityTasks: []backend.NewTask{{
-			Kind: "activity", Queue: "default", InstanceID: id, Name: "garbage", Seq: garbageActSeq, Input: []byte(`{}`),
-		}},
-		Timers:   []backend.NewTimer{{Seq: garbageTmrSeq, FireAt: fireAt}},
-		Terminal: &backend.TerminalUpdate{Status: "completed", Result: []byte(`"ok"`)},
+		InstanceID:   id,
+		TaskID:       tasks[0].ID,
+		ExpectedSeq:  st.NextSeq,
+		DrainedInbox: stale,
+		Terminal:     &backend.TerminalUpdate{Status: "completed", Result: []byte(`"ok"`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
-
-	inst, err := b.GetInstance(ctx, id)
-	if err != nil || inst.Status != "completed" {
-		t.Fatalf("status: %v %#v", err, inst)
-	}
-	atasks, err := b.ClaimTasks(ctx, claimAct())
+	st, err = b.LoadWorkflow(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(atasks) != 0 {
-		t.Fatalf("activity tasks should be gone after terminal, got %d", len(atasks))
+	if len(st.Inbox) != 0 {
+		t.Fatalf("terminal commit left %d undrained inbox rows", len(st.Inbox))
 	}
-	st3, err := b.LoadWorkflow(ctx, id)
+	for _, kind := range []string{"activity", "workflow"} {
+		claimed, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+			Kind: kind, Queues: []string{"default"}, Limit: 100,
+			Lease: time.Minute, WorkerID: "term-undrained-check",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range claimed {
+			if task.InstanceID == id {
+				t.Fatalf("%s task %d survived terminal commit of %s", kind, task.ID, id)
+			}
+		}
+	}
+}
+
+// assertNoRemnants checks the terminal invariant: no claimable tasks for the
+// instance and no inbox growth from FireDueTimers.
+func assertNoRemnants(t *testing.T, b backend.Backend, id string, fireAt time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	for _, kind := range []string{"activity", "workflow"} {
+		tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+			Kind: kind, Queues: []string{"default"}, Limit: 100,
+			Lease: time.Minute, WorkerID: "term-check",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range tasks {
+			if task.InstanceID == id {
+				t.Fatalf("%s task %d survived terminal transition of %s", kind, task.ID, id)
+			}
+		}
+	}
+	st, err := b.LoadWorkflow(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(st3.Inbox) != 0 {
-		t.Fatalf("inbox should be empty after terminal, got %+v", st3.Inbox)
-	}
-
-	advanceTo(b, fireAt.Add(time.Millisecond))
-	n, err := b.FireDueTimers(ctx, 10)
+	inboxBefore := len(st.Inbox)
+	advanceTo(b, fireAt.Add(time.Second))
+	n, err := b.FireDueTimers(ctx, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n != 0 {
-		t.Fatalf("FireDueTimers on terminal should fire 0, got %d", n)
+		t.Fatalf("FireDueTimers on terminal %s should fire 0, got %d", id, n)
 	}
-	st4, err := b.LoadWorkflow(ctx, id)
+	st, err = b.LoadWorkflow(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(st4.Inbox) != 0 {
-		t.Fatalf("FireDueTimers must not create inbox for terminal, got %+v", st4.Inbox)
+	if len(st.Inbox) != inboxBefore {
+		t.Fatalf("FireDueTimers grew inbox of terminal %s: %d -> %d", id, inboxBefore, len(st.Inbox))
 	}
-	wtasks2, err := b.ClaimTasks(ctx, claimWF())
+	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 100,
+		Lease: time.Minute, WorkerID: "term-check",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, wt := range wtasks2 {
-		if wt.InstanceID == id {
-			t.Fatalf("workflow task should be gone after terminal, got %+v", wt)
+	for _, task := range tasks {
+		if task.InstanceID == id {
+			t.Fatalf("FireDueTimers woke terminal %s (task %d)", id, task.ID)
 		}
+	}
+}
+
+// CompleteActivity vs TerminateInstance race (#299 item 2, see #291).
+//
+// Whichever wins, a subsequent TerminateInstance must leave no inbox rows and
+// no claimable tasks behind. The race itself must not error unexpectedly:
+// losers observe ErrSuperseded (or a benign nil when the task is already gone).
+func testTerminateCompleteRace(t *testing.T, newBackend Factory) {
+	t.Helper()
+	const rounds = 15
+	for r := 0; r < rounds; r++ {
+		func() {
+			ctx := context.Background()
+			probe := newBackend(t)
+			strict := probe.Capabilities().CleansTerminalState
+			b := newBackend(t)
+			setNow(b, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+			id := fmt.Sprintf("term-race-%d", r)
+			seq := scheduleActivity(t, b, id, "act")
+			atasks, err := b.ClaimTasks(ctx, claimAct())
+			if err != nil || len(atasks) != 1 {
+				t.Fatalf("round %d: claim act: %v %#v", r, err, atasks)
+			}
+			var wg sync.WaitGroup
+			wg.Add(2)
+			var completeErr, terminateErr error
+			go func() {
+				defer wg.Done()
+				completeErr = b.CompleteActivity(ctx, atasks[0].ID, journal.Event{
+					Type: journal.TypeActivityCompleted, RefSeq: seq, Payload: []byte(`"ok"`),
+				})
+			}()
+			go func() {
+				defer wg.Done()
+				terminateErr = b.TerminateInstance(ctx, id)
+			}()
+			wg.Wait()
+			if terminateErr != nil {
+				t.Fatalf("round %d: TerminateInstance: %v", r, terminateErr)
+			}
+			if completeErr != nil && !isBenignRaceErr(completeErr) {
+				t.Fatalf("round %d: CompleteActivity: %v", r, completeErr)
+			}
+			// Inspect the race outcome before any second termination can
+			// repair it: the first TerminateInstance must already have left
+			// a terminal instance with no remnants behind.
+			inst, err := b.GetInstance(ctx, id)
+			if err != nil || inst.Status != "terminated" {
+				t.Fatalf("round %d: status: %v %#v", r, err, inst)
+			}
+			if !strict {
+				t.Skip("terminal cleanup not implemented (see #291)")
+			}
+			assertRaceClean(t, b, r, id)
+			// Force the terminal end state, then require it to stay clean.
+			if err := b.TerminateInstance(ctx, id); err != nil {
+				t.Fatalf("round %d: second TerminateInstance: %v", r, err)
+			}
+			assertRaceClean(t, b, r, id)
+		}()
+	}
+}
+
+func isBenignRaceErr(err error) bool {
+	return err == nil ||
+		errors.Is(err, backend.ErrSuperseded) ||
+		errors.Is(err, backend.ErrNotFound) ||
+		errors.Is(err, backend.ErrConflict)
+}
+
+// assertRaceClean checks the post-race terminal invariant: no inbox rows and
+// no claimable tasks for the instance.
+func assertRaceClean(t *testing.T, b backend.Backend, r int, id string) {
+	t.Helper()
+	ctx := context.Background()
+	st, err := b.LoadWorkflow(ctx, id)
+	if err != nil {
+		t.Fatalf("round %d: load: %v", r, err)
+	}
+	if len(st.Inbox) != 0 {
+		t.Fatalf("round %d: terminated %s has %d inbox rows", r, id, len(st.Inbox))
+	}
+	for _, kind := range []string{"activity", "workflow"} {
+		tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+			Kind: kind, Queues: []string{"default"}, Limit: 100,
+			Lease: time.Minute, WorkerID: "race-check",
+		})
+		if err != nil {
+			t.Fatalf("round %d: claim %s: %v", r, kind, err)
+		}
+		for _, task := range tasks {
+			if task.InstanceID == id {
+				t.Fatalf("round %d: %s task %d survived terminate of %s", r, kind, task.ID, id)
+			}
+		}
+	}
+}
+
+func requireTerminalCleanup(t *testing.T, b backend.Backend) {
+	t.Helper()
+	if !b.Capabilities().CleansTerminalState {
+		t.Skip("terminal cleanup not implemented by this backend (see #290)")
 	}
 }

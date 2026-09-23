@@ -239,26 +239,55 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 			return err
 		}
 		_ = row
-		// Only the status flip rides in this transaction. Residual rows
-		// are unbounded (they span many turns), and one delete mutation
-		// per row can exceed the per-commit mutation limit, so they are
-		// swept post-commit in bounded transactions below.
-		return txn.BufferWrite([]*spanner.Mutation{
-			spanner.UpdateMap("wf_instances", map[string]any{
-				"id":           id,
-				"status":       "terminated",
-				"updated_at":   now,
-				"completed_at": now,
-			}),
-		})
+		// Status flip plus a bounded in-transaction sweep of the full
+		// residual set (tasks, timers, signal dedupe, inbox). Residual
+		// rows are unbounded (they span many turns), and one delete
+		// mutation per row can exceed the per-commit mutation limit, so
+		// at most terminalCleanupMutationBudget deletions ride along;
+		// the remainder is swept post-commit in bounded transactions
+		// below (cleanupTerminalInstance).
+		var muts []*spanner.Mutation
+		muts = append(muts, spanner.UpdateMap("wf_instances", map[string]any{
+			"id":           id,
+			"status":       "terminated",
+			"updated_at":   now,
+			"completed_at": now,
+		}))
+		budget := terminalCleanupMutationBudget
+		dMuts, err := deleteSignalDedupe(ctx, txn, id, budget)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, dMuts...)
+		budget = max(budget-len(dMuts), 0)
+		tMuts, err := deleteTasksForInstance(ctx, txn, id, 0, budget)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, tMuts...)
+		budget = max(budget-len(tMuts), 0)
+		tmMuts, err := deleteTimersForInstance(ctx, txn, id, budget)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, tmMuts...)
+		budget = max(budget-len(tmMuts), 0)
+		inMuts, err := deleteInboxForInstance(ctx, txn, id, budget)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, inMuts...)
+		return txn.BufferWrite(muts)
 	})
 	if err != nil {
 		return err
 	}
-	// Same table set as before (tasks, timers, dedupe; inbox untouched),
-	// matching the SQL backends. Claims refuse tasks of non-running
-	// instances, so leftovers are never executed in the meantime.
-	if err := b.cleanupTerminalInstance(context.Background(), id, false); err != nil {
+	// Post-commit bounded sweep for residuals beyond the in-transaction
+	// budget (or raced in concurrently). includeInbox=true keeps the full
+	// table set: TerminateInstance leaves no inbox rows behind. Claims
+	// refuse tasks of non-running instances, so leftovers are never
+	// executed in the meantime.
+	if err := b.cleanupTerminalInstance(context.Background(), id, true); err != nil {
 		return err
 	}
 	b.notifyTerminal(id)
@@ -608,6 +637,20 @@ func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement
 func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
 	if len(advs) == 0 {
 		return nil
+	}
+	// Reject duplicate instances up front: the loop below applies every
+	// advancement in one read-write transaction with the same pre-mutation
+	// reads, so two advancements for the same instance both pass the
+	// ExpectedSeq check and then collide on the second journal insert
+	// (a native AlreadyExists commit error, not ErrConflict). Preflight
+	// keeps the batch all-or-nothing with a conflict error (see backendtest
+	// CommitAdvancementsAtomic).
+	seen := make(map[string]struct{}, len(advs))
+	for _, adv := range advs {
+		if _, dup := seen[adv.InstanceID]; dup {
+			return backend.ErrConflict
+		}
+		seen[adv.InstanceID] = struct{}{}
 	}
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		// Fresh per attempt: the client retries the closure on abort, and
@@ -1184,6 +1227,11 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	now := nowUTC()
 	var wake bool
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// Reset per attempt: ReadWriteTransaction may retry this closure,
+		// and a stale wake (or a mutated ev.RefSeq) from an aborted attempt
+		// must not leak into the retry.
+		wake = false
+		ev := ev
 		row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{taskID},
 			[]string{"instance_id", "ref_seq", "kind"})
 		if err != nil {
