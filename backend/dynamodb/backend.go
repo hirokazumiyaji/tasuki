@@ -258,9 +258,11 @@ func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
 // deleteTasksForInstanceFull removes one instance's tasks with no bound on
 // verification cost: the GSI sweep first, then a fully-paginated
 // strongly-consistent Scan that reaps every lagging row anywhere in the
-// table. Only the rare paths that must leave nothing behind use it —
-// TerminateInstance and PurgeInstances — never the per-completion hot path
-// (see deleteTasksForInstance for why the hot path stays bounded).
+// table. Only the rare single-instance path that must leave nothing behind
+// uses it — TerminateInstance — never the per-completion hot path (see
+// deleteTasksForInstance for why the hot path stays bounded) and never a
+// batch purge (see deleteTasksForInstancesFull for why the purge shares one
+// scan across all its victims instead of paying one per instance).
 func (b *Backend) deleteTasksForInstanceFull(ctx context.Context, id string) error {
 	if err := b.deleteTasksForInstanceByGSI(ctx, id); err != nil {
 		if !isMissingIndexError(err) {
@@ -269,6 +271,95 @@ func (b *Backend) deleteTasksForInstanceFull(ctx context.Context, id string) err
 		// Without a queryable index the Scan below is the whole cleanup.
 	}
 	return b.deleteTasksForInstanceByScan(ctx, id)
+}
+
+// deleteTasksForInstancesFull removes the task rows of every listed instance
+// with ONE shared fleet scan: a per-instance GSI sweep first (cheap,
+// instance-keyed, no fleet read), then a single fully-paginated
+// strongly-consistent Scan attributing rows to their instances (see
+// deleteTasksForInstancesByScan).
+//
+// COST MODEL (Codex round 10 on #328): the previous purge loop ran the
+// single-instance full cleanup per victim, so every victim paid its own
+// fully-paginated Scan — a purge batch of K instances cost up to K fleet
+// scans (O(K × table)). Sharing one scan per PurgeInstances CALL costs
+// O(instance rows + table) regardless of victim count: K GSI sweeps plus
+// exactly one Scan. TerminateInstance keeps the single-instance variant for
+// the common one-ID path.
+func (b *Backend) deleteTasksForInstancesFull(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	for _, id := range ids {
+		if err := b.deleteTasksForInstanceByGSI(ctx, id); err != nil {
+			if !isMissingIndexError(err) {
+				return err
+			}
+			// The index is table-wide, so a missing index fails identically
+			// for every ID: stop probing (further Queries fail the same way)
+			// and let the shared Scan below perform the whole cleanup.
+			break
+		}
+	}
+	return b.deleteTasksForInstancesByScan(ctx, ids)
+}
+
+// deleteTasksForInstancesByScan performs one fully-paginated
+// strongly-consistent Scan over wf_tasks, deleting every row whose
+// instance_id belongs to ids. A single scan covers the whole purge batch no
+// matter how many victims it holds; rows of live instances are never
+// touched (see purgeTaskKeyForTargets).
+func (b *Backend) deleteTasksForInstancesByScan(ctx context.Context, ids []string) error {
+	targets := purgeTaskTargets(ids)
+	var start map[string]types.AttributeValue
+	for {
+		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(b.table("wf_tasks")), ConsistentRead: aws.Bool(true), ExclusiveStartKey: start})
+		if err != nil {
+			return err
+		}
+		for _, m := range out.Items {
+			pk, ok := purgeTaskKeyForTargets(m, targets)
+			if !ok {
+				continue
+			}
+			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
+				return err
+			}
+		}
+		if out.LastEvaluatedKey == nil {
+			return nil
+		}
+		start = out.LastEvaluatedKey
+	}
+}
+
+// purgeTaskTargets builds the membership set for one shared purge scan from
+// the victim IDs of a single PurgeInstances call.
+func purgeTaskTargets(ids []string) map[string]struct{} {
+	targets := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		targets[id] = struct{}{}
+	}
+	return targets
+}
+
+// purgeTaskKeyForTargets returns the task_pk of a scanned task row iff the
+// row belongs to one of the purge targets. Rows of live instances, rows
+// without an instance_id, and rows without a task_pk (undeletable by key —
+// every real task row carries its HASH key) report false and are skipped.
+func purgeTaskKeyForTargets(m map[string]types.AttributeValue, targets map[string]struct{}) (types.AttributeValue, bool) {
+	inst, ok := m["instance_id"]
+	if !ok {
+		return nil, false
+	}
+	if _, ok := targets[fromS(inst)]; !ok {
+		return nil, false
+	}
+	pk, ok := m["task_pk"]
+	if !ok || pk == nil {
+		return nil, false
+	}
+	return pk, true
 }
 
 // gsiVerifyScanLimit bounds the strongly-consistent verification Scan page

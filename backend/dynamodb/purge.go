@@ -57,13 +57,18 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 	}
 
 	purged := 0
+	// Purge is the backstop for hot-path residue (see
+	// verifyTasksFirstPageByScan), so task cleanup is always the full
+	// variant, not the bounded per-completion sweep — shared across the
+	// whole call (see deleteTasksForInstancesFull): one Scan covers every
+	// victim instead of one Scan per victim. A shared-scan failure aborts
+	// before any instance row is removed, so purged counts only
+	// fully-purged instances (zero here) and a retry resumes idempotently —
+	// deletes never partially report an instance as purged.
+	if err := b.deleteTasksForInstancesFull(ctx, ids); err != nil {
+		return purged, err
+	}
 	for _, id := range ids {
-		// Purge is the backstop for hot-path residue (see
-		// verifyTasksFirstPageByScan), so it always runs the full task
-		// cleanup, not the bounded per-completion sweep.
-		if err := b.deleteTasksForInstanceFull(ctx, id); err != nil {
-			return purged, err
-		}
 		if err := b.deleteTimersForInstance(ctx, id); err != nil {
 			return purged, err
 		}
