@@ -77,12 +77,15 @@ func testListInstancesScale(t *testing.T, newBackend Factory) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		// Return the other claimed tasks to the queue.
+		// Return the other claimed tasks to the queue. These are workflow
+		// tasks (WF# keys on Firestore/DynamoDB), so requeue through the
+		// kind-aware NackTask: ReleaseLease(taskID) resolves the ACT# key
+		// and reports ErrNotFound for workflow tasks.
 		for j := range tasks {
 			if tasks[j].InstanceID == id {
 				continue
 			}
-			if err := b.ReleaseLease(ctx, tasks[j].ID); err != nil {
+			if err := b.NackTask(ctx, tasks[j], 0); err != nil {
 				t.Fatal(err)
 			}
 		}
