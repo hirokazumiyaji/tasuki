@@ -371,14 +371,18 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 		attempted         map[int64]struct{}
 	)
 	// startOverflowRequery arms the single bounded requery pass from the
-	// pre-overflow snapshot when the batch would otherwise return empty after
-	// retention overflowed. It reports whether the caller should continue to
-	// the extra pass instead of breaking. At either break point the retained
-	// carry is exhausted (a pass that leaves un-offered pending rows behind
-	// either fills the picker or keeps scanning), so resetting the keyset
-	// cursor to the snapshot and dropping the empty carry loses nothing.
+	// pre-overflow snapshot when the batch would otherwise return
+	// underfilled after retention overflowed. It reports whether the caller
+	// should continue to the extra pass instead of breaking. At either break
+	// point the retained carry is exhausted (a pass that leaves un-offered
+	// pending rows behind either fills the picker or keeps scanning), so
+	// resetting the keyset cursor to the snapshot and dropping the empty
+	// carry loses nothing. The guard is underfilled (len(accepted) < Limit),
+	// not empty: pass 1 may secure B1 while the retained As drain on locks,
+	// leaving dropped A2002 eligible for slot 2 (Limit=2/MaxPerInstance=1
+	// over A1..A2002(locked)/B1 returns [B1] without this).
 	startOverflowRequery := func() bool {
-		if len(accepted) != 0 || !overflowSeen || !overflowSnapValid || requeryDone {
+		if len(accepted) >= req.Limit || !overflowSeen || !overflowSnapValid || requeryDone {
 			return false
 		}
 		requeryDone = true
@@ -542,10 +546,10 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 			// to revisit rejected candidates freed by lost picks.
 			if lost := len(picked) - (len(accepted) - prevAccepted); lost == 0 || len(iterRejected) == 0 {
 				// Overflow may have dropped eligible rows past the cursor
-				// (see above): with nothing secured this batch, re-issue one
-				// bounded scan from the pre-overflow snapshot instead of
-				// returning empty. Rows dropped by the requery pass itself
-				// stay claimable for a later poll.
+				// (see above): with the batch still underfilled, re-issue
+				// one bounded scan from the pre-overflow snapshot instead
+				// of returning short. Rows dropped by the requery pass
+				// itself stay claimable for a later poll.
 				if startOverflowRequery() {
 					continue
 				}

@@ -503,6 +503,151 @@ func TestFairOverflowRequeryMirror(t *testing.T) {
 	}
 }
 
+func TestFairOverflowRequeryUnderfilled(t *testing.T) {
+	// Covers the round-7 P2: the overflow requery must fire whenever the
+	// batch is underfilled, not just when it is empty. Limit=2,
+	// MaxPerInstance=1 over FIFO A1..A2002/B1 with A1..A2001 lost to
+	// concurrent locks: pass 1 secures B1 while the retained As drain on
+	// locks, and only a requery from the pre-overflow snapshot recovers the
+	// dropped A2002 for slot 2. Empty-guarded requeries return [B1]; the
+	// underfilled guard returns [B1 A2002].
+	const limit, perInstance = 2, 1
+	aTotal := backend.FairRejectedCap + 2
+	feed := make([]backend.FairTaskRef, 0, aTotal+1)
+	for i := 0; i < aTotal; i++ {
+		feed = append(feed, backend.FairTaskRef{ID: int64(i + 1), InstanceID: "A"})
+	}
+	feed = append(feed, backend.FairTaskRef{ID: int64(aTotal + 1), InstanceID: "B"})
+	// Every retained row is contended; only the dropped A2002 and B1 win.
+	lockLost := func(id int64) bool { return id <= int64(aTotal-1) }
+
+	runRefill := func(guard string) []backend.FairTaskRef {
+		cursor := 0
+		var lastID int64
+		first := true
+		var out, claimed, pending []backend.FairTaskRef
+		var overflowSnapValid, overflowSeen, requeryDone bool
+		var overflowSnapID int64
+		attempted := map[int64]struct{}{}
+		passes := 0
+		allowRequery := func() bool {
+			switch guard {
+			case "underfilled":
+				if len(out) >= limit {
+					return false
+				}
+			case "empty":
+				if len(out) != 0 {
+					return false
+				}
+			default:
+				return false
+			}
+			return overflowSeen && overflowSnapValid && !requeryDone
+		}
+		startOverflowRequery := func() bool {
+			if !allowRequery() {
+				return false
+			}
+			requeryDone = true
+			first = false
+			cursor = int(overflowSnapID)
+			pending = nil
+			return true
+		}
+		for len(out) < limit {
+			passes++
+			if passes > 2*len(feed)+10 {
+				t.Fatalf("refill loop did not terminate (guard=%s)", guard)
+			}
+			picker := backend.NewFairPicker(limit-len(out), perInstance).TrackRejected()
+			picker.Seed(claimed)
+			offered := 0
+			for _, r := range pending {
+				if picker.Full() {
+					break
+				}
+				picker.Offer(r)
+				offered++
+			}
+			if !picker.Full() {
+				for !picker.Full() && cursor < len(feed) {
+					r := feed[cursor]
+					cursor++
+					if !overflowSeen && !picker.RejectedCapped() {
+						overflowSnapID, overflowSnapValid = lastID, !first
+					}
+					first = false
+					lastID = r.ID
+					if _, dup := attempted[r.ID]; !(requeryDone && dup) {
+						offerFull := picker.Offer(r)
+						if picker.RejectedCapped() {
+							overflowSeen = true
+						}
+						if offerFull {
+							break
+						}
+					}
+				}
+			}
+			scanExhausted := !picker.Full()
+			picked := picker.Picked()
+			iterRejected := picker.Rejected()
+			for _, r := range picked {
+				attempted[r.ID] = struct{}{}
+			}
+			if len(picked) == 0 {
+				if startOverflowRequery() {
+					continue
+				}
+				break
+			}
+			prevOut := len(out)
+			for _, r := range picked {
+				if lockLost(r.ID) {
+					continue
+				}
+				out = append(out, r)
+				claimed = append(claimed, r)
+			}
+			if len(out) >= limit {
+				break
+			}
+			if scanExhausted {
+				if lost := len(picked) - (len(out) - prevOut); lost == 0 || len(iterRejected) == 0 {
+					if startOverflowRequery() {
+						continue
+					}
+					break
+				}
+			}
+			pending = append(iterRejected, pending[offered:]...)
+			if len(pending) > backend.FairRejectedCap {
+				pending = pending[:backend.FairRejectedCap]
+			}
+		}
+		return out
+	}
+
+	if got := runRefill("none"); len(got) != 1 || got[0].InstanceID != "B" {
+		t.Fatalf("no-requery refill: got %v, want [B1] (dropped A2002 unreachable)", got)
+	}
+	if got := runRefill("empty"); len(got) != 1 || got[0].InstanceID != "B" {
+		t.Fatalf("empty-guarded requery: got %v, want [B1] (reproduces the underfill bug)", got)
+	}
+	got := runRefill("underfilled")
+	if len(got) != 2 {
+		t.Fatalf("underfilled-guarded requery: got %v, want [B1 A2002]", got)
+	}
+	seen := map[int64]bool{}
+	for _, r := range got {
+		seen[r.ID] = true
+	}
+	if !seen[int64(aTotal)] || !seen[int64(aTotal+1)] {
+		t.Fatalf("underfilled-guarded requery: got %v, want B1 and dropped A%d", got, aTotal)
+	}
+}
+
 func TestNormalizePurgeStatuses(t *testing.T) {
 	got, err := backend.NormalizePurgeStatuses(nil)
 	if err != nil {
