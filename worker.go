@@ -884,19 +884,8 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	// possibly-terminated instance never runs activities on a read failure.
 	// Only a definitive ErrNotFound (instance reaped: terminal residue) is
 	// dropped silently.
-	inst, err := w.backend.GetInstance(ctx, t.InstanceID)
-	if err != nil {
-		if errors.Is(err, backend.ErrNotFound) {
-			return nil
-		}
+	if proceed, err := w.checkActivityFence(ctx, t); err != nil || !proceed {
 		return err
-	}
-	if inst.Status != "running" {
-		_ = w.backend.CompleteActivity(ctx, t.ID, journal.Event{
-			Type:   journal.TypeActivityCompleted,
-			RefSeq: t.Seq,
-		})
-		return nil
 	}
 	act, err := w.reg.activity(t.Name)
 	if err != nil {
@@ -904,6 +893,22 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 			return w.nackIncompatible(ctx, t, "unregistered_activity", err)
 		}
 		return w.failActivity(ctx, t, err)
+	}
+
+	// Narrow the check-then-invoke gap to the minimum: re-validate the
+	// instance status immediately before user code runs, so a termination
+	// that commits between the first fence check (above) and this point
+	// still drops the task instead of invoking the activity. The two reads
+	// share no transaction with TerminateInstance's status flip, so a
+	// residual TOCTOU remains — a termination committing after this second
+	// read still runs user code once (its completion is discarded by the
+	// terminal sweep). Fully closing the gap needs backend fencing tokens
+	// (e.g. a generation captured at claim that termination invalidates
+	// and completion observes); until such a token exists, the narrowest
+	// honest fence is a re-read directly before invocation, failing closed
+	// on read errors exactly like the first check.
+	if proceed, err := w.checkActivityFence(ctx, t); err != nil || !proceed {
+		return err
 	}
 
 	done := make(chan struct{})
@@ -967,6 +972,32 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		return cerr
 	}
 	return nil
+}
+
+// checkActivityFence enforces the pre-execution termination fence for one
+// activity task: it reports proceed=false (after best-effort cleanup) when
+// the owning instance already left "running", and proceed=true when user
+// code may run. A transient status-read error fails CLOSED (returned, so no
+// user code runs and the lease redelivers); only ErrNotFound — the instance
+// row reaped as terminal residue — is dropped silently. Callers invoke it
+// both at handler entry and immediately before invokeActivity to keep the
+// termination right fenced through invocation (see handleActivity).
+func (w *Worker) checkActivityFence(ctx context.Context, t backend.Task) (bool, error) {
+	inst, err := w.backend.GetInstance(ctx, t.InstanceID)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if inst.Status != "running" {
+		_ = w.backend.CompleteActivity(ctx, t.ID, journal.Event{
+			Type:   journal.TypeActivityCompleted,
+			RefSeq: t.Seq,
+		})
+		return false, nil
+	}
+	return true, nil
 }
 
 // invokeActivity runs a user activity function, converting panics into

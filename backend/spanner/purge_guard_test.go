@@ -9,6 +9,7 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"github.com/hirokazumiyaji/tasuki/backend"
+	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
 func guardTestDSN(t *testing.T) string {
@@ -66,14 +67,28 @@ func TestPurgeVictimGuards(t *testing.T) {
 
 	// The conditional delete must stand down for a stale incarnation,
 	// leaving the row untouched.
-	if done, err := b.deletePurgedInstanceRow(ctx, stale); err != nil || done {
+	if done, _, err := b.deletePurgedInstanceRow(ctx, stale); err != nil || done {
 		t.Fatalf("stale delete: done=%v err=%v", done, err)
 	}
 	if _, err := b.GetInstance(ctx, id); err != nil {
 		t.Fatalf("stale delete must not remove the row: %v", err)
 	}
-	if done, err := b.deletePurgedInstanceRow(ctx, victim); err != nil || !done {
+	// Seed a straggler pair (dedupe key + inbox row) so the atomic residual
+	// snapshot taken inside the victim-delete transaction has content to
+	// carry: the delete must return exactly the rows observed in its own
+	// transaction.
+	if err := b.SendToInbox(ctx, id, journal.Event{Type: journal.TypeSignalReceived, Name: "sig"}, "guard-key"); err != nil {
+		t.Fatal(err)
+	}
+	if done, residual, err := b.deletePurgedInstanceRow(ctx, victim); err != nil || !done {
 		t.Fatalf("own delete: done=%v err=%v", done, err)
+	} else {
+		if residual == nil || len(residual.dedupe) != 1 || residual.dedupe[0].id != dedupeKey("guard-key") {
+			t.Fatalf("own delete must snapshot the straggler dedupe key in-txn, got %+v", residual)
+		}
+		if len(residual.inboxIDs) != 1 {
+			t.Fatalf("own delete must snapshot the straggler inbox row in-txn, got %+v", residual)
+		}
 	}
 	if _, err := b.GetInstance(ctx, id); !errors.Is(err, backend.ErrNotFound) {
 		t.Fatalf("own delete must remove the row, got %v", err)
@@ -82,7 +97,7 @@ func TestPurgeVictimGuards(t *testing.T) {
 		t.Fatalf("absent row must pass the second-sweep guard: %v", err)
 	}
 	// A concurrent purge that arrives after the delete owns nothing.
-	if done, err := b.deletePurgedInstanceRow(ctx, victim); err != nil || done {
+	if done, _, err := b.deletePurgedInstanceRow(ctx, victim); err != nil || done {
 		t.Fatalf("loser delete: done=%v err=%v", done, err)
 	}
 }

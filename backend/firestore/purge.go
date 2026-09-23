@@ -25,6 +25,20 @@ type purgeVictim struct {
 	createdAt time.Time
 }
 
+// purgeFence pins one purge victim's ID-reuse fence for every sweep page:
+// the victim incarnation (id + createdAt observed at listing) and which
+// side of the victim delete the sweep runs on. The first sweep requires the
+// victim doc to still carry the listed created_at; the second requires the
+// doc to stay gone — any doc present then is a replacement incarnation
+// whose documents must never be deleted.
+type purgeFence struct {
+	victim purgeVictim
+	// absent selects the second-sweep fence (victim doc must stay gone);
+	// false selects the first-sweep fence (doc must still carry the
+	// listed incarnation).
+	absent bool
+}
+
 // purgeStatusSet filters terminal instances client-side. Only completed_at is
 // queried server-side so no composite index is required.
 func purgeStatusSet(sts []string) map[string]struct{} {
@@ -101,43 +115,38 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 // the replacement's own purge once it is terminal — leaked rows are always
 // preferable to deleting a live incarnation's documents.
 func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, error) {
-	own := func(ctx context.Context) error { return b.checkPurgeVictim(ctx, v) }
-	if err := b.purgeInstanceDocs(ctx, v.id, own); err != nil {
+	first := purgeFence{victim: v}
+	if err := b.purgeInstanceDocs(ctx, first); err != nil {
 		if errors.Is(err, errPurgeSuperseded) {
 			return false, nil
 		}
 		return false, err
 	}
-	// Snapshot residual rows observed after the first sweep but before the
-	// victim delete. Any row listed here predates the replacement (which can
-	// only appear after the delete below), so it is provably old by
-	// transaction order, not by wall-clock comparison. Rows are keyed by
-	// exact document reference: a behind-clock replacement can stamp an
-	// older created_at than a straggler, but it cannot reuse the same random
-	// inbox document ID. Dedupe keys CAN be reused (deterministic IDs), so
-	// the snapshot also pins each dedupe row's server update time and the
-	// reap deletes only rows still carrying it (see reapResidualStragglers);
-	// deleting a shared ID unconditionally would strip a replacement's live
-	// guard. Stragglers committing after this listing leak safely and are
-	// reaped with the replacement's own purge.
-	residual, rerr := b.listResidualStragglers(ctx, v.id)
-	if rerr != nil {
-		return false, rerr
-	}
+	// The residual snapshot is taken inside the victim-delete transaction
+	// (deletePurgedInstanceDoc), not by a separate listing: the delete
+	// transaction is the serialization point against an ID-reusing
+	// CreateInstance (which inserts the replacement only after the victim
+	// doc is gone), so any row the snapshot observes provably predates any
+	// replacement by transaction order, not by wall-clock comparison.
+	// Stragglers that commit concurrently with the delete and serialize
+	// after it are excluded from the snapshot and leak safely; they are
+	// reaped with the replacement's own purge once it is terminal. Leaked
+	// rows are always preferable to deleting a live incarnation's rows.
+	//
 	// Inbox writers read wf_instances inside their transaction, so once
-	// this delete commits no new child documents can appear for the
-	// instance (in-flight writers lose the race and retry into
-	// ErrNotFound). A writer that committed between the sweep above and
-	// this delete is reaped by the second pass below.
-	deleted, err := b.deletePurgedInstanceDoc(ctx, v)
+	// the delete below commits no new child documents can appear for the
+	// instance (in-flight writers lose the race and retry into ErrNotFound).
+	// A writer that committed between the sweep above and this delete is
+	// reaped by the second pass below.
+	deleted, residual, err := b.deletePurgedInstanceDoc(ctx, v)
 	if err != nil {
 		return false, err
 	}
 	if !deleted {
 		return false, nil
 	}
-	gone := func(ctx context.Context) error { return b.checkPurgeAbsent(ctx, v.id) }
-	if err := b.purgeInstanceDocs(ctx, v.id, gone); err != nil {
+	second := purgeFence{victim: v, absent: true}
+	if err := b.purgeInstanceDocs(ctx, second); err != nil {
 		if errors.Is(err, errPurgeSuperseded) {
 			// A replacement incarnation appeared after this purge deleted
 			// the victim: an inbox row (or dedupe key) that committed
@@ -189,15 +198,64 @@ func (b *Backend) checkPurgeAbsent(ctx context.Context, id string) error {
 	return errPurgeSuperseded
 }
 
+// checkFenceTx enforces a purge fence inside a page-delete (or
+// victim-delete) transaction: the victim doc must still carry the listed
+// incarnation (first sweep) or stay gone (second sweep). Reading the fence
+// inside the transaction shares one snapshot with the page query, so an
+// ID-reusing CreateInstance is either invisible to both (only provably-old
+// documents are deleted) or visible to both (the fence trips and the
+// transaction aborts before deleting anything).
+func (b *Backend) checkFenceTx(tx *gcf.Transaction, fence purgeFence) error {
+	snap, err := tx.Get(b.ref("wf_instances", fence.victim.id))
+	if isNotFound(err) || (err == nil && !snap.Exists()) {
+		if fence.absent {
+			return nil
+		}
+		return errPurgeSuperseded
+	}
+	if err != nil {
+		return err
+	}
+	if fence.absent {
+		return errPurgeSuperseded
+	}
+	if !timestamp(snap.Data(), "created_at").Equal(fence.victim.createdAt) {
+		return errPurgeSuperseded
+	}
+	return nil
+}
+
 // deletePurgedInstanceDoc removes the victim doc (plus its inbox-seq counter)
 // only if it still carries the listed incarnation. A concurrent purge that
-// won the delete, or a replacement created since, yields (false, nil): this
-// purge owns nothing and must neither sweep further nor count the instance.
-// The counter goes in the same transaction so a replacement created right
-// after the delete always starts from a fresh sequence.
-func (b *Backend) deletePurgedInstanceDoc(ctx context.Context, v purgeVictim) (bool, error) {
-	deleted := false
+// won the delete, or a replacement created since, yields (false, nil, nil):
+// this purge owns nothing and must neither sweep further nor count the
+// instance. The counter goes in the same transaction so a replacement created
+// right after the delete always starts from a fresh sequence.
+//
+// On a successful delete it also returns the residual snapshot: the dedupe
+// and inbox rows observed inside this same transaction (all reads precede
+// the writes, per Firestore transaction rules). The delete transaction is
+// the serialization point against an ID-reusing CreateInstance (which
+// inserts the replacement only after the victim doc is gone), so every
+// snapshotted row provably predates any replacement — atomically, with no
+// listing-to-delete gap for a terminal SendToInbox to slip a row into that
+// the exact-reap could then mistake for the replacement's. Rows that
+// serialize after this transaction are excluded and leak safely for the
+// replacement's own purge. Rows are keyed by exact document reference:
+// dedupe document IDs are deterministic, so the snapshot also pins each
+// dedupe row's server update time and the reap deletes only rows still
+// carrying it (see reapResidualStragglers).
+func (b *Backend) deletePurgedInstanceDoc(ctx context.Context, v purgeVictim) (bool, *residualStragglers, error) {
+	var (
+		deleted  bool
+		residual residualStragglers
+	)
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		// Reset per attempt: the transaction function may run more than
+		// once, and only the committing attempt's snapshot classifies the
+		// residual reap.
+		deleted = false
+		residual = residualStragglers{}
 		snap, err := tx.Get(b.ref("wf_instances", v.id))
 		if isNotFound(err) || (err == nil && !snap.Exists()) {
 			return errPurgeSuperseded
@@ -208,6 +266,12 @@ func (b *Backend) deletePurgedInstanceDoc(ctx context.Context, v purgeVictim) (b
 		if !timestamp(snap.Data(), "created_at").Equal(v.createdAt) {
 			return errPurgeSuperseded
 		}
+		if err := queryResidualDedupeTx(tx, b.col("wf_signal_dedupe"), v.id, &residual); err != nil {
+			return err
+		}
+		if err := queryResidualInboxTx(tx, b.col("wf_inbox"), v.id, &residual); err != nil {
+			return err
+		}
 		if err := tx.Delete(b.ref("wf_inbox_seq", v.id)); err != nil {
 			return err
 		}
@@ -215,12 +279,12 @@ func (b *Backend) deletePurgedInstanceDoc(ctx context.Context, v purgeVictim) (b
 		return tx.Delete(b.ref("wf_instances", v.id))
 	})
 	if errors.Is(err, errPurgeSuperseded) {
-		return false, nil
+		return false, nil, nil
 	}
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
-	return deleted, nil
+	return deleted, &residual, nil
 }
 
 // residualStragglers holds exact document references observed after the
@@ -255,6 +319,9 @@ type dedupeVersion struct {
 // collections can gain rows while the victim is terminal — SendToInbox
 // inserts both and wakes nothing once the instance is terminal. Task, timer
 // and journal rows are written only on behalf of the running victim.
+// Production purge takes this snapshot inside the victim-delete transaction
+// instead (see deletePurgedInstanceDoc); this standalone listing serves
+// tests that seed rows directly.
 func (b *Backend) listResidualStragglers(ctx context.Context, id string) (*residualStragglers, error) {
 	var out residualStragglers
 	it := b.col("wf_signal_dedupe").Where("instance_id", "==", id).Documents(ctx)
@@ -286,6 +353,42 @@ func (b *Backend) listResidualStragglers(ctx context.Context, id string) (*resid
 	return &out, nil
 }
 
+// queryResidualDedupeTx reads the victim's dedupe rows inside the
+// victim-delete transaction for the atomic residual snapshot (see
+// deletePurgedInstanceDoc).
+func queryResidualDedupeTx(tx *gcf.Transaction, col *gcf.CollectionRef, id string, out *residualStragglers) error {
+	it := tx.Documents(col.Where("instance_id", "==", id))
+	defer it.Stop()
+	for {
+		dsnap, err := it.Next()
+		if err == iterator.Done {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		out.dedupe = append(out.dedupe, dedupeVersion{ref: dsnap.Ref, updateTime: dsnap.UpdateTime})
+	}
+}
+
+// queryResidualInboxTx reads the victim's inbox rows inside the
+// victim-delete transaction for the atomic residual snapshot (see
+// deletePurgedInstanceDoc).
+func queryResidualInboxTx(tx *gcf.Transaction, col *gcf.CollectionRef, id string, out *residualStragglers) error {
+	it := tx.Documents(col.Where("instance_id", "==", id))
+	defer it.Stop()
+	for {
+		dsnap, err := it.Next()
+		if err == iterator.Done {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		out.inbox = append(out.inbox, dsnap.Ref)
+	}
+}
+
 // reapResidualStragglers deletes the snapshotted residual rows in paged
 // batches. Rows already gone (deleted by the second sweep before it tripped)
 // are skipped via best-effort deletes; rows never snapshotted (replacement
@@ -299,6 +402,13 @@ func (b *Backend) listResidualStragglers(ctx context.Context, id string) (*resid
 // the replacement inherited (deduped against, so no inbox event of its own)
 // still carries the snapshotted version and is reaped, letting a retry
 // insert anew.
+//
+// Datastore errors from the conditional deletes propagate to the caller:
+// only not-found (row already gone) and version-mismatch (row recreated by
+// the replacement, skipped above) are benign. A transient transaction
+// failure must fail the purge rather than report success while a stale
+// dedupe row stays attached — a later SendToInbox for that DedupeID would
+// find the stale row and drop the event.
 func (b *Backend) reapResidualStragglers(ctx context.Context, r *residualStragglers) error {
 	if r == nil {
 		return nil
@@ -307,7 +417,7 @@ func (b *Backend) reapResidualStragglers(ctx context.Context, r *residualStraggl
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		_ = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		if err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 			snap, err := tx.Get(dv.ref)
 			if isNotFound(err) || (err == nil && !snap.Exists()) {
 				return nil
@@ -319,7 +429,9 @@ func (b *Backend) reapResidualStragglers(ctx context.Context, r *residualStraggl
 				return nil
 			}
 			return tx.Delete(dv.ref)
-		})
+		}); err != nil {
+			return err
+		}
 	}
 	for start := 0; start < len(r.inbox); start += firestoreSweepBatchSize {
 		if err := ctx.Err(); err != nil {
@@ -340,53 +452,16 @@ func (b *Backend) reapResidualStragglers(ctx context.Context, r *residualStraggl
 	return nil
 }
 
-// purgeInstanceDocs removes every child document of one instance. Batches
+// purgeInstanceDocs removes every child document of one instance in
+// transactionally fenced pages (see deleteDocsByInstanceFenced). Batches
 // commit while iterating so a large journal or inbox never buffers fully in
-// memory. The guard (nil for no fence) holds the ID-reuse fence: it is
-// re-checked before each collection and after every batch commit, so the
-// sweep stops as soon as the victim incarnation is gone or replaced instead
-// of deleting a live replacement's documents.
-func (b *Backend) purgeInstanceDocs(ctx context.Context, id string, guard sweepGuard) error {
+// memory. The fence holds the ID-reuse fence through every page: a tripped
+// fence aborts the sweep so a replacement incarnation's documents are never
+// deleted.
+func (b *Backend) purgeInstanceDocs(ctx context.Context, fence purgeFence) error {
 	for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox", "wf_journal"} {
-		if guard != nil {
-			if err := guard(ctx); err != nil {
-				return err
-			}
-		}
-		batch := b.client.Batch()
-		n := 0
-		it := b.col(col).Where("instance_id", "==", id).Documents(ctx)
-		for {
-			dsnap, err := it.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				it.Stop()
-				return err
-			}
-			batch.Delete(dsnap.Ref)
-			n++
-			if n == 500 {
-				if _, err := batch.Commit(ctx); err != nil {
-					it.Stop()
-					return err
-				}
-				batch = b.client.Batch()
-				n = 0
-				if guard != nil {
-					if err := guard(ctx); err != nil {
-						it.Stop()
-						return err
-					}
-				}
-			}
-		}
-		it.Stop()
-		if n > 0 {
-			if _, err := batch.Commit(ctx); err != nil {
-				return err
-			}
+		if err := b.deleteDocsByInstanceFenced(ctx, col, fence); err != nil {
+			return err
 		}
 	}
 	return nil

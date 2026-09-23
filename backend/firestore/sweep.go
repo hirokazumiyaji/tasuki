@@ -28,6 +28,12 @@ const signalDedupeSweepTimeout = 30 * time.Second
 // victim incarnation it is deleting (see purge.go). Nil disables the check;
 // the terminate path passes nil because the instance doc still exists there,
 // so no replacement incarnation can appear mid-sweep.
+//
+// The out-of-transaction check is a cheap early exit only. The load-bearing
+// fence for purge sweeps runs inside a transaction (see
+// deleteDocsByInstanceFenced): a standalone check outside the delete leaves
+// a gap where CreateInstance can recreate the ID before the delete commits,
+// and the delete would then remove the replacement's documents.
 type sweepGuard func(ctx context.Context) error
 
 // batchesNeeded reports how many sweep batches cover total rows at the given
@@ -163,9 +169,10 @@ func (b *Backend) sweepSignalDedupeIDs(ctx context.Context, ids []string) error 
 // deleteDocsByInstance deletes every document in col with instance_id == id,
 // one Limit-sized batch commit at a time. The loop re-queries until a page
 // comes back empty, so arbitrarily many rows converge without ever buffering
-// them all or exceeding the write cap in one commit. A purge passes a guard
-// holding the ID-reuse fence through every page; a tripped guard aborts the
-// sweep so a replacement incarnation's documents are never deleted.
+// them all or exceeding the write cap in one commit. Used only by the
+// terminate path, where the instance doc still exists (no ID reuse can
+// appear mid-sweep), so no fence is needed; purge sweeps use the
+// transactionally fenced deleteDocsByInstanceFenced instead.
 func (b *Backend) deleteDocsByInstance(ctx context.Context, col, id string, guard sweepGuard) error {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -197,6 +204,69 @@ func (b *Backend) deleteDocsByInstance(ctx context.Context, col, id string, guar
 		}
 		if _, err := batch.Commit(ctx); err != nil {
 			return err
+		}
+		if n < firestoreSweepBatchSize {
+			return nil
+		}
+	}
+}
+
+// deleteDocsByInstanceFenced deletes every document in col with
+// instance_id == id in transactionally fenced pages: each page runs in one
+// Firestore transaction that first re-validates the purge fence against the
+// victim doc and then reads and deletes the page. The fence read and the
+// page query share the transaction's snapshot, so a CreateInstance that
+// recreates the ID is either invisible to both (only provably-old rows are
+// deleted) or visible to both (the fence trips and the page aborts before
+// deleting anything). A standalone guard checked outside the delete leaves
+// a gap where the recreation commits between check and delete, and the
+// delete would then corrupt the replacement — hence one transaction per
+// page instead of the non-transactional batches deleteDocsByInstance uses
+// for the (unfenced) terminate path.
+//
+// The transaction function is idempotent (fence re-read, page re-query,
+// same deletes) so Firestore's internal retries on contention are safe.
+// errPurgeSuperseded aborts the sweep: a replacement incarnation appeared
+// and its documents must never be touched.
+func (b *Backend) deleteDocsByInstanceFenced(ctx context.Context, col string, fence purgeFence) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n := 0
+		err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+			if err := b.checkFenceTx(tx, fence); err != nil {
+				return err
+			}
+			// All reads precede all writes (Firestore transaction rule):
+			// collect the page's references first, then delete them.
+			it := tx.Documents(b.col(col).Where("instance_id", "==", fence.victim.id).Limit(firestoreSweepBatchSize))
+			var refs []*gcf.DocumentRef
+			for {
+				dsnap, err := it.Next()
+				if err == iterator.Done {
+					break
+				}
+				if err != nil {
+					it.Stop()
+					return err
+				}
+				refs = append(refs, dsnap.Ref)
+			}
+			it.Stop()
+			n = len(refs)
+			for _, ref := range refs {
+				if err := tx.Delete(ref); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
 		}
 		if n < firestoreSweepBatchSize {
 			return nil

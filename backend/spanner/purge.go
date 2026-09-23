@@ -98,27 +98,26 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 // preferable to deleting a live incarnation's rows.
 func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, error) {
 	own := func(ctx context.Context) error { return b.checkPurgeVictim(ctx, v) }
-	if err := b.deleteInstanceChildren(ctx, v.id, own); err != nil {
+	ownTx := func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return b.checkPurgeVictimTx(ctx, txn, v)
+	}
+	if err := b.deleteInstanceChildren(ctx, v.id, own, ownTx); err != nil {
 		if errors.Is(err, errPurgeSuperseded) {
 			return false, nil
 		}
 		return false, err
 	}
-	// Snapshot residual rows observed after the first sweep but before the
-	// victim delete. Any key listed here predates the replacement (which can
-	// only appear after the delete below), so it is provably old by
-	// transaction order, not by wall-clock comparison. For inbox rows (random
-	// IDs) the replacement cannot reuse the same key. Dedupe keys CAN be
-	// reused (deterministic IDs), so the snapshot also pins each dedupe row's
-	// created_at and the reap deletes only rows still carrying it (see
-	// reapResidualStragglers); deleting a shared key unconditionally would
-	// strip a replacement's live guard. Stragglers committing after this
-	// listing leak safely.
-	residual, rerr := b.listResidualStragglers(ctx, v.id)
-	if rerr != nil {
-		return false, rerr
-	}
-	deleted, err := b.deletePurgedInstanceRow(ctx, v)
+	// The residual snapshot is taken inside the victim-delete transaction
+	// below (deletePurgedInstanceRow), not by a separate listing: the
+	// victim-delete transaction is the serialization point against an
+	// ID-reusing CreateInstance (which can only insert once the victim row
+	// is gone), so any key the snapshot observes provably predates any
+	// replacement by transaction order, not by wall-clock comparison.
+	// Stragglers that commit concurrently with the delete and serialize
+	// after it are excluded from the snapshot and leak safely; they are
+	// reaped with the replacement's own purge once it is terminal. Leaked
+	// rows are always preferable to deleting a live incarnation's rows.
+	deleted, residual, err := b.deletePurgedInstanceRow(ctx, v)
 	if err != nil {
 		return false, err
 	}
@@ -126,7 +125,10 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 		return false, nil
 	}
 	gone := func(ctx context.Context) error { return b.checkPurgeAbsent(ctx, v.id) }
-	if err := b.deleteInstanceChildren(ctx, v.id, gone); err != nil {
+	goneTx := func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return b.checkPurgeAbsentTx(ctx, txn, v.id)
+	}
+	if err := b.deleteInstanceChildren(ctx, v.id, gone, goneTx); err != nil {
 		if errors.Is(err, errPurgeSuperseded) {
 			// A replacement incarnation appeared after this purge deleted
 			// the victim: reap the residual rows snapshotted above by exact
@@ -179,13 +181,71 @@ func (b *Backend) checkPurgeAbsent(ctx context.Context, id string) error {
 	return errPurgeSuperseded
 }
 
+// checkPurgeVictimTx enforces the first-sweep fence inside a page-delete
+// transaction: the victim row must still exist with the incarnation observed
+// at listing time. Reading the fence inside the transaction shares one
+// snapshot with the page query, so a CreateInstance that recreates the ID
+// is either invisible to both (only old rows are deleted) or visible to
+// both (the fence trips and the transaction aborts before deleting
+// anything). A missing row means a concurrent purge already deleted it; a
+// different created_at means the ID was recreated after such a delete.
+func (b *Backend) checkPurgeVictimTx(ctx context.Context, txn *spanner.ReadWriteTransaction, v purgeVictim) error {
+	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{v.id}, []string{"created_at"})
+	if isNotFound(err) {
+		return errPurgeSuperseded
+	}
+	if err != nil {
+		return err
+	}
+	var createdAt time.Time
+	if err := row.Columns(&createdAt); err != nil {
+		return err
+	}
+	if !createdAt.Equal(v.createdAt) {
+		return errPurgeSuperseded
+	}
+	return nil
+}
+
+// checkPurgeAbsentTx enforces the second-sweep fence inside a page-delete
+// transaction: the victim row must stay gone. Any row present in the same
+// snapshot as the page query is a replacement incarnation, so the sweep
+// stops before deleting its children.
+func (b *Backend) checkPurgeAbsentTx(ctx context.Context, txn *spanner.ReadWriteTransaction, id string) error {
+	_, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"id"})
+	if isNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return errPurgeSuperseded
+}
+
 // deletePurgedInstanceRow removes the victim row (plus its inbox-seq counter)
 // only if it still carries the listed incarnation. A concurrent purge that
-// won the delete, or a replacement created since, yields (false, nil): this
-// purge owns nothing and must neither sweep further nor count the instance.
-func (b *Backend) deletePurgedInstanceRow(ctx context.Context, v purgeVictim) (bool, error) {
+// won the delete, or a replacement created since, yields (false, nil, nil):
+// this purge owns nothing and must neither sweep further nor count the
+// instance.
+//
+// On a successful delete it also returns the residual snapshot: the dedupe
+// and inbox keys observed inside this same transaction. The delete
+// transaction is the serialization point against an ID-reusing
+// CreateInstance (which inserts the replacement only after this row is
+// gone), so every snapshotted key provably predates any replacement —
+// atomically, with no listing-to-delete gap for a terminal SendToInbox to
+// slip a row into that the exact-reap could then mistake for the
+// replacement's. Rows that serialize after this transaction are excluded
+// and leak safely for the replacement's own purge.
+func (b *Backend) deletePurgedInstanceRow(ctx context.Context, v purgeVictim) (bool, *residualStragglers, error) {
 	deleted := false
+	var residual residualStragglers
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// Reset per attempt: the transaction function may run more than
+		// once, and only the committing attempt's snapshot classifies the
+		// residual reap.
+		deleted = false
+		residual = residualStragglers{}
 		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{v.id}, []string{"created_at"})
 		if isNotFound(err) {
 			return errPurgeSuperseded
@@ -200,6 +260,12 @@ func (b *Backend) deletePurgedInstanceRow(ctx context.Context, v purgeVictim) (b
 		if !createdAt.Equal(v.createdAt) {
 			return errPurgeSuperseded
 		}
+		if err := queryResidualDedupeTx(ctx, txn, v.id, &residual); err != nil {
+			return err
+		}
+		if err := queryResidualInboxTx(ctx, txn, v.id, &residual); err != nil {
+			return err
+		}
 		deleted = true
 		return txn.BufferWrite([]*spanner.Mutation{
 			spanner.Delete("wf_inbox_seq", spanner.Key{v.id}),
@@ -207,28 +273,28 @@ func (b *Backend) deletePurgedInstanceRow(ctx context.Context, v purgeVictim) (b
 		})
 	})
 	if errors.Is(err, errPurgeSuperseded) {
-		return false, nil
+		return false, nil, nil
 	}
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
-	return deleted, nil
+	return deleted, &residual, nil
 }
 
-func (b *Backend) deleteInstanceChildren(ctx context.Context, id string, guard sweepGuard) error {
-	if err := b.deleteTasksForInstance(ctx, id, guard); err != nil {
+func (b *Backend) deleteInstanceChildren(ctx context.Context, id string, guard sweepGuard, guardTx sweepGuardTx) error {
+	if err := b.deleteTasksForInstance(ctx, id, guard, guardTx); err != nil {
 		return err
 	}
-	if err := b.deleteTimersForInstance(ctx, id, guard); err != nil {
+	if err := b.deleteTimersForInstance(ctx, id, guard, guardTx); err != nil {
 		return err
 	}
-	if err := b.deleteAllSignalDedupe(ctx, id, guard); err != nil {
+	if err := b.deleteAllSignalDedupe(ctx, id, guard, guardTx); err != nil {
 		return err
 	}
-	if err := b.deleteInboxForInstance(ctx, id, guard); err != nil {
+	if err := b.deleteInboxForInstance(ctx, id, guard, guardTx); err != nil {
 		return err
 	}
-	return b.deleteJournalForInstance(ctx, id, guard)
+	return b.deleteJournalForInstance(ctx, id, guard, guardTx)
 }
 
 // residualStragglers holds exact keys observed after the first sweep but
@@ -259,7 +325,10 @@ type dedupeVersion struct {
 
 // listResidualStragglers snapshots the dedupe and inbox keys that survived
 // the first sweep (stragglers committed during the sweep). Only these two
-// tables can gain rows while the victim is terminal.
+// tables can gain rows while the victim is terminal. Production purge takes
+// this snapshot inside the victim-delete transaction instead (see
+// deletePurgedInstanceRow); this standalone listing serves tests that seed
+// keys directly.
 func (b *Backend) listResidualStragglers(ctx context.Context, id string) (*residualStragglers, error) {
 	var out residualStragglers
 	iter := b.client.Single().Query(ctx, spanner.Statement{
@@ -308,6 +377,58 @@ func (b *Backend) listResidualStragglers(ctx context.Context, id string) (*resid
 	return &out, nil
 }
 
+// queryResidualDedupeTx reads the victim's dedupe keys inside the
+// victim-delete transaction for the atomic residual snapshot (see
+// deletePurgedInstanceRow). Only these two tables can gain rows while the
+// victim is terminal — SendToInbox inserts both.
+func queryResidualDedupeTx(ctx context.Context, txn *spanner.ReadWriteTransaction, id string, out *residualStragglers) error {
+	iter := txn.Query(ctx, spanner.Statement{
+		SQL:    `SELECT dedupe_id, created_at FROM wf_signal_dedupe WHERE instance_id = @id`,
+		Params: map[string]any{"id": id},
+	})
+	defer iter.Stop()
+	for {
+		row, err := iter.Next()
+		if err == iterator.Done {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var k string
+		var ts time.Time
+		if err := row.Columns(&k, &ts); err != nil {
+			return err
+		}
+		out.dedupe = append(out.dedupe, dedupeVersion{id: k, createdAt: ts})
+	}
+}
+
+// queryResidualInboxTx reads the victim's inbox keys inside the
+// victim-delete transaction for the atomic residual snapshot (see
+// deletePurgedInstanceRow).
+func queryResidualInboxTx(ctx context.Context, txn *spanner.ReadWriteTransaction, id string, out *residualStragglers) error {
+	iter := txn.Query(ctx, spanner.Statement{
+		SQL:    `SELECT id FROM wf_inbox WHERE instance_id = @id`,
+		Params: map[string]any{"id": id},
+	})
+	defer iter.Stop()
+	for {
+		row, err := iter.Next()
+		if err == iterator.Done {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var k int64
+		if err := row.Columns(&k); err != nil {
+			return err
+		}
+		out.inboxIDs = append(out.inboxIDs, k)
+	}
+}
+
 // reapResidualStragglers deletes the snapshotted residual keys. Inbox keys
 // (random IDs) go by exact key in paged transactions: keys already gone are
 // skipped, keys never snapshotted (replacement rows and post-snapshot
@@ -327,6 +448,12 @@ func (b *Backend) reapResidualStragglers(ctx context.Context, id string, r *resi
 	if r == nil {
 		return nil
 	}
+	// Datastore errors from either loop propagate to the caller: purge must
+	// report failure rather than success while a stale dedupe row stays
+	// attached (a later SendToInbox for that DedupeID would find the stale
+	// row and drop the event). Only version-mismatch is benign — the
+	// predicated delete then matches zero rows, which commits successfully
+	// and preserves the replacement's recreated guard.
 	for _, dv := range r.dedupe {
 		if err := ctx.Err(); err != nil {
 			return err

@@ -12,7 +12,21 @@ import (
 // victim incarnation it is deleting (see purge.go). Nil disables the check;
 // the terminate path passes nil because the instance row still exists there,
 // so no replacement incarnation can appear mid-sweep.
+//
+// The out-of-transaction pre-check is a cheap early exit only: the
+// load-bearing fence is the in-transaction check (sweepGuardTx), which runs
+// inside the same read-write transaction as the page read and delete. A
+// standalone check outside the transaction leaves a gap where CreateInstance
+// can recreate the ID before the delete transaction commits, and the delete
+// would then remove the replacement's children. Reading the fence inside
+// the transaction shares one snapshot with the page query: the delete sees
+// the replacement's row iff it sees the replacement's children, so it
+// either deletes only provably-old rows or aborts.
 type sweepGuard func(ctx context.Context) error
+
+// sweepGuardTx re-validates the purge fence inside the page-delete
+// transaction itself (see sweepGuard). Nil disables the check.
+type sweepGuardTx func(ctx context.Context, txn *spanner.ReadWriteTransaction) error
 
 // checkGuard runs the per-page fence when one is set.
 func checkGuard(ctx context.Context, guard sweepGuard) error {
@@ -20,6 +34,15 @@ func checkGuard(ctx context.Context, guard sweepGuard) error {
 		return nil
 	}
 	return guard(ctx)
+}
+
+// checkGuardTx runs the in-transaction fence when one is set, before the
+// page query, so the fence read and the page read share one snapshot.
+func checkGuardTx(ctx context.Context, txn *spanner.ReadWriteTransaction, guardTx sweepGuardTx) error {
+	if guardTx == nil {
+		return nil
+	}
+	return guardTx(ctx, txn)
 }
 
 // Spanner commits cap buffered mutations (documented 20k; emulator and large
@@ -105,13 +128,13 @@ func chunkInt64s(in []int64, size int) [][]int64 {
 // independent. Inbox/journal rows (if any) are left for purge: terminate never
 // owned them and they need no prompt reclaim to unblock anything.
 func (b *Backend) sweepTerminateDocs(ctx context.Context, id string) error {
-	if err := b.deleteTasksForInstance(ctx, id, nil); err != nil {
+	if err := b.deleteTasksForInstance(ctx, id, nil, nil); err != nil {
 		return err
 	}
-	if err := b.deleteTimersForInstance(ctx, id, nil); err != nil {
+	if err := b.deleteTimersForInstance(ctx, id, nil, nil); err != nil {
 		return err
 	}
-	return b.deleteAllSignalDedupe(ctx, id, nil)
+	return b.deleteAllSignalDedupe(ctx, id, nil, nil)
 }
 
 // listSignalDedupeIDs returns every dedupe key currently stored for one
@@ -217,7 +240,12 @@ func (b *Backend) sweepSignalDedupeIDs(ctx context.Context, id string, guard swe
 // awaited (terminate) or fenced (purge) and the full key set must go —
 // unlike the commit path there is no post-sweep send window that snapshot
 // classification needs to protect.
-func (b *Backend) deleteAllSignalDedupe(ctx context.Context, id string, guard sweepGuard) error {
+//
+// The purge fence is validated twice per page: checkGuard outside (cheap
+// early exit) and guardTx inside the delete transaction (load-bearing; see
+// sweepGuard). The in-transaction check must run before the page query so
+// both reads share one snapshot.
+func (b *Backend) deleteAllSignalDedupe(ctx context.Context, id string, guard sweepGuard, guardTx sweepGuardTx) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -227,6 +255,9 @@ func (b *Backend) deleteAllSignalDedupe(ctx context.Context, id string, guard sw
 		}
 		var keys []string
 		err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			if err := checkGuardTx(ctx, txn, guardTx); err != nil {
+				return err
+			}
 			keys = keys[:0]
 			iter := txn.Query(ctx, spanner.Statement{
 				SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id LIMIT @limit`,
@@ -269,7 +300,9 @@ func (b *Backend) deleteAllSignalDedupe(ctx context.Context, id string, guard sw
 }
 
 // deleteTasksForInstance removes wf_tasks rows for one instance in pages.
-func (b *Backend) deleteTasksForInstance(ctx context.Context, id string, guard sweepGuard) error {
+// The purge fence is validated outside (cheap early exit) and inside the
+// delete transaction (load-bearing; see sweepGuard).
+func (b *Backend) deleteTasksForInstance(ctx context.Context, id string, guard sweepGuard, guardTx sweepGuardTx) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -279,6 +312,9 @@ func (b *Backend) deleteTasksForInstance(ctx context.Context, id string, guard s
 		}
 		var keys []int64
 		err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			if err := checkGuardTx(ctx, txn, guardTx); err != nil {
+				return err
+			}
 			keys = keys[:0]
 			iter := txn.Query(ctx, spanner.Statement{
 				SQL:    `SELECT id FROM wf_tasks WHERE instance_id = @id LIMIT @limit`,
@@ -321,7 +357,9 @@ func (b *Backend) deleteTasksForInstance(ctx context.Context, id string, guard s
 }
 
 // deleteTimersForInstance removes wf_timers rows for one instance in pages.
-func (b *Backend) deleteTimersForInstance(ctx context.Context, id string, guard sweepGuard) error {
+// The purge fence is validated outside (cheap early exit) and inside the
+// delete transaction (load-bearing; see sweepGuard).
+func (b *Backend) deleteTimersForInstance(ctx context.Context, id string, guard sweepGuard, guardTx sweepGuardTx) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -331,6 +369,9 @@ func (b *Backend) deleteTimersForInstance(ctx context.Context, id string, guard 
 		}
 		var seqs []int64
 		err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			if err := checkGuardTx(ctx, txn, guardTx); err != nil {
+				return err
+			}
 			seqs = seqs[:0]
 			iter := txn.Query(ctx, spanner.Statement{
 				SQL:    `SELECT seq FROM wf_timers WHERE instance_id = @id LIMIT @limit`,
@@ -373,7 +414,9 @@ func (b *Backend) deleteTimersForInstance(ctx context.Context, id string, guard 
 }
 
 // deleteInboxForInstance removes wf_inbox rows for one instance in pages.
-func (b *Backend) deleteInboxForInstance(ctx context.Context, id string, guard sweepGuard) error {
+// The purge fence is validated outside (cheap early exit) and inside the
+// delete transaction (load-bearing; see sweepGuard).
+func (b *Backend) deleteInboxForInstance(ctx context.Context, id string, guard sweepGuard, guardTx sweepGuardTx) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -383,6 +426,9 @@ func (b *Backend) deleteInboxForInstance(ctx context.Context, id string, guard s
 		}
 		var keys []int64
 		err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			if err := checkGuardTx(ctx, txn, guardTx); err != nil {
+				return err
+			}
 			keys = keys[:0]
 			iter := txn.Query(ctx, spanner.Statement{
 				SQL:    `SELECT id FROM wf_inbox WHERE instance_id = @id LIMIT @limit`,
@@ -425,7 +471,9 @@ func (b *Backend) deleteInboxForInstance(ctx context.Context, id string, guard s
 }
 
 // deleteJournalForInstance removes wf_journal rows for one instance in pages.
-func (b *Backend) deleteJournalForInstance(ctx context.Context, id string, guard sweepGuard) error {
+// The purge fence is validated outside (cheap early exit) and inside the
+// delete transaction (load-bearing; see sweepGuard).
+func (b *Backend) deleteJournalForInstance(ctx context.Context, id string, guard sweepGuard, guardTx sweepGuardTx) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -435,6 +483,9 @@ func (b *Backend) deleteJournalForInstance(ctx context.Context, id string, guard
 		}
 		var seqs []int64
 		err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			if err := checkGuardTx(ctx, txn, guardTx); err != nil {
+				return err
+			}
 			seqs = seqs[:0]
 			iter := txn.Query(ctx, spanner.Statement{
 				SQL:    `SELECT seq FROM wf_journal WHERE instance_id = @id LIMIT @limit`,
