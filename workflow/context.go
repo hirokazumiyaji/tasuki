@@ -210,7 +210,10 @@ func SleepUntil(ctx *Context, t time.Time) error {
 	if err := checkPortableDeadline(t); err != nil {
 		return err
 	}
-	return sleepAt(ctx, t)
+	// Normalize to UTC before encoding: the check above accepts any instant
+	// whose UTC year is portable, but time.Time.MarshalJSON rejects a local
+	// year outside 0-9999 (e.g. year-10000 +02:00 rendering 9999-12-31T23:00Z).
+	return sleepAt(ctx, t.UTC())
 }
 
 // checkPortableDeadline rejects timer deadlines whose UTC instant cannot be

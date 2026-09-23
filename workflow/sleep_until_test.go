@@ -153,3 +153,38 @@ func TestSleepUntil_AcceptsMaxPortableDeadline(t *testing.T) {
 		t.Fatalf("%+v", res.NewCommands)
 	}
 }
+
+func TestSleepUntil_NormalizesPortableDeadlineToUTC(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	// UTC instant 9999-12-31T23:00Z is portable, but the +02:00 rendering
+	// has local year 10000, which time.Time.MarshalJSON rejects. SleepUntil
+	// must normalize to UTC and record 9999-12-31T23:00Z instead of
+	// returning a JSON encoding error.
+	deadline := time.Date(10000, 1, 1, 1, 0, 0, 0, time.FixedZone("+02", 2*60*60))
+	if got := deadline.UTC().Year(); got != 9999 {
+		t.Fatalf("setup: UTC year=%d want 9999", got)
+	}
+	want := time.Date(9999, 12, 31, 23, 0, 0, 0, time.UTC)
+	events := []journal.Event{{Seq: 1, Type: journal.TypeWorkflowStarted, Name: "WF"}}
+	res := engine.RunAt(events, now, func(ctx *workflow.Context) (any, error) {
+		return nil, workflow.SleepUntil(ctx, deadline)
+	})
+	if !res.Suspended || res.Err != nil {
+		t.Fatalf("want suspend, got %+v err=%v", res, res.Err)
+	}
+	if len(res.NewCommands) != 2 || res.NewCommands[1].Type != journal.TypeTimerCreated {
+		t.Fatalf("%+v", res.NewCommands)
+	}
+	var p struct {
+		FireAt time.Time `json:"fire_at"`
+	}
+	if err := json.Unmarshal(res.NewCommands[1].Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	if !p.FireAt.Equal(want) {
+		t.Fatalf("fire_at=%v want=%v", p.FireAt, want)
+	}
+	if _, err := json.Marshal(p.FireAt); err != nil {
+		t.Fatalf("recorded fire_at must stay marshalable: %v", err)
+	}
+}
