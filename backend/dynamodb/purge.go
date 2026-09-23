@@ -112,7 +112,12 @@ func (b *Backend) deleteByInstance(ctx context.Context, name, id string) error {
 			TableName:                 aws.String(table),
 			KeyConditionExpression:    aws.String("instance_id = :id"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)},
-			ExclusiveStartKey:         startKey,
+			// Terminal cleanup must observe just-committed rows: an
+			// eventually-consistent read can miss an inbox row committed
+			// right before the terminal transition, reporting success while
+			// leaving leftovers no later pass revisits.
+			ConsistentRead:    aws.Bool(true),
+			ExclusiveStartKey: startKey,
 		})
 		if err != nil {
 			return err

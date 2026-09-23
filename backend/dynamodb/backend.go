@@ -218,47 +218,59 @@ func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
 	// The GSI is eventually consistent: a sweep can report a partial match
 	// while lagging rows are still invisible to the index, and nothing
 	// revisits them afterwards (the claim-time status gate stops execution
-	// but not the leak). Confirm against strongly consistent state with one
-	// bounded Scan page on every sweep, not just zero-row results.
-	// Residual guarantee: a row beyond the verification window stays until
-	// a TerminateInstance or PurgeInstances full sweep reaps it, and is
-	// never executed meanwhile.
+	// but not the leak). Confirm against strongly consistent state with a
+	// full paginated Scan on every sweep, not just zero-row results: a
+	// single page would leave lagging tasks past 1000 items/1 MiB behind
+	// with no later pass revisiting them.
 	_ = n
 	return b.verifyTasksEmptyByScan(ctx, id)
 }
 
-// gsiVerifyScanLimit bounds the strongly-consistent verification Scan to a
-// single page of evaluated items: enough to catch lagged rows in ordinary
-// tables without turning every terminal completion into a fleet-wide scan.
+// gsiVerifyScanLimit caps each strongly-consistent verification Scan page.
+// The sweep follows LastEvaluatedKey until the whole table is checked, so a
+// lagging task anywhere in the table is reaped instead of leaking until
+// purge. Cost: every terminal completion pays a full strongly-consistent
+// table Scan (one page per gsiVerifyScanLimit evaluated items), proportional
+// to fleet size rather than the instance's rows. The GSI sweep first keeps
+// the common case cheap (no writes when nothing lags); the scan only reads.
 const gsiVerifyScanLimit = 1000
 
-// verifyTasksEmptyByScan deletes up to one page worth of the instance's tasks
-// read with ConsistentRead. It runs after every GSI-based sweep — including
-// partial matches, where lagging rows are invisible to the index but present
-// in strongly consistent state — so the common no-task completion pays one
-// bounded read.
+// verifyTasksEmptyByScan deletes every one of the instance's tasks visible
+// to a strongly-consistent Scan. It runs after every GSI-based sweep —
+// including partial matches, where lagging rows are invisible to the index
+// but present in strongly consistent state — so the common no-task
+// completion pays one bounded read per page and a lagging task beyond the
+// first page (past 1000 items/1 MiB) is still reaped instead of leaking
+// until purge with no later pass revisiting it.
 func (b *Backend) verifyTasksEmptyByScan(ctx context.Context, id string) error {
-	out, err := b.client.Scan(ctx, &dynamodb.ScanInput{
-		TableName:      aws.String(b.table("wf_tasks")),
-		Limit:          aws.Int32(gsiVerifyScanLimit),
-		ConsistentRead: aws.Bool(true),
-	})
-	if err != nil {
-		return err
-	}
-	for _, m := range out.Items {
-		if fromS(m["instance_id"]) != id {
-			continue
-		}
-		pk, ok := m["task_pk"]
-		if !ok {
-			continue
-		}
-		if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
+	var start map[string]types.AttributeValue
+	for {
+		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{
+			TableName:         aws.String(b.table("wf_tasks")),
+			Limit:             aws.Int32(gsiVerifyScanLimit),
+			ConsistentRead:    aws.Bool(true),
+			ExclusiveStartKey: start,
+		})
+		if err != nil {
 			return err
 		}
+		for _, m := range out.Items {
+			if fromS(m["instance_id"]) != id {
+				continue
+			}
+			pk, ok := m["task_pk"]
+			if !ok {
+				continue
+			}
+			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
+				return err
+			}
+		}
+		if out.LastEvaluatedKey == nil {
+			return nil
+		}
+		start = out.LastEvaluatedKey
 	}
-	return nil
 }
 
 // deleteTasksForInstanceByGSI removes one instance's tasks via the
@@ -333,7 +345,7 @@ func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string) (
 	var start map[string]types.AttributeValue
 	deleted := 0
 	for {
-		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(b.table("wf_tasks")), ExclusiveStartKey: start})
+		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(b.table("wf_tasks")), ConsistentRead: aws.Bool(true), ExclusiveStartKey: start})
 		if err != nil {
 			return deleted, err
 		}
@@ -354,10 +366,12 @@ func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string) (
 
 // deleteTimersForInstance pages through the instance's timers (Query results
 // larger than 1 MB arrive in pages via LastEvaluatedKey) and removes each one.
+// The read is strongly consistent so a timer committed just before the
+// terminal transition is not missed (same gap as the terminal inbox query).
 func (b *Backend) deleteTimersForInstance(ctx context.Context, id string) error {
 	var start map[string]types.AttributeValue
 	for {
-		out, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_timers")), KeyConditionExpression: aws.String("instance_id = :id"), ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)}, ExclusiveStartKey: start})
+		out, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_timers")), KeyConditionExpression: aws.String("instance_id = :id"), ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)}, ConsistentRead: aws.Bool(true), ExclusiveStartKey: start})
 		if err != nil {
 			return err
 		}
@@ -1379,7 +1393,9 @@ func (b *Backend) RecoverOrphanedWorkflowTasks(ctx context.Context) (int, error)
 }
 // deleteSignalDedupeForInstance pages through the instance's dedupe entries
 // (Query results larger than 1 MB arrive in pages via LastEvaluatedKey) and
-// removes each one.
+// removes each one. The read is strongly consistent so a dedupe key committed
+// just before the terminal transition is not missed (same gap as the
+// terminal inbox query).
 func (b *Backend) deleteSignalDedupeForInstance(ctx context.Context, id string) error {
 	var start map[string]types.AttributeValue
 	for {
@@ -1387,6 +1403,7 @@ func (b *Backend) deleteSignalDedupeForInstance(ctx context.Context, id string) 
 			TableName:                 aws.String(b.table("wf_signal_dedupe")),
 			KeyConditionExpression:    aws.String("instance_id = :id"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)},
+			ConsistentRead:            aws.Bool(true),
 			ExclusiveStartKey:         start,
 		})
 		if err != nil {
