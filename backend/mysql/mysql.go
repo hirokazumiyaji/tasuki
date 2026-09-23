@@ -129,8 +129,9 @@ func (b *Backend) DB() *sql.DB { return b.db }
 // identity so migrations for unrelated databases proceed concurrently while
 // migrations for the same database never interleave migration steps. The
 // cross-process exclusion still comes from the per-database MySQL named lock
-// (see scopedMigrationLockName), held for the whole run; the in-process
-// guard only serializes goroutines sharing this process.
+// (see scopedMigrationLockName), held for the whole run, except on TiDB
+// where GET_LOCK is unavailable and the named-lock step is skipped (see
+// isTiDB); the in-process guard only serializes goroutines sharing this process.
 var (
 	migrationProcessLocksMu sync.Mutex
 	migrationProcessLocks   = map[string]*migrationProcessLock{}
@@ -261,7 +262,13 @@ type migrationQueryer interface {
 // Concurrency: Migrate holds the per-database in-process guard (keyed by
 // server + database, ctx-aware) and a per-database MySQL
 // named lock (cross-process) for the whole run, so a concurrent Migrate
-// blocks instead of observing a half-applied schema. Every statement runs
+// blocks instead of observing a half-applied schema. On TiDB the named-lock
+// step is skipped (TiDB has no GET_LOCK/RELEASE_LOCK; see isTiDB): the
+// in-process guard still serializes goroutines in this process, and the DDL
+// itself is idempotent (CREATE TABLE IF NOT EXISTS, INSERT IGNORE,
+// duplicate-column tolerance), so concurrent Migrates from separate
+// processes may interleave but converge instead of corrupting the schema.
+// Cross-process exclusion on TiDB is therefore weaker than on MySQL. Every statement runs
 // on lockConn, the
 // session holding the named lock: with MaxOpenConns(1) that session occupies
 // the pool's only connection, so touching b.db here would wait for a
@@ -293,16 +300,27 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	// statement below runs on lockConn: it is the session holding the named
 	// lock, and with MaxOpenConns(1) no other connection can be checked out
 	// until Migrate returns.
+	//
+	// TiDB has no GET_LOCK/RELEASE_LOCK, so the named-lock step is skipped
+	// there (see isTiDB): the in-process guard above plus the idempotent DDL
+	// below are the only exclusion, and concurrent cross-process Migrates
+	// may interleave but converge.
 	lockConn, err := b.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("mysql: acquire migration lock: %w", err)
 	}
 	defer lockConn.Close()
-	lockName, err := acquireMigrationLock(ctx, lockConn)
+	tidb, err := isTiDB(ctx, lockConn)
 	if err != nil {
 		return err
 	}
-	defer releaseMigrationLock(context.WithoutCancel(ctx), lockConn, lockName)
+	if !tidb {
+		lockName, err := acquireMigrationLock(ctx, lockConn)
+		if err != nil {
+			return err
+		}
+		defer releaseMigrationLock(context.WithoutCancel(ctx), lockConn, lockName)
+	}
 	if _, err := lockConn.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS `+migrationTableName+` (
 			version    BIGINT PRIMARY KEY,
@@ -393,6 +411,18 @@ func applyMigration(ctx context.Context, q migrationQueryer, m migration) error 
 		return err
 	}
 	return nil
+}
+
+// isTiDB reports whether the server behind conn is TiDB. TiDB version
+// strings look like "8.5.1-TiDB-v8.5.1"; plain MySQL/MariaDB never contain
+// "TiDB". It is called once per Migrate so the named-lock path (which needs
+// GET_LOCK/RELEASE_LOCK, absent on TiDB) can be skipped there.
+func isTiDB(ctx context.Context, conn *sql.Conn) (bool, error) {
+	var version string
+	if err := conn.QueryRowContext(ctx, `SELECT VERSION()`).Scan(&version); err != nil {
+		return false, fmt.Errorf("mysql: detect server flavor: %w", err)
+	}
+	return strings.Contains(strings.ToLower(version), "tidb"), nil
 }
 
 // acquireMigrationLock holds the per-database migration lock on conn for the
