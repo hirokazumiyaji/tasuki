@@ -8,10 +8,10 @@ import (
 
 type Capabilities struct {
 	MaxAdvancementEffects int // 0 = unlimited
-	// SupportsFairDispatch reports whether ClaimTasks honors
-	// ClaimRequest.MaxPerInstance to interleave instances.
-	// Backends without native support ignore the cap (see #297).
-	SupportsFairDispatch bool
+	// FairDispatch reports whether ClaimTasks honors ClaimRequest.MaxPerInstance.
+	// Backends without support ignore the cap (FIFO) and the conformance
+	// fair-dispatch test skips them explicitly.
+	FairDispatch bool
 	// CleansTerminalState reports whether terminal transitions fully clean
 	// up: TerminateInstance and terminal CommitAdvancement remove pending
 	// tasks, timers, and inbox rows, and FireDueTimers never creates inbox
@@ -106,7 +106,8 @@ type ClaimRequest struct {
 	WorkerID string
 	// MaxPerInstance caps how many tasks of one instance a single claim
 	// returns, interleaving instances instead of strict FIFO (fair dispatch).
-	// 0 disables the cap. Backends without native support ignore it.
+	// 0 disables the cap. Backends that do not advertise
+	// Capabilities.FairDispatch ignore it and fall back to FIFO.
 	MaxPerInstance int
 }
 

@@ -119,22 +119,108 @@ func (w *Worker) loadWorkflowState(ctx context.Context, instanceID string) (*bac
 	return head, nil
 }
 
-func (w *Worker) commitWorkflow(ctx context.Context, instanceID string, baseJournal []journal.Event, adv backend.Advancement) error {
+func (w *Worker) commitWorkflow(ctx context.Context, task backend.Task, baseJournal []journal.Event, adv backend.Advancement) error {
+	instanceID := task.InstanceID
+	if instanceID == "" {
+		instanceID = adv.InstanceID
+	}
 	err := w.backend.CommitAdvancement(ctx, adv)
 	if err != nil {
 		if errors.Is(err, backend.ErrConflict) {
 			w.dropSticky(instanceID)
 		}
+		// Contention releases immediately for fast replay; other commit
+		// failures back off via delayed nack (see requeueWorkflowTask) so
+		// a persistently failing task does not spin the poll loop.
+		// Best-effort: the task may already be gone.
+		w.requeueWorkflowTask(ctx, task, err)
 		return err
 	}
 	w.applyStickyAfterCommit(instanceID, baseJournal, adv)
 	return nil
 }
 
+// trackWfClaim records the local wall-clock claim time of a workflow task.
+func (w *Worker) trackWfClaim(taskID int64) {
+	w.wfClaimMu.Lock()
+	defer w.wfClaimMu.Unlock()
+	if w.wfClaim == nil {
+		w.wfClaim = map[int64]time.Time{}
+	}
+	w.wfClaim[taskID] = time.Now()
+}
+
+// clearWfClaims drops local claim records after the tick's flush.
+func (w *Worker) clearWfClaims(tasks []backend.Task) {
+	w.wfClaimMu.Lock()
+	defer w.wfClaimMu.Unlock()
+	for _, t := range tasks {
+		delete(w.wfClaim, t.ID)
+	}
+}
+
+// wfLeaseExpired reports whether the local lease-expiry estimate for a
+// claimed workflow task has passed. Unknown IDs (direct commitWorkflow /
+// requeueWorkflowTask calls outside tickWorkflows, e.g. unit tests) report
+// false so the nack proceeds as before.
+func (w *Worker) wfLeaseExpired(taskID int64) bool {
+	w.wfClaimMu.Lock()
+	defer w.wfClaimMu.Unlock()
+	claimed, ok := w.wfClaim[taskID]
+	if !ok {
+		return false
+	}
+	lease := w.opts.LeaseDuration
+	if lease <= 0 {
+		lease = 30 * time.Second
+	}
+	return !time.Now().Before(claimed.Add(lease))
+}
+
+// requeueWorkflowTask makes a failed workflow task visible again after a
+// handleWorkflow/commit error. Contention (ErrConflict/ErrSuperseded) can
+// succeed on replay, so the lease is released immediately for fast retry:
+// the release carries the claim token (kind/instance for WF# routing,
+// worker + attempt fencing) so a stale worker never clears a peer's fresh
+// lease after a reclaim race. Any other failure — transient store errors or
+// deterministic oversized-advancement diagnostics from checkTerminalBudget/
+// fitAdvancementToBudget — is nacked with IncompatibleRetryDelay: every
+// ReleaseLease also emits a task notification that wakes the poll loop, so
+// an immediate release of a persistently failing task would
+// reclaim-fail-notify in a tight loop, saturating the worker and backing
+// store. Unlike the fast-path precheck below, NackTask itself is fenced on
+// the claim ownership token (worker + attempt, plus numeric id on WF keys),
+// so a delayed nack that lost the check→nack race to a peer reclaim is
+// rejected by the backend with ErrNotFound without touching the peer's
+// fresh lease. The local lease-expiry estimate stays as a fast path: once
+// it has passed, a peer may have reclaimed the task, so the stale worker
+// skips the nack and expiry reclaims naturally. Nack failures share the
+// release_lease store-error op label to keep the op vocabulary bounded.
+func (w *Worker) requeueWorkflowTask(ctx context.Context, t backend.Task, herr error) {
+	if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {
+		if rerr := w.backend.ReleaseLease(ctx, t); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
+			w.recordStoreError(ctx, "release_lease", rerr, "task_id", t.ID)
+		}
+		return
+	}
+	if w.wfLeaseExpired(t.ID) {
+		w.opts.Logger.Debug("skipping stale workflow nack; local lease expired",
+			"task_id", t.ID, "instance_id", t.InstanceID)
+		return
+	}
+	if rerr := w.backend.NackTask(ctx, t, w.opts.IncompatibleRetryDelay); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
+		w.recordStoreError(ctx, "release_lease", rerr, "task_id", t.ID)
+	}
+}
+
 type pendingWorkflowCommit struct {
 	instanceID  string
 	baseJournal []journal.Event
 	adv         backend.Advancement
+	// task is the claimed workflow task (ownership token for fenced lease
+	// release on commit failure). Older call sites may leave it zero; the
+	// release then falls back to adv-derived routing without fencing.
+	task backend.Task
 }
 
 func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWorkflowCommit) {
@@ -147,10 +233,17 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 			advs[i] = p.adv
 		}
 		if err := batcher.CommitAdvancements(ctx, advs); err != nil {
-			for _, p := range pending {
-				w.dropSticky(p.instanceID)
-			}
 			w.recordStoreError(ctx, "commit_workflow", err, "n", len(pending))
+			// One conflict rolls back the whole batch transaction, so fall
+			// back to per-instance commits: healthy instances still advance
+			// in this tick, and failed items release their leases inside
+			// commitWorkflow for immediate re-visibility (independent of
+			// LeaseDuration).
+			for _, p := range pending {
+				if cerr := w.commitWorkflow(ctx, w.taskForCommit(p), p.baseJournal, p.adv); cerr != nil {
+					w.recordStoreError(ctx, "commit_workflow", cerr, "instance_id", p.instanceID)
+				}
+			}
 			return
 		}
 		for _, p := range pending {
@@ -159,9 +252,24 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 		return
 	}
 	for _, p := range pending {
-		if err := w.commitWorkflow(ctx, p.instanceID, p.baseJournal, p.adv); err != nil {
+		if err := w.commitWorkflow(ctx, w.taskForCommit(p), p.baseJournal, p.adv); err != nil {
 			w.recordStoreError(ctx, "commit_workflow", err, "instance_id", p.instanceID)
 		}
+	}
+}
+
+// taskForCommit resolves the fenced release token for a pending commit.
+// Production paths (handleWorkflow) populate p.task; legacy/test paths that
+// only set adv fall back to an adv-derived task (workflow routing without
+// ownership fencing).
+func (w *Worker) taskForCommit(p pendingWorkflowCommit) backend.Task {
+	if p.task.ID != 0 || p.task.InstanceID != "" {
+		return p.task
+	}
+	return backend.Task{
+		ID:         p.adv.TaskID,
+		Kind:       "workflow",
+		InstanceID: p.instanceID,
 	}
 }
 

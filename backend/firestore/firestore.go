@@ -77,6 +77,7 @@ func deleteCollection(ctx context.Context, client *firestore.Client, name string
 	for {
 		iter := col.Limit(100).Documents(ctx)
 		numDeleted := 0
+		//lint:ignore SA1019 WriteBatch still functional; migrate to BulkWriter in an emulator-verified follow-up.
 		batch := client.Batch()
 		for {
 			doc, err := iter.Next()

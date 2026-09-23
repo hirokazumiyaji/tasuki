@@ -4,8 +4,83 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Nightly verification (fuzzing + full matrix).
+    - cron: '0 3 * * *'
+  workflow_dispatch:
 
 jobs:
+  # NOTE: there is intentionally no backend `go mod tidy` gate. Even with
+  # GOWORK=off, tidying a backend module tries to resolve the root module's
+  # test-only dependency (otel/sdk/metric, imported by
+  # worker_store_error_test.go via the `replace tasuki => ../..` directive)
+  # at the latest version, which requires a newer Go toolchain than CI pins.
+  # Root-module tidiness is gated by #302 instead.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+      - name: Run staticcheck (root module)
+        run: staticcheck ./...
+      - name: Run staticcheck (backend modules)
+        run: |
+          for m in backend/sqlite backend/postgres backend/mysql backend/spanner backend/dynamodb backend/firestore; do
+            (cd "$m" && staticcheck ./...)
+          done
+
+  vuln:
+    # Advisory: stdlib findings track the auto-selected toolchain versus the
+    # vulnerability database, so a hard gate would flap red on CVEs
+    # unrelated to the PR (verified: 16 stdlib call-chain findings under the
+    # current toolchain). Keep visible but non-blocking; promote to a hard
+    # gate once the toolchain is pinned past the fixed versions.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+      - name: Run govulncheck (root module)
+        # Non-fatal on its own: the root scan currently reports known
+        # findings, and a hard failure here must not skip the backend scans
+        # below (job-level continue-on-error does not propagate to steps).
+        # The root outcome is recorded under the `root` step id and folded
+        # into the aggregate status by the backend step below (advisory
+        # through job-level continue-on-error).
+        id: root
+        continue-on-error: true
+        env:
+          # Scan the standalone root module, not the workspace-wide MVS
+          # build list (which may select higher versions than the root pins,
+          # omitting real vulns).
+          GOWORK: off
+        run: govulncheck ./...
+      - name: Run govulncheck (backend modules)
+        if: always()
+        env:
+          # Same workspace isolation per backend invocation: each module's
+          # own dependency graph, not the workspace-wide build list.
+          GOWORK: off
+        run: |
+          # Aggregate the root scan with the backend scans. With
+          # continue-on-error the root step's conclusion is success even on
+          # failure, so steps.root.outcome must be folded in explicitly;
+          # otherwise a root-only failure would exit 0 and be discarded.
+          status=0
+          if [ "${{ steps.root.outcome }}" = "failure" ]; then status=1; fi
+          for m in backend/sqlite backend/postgres backend/mysql backend/spanner backend/dynamodb backend/firestore; do
+            (cd "$m" && govulncheck ./...) || status=$?
+          done
+          exit $status
+
   root:
     runs-on: ubuntu-latest
     services:
@@ -41,7 +116,7 @@ jobs:
           go-version: "1.24.x"
       - name: Test sqlite
         working-directory: backend/sqlite
-        run: go test ./... -count=1 -timeout 120s
+        run: go test ./... -race -count=1 -timeout 120s
 
   backend-postgres:
     runs-on: ubuntu-latest
@@ -68,7 +143,7 @@ jobs:
           go-version: "1.24.x"
       - name: Test postgres
         working-directory: backend/postgres
-        run: go test ./... -count=1 -timeout 120s
+        run: go test ./... -race -count=1 -timeout 120s
 
   backend-mysql:
     runs-on: ubuntu-latest
@@ -96,7 +171,7 @@ jobs:
           go-version: "1.24.x"
       - name: Test mysql
         working-directory: backend/mysql
-        run: go test ./... -count=1 -timeout 180s
+        run: go test ./... -race -count=1 -timeout 180s
 
   backend-spanner:
     runs-on: ubuntu-latest
@@ -124,7 +199,7 @@ jobs:
           exit 1
       - name: Test spanner
         working-directory: backend/spanner
-        run: go test ./... -count=1 -timeout 180s
+        run: go test ./... -race -count=1 -timeout 180s
 
   backend-dynamodb:
     runs-on: ubuntu-latest
@@ -152,7 +227,7 @@ jobs:
           exit 1
       - name: Test dynamodb
         working-directory: backend/dynamodb
-        run: go test ./... -count=1 -timeout 180s
+        run: go test ./... -race -count=1 -timeout 180s
 
   backend-firestore:
     runs-on: ubuntu-latest
@@ -177,7 +252,7 @@ jobs:
           exit 1
       - name: Test firestore
         working-directory: backend/firestore
-        run: go test ./... -count=1 -timeout 180s
+        run: go test ./... -race -count=1 -timeout 180s
 
   chaos-postgres:
     runs-on: ubuntu-latest
@@ -203,8 +278,7 @@ jobs:
         with:
           go-version: "1.24.x"
       - name: Chaos postgres
-        run: go test -tags tasuki_all ./chaos/ -run 'TestChaos_KillWorkers$' -count=1 -timeout 5m
-
+        run: go test -tags tasuki_all ./chaos/ -run 'TestChaos_KillWorkers$' -race -count=1 -timeout 5m
   chaos-mysql:
     runs-on: ubuntu-latest
     services:
@@ -230,8 +304,7 @@ jobs:
         with:
           go-version: "1.24.x"
       - name: Chaos mysql
-        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_MySQL -count=1 -timeout 5m
-
+        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_MySQL -race -count=1 -timeout 5m
   chaos-spanner:
     runs-on: ubuntu-latest
     services:
@@ -256,8 +329,7 @@ jobs:
           done
           exit 1
       - name: Chaos spanner
-        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_Spanner -count=1 -timeout 5m
-
+        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_Spanner -race -count=1 -timeout 5m
   chaos-dynamodb:
     runs-on: ubuntu-latest
     env:
@@ -281,8 +353,7 @@ jobs:
           docker logs dynamodb || true
           exit 1
       - name: Chaos dynamodb
-        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_DynamoDB -count=1 -timeout 5m
-
+        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_DynamoDB -race -count=1 -timeout 5m
   chaos-firestore:
     runs-on: ubuntu-latest
     env:
@@ -305,7 +376,17 @@ jobs:
           docker logs firestore || true
           exit 1
       - name: Chaos firestore
-        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_Firestore -count=1 -timeout 5m
+        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_Firestore -race -count=1 -timeout 5m
+
+  chaos-sqlite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Chaos sqlite
+        run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_SQLite -race -count=1 -timeout 5m
 
   cover:
     runs-on: ubuntu-latest
@@ -378,3 +459,24 @@ jobs:
         run: GOTOOLCHAIN=local go build ./...
       - name: Full workspace build with all backends
         run: go build -tags tasuki_all ./...
+      - name: Test contrib and examples with all backends
+        run: go test -tags tasuki_all ./contrib/... ./examples/...
+
+  fuzz-nightly:
+    # Runs only on schedule / manual dispatch: ~60s of fuzzing per target.
+    # Fuzz seed corpora run as ordinary unit tests in the `root` job on every PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Fuzz codec JSON round-trip (60s)
+        run: go test -fuzz=FuzzJSONRoundTrip -fuzztime 60s ./codec/
+      - name: Fuzz codec encrypted round-trip (60s)
+        run: go test -fuzz=FuzzEncryptedRoundTrip -fuzztime 60s ./codec/
+      - name: Fuzz codec encrypted garbage (60s)
+        run: go test -fuzz=FuzzEncryptedGarbage -fuzztime 60s ./codec/
+      - name: Fuzz engine synthetic journal (60s)
+        run: go test -fuzz=FuzzRunSyntheticJournal -fuzztime 60s ./internal/engine/

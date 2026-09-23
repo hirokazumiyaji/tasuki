@@ -102,10 +102,10 @@ Functions provided by the `workflow` package:
 
 | Function | Description |
 |---|---|
-| `Execute[I, O](ctx, fn, in, opts...) (O, error)` | Runs an activity and waits for completion (`WithRetry`, `WithStartToCloseTimeout`) |
+| `Execute[I, O](ctx, name, in, opts...) (O, error)` | Runs an activity and waits for completion (`WithRetry`, `WithStartToCloseTimeout`) |
 | `ExecuteLocal[I, O](ctx, name, in) (O, error)` | Executes an activity synchronously on the same worker, recording results directly in the journal (no task queue, no retry) |
-| `ExecuteAsync[I, O](ctx, fn, in, opts...) *Future[O]` | Schedules an activity asynchronously and returns a `Future` |
-| `ExecuteChild[I, O](ctx, wf, in, opts...) (O, error)` | Runs a child workflow and waits for completion (`ExecuteChildAsync` also available) |
+| `ExecuteAsync[I, O](ctx, name, in, opts...) *Future[O]` | Schedules an activity asynchronously and returns a `Future` |
+| `ExecuteChild[I, O](ctx, name, in) (O, error)` | Runs a child workflow and waits for completion (`ExecuteChildAsync[I, O](ctx, name, in) *Future[O]` also available; neither takes options) |
 | `Sleep(ctx, d) error` / `SleepUntil(ctx, t) error` | Suspends execution using a durable timer |
 | `SleepAsync(ctx, d) *Future[struct{}]` | Starts a durable timer as a `Future` (useful for Select timeouts) |
 | `Now(ctx) time.Time` | Returns the recorded current time that remains constant across replays |
@@ -131,7 +131,7 @@ Functions provided by the `workflow` package:
 
 `UpsertMemo` is similarly recorded as a command event, but memo fields are intended for display metadata and are not indexed for `List` filtering.
 
-`ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay.
+`ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay. The workflow task turn performs no lease extension: the lease clock starts when `ClaimTasks` returns, so replay, every `ExecuteLocal` call, and the commit must together fit well within the remaining `LeaseDuration` with margin — it is not enough for each activity alone to be shorter than the lease. For example, with a 30s lease, 15s of replay followed by a 20s `ExecuteLocal` crosses expiry, letting a peer reclaim the task and repeat the local side effect before the first worker commits. Use `Execute` for anything longer than a small fraction of the lease, and keep local activities side-effect-free or idempotent where possible.
 
 For long-running or looping workflows, calling `ContinueAsNew` when event counts reach thousands is strongly recommended to bound history size.
 
@@ -386,8 +386,11 @@ type WorkerOptions struct {
     Logger                 *slog.Logger  // Default: slog.Default()
     JournalWarnThreshold   int           // Default: 10000; negative disables
     IncompatibleRetryDelay time.Duration // Default: 5s; negative redisplays immediately
+    MaxPerInstance         int           // Default: 0 (disabled); caps tasks claimed per instance per batch
 }
 ```
+
+`MaxPerInstance` is honored only by backends with fair-dispatch support (PostgreSQL, MySQL, SQLite, in-memory). DynamoDB, Firestore, and Spanner ignore it and claim in FIFO order (see [08-fair-dispatch.md](08-fair-dispatch.md)).
 
 ## Schema Validation and Migrations
 

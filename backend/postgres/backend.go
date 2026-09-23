@@ -15,9 +15,9 @@ import (
 
 func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
-		SupportsFairDispatch: true,
-		CleansTerminalState:  true,
-		SupportsBulkCleanup:  true,
+		FairDispatch:        true,
+		CleansTerminalState: true,
+		SupportsBulkCleanup: true,
 	}
 }
 
@@ -397,9 +397,18 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 	return nil
 }
 
-func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
-	tag, err := b.pool.Exec(ctx, `
-		UPDATE wf_tasks SET visible_at = now(), worker_id = NULL WHERE id = $1`, taskID)
+func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
+	var tag pgconn.CommandTag
+	var err error
+	if t.WorkerID != "" {
+		// Conditional on the claim ownership token (see sqlite backend).
+		tag, err = b.pool.Exec(ctx, `
+		UPDATE wf_tasks SET visible_at = now(), worker_id = NULL WHERE id = $1 AND worker_id = $2 AND attempt = $3`,
+			t.ID, t.WorkerID, t.Attempt)
+	} else {
+		tag, err = b.pool.Exec(ctx, `
+		UPDATE wf_tasks SET visible_at = now(), worker_id = NULL WHERE id = $1`, t.ID)
+	}
 	if err != nil {
 		return err
 	}
@@ -411,9 +420,18 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 }
 
 func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {
-	tag, err := b.pool.Exec(ctx, `
+	var tag pgconn.CommandTag
+	var err error
+	if t.WorkerID != "" {
+		// Conditional on the claim ownership token (see ReleaseLease).
+		tag, err = b.pool.Exec(ctx, `
+		UPDATE wf_tasks SET visible_at = now() + $2::interval, worker_id = NULL WHERE id = $1 AND worker_id = $3 AND attempt = $4`,
+			t.ID, interval(delay), t.WorkerID, t.Attempt)
+	} else {
+		tag, err = b.pool.Exec(ctx, `
 		UPDATE wf_tasks SET visible_at = now() + $2::interval, worker_id = NULL WHERE id = $1`,
-		t.ID, interval(delay))
+			t.ID, interval(delay))
+	}
 	if err != nil {
 		return err
 	}

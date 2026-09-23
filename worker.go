@@ -23,7 +23,18 @@ type Worker struct {
 	mu       sync.Mutex
 	cancel   context.CancelFunc
 	done     chan struct{}
-	inFlight map[int64]struct{}
+	inFlight map[int64]backend.Task
+
+	// wfClaim records the local wall-clock claim time of each workflow
+	// task claimed by tickWorkflows. NackTask is fenced on the claim token
+	// (worker + attempt, like ReleaseLease), so a stale delayed nack in
+	// requeueWorkflowTask is rejected by the backend without touching a
+	// peer's fresh lease. The local lease-expiry estimate (claim time +
+	// LeaseDuration) stays as a fast path: once it has passed, a peer may
+	// have reclaimed the task, so the stale worker skips the nack call
+	// entirely and expiry reclaims naturally.
+	wfClaimMu sync.Mutex
+	wfClaim   map[int64]time.Time
 
 	stickyMu sync.Mutex
 	sticky   map[string]stickyEntry
@@ -56,7 +67,8 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		backend:  b,
 		opts:     opts,
 		reg:      newRegistry(opts.Codec),
-		inFlight: map[int64]struct{}{},
+		inFlight: map[int64]backend.Task{},
+		wfClaim:  map[int64]time.Time{},
 		sticky:   map[string]stickyEntry{},
 		instLock: map[string]*workflowActor{},
 		wfSem:    make(chan struct{}, opts.WorkflowConcurrency),
@@ -90,6 +102,10 @@ func (w *Worker) StartWithError(parent context.Context) error {
 		if err := ValidateSchema(parent, w.backend); err != nil {
 			return fmt.Errorf("tasuki: schema validation failed: %w", err)
 		}
+	}
+	if w.opts.MaxPerInstance > 0 && !w.backend.Capabilities().FairDispatch {
+		w.opts.Logger.Warn("tasuki: MaxPerInstance is set but the backend ignores it (no fair dispatch support); claims fall back to FIFO",
+			"max_per_instance", w.opts.MaxPerInstance)
 	}
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
@@ -217,9 +233,9 @@ func (w *Worker) trackActivity() (done func(), ok bool) {
 	return w.actWg.Done, true
 }
 
-func (w *Worker) track(taskID int64) {
+func (w *Worker) track(t backend.Task) {
 	w.mu.Lock()
-	w.inFlight[taskID] = struct{}{}
+	w.inFlight[t.ID] = t
 	w.mu.Unlock()
 }
 
@@ -231,24 +247,27 @@ func (w *Worker) untrack(taskID int64) {
 
 func (w *Worker) releaseInFlight(ctx context.Context) {
 	w.mu.Lock()
-	ids := make([]int64, 0, len(w.inFlight))
-	for id := range w.inFlight {
-		ids = append(ids, id)
+	tasks := make([]backend.Task, 0, len(w.inFlight))
+	for _, t := range w.inFlight {
+		tasks = append(tasks, t)
 	}
-	w.inFlight = map[int64]struct{}{}
+	w.inFlight = map[int64]backend.Task{}
 	w.mu.Unlock()
-	for _, id := range ids {
+	for _, t := range tasks {
 		select {
 		case <-ctx.Done():
 			w.opts.Logger.Warn("shutdown lease release timed out",
-				"released", 0, "remaining", len(ids), "error", ctx.Err())
+				"released", 0, "remaining", len(tasks), "error", ctx.Err())
 			w.opts.Metrics.AddStoreError(context.Background(), "release_lease")
 			return
 		default:
 		}
-		if err := w.backend.ReleaseLease(ctx, id); err != nil {
+		// Fenced by the tracked claim token: if the task was reclaimed by
+		// a peer while shutting down, the backend reports ErrNotFound and
+		// the fresh lease is left intact.
+		if err := w.backend.ReleaseLease(ctx, t); err != nil && !errors.Is(err, backend.ErrNotFound) {
 			w.opts.Logger.Warn("shutdown lease release failed",
-				"task_id", id, "error", err)
+				"task_id", t.ID, "error", err)
 			w.opts.Metrics.AddStoreError(context.Background(), "release_lease")
 			select {
 			case <-ctx.Done():
@@ -385,6 +404,13 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 	if len(wtasks) == 0 {
 		return
 	}
+	// Record local claim times so the delayed nack can be fenced against
+	// a reclaim race (see requeueWorkflowTask). Cleared after the flush
+	// below; entries are wall-clock only, never store time.
+	for _, t := range wtasks {
+		w.trackWfClaim(t.ID)
+	}
+	defer w.clearWfClaims(wtasks)
 	var wg sync.WaitGroup
 	var pendingMu sync.Mutex
 	var pending []pendingWorkflowCommit
@@ -395,7 +421,9 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		case w.wfSem <- struct{}{}:
 		default:
 			// No slot: make the task visible again promptly for peers.
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			// Fenced on the just-claimed token, so this only releases our
+			// own claim.
+			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
 		wg.Add(1)
@@ -409,13 +437,21 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 			actor.dispatch(func() {
 				w.opts.Metrics.AddWorkflowTask(ctx, 1)
 				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
-				w.track(t.ID)
+				w.track(t)
 				p, herr := w.handleWorkflow(ctx, t)
 				w.untrack(t.ID)
 				if herr != nil {
 					w.recordStoreError(ctx, "commit_workflow", herr,
 						"instance_id", t.InstanceID, "task_id", t.ID)
 					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", herr)
+					if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {
+						w.dropSticky(t.InstanceID)
+					}
+					// Contention releases immediately for fast replay;
+					// anything else backs off via delayed nack so a
+					// persistently failing task does not spin the poll
+					// loop (see requeueWorkflowTask).
+					w.requeueWorkflowTask(ctx, t, herr)
 					return
 				}
 				if p != nil {
@@ -454,7 +490,7 @@ func (w *Worker) tickActivities(ctx context.Context) {
 		select {
 		case w.actSem <- struct{}{}:
 		default:
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
 		// Lease extension starts in the handler goroutine immediately,
@@ -463,12 +499,12 @@ func (w *Worker) tickActivities(ctx context.Context) {
 		w.opts.Metrics.AddActivityTask(ctx, 1)
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
-		w.track(t.ID)
+		w.track(t)
 		done, ok := w.trackActivity()
 		if !ok {
 			w.untrack(t.ID)
 			<-w.actSem
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
 		go func(t backend.Task) {
@@ -511,14 +547,14 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 		select {
 		case w.actSem <- struct{}{}:
 		default:
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
 		wg.Add(1)
 		w.opts.Metrics.AddActivityTask(ctx, 1)
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
-		w.track(t.ID)
+		w.track(t)
 		done, global := w.trackActivity()
 		go func(t backend.Task) {
 			defer wg.Done()
@@ -645,6 +681,7 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 			instanceID:  t.InstanceID,
 			baseJournal: state.Journal,
 			adv:         adv,
+			task:        t,
 		}
 	}
 
