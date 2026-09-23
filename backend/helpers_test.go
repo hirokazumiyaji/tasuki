@@ -648,6 +648,268 @@ func TestFairOverflowRequeryUnderfilled(t *testing.T) {
 	}
 }
 
+func TestFairOverflowRequerySuccessiveSegments(t *testing.T) {
+	// Covers the round-8 P2 on the postgres/mysql refill loops: a flood
+	// spanning MULTIPLE rejected-retention caps strands candidates even with
+	// the single overflow requery. Limit=2, MaxPerInstance=1 over FIFO
+	// A1..A4003 (2*FairRejectedCap+3 rows from one instance) with A1..A4002
+	// lost to concurrent locks: the first requery advances one segment
+	// (~2001 rows) and drops the tail past the cap again, so the single-shot
+	// guard returns empty while the never-attempted A4003 stays claimable.
+	// Looping the bounded requery through successive snapshots recovers it.
+	const limit, perInstance = 2, 1
+	total := 2*backend.FairRejectedCap + 3
+	feed := make([]backend.FairTaskRef, 0, total)
+	for i := 0; i < total; i++ {
+		feed = append(feed, backend.FairTaskRef{ID: int64(i + 1), InstanceID: "A"})
+	}
+	// Only the overflow-dropped tail ever wins the lock race.
+	lockLost := func(id int64) bool { return id <= int64(total-1) }
+
+	// runRefill mirrors the postgres/mysql refill loops with the round-8
+	// looping requery: successive segments resume from each pass's fresh
+	// pre-overflow snapshot while skipping attempted IDs, stop early when a
+	// segment makes no progress, and never exceed maxRequeries arms.
+	// maxRequeries=1 reproduces the single-shot (pre-fix) behavior.
+	runRefill := func(maxRequeries int) (out []backend.FairTaskRef, arms, passes int) {
+		cursor := 0 // index of the next unscanned feed row (keyset cursor)
+		var lastID int64
+		first := true
+		var claimed, pending []backend.FairTaskRef
+		var overflowSnapValid, overflowSeen bool
+		var overflowSnapID int64
+		var requeryPasses, requeryAttempted, requeryOut int
+		attempted := map[int64]struct{}{}
+		startOverflowRequery := func() bool {
+			if len(out) >= limit || !overflowSeen || !overflowSnapValid || requeryPasses >= maxRequeries {
+				return false
+			}
+			if requeryPasses > 0 && len(attempted) <= requeryAttempted && len(out) <= requeryOut {
+				return false
+			}
+			requeryPasses++
+			arms++
+			requeryAttempted, requeryOut = len(attempted), len(out)
+			overflowSeen = false
+			first = false
+			cursor = int(overflowSnapID) // IDs are 1-based sequential
+			overflowSnapValid = false
+			pending = nil
+			return true
+		}
+		for len(out) < limit {
+			passes++
+			if passes > 4*len(feed)+20 {
+				t.Fatalf("refill loop did not terminate (maxRequeries=%d)", maxRequeries)
+			}
+			picker := backend.NewFairPicker(limit-len(out), perInstance).TrackRejected()
+			picker.Seed(claimed)
+			offered := 0
+			for _, r := range pending {
+				if picker.Full() {
+					break
+				}
+				picker.Offer(r)
+				offered++
+			}
+			if !picker.Full() {
+				for !picker.Full() && cursor < len(feed) {
+					r := feed[cursor]
+					cursor++
+					if !overflowSeen && !picker.RejectedCapped() {
+						overflowSnapID, overflowSnapValid = lastID, !first
+					}
+					first = false
+					lastID = r.ID
+					if _, dup := attempted[r.ID]; !(requeryPasses > 0 && dup) {
+						offerFull := picker.Offer(r)
+						if picker.RejectedCapped() {
+							overflowSeen = true
+						}
+						if offerFull {
+							break
+						}
+					}
+				}
+			}
+			scanExhausted := !picker.Full()
+			picked := picker.Picked()
+			iterRejected := picker.Rejected()
+			for _, r := range picked {
+				attempted[r.ID] = struct{}{}
+			}
+			if len(picked) == 0 {
+				if startOverflowRequery() {
+					continue
+				}
+				break
+			}
+			prevOut := len(out)
+			for _, r := range picked {
+				if lockLost(r.ID) {
+					continue
+				}
+				out = append(out, r)
+				claimed = append(claimed, r)
+			}
+			if len(out) >= limit {
+				break
+			}
+			if scanExhausted {
+				if lost := len(picked) - (len(out) - prevOut); lost == 0 || len(iterRejected) == 0 {
+					if startOverflowRequery() {
+						continue
+					}
+					break
+				}
+			}
+			pending = append(iterRejected, pending[offered:]...)
+			if len(pending) > backend.FairRejectedCap {
+				pending = pending[:backend.FairRejectedCap]
+			}
+		}
+		return out, arms, passes
+	}
+
+	// Pre-fix shape: the single requery advances one segment, the tail drops
+	// past the cap again, the guard blocks any further requery, and the
+	// claim returns empty although A4003 was never attempted.
+	if got, arms, _ := runRefill(1); len(got) != 0 || arms != 1 {
+		t.Fatalf("single-shot requery: got %v arms=%d, want empty with 1 arm (reproduces the bug)", got, arms)
+	}
+	// Fixed contract: successive segments walk the flood and recover the
+	// never-attempted tail with exactly two requery arms.
+	got, arms, _ := runRefill(backend.MaxOverflowRequeryPasses)
+	if len(got) != 1 || got[0].ID != int64(total) || got[0].InstanceID != "A" {
+		t.Fatalf("looping requery: got %v, want [A%d]", got, total)
+	}
+	if arms != 2 {
+		t.Fatalf("looping requery: arms=%d, want 2 successive segments", arms)
+	}
+}
+
+func TestFairOverflowRequeryNoProgressStops(t *testing.T) {
+	// The looping requery must not burn through its pass bound when a
+	// segment cannot make progress: Limit=2, MaxPerInstance=1 over FIFO
+	// A1..A4003 where only A1 wins the lock race. Pass 1 secures A1; the
+	// requery segment then offers only A rows against the seeded per-instance
+	// cap, picks nothing, attempts nothing new, and secures nothing — so no
+	// second segment may arm even though it overflowed again.
+	const limit, perInstance = 2, 1
+	total := 2*backend.FairRejectedCap + 3
+	feed := make([]backend.FairTaskRef, 0, total)
+	for i := 0; i < total; i++ {
+		feed = append(feed, backend.FairTaskRef{ID: int64(i + 1), InstanceID: "A"})
+	}
+	lockLost := func(id int64) bool { return id != 1 }
+
+	cursor := 0
+	var lastID int64
+	first := true
+	var out, claimed, pending []backend.FairTaskRef
+	var overflowSnapValid, overflowSeen bool
+	var overflowSnapID int64
+	var requeryPasses, requeryAttempted, requeryOut int
+	arms := 0
+	attempted := map[int64]struct{}{}
+	startOverflowRequery := func() bool {
+		if len(out) >= limit || !overflowSeen || !overflowSnapValid || requeryPasses >= backend.MaxOverflowRequeryPasses {
+			return false
+		}
+		if requeryPasses > 0 && len(attempted) <= requeryAttempted && len(out) <= requeryOut {
+			return false
+		}
+		requeryPasses++
+		arms++
+		requeryAttempted, requeryOut = len(attempted), len(out)
+		overflowSeen = false
+		first = false
+		cursor = int(overflowSnapID)
+		overflowSnapValid = false
+		pending = nil
+		return true
+	}
+	passes := 0
+	for len(out) < limit {
+		passes++
+		if passes > 4*len(feed)+20 {
+			t.Fatal("refill loop did not terminate")
+		}
+		picker := backend.NewFairPicker(limit-len(out), perInstance).TrackRejected()
+		picker.Seed(claimed)
+		offered := 0
+		for _, r := range pending {
+			if picker.Full() {
+				break
+			}
+			picker.Offer(r)
+			offered++
+		}
+		if !picker.Full() {
+			for !picker.Full() && cursor < len(feed) {
+				r := feed[cursor]
+				cursor++
+				if !overflowSeen && !picker.RejectedCapped() {
+					overflowSnapID, overflowSnapValid = lastID, !first
+				}
+				first = false
+				lastID = r.ID
+				if _, dup := attempted[r.ID]; !(requeryPasses > 0 && dup) {
+					offerFull := picker.Offer(r)
+					if picker.RejectedCapped() {
+						overflowSeen = true
+					}
+					if offerFull {
+						break
+					}
+				}
+			}
+		}
+		scanExhausted := !picker.Full()
+		picked := picker.Picked()
+		iterRejected := picker.Rejected()
+		for _, r := range picked {
+			attempted[r.ID] = struct{}{}
+		}
+		if len(picked) == 0 {
+			if startOverflowRequery() {
+				continue
+			}
+			break
+		}
+		prevOut := len(out)
+		for _, r := range picked {
+			if lockLost(r.ID) {
+				continue
+			}
+			out = append(out, r)
+			claimed = append(claimed, r)
+		}
+		if len(out) >= limit {
+			break
+		}
+		if scanExhausted {
+			if lost := len(picked) - (len(out) - prevOut); lost == 0 || len(iterRejected) == 0 {
+				if startOverflowRequery() {
+					continue
+				}
+				break
+			}
+		}
+		pending = append(iterRejected, pending[offered:]...)
+		if len(pending) > backend.FairRejectedCap {
+			pending = pending[:backend.FairRejectedCap]
+		}
+	}
+
+	if len(out) != 1 || out[0].ID != 1 {
+		t.Fatalf("no-progress refill: got %v, want [A1]", out)
+	}
+	if arms != 1 {
+		t.Fatalf("no-progress refill: arms=%d, want exactly 1 (second segment must stop for no progress)", arms)
+	}
+}
+
 func TestFairPickerRelease(t *testing.T) {
 	mk := func(id int64, inst string) backend.FairTaskRef {
 		return backend.FairTaskRef{ID: id, InstanceID: inst}

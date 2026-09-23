@@ -288,19 +288,27 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 	// claim even though it may hold eligible rows (e.g. Limit=2,
 	// MaxPerInstance=1 over A1..A2002 with A1..A2001 locked: A2002 is dropped
 	// by the cap and never revisited). Remember the pre-overflow keyset
-	// position and the IDs already attempted, so the claim can re-issue one
-	// bounded requery pass from the snapshot instead of returning empty. One
-	// extra pass only, to preserve termination; rows dropped by a requery pass
-	// itself stay claimable for a later poll, which restarts from the head.
+	// position and the IDs already attempted, so the claim can re-issue
+	// bounded requery passes from the snapshot instead of returning
+	// underfilled. A requery pass that itself overflows arms the next pass
+	// from its own fresher snapshot (successive segments), so multi-cap
+	// floods (A1..A4003, all locked) are walked through segment by segment.
+	// Passes stop at MaxOverflowRequeryPasses, when the batch fills, when a
+	// pass makes no progress (nothing newly attempted or secured), or when a
+	// pass proves no unattempted candidates remain (no overflow). Rows still
+	// dropped afterwards stay claimable for a later poll, which restarts from
+	// the head.
 	var (
 		overflowSnapValid bool
 		overflowSnapVis   time.Time
 		overflowSnapID    int64
 		overflowSeen      bool
-		requeryDone       bool
+		requeryPasses     int
+		requeryAttempted  int
+		requeryOut        int
 		attempted         map[int64]struct{}
 	)
-	// startOverflowRequery arms the single bounded requery pass from the
+	// startOverflowRequery arms the next bounded requery pass from the
 	// pre-overflow snapshot when the batch would otherwise return
 	// underfilled after retention overflowed. It reports whether the caller
 	// should continue to the extra pass instead of breaking. At either break
@@ -310,14 +318,25 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 	// carry loses nothing. The guard is underfilled (len(out) < Limit), not
 	// empty: pass 1 may secure B1 while the retained As drain on locks,
 	// leaving dropped A2002 eligible for slot 2 (Limit=2/MaxPerInstance=1
-	// over A1..A2002(locked)/B1 returns [B1] without this).
+	// over A1..A2002(locked)/B1 returns [B1] without this). Arming consumes
+	// the overflow flag and the snapshot, so the next pass takes a fresh
+	// snapshot further along (successive segments); passes beyond the first
+	// additionally require progress (a newly attempted or secured row) since
+	// the previous arm, and the total is bounded by MaxOverflowRequeryPasses.
 	startOverflowRequery := func() bool {
-		if len(out) >= req.Limit || !overflowSeen || !overflowSnapValid || requeryDone {
+		if len(out) >= req.Limit || !overflowSeen || !overflowSnapValid ||
+			requeryPasses >= backend.MaxOverflowRequeryPasses {
 			return false
 		}
-		requeryDone = true
+		if requeryPasses > 0 && len(attempted) <= requeryAttempted && len(out) <= requeryOut {
+			return false
+		}
+		requeryPasses++
+		requeryAttempted, requeryOut = len(attempted), len(out)
+		overflowSeen = false
 		first = false
 		lastVis, lastID = overflowSnapVis, overflowSnapID
+		overflowSnapValid = false
 		pending = nil
 		return true
 	}
@@ -373,8 +392,11 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 					page++
 					// Snapshot the pre-row cursor while retention is intact, so
 					// an overflow-triggered requery can resume from the last
-					// retained position. First snapshot wins: it covers the
-					// largest dropped tail. Only SQL scan rows reach here;
+					// retained position. First snapshot per pass wins: it covers
+					// the largest dropped tail. Arming a requery consumes the
+					// overflow flag and the snapshot, so each successive
+					// segment takes its own snapshot further along. Only SQL
+					// scan rows reach here;
 					// pending-phase re-offers never advance the cursor, and the
 					// pending carry is bounded by FairRejectedCap so it cannot
 					// overflow on its own.
@@ -383,10 +405,10 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 					}
 					first = false
 					lastVis, lastID = vis, r.ID
-					// The single overflow-requery pass skips IDs already put
-					// through the lock step this claim, so never-attempted
-					// dropped rows get priority in the bounded pass.
-					if _, dup := attempted[r.ID]; !(requeryDone && dup) {
+					// Overflow-requery passes skip IDs already put through the
+					// lock step this claim, so never-attempted dropped rows
+					// get priority in each bounded segment.
+					if _, dup := attempted[r.ID]; !(requeryPasses > 0 && dup) {
 						offerFull := picker.Offer(r)
 						if picker.RejectedCapped() {
 							overflowSeen = true
@@ -490,10 +512,11 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 			// to revisit rejected candidates freed by lost picks.
 			if lost := len(picked) - (len(out) - prevOut); lost == 0 || len(iterRejected) == 0 {
 				// Overflow may have dropped eligible rows past the cursor
-				// (see above): with the batch still underfilled, re-issue
-				// one bounded scan from the pre-overflow snapshot instead
-				// of returning short. Rows dropped by the requery pass
-				// itself stay claimable for a later poll.
+				// (see above): with the batch still underfilled, re-issue a
+				// bounded scan from the pre-overflow snapshot instead of
+				// returning short. A requery segment that itself overflows
+				// arms the next segment; rows still dropped after the pass
+				// bound stay claimable for a later poll.
 				if startOverflowRequery() {
 					continue
 				}
