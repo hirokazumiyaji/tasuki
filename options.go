@@ -24,6 +24,10 @@ type WorkerOptions struct {
 	JournalWarnThreshold int // 0 → 10000; <0 disabled
 	// IncompatibleRetryDelay is how long to hide a task after an incompatible Worker nacks it.
 	// Unset (0) defaults to 5s; negative means immediate re-visibility.
+	// It also backs off failed workflow tasks: non-contention handle/commit
+	// errors (store failures, oversized-advancement budget diagnostics) nack
+	// with this delay instead of an immediate lease release, so a
+	// persistently failing task does not reclaim-fail-notify in a tight loop.
 	IncompatibleRetryDelay time.Duration
 	// MaxPerInstance caps how many tasks of one instance a single claim batch
 	// returns (fair dispatch; see docs/08-fair-dispatch.md). 0 disables the
@@ -31,13 +35,20 @@ type WorkerOptions struct {
 	MaxPerInstance int
 	// DisableSchemaValidation skips the startup check against backends that
 	// implement backend.SchemaValidator. Validation is on by default: when the
-	// store is missing tables (e.g. migrations have not run), Start logs an
-	// error and does not launch the poll loop.
+	// store is missing tables (e.g. migrations have not run), StartWithError
+	// returns an error and the poll loop is not launched (Start logs the same
+	// error and leaves the worker stopped; see Worker.Running).
 	DisableSchemaValidation bool
 	// ShutdownReleaseTimeout bounds lease release during Shutdown.
 	// Unreleased leases expire via lease timeout and are reclaimed by peers.
 	// <=0 defaults to 5s.
 	ShutdownReleaseTimeout time.Duration
+	// BacklogSampleInterval throttles backlog gauge sampling (2x
+	// CountClaimableTasks per sample when Metrics is set). 0 defaults to
+	// 10s (coarser than the 1s PollInterval default); negative disables
+	// sampling entirely. Set a smaller positive value (e.g. time.Second)
+	// for tests or low-traffic stores that want fresher backlog gauges.
+	BacklogSampleInterval time.Duration
 }
 
 func (o WorkerOptions) withDefaults() WorkerOptions {
@@ -81,6 +92,9 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 		o.IncompatibleRetryDelay = 5 * time.Second
 	} else if o.IncompatibleRetryDelay < 0 {
 		o.IncompatibleRetryDelay = 0
+	}
+	if o.BacklogSampleInterval == 0 {
+		o.BacklogSampleInterval = 10 * time.Second
 	}
 	return o
 }

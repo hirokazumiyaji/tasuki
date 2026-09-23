@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,6 +28,21 @@ func jsonOrNull(b []byte) any {
 func isUniqueViolation(err error) bool {
 	var mysqlErr *mysql.MySQLError
 	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1062
+}
+
+// isDuplicateColumnError reports whether err is a duplicate-column error
+// (MySQL error 1060). Only this class of ALTER TABLE ... ADD COLUMN failure
+// may be tolerated by Migrate; everything else (permissions, missing table,
+// syntax) must abort the migration.
+func isDuplicateColumnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		return mysqlErr.Number == 1060
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "duplicate column")
 }
 
 func beginTx(ctx context.Context, db *sql.DB) (*sql.Conn, error) {
@@ -85,6 +101,17 @@ func inClause(n int) string {
 		parts[i] = "?"
 	}
 	return strings.Join(parts, ", ")
+}
+
+// sortedSearchAttributeKeys returns the filter keys in sorted order so the
+// generated SQL is deterministic.
+func sortedSearchAttributeKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 type activityPayload struct {

@@ -5,6 +5,9 @@ import "errors"
 var (
 	ErrWorkflowNotRegistered = errors.New("workflow not registered")
 	ErrActivityNotRegistered = errors.New("activity not registered")
+	// ErrWorkerAlreadyRunning is returned by Worker.StartWithError when Start
+	// is called on a worker that is already running.
+	ErrWorkerAlreadyRunning = errors.New("tasuki: worker already running")
 )
 
 type nonRetryable struct{ err error }

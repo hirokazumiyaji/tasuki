@@ -32,6 +32,7 @@ button { padding:0.45rem 0.8rem; border:1px solid var(--line); background:#fff; 
 <form class="filter" method="get" action="/">
   <label>status <input name="status" value="{{.Status}}" placeholder="running"></label>
   <label>name <input name="name" value="{{.Name}}" placeholder="workflow name"></label>
+  <label>limit <input name="limit" value="{{.Limit}}" inputmode="numeric" placeholder="100"></label>
   <button type="submit">Filter</button>
 </form>
 {{if .Rows}}
@@ -51,6 +52,8 @@ button { padding:0.45rem 0.8rem; border:1px solid var(--line); background:#fff; 
 {{else}}
 <p class="empty">No instances.</p>
 {{end}}
+{{if .HasPrev}}<p><a href="{{.PrevURL}}">← Prev</a></p>{{end}}
+{{if .HasMore}}<p>さらにあります <a href="{{.NextURL}}">Next →</a></p>{{end}}
 </main>
 </body>
 </html>

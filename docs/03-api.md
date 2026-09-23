@@ -102,10 +102,10 @@ Functions provided by the `workflow` package:
 
 | Function | Description |
 |---|---|
-| `Execute[I, O](ctx, fn, in, opts...) (O, error)` | Runs an activity and waits for completion (`WithRetry`, `WithStartToCloseTimeout`) |
+| `Execute[I, O](ctx, name, in, opts...) (O, error)` | Runs an activity and waits for completion (`WithRetry`, `WithStartToCloseTimeout`) |
 | `ExecuteLocal[I, O](ctx, name, in) (O, error)` | Executes an activity synchronously on the same worker, recording results directly in the journal (no task queue, no retry) |
-| `ExecuteAsync[I, O](ctx, fn, in, opts...) *Future[O]` | Schedules an activity asynchronously and returns a `Future` |
-| `ExecuteChild[I, O](ctx, wf, in, opts...) (O, error)` | Runs a child workflow and waits for completion (`ExecuteChildAsync` also available) |
+| `ExecuteAsync[I, O](ctx, name, in, opts...) *Future[O]` | Schedules an activity asynchronously and returns a `Future` |
+| `ExecuteChild[I, O](ctx, name, in) (O, error)` | Runs a child workflow and waits for completion (`ExecuteChildAsync[I, O](ctx, name, in) *Future[O]` also available; neither takes options) |
 | `Sleep(ctx, d) error` / `SleepUntil(ctx, t) error` | Suspends execution using a durable timer |
 | `SleepAsync(ctx, d) *Future[struct{}]` | Starts a durable timer as a `Future` (useful for Select timeouts) |
 | `Now(ctx) time.Time` | Returns the recorded current time that remains constant across replays |
@@ -131,7 +131,7 @@ Functions provided by the `workflow` package:
 
 `UpsertMemo` is similarly recorded as a command event, but memo fields are intended for display metadata and are not indexed for `List` filtering.
 
-`ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay.
+`ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay. The workflow task turn performs no lease extension: the lease clock starts when `ClaimTasks` returns, so replay, every `ExecuteLocal` call, and the commit must together fit well within the remaining `LeaseDuration` with margin — it is not enough for each activity alone to be shorter than the lease. For example, with a 30s lease, 15s of replay followed by a 20s `ExecuteLocal` crosses expiry, letting a peer reclaim the task and repeat the local side effect before the first worker commits. Use `Execute` for anything longer than a small fraction of the lease, and keep local activities side-effect-free or idempotent where possible.
 
 For long-running or looping workflows, calling `ContinueAsNew` when event counts reach thousands is strongly recommended to bound history size.
 
@@ -299,6 +299,8 @@ out, err := tasuki.Update[ReviseIn, ReviseOut](ctx, w, "order-123", "revise", in
 
 Updates enqueue an `update_requested` event to the inbox. The worker executes the registered `SetUpdateHandler`, which can invoke activities or sleep. Completed updates commit as `update_completed` events.
 
+`Update` only enqueues the request and waits for completion: it never claims or executes workflow/activity tasks on the caller goroutine, so unrelated activities are never run by the caller. Progress is driven by a started Worker loop (`w.Start(ctx)`) in the same process, which `Update` requires in order to complete. For deterministic tests without a background loop, drive progress explicitly with `w.PollOnce(ctx)` from test code instead of relying on `Update`.
+
 ## Registration and Naming
 
 Workflow and activity names are stored in the database and serve as matching keys during replay. By default, names are derived from function reflection (e.g., `OrderWorkflow`). In production, explicit names are recommended to safeguard against accidental refactoring breakages:
@@ -336,6 +338,15 @@ c := tasuki.NewClient(b, tasuki.WithCodec(enc))
 ```
 
 Key rotation is supported by specifying a new primary key while retaining historical keys in the keyring. Unencrypted payloads lacking envelope markers fall back to plaintext reading, allowing encryption to be enabled on existing deployments without data migration.
+
+Envelope versions and rolling upgrades: new writes default to `Enc:1` (nil AAD) so previous-release readers can still decrypt them. Readers accept both `Enc:1` and `Enc:2` (key id bound via AAD). Enable the hardened `Enc:2` writes only after every reader (workers and replay tooling) understands v2:
+
+```go
+encV2 := codec.EncryptedWithOptions(codec.JSON(), keys,
+    codec.WithWriteVersion(codec.WriteVersionV2))
+```
+
+Staged order: (1) deploy v2-capable binaries while still writing v1, (2) switch writers to v2 once all readers are upgraded. A v2 payload handed to an old reader fails authentication, and that decode error is committed as a terminal workflow failure rather than an incompatible-task Nack — which is why writes stay on v1 by default.
 
 ## Testing Support
 
@@ -375,16 +386,21 @@ type WorkerOptions struct {
     Logger                 *slog.Logger  // Default: slog.Default()
     JournalWarnThreshold   int           // Default: 10000; negative disables
     IncompatibleRetryDelay time.Duration // Default: 5s; negative redisplays immediately
+    MaxPerInstance         int           // Default: 0 (disabled); caps tasks claimed per instance per batch
 }
 ```
+
+`MaxPerInstance` is honored only by backends with fair-dispatch support (PostgreSQL, MySQL, SQLite, in-memory). DynamoDB, Firestore, and Spanner ignore it and claim in FIFO order (see [08-fair-dispatch.md](08-fair-dispatch.md)).
 
 ## Schema Validation and Migrations
 
 Schema migrations are managed per backend. The PostgreSQL backend uses versioned migration files under `backend/postgres/migrations/` (see the [PostgreSQL Migrations README](../backend/postgres/migrations/README.md)).
 
-Workers verify database schemas at startup if the backend implements `backend.SchemaValidator`. If required tables are missing, the worker logs an error and avoids starting the polling loop. This validation can be disabled using `WorkerOptions.DisableSchemaValidation`.
+Workers verify database schemas at startup if the backend implements `backend.SchemaValidator`. If required tables are missing, `StartWithError` returns an error and the polling loop is not launched (the legacy `Start` wrapper logs the same error and leaves the worker stopped). This validation can be disabled using `WorkerOptions.DisableSchemaValidation`.
 
 Applications can explicitly trigger validation using `tasuki.ValidateSchema(ctx, backend)`.
 
 - `w.Start(ctx)` starts task polling loops asynchronously and returns immediately.
+- `w.StartWithError(ctx)` is the same but reports startup failures (schema validation, double start via `ErrWorkerAlreadyRunning`) to the caller instead of only logging.
+- `w.Running()` reports whether the background polling loop is started (useful for health checks).
 - `w.Shutdown(ctx)` gracefully halts new task acquisition, waits for in-flight tasks within the context deadline, and releases task leases so peer workers can claim them without waiting for expiration.

@@ -441,6 +441,7 @@ func (b *Backend) reapResidualStragglers(ctx context.Context, r *residualStraggl
 		if end > len(r.inbox) {
 			end = len(r.inbox)
 		}
+		//lint:ignore SA1019 WriteBatch still functional; migrate to BulkWriter in an emulator-verified follow-up.
 		batch := b.client.Batch()
 		for _, ref := range r.inbox[start:end] {
 			batch.Delete(ref)
