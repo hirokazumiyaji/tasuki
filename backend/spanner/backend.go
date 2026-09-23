@@ -1265,22 +1265,21 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		var muts []*spanner.Mutation
 		// Track DedupeIDs reserved in this transaction: ReadRow only sees committed
 		// rows, so same-batch duplicates would otherwise emit colliding InsertMaps.
-		// Terminal sends must not be swallowed by pre-terminal dedupe keys: a
-		// SendToInbox racing a terminal transition (CommitAdvancements or
+		// Terminal sends must not be swallowed by pre-terminal dedupe keys:
+		// a SendToInbox racing a terminal transition (CommitAdvancements or
 		// TerminateInstance) can observe a key snapshotted for the post-commit
-		// sweep, skip its inbox insert as a duplicate, and then lose the
-		// signal when the sweep deletes the key. Sends that commit while the
-		// instance is already terminal insert on the first post-terminal
-		// send; retries dedupe via a post-terminal marker (see
-		// postTerminalDedupeMarker): the first terminal send creates the
-		// marker alongside the event, later retries see it and skip. The
-		// base key is created when absent but a versioned base key never
-		// suppresses a terminal insert — only the marker does. A legacy
-		// (NULL format_version, pre-marker-release) owned guard does
-		// suppress: the previous release had no markers and deleted every
-		// pre-terminal key at the terminal commit, so a surviving legacy
-		// guard is the old release's own post-terminal retry guard whose
-		// event was already inserted (Codex round 14 on #296).
+		// sweep. The sweep deletes exactly the snapshotted keys, so a send
+		// that commits in the notify-to-sweep window must insert its own
+		// event immediately: suppressing it on the doomed pre-terminal row
+		// while stamping only a marker loses the signal permanently once the
+		// sweep removes the row — the marker then suppresses every retry
+		// (Codex round-15 on #296). Sends that commit while the instance is
+		// already terminal insert on the first post-terminal send; retries
+		// dedupe via a post-terminal marker (see postTerminalDedupeMarker):
+		// the first terminal send creates the marker alongside the event,
+		// later retries see it and skip. The base key is created when absent
+		// but an owned base key — legacy or versioned — never suppresses
+		// a terminal insert — only the marker does.
 		terminal := status != "running"
 		created := map[string]bool{}
 		for _, it := range items {
@@ -1307,17 +1306,20 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					}
 					// First post-terminal send: stamp the marker; create
 					// the base key too when absent for sweep consistency.
-					// A versioned owned guard never suppresses the insert
-					// (reset semantics: its pre-terminal event was swept,
-					// so a fresh post-terminal delivery is promised — see
-					// TestTerminalSendBypassesStaleDedupe). A legacy owned
-					// guard suppresses instead: pre-marker releases stored
-					// post-terminal retry guards only in wf_signal_dedupe
-					// and deleted every pre-terminal key at the terminal
-					// commit, so the surviving legacy row guards an already
-					// inserted post-terminal event (Codex round 14 on
-					// #296). The marker mutation above is still buffered,
-					// so the next retry takes the marker fast path.
+					// An owned base guard (versioned or legacy) never
+					// suppresses the insert: a pre-terminal key's event was
+					// swept, so a fresh post-terminal delivery is promised
+					// (reset semantics — see TestTerminalSendBypassesStaleDedupe)
+					// — and a key observed here may itself be snapshotted for
+					// a sweep that has not run yet (notify-to-sweep window,
+					// Codex round-15 on #296): suppressing on it while
+					// stamping only a marker loses the signal once the sweep
+					// removes the row, with the marker then suppressing every
+					// retry. Only the marker suppresses terminal retries.
+					// (A pre-upgrade legacy post-terminal retry guard therefore
+					// duplicates once on its first post-upgrade retry instead
+					// of suppressing — the safe direction: never drop. The
+					// marker mutation above still dedupes all later retries.)
 					// Marker-shaped candidates are never user keys:
 					// markers live in their own table now, so a row shaped
 					// like one is either an inert pre-upgrade marker or a
@@ -1328,7 +1330,6 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						"instance_id": instanceID, "marker_key": dedupeMarkerKey(it.DedupeID), "created_at": now,
 					}))
 					baseExists := false
-					baseLegacy := false
 					canonicalOccupied := false
 					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 						if isPostTerminalMarkerKey(bk) {
@@ -1346,13 +1347,8 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						}
 						if matchDedupeRow(it.DedupeID, bk, stored, version) {
 							baseExists = true
-							baseLegacy = !version.Valid || version.Int64 < dedupeFormatVersion
 							break
 						}
-					}
-					if baseExists && baseLegacy {
-						created[it.DedupeID] = true
-						continue
 					}
 					if baseExists || canonicalOccupied {
 						created[it.DedupeID] = true

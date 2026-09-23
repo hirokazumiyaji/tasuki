@@ -1216,19 +1216,21 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		// Terminal sends must not be swallowed by pre-terminal dedupe keys:
 		// a SendToInbox racing a terminal transition (CommitAdvancements or
 		// TerminateInstance) can observe a key snapshotted for the
-		// post-commit sweep, skip its inbox insert as a duplicate, and then
-		// lose the signal when the sweep deletes the key. Sends that commit
-		// while the instance is already terminal always insert their event
-		// on the first post-terminal send; retries still dedupe via a
-		// post-terminal marker (see postTerminalDedupeMarker): the first
-		// terminal send with a DedupeID creates the marker alongside the
-		// event, and later retries see the marker and skip. The base key is
-		// created when absent (so sweeps/purge stay consistent) but a
-		// versioned base key never suppresses a terminal insert — only the
-		// marker does. A legacy (unversioned, pre-marker-release) owned
-		// guard does suppress: it is the old release's own post-terminal
-		// retry guard, so the event was already inserted (Codex round 14 on
-		// #296). (Same-batch duplicates still collapse to one insert
+		// post-commit sweep. The sweep deletes exactly the snapshotted keys,
+		// so a send that commits in the notify-to-sweep window must insert
+		// its own event immediately: suppressing it on the doomed
+		// pre-terminal row (legacy or versioned) while stamping only a
+		// marker loses the signal permanently once the sweep removes the
+		// row — the marker then suppresses every retry (Codex round-15 on
+		// #296). Sends that commit while the instance is already terminal
+		// always insert their event on the first post-terminal send;
+		// retries still dedupe via a post-terminal marker (see
+		// postTerminalDedupeMarker): the first terminal send with a DedupeID
+		// creates the marker alongside the event, and later retries see
+		// the marker and skip. The base key is created when absent (so
+		// sweeps/purge stay consistent) but an owned base key — legacy or
+		// versioned — never suppresses a terminal insert, only the marker
+		// does. (Same-batch duplicates still collapse to one insert
 		// so a batch never issues conflicting Creates.)
 		terminal := str(isnap.Data(), "status") != "running"
 		// Firestore requires all reads before writes; also skip same-batch DedupeID dups.
@@ -1270,20 +1272,21 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				}
 				// First post-terminal send: insert + stamp the marker.
 				// Create the base key too when absent for sweep/purge
-				// consistency. A versioned base guard (written by current
-				// code) never suppresses a terminal insert - it is a
-				// pre-terminal key whose event the terminal sweep retired,
-				// so the reset semantics still promise a fresh post-terminal
-				// delivery (see TestTerminalSendBypassesStaleDedupe); only
-				// the marker suppresses those retries. A LEGACY (unversioned)
-				// owned guard is different: the previous release had no
-				// markers and deleted every pre-terminal key at the terminal
-				// commit, so a surviving legacy guard is the old release's
-				// own post-terminal retry guard - its event was already
-				// inserted. Suppress the retry (no new event) and stamp the
-				// marker so the next retry takes the marker fast path
-				// (Codex round 14 on #296). Without this, the first retry
-				// after upgrade duplicates a delivered signal.
+				// consistency. An owned base guard (versioned or legacy)
+				// never suppresses a terminal insert: a pre-terminal key's
+				// event was retired by the terminal sweep, so the reset
+				// semantics still promise a fresh post-terminal delivery
+				// (see TestTerminalSendBypassesStaleDedupe) — and a key
+				// observed here may itself be snapshotted for a sweep that
+				// has not run yet (notify-to-sweep window, Codex round-15
+				// on #296): suppressing on it while stamping only a marker
+				// loses the signal once the sweep removes the row, with
+				// the marker then suppressing every retry. Only the marker
+				// suppresses terminal retries. (A pre-upgrade legacy
+				// post-terminal retry guard therefore duplicates once on
+				// its first post-upgrade retry instead of suppressing —
+				// the safe direction: never drop. The marker stamped
+				// alongside still dedupes all later retries.)
 				// Marker-shaped candidates are never user keys: markers
 				// live in their own collection now, so a row shaped like
 				// one is either an inert pre-upgrade marker or a legacy
@@ -1296,7 +1299,6 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				// creating over it would fail and must not suppress the
 				// insert.
 				baseExists := false
-				baseLegacy := false
 				canonicalOccupied := false
 				for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 					if isPostTerminalMarkerKey(bk) {
@@ -1312,17 +1314,11 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						}
 						if matchDedupeRow(it.DedupeID, bk, snap.Data()) {
 							baseExists = true
-							baseLegacy = i64(snap.Data(), dedupeFormatVersionField) < dedupeFormatVersion
 							break
 						}
 					}
 				}
 				created[it.DedupeID] = true
-				if baseExists && baseLegacy {
-					skip[i] = true
-					createMarker[i] = true
-					continue
-				}
 				if baseExists || canonicalOccupied {
 					createMarker[i] = true
 					continue
@@ -1385,9 +1381,9 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		}
 		for i, it := range items {
 			if skip[i] {
-				// Terminal upgrade path (see the terminal read branch): a
-				// pre-upgrade legacy guard suppressed the insert, but the
-				// marker must still be stamped so the next retry takes the
+				// Suppressed same-batch duplicate (or a running-state
+				// dedupe hit): no inbox insert. The marker is still
+				// stamped when requested so the next retry takes the
 				// marker fast path. A lost Create race here (concurrent
 				// retry stamping first) surfaces as a transaction conflict
 				// and the caller retries into a marker hit — the same shape
