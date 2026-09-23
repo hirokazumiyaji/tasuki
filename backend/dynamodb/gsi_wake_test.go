@@ -159,6 +159,46 @@ func TestDeleteTasksForInstance_UsesQueryNotScan(t *testing.T) {
 	}
 }
 
+// TestTouchWake_PostCloseRegistrationHoldsWakeMu pins the shared
+// synchronization boundary between post-Close registration and the flush's
+// final observation: both hold wakeMu, so a mutation preempted between the
+// closed-check and the wakePostClose Add cannot slip through the flush's
+// zero observation and write post-Close after Close returned. Without the
+// mutex, the lock-free fast path issues the UpdateItem below while the test
+// holds wakeMu.
+func TestTouchWake_PostCloseRegistrationHoldsWakeMu(t *testing.T) {
+	f := &fakeDynamo{}
+	b := newTestBackend(f)
+	b.wakeDebounce = time.Hour
+	b.wakeClosed.Store(true)
+	b.wakeMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.notifyTasks()
+	}()
+	// Registration requires wakeMu: while it is held, no write may start.
+	select {
+	case <-done:
+		b.wakeMu.Unlock()
+		t.Fatal("post-Close touchWake completed without holding wakeMu (registration raced the flush observation)")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := atomic.LoadInt64(&f.updateCalls); got != 0 {
+		b.wakeMu.Unlock()
+		t.Fatalf("UpdateItem calls = %d while wakeMu held, want 0 (registration and observation must share the mutex)", got)
+	}
+	b.wakeMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-Close touchWake never completed after wakeMu released")
+	}
+	if got := atomic.LoadInt64(&f.updateCalls); got != 1 {
+		t.Fatalf("UpdateItem calls = %d, want 1 (post-Close wake writes once)", got)
+	}
+}
+
 func TestDeleteTasksForInstance_FallsBackToScanWhenGSIMissing(t *testing.T) {
 	f := &fakeDynamo{
 		queryErr: errors.New("ValidationException: The table does not have the specified index: " + instanceGSIName),
@@ -184,6 +224,86 @@ func TestDeleteTasksForInstance_FallsBackToScanWhenGSIMissing(t *testing.T) {
 	defer f.mu.Unlock()
 	if len(f.deleted) != 1 || f.deleted[0] != "WF#inst-9" {
 		t.Fatalf("deleted = %v, want [WF#inst-9]", f.deleted)
+	}
+}
+
+// TestDeleteTasksForInstance_AccessDeniedDoesNotFallBack pins the restricted
+// fallback: an IAM denial that merely mentions the index ARN must surface
+// instead of silently degrading to perpetual full-table Scans. Without the
+// restriction, the bare index-name mention matched and the Scan fallback hid
+// the config error.
+func TestDeleteTasksForInstance_AccessDeniedDoesNotFallBack(t *testing.T) {
+	f := &fakeDynamo{
+		queryErr: errors.New("AccessDeniedException: User: arn:aws:iam::123456789012:user/test is not authorized to perform: dynamodb:Query on resource: arn:aws:dynamodb:us-east-1:123456789012:table/tasuki_wf_tasks/index/" + instanceGSIName),
+		scanItems: []map[string]types.AttributeValue{
+			{"task_pk": avS("WF#inst-9"), "instance_id": avS("inst-9")},
+		},
+	}
+	b := newTestBackend(f)
+	if err := b.deleteTasksForInstance(context.Background(), "inst-9"); err == nil {
+		t.Fatal("delete with IAM denial = nil, want the access error (no Scan fallback)")
+	}
+	if got := atomic.LoadInt64(&f.queryCalls); got != 1 {
+		t.Fatalf("Query calls = %d, want 1 (attempted first)", got)
+	}
+	if got := atomic.LoadInt64(&f.scanCalls); got != 0 {
+		t.Fatalf("Scan calls = %d, want 0 (access errors must not fall back to Scan)", got)
+	}
+	if got := atomic.LoadInt64(&f.deleteCalls); got != 0 {
+		t.Fatalf("Delete calls = %d, want 0", got)
+	}
+}
+
+// TestDeleteTasksForInstance_TypedMissingIndexFallsBack pins the recognized
+// missing/backfilling-index failures that still fall back: typed
+// ValidationException (missing or backfilling) and typed
+// ResourceNotFoundException naming the index. An unrelated
+// ValidationException must surface like any other error.
+func TestDeleteTasksForInstance_TypedMissingIndexFallsBack(t *testing.T) {
+	scanItems := []map[string]types.AttributeValue{
+		{"task_pk": avS("WF#inst-9"), "instance_id": avS("inst-9")},
+		{"task_pk": avS("WF#other"), "instance_id": avS("other")},
+	}
+	cases := []struct {
+		name     string
+		queryErr error
+		fallback bool
+	}{
+		{"missing index", &types.IndexNotFoundException{Message: aws.String("The operation tried to access a nonexistent index: " + instanceGSIName)}, true},
+		{"backfilling index", errors.New("ValidationException: The index " + instanceGSIName + " is being backfilled and cannot be queried"), true},
+		{"resource not found naming the index", &types.ResourceNotFoundException{Message: aws.String("Requested resource not found: index " + instanceGSIName)}, true},
+		{"unrelated validation error", errors.New("ValidationException: Query condition missed key schema element: userId"), false},
+		{"missing table", &types.TableNotFoundException{Message: aws.String("Cannot do operations on a non-existent table")}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeDynamo{queryErr: tc.queryErr, scanItems: scanItems}
+			b := newTestBackend(f)
+			err := b.deleteTasksForInstance(context.Background(), "inst-9")
+			if tc.fallback {
+				if err != nil {
+					t.Fatalf("delete = %v, want nil (Scan fallback)", err)
+				}
+				if got := atomic.LoadInt64(&f.scanCalls); got != 1 {
+					t.Fatalf("Scan calls = %d, want 1 (fallback)", got)
+				}
+				if got := atomic.LoadInt64(&f.deleteCalls); got != 1 {
+					t.Fatalf("Delete calls = %d, want 1 (only matching instance)", got)
+				}
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				if len(f.deleted) != 1 || f.deleted[0] != "WF#inst-9" {
+					t.Fatalf("deleted = %v, want [WF#inst-9]", f.deleted)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("delete = nil, want the validation error (no Scan fallback)")
+			}
+			if got := atomic.LoadInt64(&f.scanCalls); got != 0 {
+				t.Fatalf("Scan calls = %d, want 0", got)
+			}
+		})
 	}
 }
 

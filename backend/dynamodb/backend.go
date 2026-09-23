@@ -253,20 +253,29 @@ func isMissingIndexError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	if strings.Contains(msg, "specified index") ||
-		strings.Contains(msg, "no such index") ||
-		strings.Contains(msg, "unknown index") {
+	// Typed nonexistent-index failure: unambiguous, always falls back to
+	// the full-table Scan.
+	var infe *types.IndexNotFoundException
+	if errors.As(err, &infe) {
 		return true
 	}
 	var rnfe *types.ResourceNotFoundException
-	if errors.As(err, &rnfe) && strings.Contains(msg, instanceGSIName) {
-		return true
+	if errors.As(err, &rnfe) {
+		return strings.Contains(err.Error(), instanceGSIName)
 	}
-	if strings.Contains(msg, instanceGSIName) && strings.Contains(strings.ToLower(msg), "index") {
-		return true
+	// Anything else must carry an explicit missing-index code AND phrasing.
+	// In particular a bare index-name mention (e.g. an IAM AccessDenied
+	// quoting the index ARN) must NOT fall back: that would silently turn
+	// every Terminate into perpetual full scans while hiding the config
+	// error, so unrecognized failures return false and surface.
+	lower := strings.ToLower(err.Error())
+	if !strings.Contains(lower, "validationexception") && !strings.Contains(lower, "indexnotfoundexception") {
+		return false
 	}
-	return false
+	return strings.Contains(lower, "specified index") ||
+		strings.Contains(lower, "no such index") ||
+		strings.Contains(lower, "unknown index") ||
+		strings.Contains(lower, "backfill")
 }
 
 func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string) error {

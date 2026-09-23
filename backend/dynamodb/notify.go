@@ -99,36 +99,41 @@ func (b *Backend) wakeDebounceOrDefault() time.Duration {
 // wakeWriteTimeout-bound context instead of being dropped with the stopped
 // timers. Post-Close wakes deliberately bypass coalescing — each one writes
 // — so a mutation racing Close still lands on fast exit. The synchronous
-// path is tracked in wakePostClose (not wakeWG: Add concurrent with Wait
-// panics, and post-Close writes may start while the flush is already
-// waiting), which the flush drains before returning, so it never interferes
-// with the in-flight flush unseen.
+// path registers in wakePostClose under wakeMu (not wakeWG: Add concurrent
+// with Wait panics, and post-Close writes may start while the flush is
+// already waiting), which the flush drains before returning, so it never
+// interferes with the in-flight flush unseen.
+//
+// The closed-check AND the wakePostClose registration are one critical
+// section under wakeMu, and the flush's final zero-observation holds the
+// same mutex: registration and observation are mutually exclusive, so a
+// mutation preempted between check and Add cannot slip through the flush's
+// observation and write post-Close after Close returned. Either this section
+// runs first (the flush observes the registration and drains it) or the
+// flush's observation runs first (the write begins after Close returned and
+// is the caller's responsibility).
 func (b *Backend) touchWake(ctx context.Context, pk, instanceID string) {
 	_ = ctx
+	d := b.wakeDebounceOrDefault()
+	b.wakeMu.Lock()
 	if b.wakeClosed.Load() {
-		b.writeWakePostClose(pk, instanceID)
+		// Lost the race with Close (or arrived after it): fall back to the
+		// synchronous path without touching shared debounce state. The Add
+		// happens before Unlock, so the flush — whose final observation
+		// also holds wakeMu — either sees this write and drains it or has
+		// already returned. It also keeps wakeWG.Add clear of the flush's
+		// Wait, which must never observe an Add once its counter is zero.
+		b.wakePostClose.Add(1)
+		b.wakeMu.Unlock()
+		b.writeWakeCounted(pk, instanceID)
 		return
 	}
-	d := b.wakeDebounceOrDefault()
 	if d <= 0 {
+		b.wakeMu.Unlock()
 		b.writeWake(context.Background(), pk, instanceID)
 		return
 	}
 	key := pk + "\x00" + instanceID
-	b.wakeMu.Lock()
-	if b.wakeClosed.Load() {
-		// Lost the race with Close after the fast-path check: Close has
-		// set the flag and either already snapshotted (an entry created
-		// here would be lost) or is about to. Fall back to the
-		// synchronous path without touching shared state. The lock
-		// serializes this recheck against the flush snapshot, so every
-		// touchWake is either flushed by Close or written here: none is
-		// dropped. It also keeps wakeWG.Add clear of the flush's Wait,
-		// which must never observe an Add once its counter is zero.
-		b.wakeMu.Unlock()
-		b.writeWakePostClose(pk, instanceID)
-		return
-	}
 	if b.wakePending == nil {
 		b.wakePending = make(map[string]wakeEntry)
 		b.wakeTimers = make(map[string]*time.Timer)
@@ -188,10 +193,13 @@ func (b *Backend) writeWakeBounded(pk, instanceID string) {
 	b.writeWake(ctx, pk, instanceID)
 }
 
-// writeWakePostClose performs one tracked best-effort wake write for the
-// post-Close touchWake path. The write registers in wakePostClose for its
-// whole flight, which flushPendingWakes drains before Close returns, so a
-// wake racing Close is waited on instead of dropped on fast exit: without
+// writeWakeCounted performs one tracked best-effort wake write for the
+// post-Close touchWake path. The caller registers the write in wakePostClose
+// under wakeMu before calling — sharing the mutex the flush's final
+// observation holds, so registration and observation are mutually exclusive
+// — and this function performs the bounded write and unregisters it on
+// completion, which the flush drains before Close returns. A wake racing
+// Close is therefore waited on instead of dropped on fast exit: without
 // this, the flush could snapshot empty debounce maps and Wait on a zero
 // wakeWG while the synchronous write is still in flight.
 //
@@ -202,9 +210,8 @@ func (b *Backend) writeWakeBounded(pk, instanceID string) {
 // zero. Each write stays wakeWriteTimeout-bounded, so the drain is bounded
 // as well. Writes that begin after the drain's final zero observation (i.e.
 // after Close returns) are inherently unobservable and remain the caller's
-// responsibility — but the window is a single atomic load before return.
-func (b *Backend) writeWakePostClose(pk, instanceID string) {
-	b.wakePostClose.Add(1)
+// responsibility — but the window is a single mutex-held check before return.
+func (b *Backend) writeWakeCounted(pk, instanceID string) {
 	defer b.wakePostClose.Add(-1)
 	b.writeWakeBounded(pk, instanceID)
 }
@@ -264,8 +271,18 @@ func (b *Backend) flushPendingWakes() {
 	// writes that start while it is being waited on), so without this drain
 	// the flush could return while such a write is still in flight and the
 	// process could exit before the wake lands. Each write is
-	// wakeWriteTimeout-bounded, so this wait is bounded as well.
-	for b.wakePostClose.Load() > 0 {
+	// wakeWriteTimeout-bounded, so this wait is bounded as well. Registration
+	// (the Add in touchWake) and the final zero-observation below share
+	// wakeMu, so they are mutually exclusive: a write that registered first
+	// is observed and waited on here, and one that registers later began
+	// after Close returned.
+	for {
+		b.wakeMu.Lock()
+		pending := b.wakePostClose.Load()
+		b.wakeMu.Unlock()
+		if pending <= 0 {
+			break
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
 }
