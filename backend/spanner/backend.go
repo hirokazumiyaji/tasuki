@@ -610,8 +610,12 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		return nil
 	}
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// Fresh per attempt: the client retries the closure on abort, and
+		// buffered mutations are discarded, so read-your-writes state must
+		// reset with it.
+		st := newSpannerTxnState()
 		for _, adv := range advs {
-			if err := b.commitAdvancementTxn(ctx, txn, adv); err != nil {
+			if err := b.commitAdvancementTxn(ctx, txn, st, adv); err != nil {
 				return err
 			}
 		}
@@ -642,7 +646,7 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			continue
 		}
 		if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-			return ensureWorkflowTaskIfInbox(ctx, txn, adv.InstanceID)
+			return ensureWorkflowTaskIfInbox(ctx, txn, nil, adv.InstanceID)
 		}); err != nil {
 			return err
 		}
@@ -741,7 +745,10 @@ func (b *Backend) deleteTerminalBatch(ctx context.Context, id string, includeInb
 	return n, err
 }
 
-func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWriteTransaction, adv backend.Advancement) error {
+func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWriteTransaction, st *spannerTxnState, adv backend.Advancement) error {
+	if st == nil {
+		st = newSpannerTxnState()
+	}
 	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{adv.InstanceID},
 		[]string{"status", "next_seq", "queue", "parent_id", "parent_seq"})
 	if err != nil {
@@ -782,6 +789,19 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	}
 	if kind != "workflow" || taskInst != adv.InstanceID {
 		return backend.ErrConflict
+	}
+	// Read-your-writes: Spanner buffers mutations client-side until commit,
+	// so queries below do not see them. The owned workflow task is deleted
+	// later in this commit; record it before any existence check, otherwise
+	// the check sees the stale row and skips the follow-up insert, leaving
+	// no claimable task (TerminalCleanup "claim wf for terminal" empty).
+	st.wfDeleted[adv.TaskID] = true
+	if adv.Terminal != nil {
+		st.terminal[adv.InstanceID] = true
+	} else {
+		for _, inboxID := range adv.DrainedInbox {
+			st.inboxDeleted[inboxID] = true
+		}
 	}
 
 	var muts []*spanner.Mutation
@@ -969,8 +989,9 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		if err := txn.BufferWrite(muts); err != nil {
 			return err
 		}
+		st.inboxAdded[parentID.StringVal]++
 		if parentStatus == "running" {
-			if err := enqueueWorkflowTask(ctx, txn, parentID.StringVal, parentQueue, now); err != nil {
+			if err := enqueueWorkflowTask(ctx, txn, st, parentID.StringVal, parentQueue, now); err != nil {
 				return err
 			}
 		}
@@ -981,7 +1002,13 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	}); err != nil {
 		return err
 	}
-	if err := ensureWorkflowTaskIfInbox(ctx, txn, adv.InstanceID); err != nil {
+	if adv.Terminal != nil {
+		// Terminal instances take no follow-up task. The status flip is
+		// only buffered, so the running check below would still see the
+		// stale pre-commit row; skip explicitly instead.
+		return nil
+	}
+	if err := ensureWorkflowTaskIfInbox(ctx, txn, st, adv.InstanceID); err != nil {
 		return err
 	}
 	if adv.EnsureWorkflowTask {
@@ -990,12 +1017,53 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		// the instance row itself, so no separate pre-read is needed, and
 		// its error must fail the advancement: without the follow-up task
 		// the uncommitted remainder could never be reached.
-		return enqueueWorkflowTask(ctx, txn, adv.InstanceID, "", nowUTC())
+		return enqueueWorkflowTask(ctx, txn, st, adv.InstanceID, "", nowUTC())
 	}
 	return nil
 }
 
-func enqueueWorkflowTask(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID, queue string, now time.Time) error {
+// spannerTxnState tracks buffered writes within one Spanner read-write
+// transaction for read-your-writes. Spanner buffers mutations client-side
+// until commit: queries in the same transaction do NOT see them, so the
+// check-then-insert workflow-task helpers consult this state to observe
+// post-commit state.
+type spannerTxnState struct {
+	// wfEnqueued marks instances with a workflow-task insert buffered in
+	// this transaction (dedupes repeat enqueues, which would otherwise
+	// violate the wf_tasks_wf_singleton unique index at commit).
+	wfEnqueued map[string]bool
+	// wfDeleted marks task IDs with a delete buffered in this transaction
+	// (the owned workflow task being committed, terminal sweep victims).
+	wfDeleted map[int64]bool
+	// terminal marks instances known terminal in this transaction (the
+	// status flip is only buffered, so status reads still see running).
+	terminal map[string]bool
+	// inboxDeleted marks inbox IDs with a delete buffered in this
+	// transaction (drained rows); inboxAdded counts inbox inserts buffered
+	// per instance.
+	inboxDeleted map[int64]bool
+	inboxAdded   map[string]int
+}
+
+func newSpannerTxnState() *spannerTxnState {
+	return &spannerTxnState{
+		wfEnqueued:   map[string]bool{},
+		wfDeleted:    map[int64]bool{},
+		terminal:     map[string]bool{},
+		inboxDeleted: map[int64]bool{},
+		inboxAdded:   map[string]int{},
+	}
+}
+
+func enqueueWorkflowTask(ctx context.Context, txn *spanner.ReadWriteTransaction, st *spannerTxnState, instanceID, queue string, now time.Time) error {
+	if st != nil {
+		if st.terminal[instanceID] {
+			return nil
+		}
+		if st.wfEnqueued[instanceID] {
+			return nil
+		}
+	}
 	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"queue", "status"})
 	if err != nil {
 		return err
@@ -1012,27 +1080,59 @@ func enqueueWorkflowTask(ctx context.Context, txn *spanner.ReadWriteTransaction,
 		queue = q
 	}
 	// Spanner reports unique violations at commit; check first (insert-or-ignore).
-	exist := txn.Query(ctx, spanner.Statement{
-		SQL:    `SELECT id FROM wf_tasks WHERE kind = 'workflow' AND instance_id = @id LIMIT 1`,
+	// The check must ignore tasks deleted earlier in this transaction: the
+	// owned workflow task's delete is only buffered, so the pre-commit row
+	// is still returned and would wrongly suppress the follow-up insert.
+	iter := txn.Query(ctx, spanner.Statement{
+		SQL:    `SELECT id FROM wf_tasks WHERE kind = 'workflow' AND instance_id = @id`,
 		Params: map[string]any{"id": instanceID},
 	})
-	_, err = exist.Next()
-	exist.Stop()
-	if err == nil {
+	live := false
+	for {
+		r, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			iter.Stop()
+			return err
+		}
+		var tid int64
+		if err := r.Columns(&tid); err != nil {
+			iter.Stop()
+			return err
+		}
+		if st != nil && st.wfDeleted[tid] {
+			continue
+		}
+		live = true
+		break
+	}
+	iter.Stop()
+	if live {
+		if st != nil {
+			st.wfEnqueued[instanceID] = true
+		}
 		return nil
 	}
-	if err != iterator.Done {
-		return err
-	}
-	return txn.BufferWrite([]*spanner.Mutation{
+	if err := txn.BufferWrite([]*spanner.Mutation{
 		spanner.InsertMap("wf_tasks", map[string]any{
 			"id": newID(), "kind": "workflow", "queue": queue, "instance_id": instanceID,
 			"attempt": int64(0), "visible_at": now, "created_at": now,
 		}),
-	})
+	}); err != nil {
+		return err
+	}
+	if st != nil {
+		st.wfEnqueued[instanceID] = true
+	}
+	return nil
 }
 
-func ensureWorkflowTaskIfInbox(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string) error {
+func ensureWorkflowTaskIfInbox(ctx context.Context, txn *spanner.ReadWriteTransaction, st *spannerTxnState, instanceID string) error {
+	if st != nil && st.terminal[instanceID] {
+		return nil
+	}
 	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"status", "queue"})
 	if err != nil {
 		if isNotFound(err) {
@@ -1047,19 +1147,37 @@ func ensureWorkflowTaskIfInbox(ctx context.Context, txn *spanner.ReadWriteTransa
 	if status != "running" {
 		return nil
 	}
+	if st != nil && st.inboxAdded[instanceID] > 0 {
+		return enqueueWorkflowTask(ctx, txn, st, instanceID, queue, nowUTC())
+	}
+	// The inbox check must ignore rows drained earlier in this transaction:
+	// their deletes are only buffered, so drained rows still read back and
+	// would otherwise cause a spurious follow-up task.
 	iter := txn.Query(ctx, spanner.Statement{
-		SQL:    `SELECT 1 FROM wf_inbox WHERE instance_id = @id LIMIT 1`,
+		SQL:    `SELECT id FROM wf_inbox WHERE instance_id = @id`,
 		Params: map[string]any{"id": instanceID},
 	})
-	_, err = iter.Next()
-	iter.Stop()
-	if err == iterator.Done {
-		return nil
+	for {
+		r, err := iter.Next()
+		if err == iterator.Done {
+			iter.Stop()
+			return nil
+		}
+		if err != nil {
+			iter.Stop()
+			return err
+		}
+		var inboxID int64
+		if err := r.Columns(&inboxID); err != nil {
+			iter.Stop()
+			return err
+		}
+		if st != nil && st.inboxDeleted[inboxID] {
+			continue
+		}
+		iter.Stop()
+		return enqueueWorkflowTask(ctx, txn, st, instanceID, queue, nowUTC())
 	}
-	if err != nil {
-		return err
-	}
-	return enqueueWorkflowTask(ctx, txn, instanceID, queue, nowUTC())
 }
 
 func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
@@ -1114,7 +1232,7 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 			return err
 		}
 		wake = true
-		return enqueueWorkflowTask(ctx, txn, instanceID, queue, now)
+		return enqueueWorkflowTask(ctx, txn, nil, instanceID, queue, now)
 	})
 	if err != nil {
 		return err
@@ -1151,6 +1269,10 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n = 0
 		now := nowUTC()
+		// Shared across dues in this transaction: repeat fires for the same
+		// instance must not buffer duplicate workflow-task inserts (reads
+		// do not see the first insert; the unique index would fail commit).
+		st := newSpannerTxnState()
 		iter := txn.Query(ctx, spanner.Statement{
 			SQL: `SELECT instance_id, seq FROM wf_timers
 				WHERE fire_at <= @now ORDER BY fire_at, instance_id, seq LIMIT @limit`,
@@ -1216,7 +1338,7 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			if err := txn.BufferWrite(muts); err != nil {
 				return err
 			}
-			if err := enqueueWorkflowTask(ctx, txn, d.instanceID, "", now); err != nil {
+			if err := enqueueWorkflowTask(ctx, txn, st, d.instanceID, "", now); err != nil {
 				return err
 			}
 			n++
@@ -1301,7 +1423,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			}
 		}
 		if inserted > 0 && status == "running" {
-			return enqueueWorkflowTask(ctx, txn, instanceID, queue, now)
+			return enqueueWorkflowTask(ctx, txn, nil, instanceID, queue, now)
 		}
 		return nil
 	})
@@ -1312,7 +1434,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		return nil
 	}
 	if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		return ensureWorkflowTaskIfInbox(ctx, txn, instanceID)
+		return ensureWorkflowTaskIfInbox(ctx, txn, nil, instanceID)
 	}); err != nil {
 		return err
 	}
