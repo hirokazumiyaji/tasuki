@@ -226,3 +226,42 @@ func BadMethodOnlyMakeChan[C interface {
 	_ = make(C) // want `make\(chan`
 	return nil
 }
+
+// comparable filters non-comparable terms (maps, slices, funcs) out of the
+// candidate set: `~map[string]int | ~chan int` ∩ comparable is {chan int},
+// so range and make over it must still flag as channel operations (not map
+// operations, and not silence).
+
+func BadComparableMixedRange[C interface {
+	~map[string]int | ~chan int
+	comparable
+}](ctx *workflow.Context, ch C) error {
+	for v := range ch { // want `ranging over a channel is not allowed`
+		_ = v
+	}
+	return nil
+}
+
+func BadComparableMixedMake[C interface {
+	~map[string]int | ~chan int
+	comparable
+}](ctx *workflow.Context, _ struct{}) error {
+	_ = make(C) // want `make\(chan`
+	return nil
+}
+
+// The filter is transitive through named constraints: Base carries
+// comparable into the intersection even though the outer interface never
+// names it.
+
+type ComparableBase interface{ comparable }
+
+func BadComparableNamedMixedRange[C interface {
+	~map[string]int | ~chan int
+	ComparableBase
+}](ctx *workflow.Context, ch C) error {
+	for v := range ch { // want `ranging over a channel is not allowed`
+		_ = v
+	}
+	return nil
+}

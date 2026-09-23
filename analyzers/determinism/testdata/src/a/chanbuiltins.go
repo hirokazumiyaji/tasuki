@@ -102,3 +102,30 @@ func OkGenericLenSlice[S ~[]int](ctx *workflow.Context, s S) error {
 	_ = len(s)
 	return nil
 }
+
+// close/len/cap accept channel unions with mixed element types (unlike make,
+// which must allocate a common element type): every instantiation is a
+// send-capable channel, so these must still be flagged.
+
+func BadMixedCloseChan[C chan int | chan string](ctx *workflow.Context, ch C) error {
+	close(ch) // want `close on a channel is not allowed`
+	return nil
+}
+
+func BadMixedLenChan[C chan int | chan string](ctx *workflow.Context, ch C) error {
+	_ = len(ch) // want `len on a channel is not allowed`
+	return nil
+}
+
+func BadMixedCapChan[C chan int | chan string](ctx *workflow.Context, ch C) error {
+	_ = cap(ch) // want `cap on a channel is not allowed`
+	return nil
+}
+
+// A mixed channel/non-channel union is not provably a channel operand: len
+// may legally apply to the non-channel member, so it stays clean.
+
+func OkMixedChanSliceLen[C chan int | []int](ctx *workflow.Context, x C) error {
+	_ = len(x)
+	return nil
+}

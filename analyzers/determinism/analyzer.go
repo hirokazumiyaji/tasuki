@@ -411,19 +411,29 @@ func checkCall(pass *analysis.Pass, call *ast.CallExpr) {
 	// below (empty package path). Recognize the predeclared builtins here —
 	// TypesInfo.Uses resolves to *types.Builtin only for the real builtin,
 	// so a shadowing local or package-level func never matches — and flag
-	// channel arguments through the same core-type resolution as make/range
-	// (coreMakeChanType covers named channels and channel-constraint type
-	// parameters of any direction). len/cap on non-channels (slices, maps,
-	// strings) stay clean, and close on a non-channel does not compile, so
-	// only channel arguments are ever flagged.
+	// channel arguments through the builtin-specific classifier
+	// (coreBuiltinChanType): unlike make, close/len/cap accept channel
+	// unions with mixed element types (`C chan int | chan string` is
+	// closable/measurable for every instantiation), so no common element is
+	// required — only that every term be a channel, plus send capability
+	// for close. len/cap on non-channels (slices, maps, strings) stay
+	// clean, and close on a non-channel does not compile, so only channel
+	// arguments are ever flagged.
 	if pkgPath == "" && len(call.Args) == 1 {
 		if ident, ok := unwrapParen(call.Fun).(*ast.Ident); ok {
 			if obj, ok := pass.TypesInfo.Uses[ident]; ok {
 				if b, ok := obj.(*types.Builtin); ok {
 					switch b.Name() {
-					case "close", "len", "cap":
+					case "close":
 						if tv, ok := pass.TypesInfo.Types[call.Args[0]]; ok && tv.Type != nil {
-							if _, ok := coreMakeChanType(tv.Type).(*types.Chan); ok {
+							if _, ok := coreBuiltinChanType(tv.Type, true).(*types.Chan); ok {
+								pass.Reportf(call.Pos(), "%s on a channel is not allowed in workflow code; use workflow.Execute/ExecuteAsync and workflow.Await", b.Name())
+								return
+							}
+						}
+					case "len", "cap":
+						if tv, ok := pass.TypesInfo.Types[call.Args[0]]; ok && tv.Type != nil {
+							if _, ok := coreBuiltinChanType(tv.Type, false).(*types.Chan); ok {
 								pass.Reportf(call.Pos(), "%s on a channel is not allowed in workflow code; use workflow.Execute/ExecuteAsync and workflow.Await", b.Name())
 								return
 							}
@@ -477,9 +487,11 @@ func checkMapRange(pass *analysis.Pass, x *ast.RangeStmt) {
 // embedded constraint term: union members expand per member, exact terms
 // (e.g. `C chan int`) resolve to their underlying type, and embedded
 // constraint interfaces (named like `Base` or anonymous) resolve to their
-// effective (intersected) set. Recursion is guarded by seen with mark/unmark
-// so sibling embeds sharing a base do not suppress each other; cycles yield
-// no terms (the caller treats term-less embeds as neutral). Non-channel/map terms are kept as-is for the caller to reject.
+// effective (intersected, comparable-filtered) set. Recursion is guarded by
+// seen with mark/unmark so sibling embeds sharing a base do not suppress
+// each other; cycles yield no terms (the caller treats term-less embeds as
+// method-only-neutral unless they carry `comparable`, which filters).
+// Non-channel/map terms are kept as-is for the caller to reject.
 func embeddedAlternatives(embedded types.Type, seen map[types.Type]bool) []types.Type {
 	et := types.Unalias(embedded)
 	if union, ok := et.(*types.Union); ok {
@@ -522,9 +534,13 @@ func embeddedAlternatives(embedded types.Type, seen map[types.Type]bool) []types
 // a mixed list although only chan int satisfies both embeds. A single embed
 // intersects to itself, preserving all prior single-union behavior.
 //
-// Embeds contributing zero type terms (comparable, method-only interfaces)
-// are neutral and skipped: they constrain by method set, not by type terms,
-// so they must filter nothing at the core-type level. Treating them as empty
+// A `comparable` embed is not neutral: it filters the intersected candidates,
+// dropping terms that definitely violate comparability (slices, maps, funcs)
+// while keeping everything else — e.g.
+// `interface { ~map[string]int | ~chan int; comparable }` is {chan int}, so
+// range/make over it must still flag as a channel. Method-only embeds stay
+// neutral (they constrain by method set, not by type terms, so they filter
+// nothing at the core-type level); treating any term-less embed as empty
 // would erase the intersection (e.g. `interface { ~chan int; comparable }`
 // must keep {chan int}). Genuinely empty intersections (e.g. `int` ∩
 // `string`) still yield empty via intersectTypeSets below — no value can
@@ -532,9 +548,23 @@ func embeddedAlternatives(embedded types.Type, seen map[types.Type]bool) []types
 // embed contributes terms at all, nil is returned as before (unconstrained).
 func effectiveConstraintSet(iface *types.Interface, seen map[types.Type]bool) []types.Type {
 	var sets [][]types.Type
+	hasComparable := false
 	for i := 0; i < iface.NumEmbeddeds(); i++ {
-		alt := embeddedAlternatives(iface.EmbeddedType(i), seen)
+		emb := iface.EmbeddedType(i)
+		if isComparableEmbed(emb) {
+			hasComparable = true
+			continue
+		}
+		alt := embeddedAlternatives(emb, seen)
 		if len(alt) == 0 {
+			// A term-less embed is either method-only (neutral) or a named
+			// constraint carrying comparable transitively (e.g.
+			// `interface { Base; ... }` with
+			// `type Base interface{ comparable }`): only the latter must
+			// filter the final candidates.
+			if embedCarriesComparable(emb) {
+				hasComparable = true
+			}
 			continue
 		}
 		sets = append(sets, alt)
@@ -542,7 +572,87 @@ func effectiveConstraintSet(iface *types.Interface, seen map[types.Type]bool) []
 	if len(sets) == 0 {
 		return nil
 	}
-	return intersectTypeSets(sets)
+	out := intersectTypeSets(sets)
+	if hasComparable {
+		out = filterComparable(out)
+	}
+	return out
+}
+
+// isComparableEmbed reports whether an embedded constraint term is the
+// predeclared universe `comparable`. A user-declared type that happens to be
+// named "comparable" carries its package qualifier in the type string and
+// never matches.
+func isComparableEmbed(emb types.Type) bool {
+	et := types.Unalias(emb)
+	if named, ok := et.(*types.Named); ok {
+		if obj := named.Obj(); obj != nil && obj.Name() == "comparable" && obj.Pkg() == nil {
+			return true
+		}
+	}
+	return types.TypeString(et, nil) == "comparable"
+}
+
+// embedCarriesComparable reports whether an embedded constraint carries a
+// `comparable` restriction transitively: either the predeclared comparable
+// itself or a (possibly named) constraint interface embedding it. Unions
+// never carry it — comparable cannot be a union member — and non-interface
+// exact terms (e.g. `C chan int`) do not constrain comparability.
+func embedCarriesComparable(emb types.Type) bool {
+	return embedCarriesComparableSeen(emb, map[types.Type]bool{})
+}
+
+func embedCarriesComparableSeen(emb types.Type, seen map[types.Type]bool) bool {
+	if isComparableEmbed(emb) {
+		return true
+	}
+	et := types.Unalias(emb)
+	if _, ok := et.(*types.Union); ok {
+		return false
+	}
+	inner, ok := et.Underlying().(*types.Interface)
+	if !ok {
+		return false
+	}
+	if seen[et] {
+		return false
+	}
+	seen[et] = true
+	defer delete(seen, et)
+	for i := 0; i < inner.NumEmbeddeds(); i++ {
+		if embedCarriesComparableSeen(inner.EmbeddedType(i), seen) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterComparable drops candidates that definitely violate comparability:
+// slices, maps, and funcs are never comparable. Channels are always
+// comparable and stay; arrays, structs, basic types, interfaces, and type
+// parameters stay conservatively (precise comparability of composites
+// depends on their elements/fields, and interfaces may hold comparable
+// dynamics).
+func filterComparable(terms []types.Type) []types.Type {
+	var out []types.Type
+	for _, t := range terms {
+		if violatesComparable(t) {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+// violatesComparable reports whether t's core type is definitely not
+// comparable (slice, map, or func). Everything else is kept conservatively
+// (see filterComparable).
+func violatesComparable(t types.Type) bool {
+	switch types.Unalias(t).Underlying().(type) {
+	case *types.Slice, *types.Map, *types.Signature:
+		return true
+	}
+	return false
 }
 
 // intersectTypeSets returns members of sets[0] present (types.Identical) in
@@ -689,6 +799,56 @@ func coreMakeChanType(t types.Type) types.Type {
 	for _, term := range terms[1:] {
 		ch, ok := term.(*types.Chan)
 		if !ok || !types.Identical(elem, ch.Elem()) {
+			return nil
+		}
+	}
+	return terms[0]
+}
+
+// coreBuiltinChanType resolves the channel operand of the close/len/cap
+// builtins, where the argument may be a channel type or a type parameter
+// whose constraint is a channel union. Unlike make (which requires a common
+// element type to allocate) and range (which requires a single core type to
+// type the iteration variables), close/len/cap accept ANY channel union:
+// `C chan int | chan string` is closable and measurable for every
+// instantiation, so the classifier requires only that every term be a
+// channel — with NO common-element requirement — plus send capability for
+// close (bidirectional or send-only; a receive-only member would not compile
+// under close). Only the close/len/cap builtin checks use it. It returns nil
+// when the operand cannot be a channel builtin argument (e.g. a mixed
+// channel/non-channel union, where len may legally apply to the non-channel
+// member), in which case the call stays clean.
+func coreBuiltinChanType(t types.Type, needSend bool) types.Type {
+	tp, ok := types.Unalias(t).(*types.TypeParam)
+	if !ok {
+		u := types.Unalias(t).Underlying()
+		ch, ok := u.(*types.Chan)
+		if !ok {
+			return nil
+		}
+		if needSend && ch.Dir() == types.RecvOnly {
+			return nil
+		}
+		return u
+	}
+	c := tp.Constraint()
+	if c == nil {
+		return nil
+	}
+	iface, ok := c.Underlying().(*types.Interface)
+	if !ok {
+		return nil
+	}
+	terms := embeddedCoreTerms(iface)
+	if len(terms) == 0 {
+		return nil
+	}
+	for _, term := range terms {
+		ch, ok := term.(*types.Chan)
+		if !ok {
+			return nil
+		}
+		if needSend && ch.Dir() == types.RecvOnly {
 			return nil
 		}
 	}
