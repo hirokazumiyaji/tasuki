@@ -1203,6 +1203,182 @@ func TestFairOverflowRequerySkipsWithoutLoss(t *testing.T) {
 	// (all lossy); this gate only skips the lost==0 rescan.
 }
 
+func TestFairOverflowRequeryEmptyCarryAfterLoss(t *testing.T) {
+	// Covers the round-13 P2s (issue #294) at the refill-loop level without
+	// a live DB: (a) an empty carry pass after an earlier lock loss must
+	// still requery; (b) the attempted-ID set is recorded only while an
+	// overflow requery may need it.
+	//
+	// (a): Limit=3, MaxPerInstance=1 over FIFO A1,B1..B2001,A2 with A1 lost
+	// to a concurrent lock. Pass 1 secures B1, retains 2000 rejected Bs, and
+	// drops A2 past FairRejectedCap; pass 2 re-offers the carry against the
+	// seeded B cap, picks nothing, and — pre-fix — breaks unconditionally,
+	// stranding A2 although the pass-1 lock loss freed quota for it. The
+	// fixed loop carries the loss across passes (lostLock) and requeries
+	// from the pre-overflow snapshot, recovering A2 for slot 3.
+	const limit, perInstance = 3, 1
+	mainFeed := make([]backend.FairTaskRef, 0, backend.FairRejectedCap+3)
+	mainFeed = append(mainFeed, backend.FairTaskRef{ID: 1, InstanceID: "A"})
+	for i := 0; i < backend.FairRejectedCap+1; i++ {
+		mainFeed = append(mainFeed, backend.FairTaskRef{ID: int64(i + 2), InstanceID: "B"})
+	}
+	mainFeed = append(mainFeed, backend.FairTaskRef{ID: int64(backend.FairRejectedCap + 3), InstanceID: "A"})
+	mainLost := func(id int64) bool { return id == 1 }
+	// (b): a small overflow-free claim (alternating A/B, nothing rejected
+	// past the cap) never consults the attempted set.
+	miniFeed := []backend.FairTaskRef{
+		{ID: 1, InstanceID: "A"}, {ID: 2, InstanceID: "B"},
+		{ID: 3, InstanceID: "A"}, {ID: 4, InstanceID: "B"},
+		{ID: 5, InstanceID: "A"}, {ID: 6, InstanceID: "B"},
+	}
+	miniLost := func(id int64) bool { return id == 2 }
+
+	// runRefill mirrors the postgres/mysql refill loops with the round-13
+	// fixes under `fixed`: the lostLock cross-pass flag gating the zero-pick
+	// requery, and attempted recording only while overflowSeen (or inside a
+	// requery pass). With fixed=false it mirrors the pre-fix loop
+	// (unconditional break on an empty pick, unconditional recording).
+	runRefill := func(fixed bool, feed []backend.FairTaskRef, lockLost func(int64) bool) (out []backend.FairTaskRef, arms, attemptedSize int) {
+		cursor := 0
+		var lastID int64
+		first := true
+		var claimed, pending []backend.FairTaskRef
+		var overflowSnapValid, overflowSeen bool
+		var overflowSnapID int64
+		var requeryPasses, requeryAttempted, requeryOut int
+		attempted := map[int64]struct{}{}
+		lostLock := false
+		startOverflowRequery := func() bool {
+			if len(out) >= limit || !overflowSeen || !overflowSnapValid || requeryPasses >= backend.MaxOverflowRequeryPasses {
+				return false
+			}
+			if requeryPasses > 0 && len(attempted) <= requeryAttempted && len(out) <= requeryOut {
+				return false
+			}
+			requeryPasses++
+			arms++
+			requeryAttempted, requeryOut = len(attempted), len(out)
+			overflowSeen = false
+			first = false
+			cursor = int(overflowSnapID) // IDs are 1-based sequential
+			overflowSnapValid = false
+			pending = nil
+			return true
+		}
+		passes := 0
+		for len(out) < limit {
+			passes++
+			if passes > 4*len(feed)+20 {
+				t.Fatalf("refill loop did not terminate (fixed=%v)", fixed)
+			}
+			picker := backend.NewFairPicker(limit-len(out), perInstance).TrackRejected()
+			picker.Seed(claimed)
+			offered := 0
+			for _, r := range pending {
+				if picker.Full() {
+					break
+				}
+				picker.Offer(r)
+				offered++
+			}
+			if !picker.Full() {
+				for !picker.Full() && cursor < len(feed) {
+					r := feed[cursor]
+					cursor++
+					if !overflowSeen && !picker.RejectedCapped() {
+						overflowSnapID, overflowSnapValid = lastID, !first
+					}
+					first = false
+					lastID = r.ID
+					if _, dup := attempted[r.ID]; !(requeryPasses > 0 && dup) {
+						offerFull := picker.Offer(r)
+						if picker.RejectedCapped() {
+							overflowSeen = true
+						}
+						if offerFull {
+							break
+						}
+					}
+				}
+			}
+			scanExhausted := !picker.Full()
+			picked := picker.Picked()
+			iterRejected := picker.Rejected()
+			if !fixed || overflowSeen || requeryPasses > 0 {
+				for _, r := range picked {
+					attempted[r.ID] = struct{}{}
+				}
+			}
+			if len(picked) == 0 {
+				if fixed {
+					if lostLock && startOverflowRequery() {
+						continue
+					}
+					break
+				}
+				break
+			}
+			prevOut := len(out)
+			for _, r := range picked {
+				if lockLost(r.ID) {
+					continue
+				}
+				out = append(out, r)
+				claimed = append(claimed, r)
+			}
+			if len(out)-prevOut < len(picked) {
+				lostLock = true
+			}
+			if len(out) >= limit {
+				break
+			}
+			if scanExhausted {
+				if lost := len(picked) - (len(out) - prevOut); lost == 0 || len(iterRejected) == 0 {
+					if startOverflowRequery() {
+						continue
+					}
+					break
+				}
+			}
+			pending = append(iterRejected, pending[offered:]...)
+			if len(pending) > backend.FairRejectedCap {
+				pending = pending[:backend.FairRejectedCap]
+			}
+		}
+		return out, arms, len(attempted)
+	}
+
+	// Pre-fix shape: the empty second pass breaks, stranding A2.
+	if got, _, _ := runRefill(false, mainFeed, mainLost); len(got) != 1 || got[0].InstanceID != "B" {
+		t.Fatalf("pre-fix refill: got %v, want [B1] (A2 stranded past the cap)", got)
+	}
+	// Fixed contract: one requery arm recovers the never-attempted A2, and
+	// the attempted set holds only overflow/requery picks.
+	got, arms, size := runRefill(true, mainFeed, mainLost)
+	if len(got) != 2 || arms != 1 {
+		t.Fatalf("fixed refill: got %v arms=%d, want [B1 A2] with 1 requery arm", got, arms)
+	}
+	seen := map[int64]bool{}
+	for _, r := range got {
+		seen[r.ID] = true
+	}
+	tail := int64(backend.FairRejectedCap + 3)
+	if !seen[2] || !seen[tail] {
+		t.Fatalf("fixed refill: got %v, want B1 and dropped A%d", got, tail)
+	}
+	if size != 3 {
+		t.Fatalf("fixed refill: attempted set size=%d, want 3 (A1, B1, A2 only)", size)
+	}
+	// Bounded tracker: an overflow-free claim records nothing under the fix
+	// (pre-fix it records every pick, O(queue) on lock-heavy claims).
+	if _, _, sizePre := runRefill(false, miniFeed, miniLost); sizePre == 0 {
+		t.Fatal("pre-fix tracker: want every pick recorded (pins the old waste)")
+	}
+	if _, _, sizeFixed := runRefill(true, miniFeed, miniLost); sizeFixed != 0 {
+		t.Fatalf("fixed tracker: overflow-free claim recorded %d IDs, want 0", sizeFixed)
+	}
+}
+
 func TestFairPickerRelease(t *testing.T) {
 	mk := func(id int64, inst string) backend.FairTaskRef {
 		return backend.FairTaskRef{ID: id, InstanceID: inst}

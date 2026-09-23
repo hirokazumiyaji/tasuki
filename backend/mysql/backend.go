@@ -397,16 +397,25 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 		requeryAttempted  int
 		requeryAccepted   int
 		attempted         map[int64]struct{}
+		// lostLock remembers whether ANY earlier pass in this batch lost
+		// picks to concurrent locks, freeing quota a later pass can reuse
+		// (round-13 P2 on #294). A pass that picks nothing loses nothing
+		// itself, so without this cross-pass flag it cannot tell whether a
+		// requery could admit a previously dropped row.
+		lostLock bool
 	)
 	// startOverflowRequery arms the next bounded requery pass from the
 	// pre-overflow snapshot when the batch would otherwise return
 	// underfilled after retention overflowed AND a lock loss actually freed
-	// quota (lost>0 at the call site). When every pick succeeded (lost==0)
-	// no slot was freed, so a requery would rescan the same dropped tail
-	// against the same per-instance caps and return an identical result —
-	// up to 2x the scan cost for nothing. Call sites therefore gate on
-	// lost>0 and skip the requery (break) when nothing was lost; the
-	// dropped rows stay claimable for a later poll starting from the head.
+	// quota. When every pick succeeded no slot was freed, so a requery would
+	// rescan the same dropped tail against the same per-instance caps and
+	// return an identical result — up to 2x the scan cost for nothing. The
+	// scan-exhausted call site therefore gates on its own pass lost>0, while
+	// the zero-pick call site gates on the cross-pass lostLock flag: a pass
+	// that picks nothing loses nothing itself, but an earlier pass may have
+	// freed quota (round-13 P2 on #294). Call sites skip the requery (break)
+	// when no loss freed quota; the dropped rows stay claimable for a later
+	// poll starting from the head.
 	// It reports whether the caller
 	// should continue to the extra pass instead of breaking. At either break
 	// point the retained carry is exhausted (a pass that leaves un-offered
@@ -537,20 +546,36 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 		scanExhausted := !picker.Full()
 		picked := picker.Picked()
 		iterRejected := picker.Rejected()
-		// Record every pick attempt so the overflow requery below can skip
-		// IDs already put through the lock step this batch.
-		for _, r := range picked {
-			if attempted == nil {
-				attempted = make(map[int64]struct{})
+		// Record pick attempts only while an overflow requery may need them
+		// (round-13 P2 on #294): the set is consulted solely by requery
+		// passes (to skip already-attempted IDs in favor of never-attempted
+		// dropped rows), so recording every pick on batches that never
+		// overflow grows O(queue) on lock-heavy batches for nothing.
+		// Overflow passes record their picks; requery passes keep recording
+		// theirs for the progress guard and successive segments.
+		if overflowSeen || requeryPasses > 0 {
+			for _, r := range picked {
+				if attempted == nil {
+					attempted = make(map[int64]struct{})
+				}
+				attempted[r.ID] = struct{}{}
 			}
-			attempted[r.ID] = struct{}{}
 		}
 		if len(picked) == 0 {
-			// No picks means no lock losses freed quota (lost==0 by
-			// definition): an overflow requery would re-offer the dropped
-			// tail against identical caps and return the same empty pick,
-			// so skip it and break. Dropped rows stay claimable for later
-			// polls.
+			// No picks means this pass lost nothing (lost==0 by
+			// definition): without a prior loss an overflow requery would
+			// re-offer the dropped tail against identical caps and return
+			// the same empty pick, so skip it and break. But when an
+			// earlier pass lost picks to locks (lostLock), quota was freed
+			// that can admit a previously dropped row (e.g. Limit=3/
+			// MaxPerInstance=1 over A1,B1,B2..B2001,A2 with A1 locked:
+			// pass 1 secures B1 and drops A2 past the cap, pass 2
+			// re-rejects the carry and picks nothing — only a requery from
+			// the pre-overflow snapshot revisits A2). Dropped rows stay
+			// claimable for later polls.
+			if lostLock && startOverflowRequery() {
+				continue
+			}
 			break
 		}
 		// Lock only the accepted IDs. Rows locked by a concurrent claimant
@@ -591,6 +616,12 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 			if locked[r.ID] {
 				accepted = append(accepted, r)
 			}
+		}
+		if len(accepted)-prevAccepted < len(picked) {
+			// Picks lost to concurrent locks free quota a later pass can
+			// reuse; remember across passes for the zero-pick requery gate
+			// above (round-13 P2 on #294).
+			lostLock = true
 		}
 		if len(accepted) >= req.Limit {
 			break
