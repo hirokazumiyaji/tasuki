@@ -172,11 +172,11 @@ func TestWorker_DetachedCommitRenewalEnteredBeforeCancelCheck(t *testing.T) {
 		errBlocked: make(chan struct{}),
 		errRelease: make(chan struct{}),
 	}
-	w.track(task.ID)
-	defer w.untrack(task.ID)
+	tok := w.track(task.ID)
+	defer w.untrack(task.ID, tok)
 	store.armCommit.Store(true)
 	herrCh := make(chan error, 1)
-	go func() { herrCh <- w.handleActivity(hook, task) }()
+	go func() { herrCh <- w.handleActivity(hook, task, tok) }()
 
 	select {
 	case <-hook.errBlocked:
@@ -240,11 +240,11 @@ func TestWorker_UnregisteredActivityRenewalCoversEarlyNack(t *testing.T) {
 	// visible, and the gated run below exercises the same early path.
 	task := setupClaimableActivityTask(t, ctx, store, mem, w, "early-nack-1", "ghost")
 
-	w.track(task.ID)
-	defer w.untrack(task.ID)
+	tok := w.track(task.ID)
+	defer w.untrack(task.ID, tok)
 	store.armNack.Store(true)
 	herrCh := make(chan error, 1)
-	go func() { herrCh <- w.handleActivity(ctx, task) }()
+	go func() { herrCh <- w.handleActivity(ctx, task, tok) }()
 	select {
 	case <-store.nackEntered:
 	case <-time.After(5 * time.Second):

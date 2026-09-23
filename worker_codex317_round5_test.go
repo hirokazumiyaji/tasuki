@@ -151,10 +151,10 @@ func TestWorker_CanceledActivityReleaseJoinsRenewal(t *testing.T) {
 		errEntered: make(chan struct{}),
 		errRelease: make(chan struct{}),
 	}
-	w.track(task.ID)
-	defer w.untrack(task.ID)
+	tok := w.track(task.ID)
+	defer w.untrack(task.ID, tok)
 	herrCh := make(chan error, 1)
-	go func() { herrCh <- w.handleActivity(hook, task) }()
+	go func() { herrCh <- w.handleActivity(hook, task, tok) }()
 
 	select {
 	case <-hook.errEntered:

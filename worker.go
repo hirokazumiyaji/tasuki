@@ -33,7 +33,27 @@ type Worker struct {
 	// clear the peer's fresh lease. Release paths must honor the expiry;
 	// result commits additionally transfer ownership out of this map
 	// before touching the store (see claimCommitOwnership).
-	inFlight map[int64]time.Time
+	//
+	// Entries are stamped with the claiming invocation's token (start
+	// epoch + per-claim sequence): a Start-parent cancel followed by a
+	// worker restart lets a cancellation-ignoring invocation outlive its
+	// lease while the new generation reclaims and tracks the same task
+	// ID. The stale invocation must not treat the new entry as its own
+	// (delete it and release the new lease, enabling concurrent
+	// execution). Every removal honors the token and ignores entries
+	// stamped by another invocation.
+	inFlight map[int64]inFlightEntry
+	// epoch identifies this worker's Start generation. It is incremented
+	// on every StartWithError under mu and stamped into each in-flight
+	// entry, so a claim from a previous run never matches an entry
+	// tracked by the current run (see claimToken).
+	epoch uint64
+	// claimSeq sources per-claim sequence numbers stamped into each
+	// in-flight entry. It is monotonic across restarts, so two
+	// invocations of the same generation claiming the same task ID (a
+	// reclaim after local expiry with spare concurrency) still hold
+	// distinct tokens.
+	claimSeq uint64
 
 	stickyMu sync.Mutex
 	sticky   map[string]stickyEntry
@@ -73,12 +93,32 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		backend:  b,
 		opts:     opts,
 		reg:      newRegistry(opts.Codec),
-		inFlight: map[int64]time.Time{},
+		inFlight: map[int64]inFlightEntry{},
 		sticky:   map[string]stickyEntry{},
 		instLock: map[string]*workflowActor{},
 		wfSem:    make(chan struct{}, opts.WorkflowConcurrency),
 		actSem:   make(chan struct{}, opts.ActivityConcurrency),
 	}
+}
+
+// inFlightEntry is one tracked claim: the local lease-expiry estimate plus
+// the claiming invocation's token (see claimToken).
+type inFlightEntry struct {
+	expiry time.Time
+	epoch  uint64
+	seq    uint64
+}
+
+// claimToken identifies one claim invocation: the worker Start generation
+// (epoch) plus a per-claim sequence number. In-flight removals (untrack,
+// commit/release ownership, lease refresh) honor the token and ignore
+// entries stamped by another invocation, so a stale invocation from a
+// previous run — or an earlier claim of the same run that lost its lease
+// to a reclaim — cannot delete or release a new generation's entry for
+// the same task ID.
+type claimToken struct {
+	epoch uint64
+	seq   uint64
 }
 
 func (w *Worker) Start(parent context.Context) {
@@ -112,6 +152,10 @@ func (w *Worker) StartWithError(parent context.Context) error {
 	done := make(chan struct{})
 	w.cancel = cancel
 	w.done = done
+	// A new Start generation: stamp subsequent claims with a fresh epoch
+	// so invocations from a previous run (still holding cancellation-
+	// ignoring activities) never match entries tracked by this run.
+	w.epoch++
 	w.actMu.Lock()
 	w.stopping = false
 	// Execution observes the Start parent (so parent cancel still aborts
@@ -306,16 +350,21 @@ func (w *Worker) commitContext(ctx context.Context) (context.Context, context.Ca
 	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
 
-func (w *Worker) track(taskID int64) {
+func (w *Worker) track(taskID int64) claimToken {
 	w.mu.Lock()
-	w.inFlight[taskID] = time.Now().Add(w.leaseDuration())
-	w.mu.Unlock()
+	defer w.mu.Unlock()
+	w.claimSeq++
+	tok := claimToken{epoch: w.epoch, seq: w.claimSeq}
+	w.inFlight[taskID] = inFlightEntry{expiry: time.Now().Add(w.leaseDuration()), epoch: tok.epoch, seq: tok.seq}
+	return tok
 }
 
-func (w *Worker) untrack(taskID int64) {
+func (w *Worker) untrack(taskID int64, tok claimToken) {
 	w.mu.Lock()
-	delete(w.inFlight, taskID)
-	w.mu.Unlock()
+	defer w.mu.Unlock()
+	if e, ok := w.inFlight[taskID]; ok && e.epoch == tok.epoch && e.seq == tok.seq {
+		delete(w.inFlight, taskID)
+	}
 }
 
 // leaseDuration returns the configured lease, defaulted so a missing value
@@ -328,14 +377,27 @@ func (w *Worker) leaseDuration() time.Duration {
 }
 
 // refreshLease pushes a task's local lease expiry forward after a successful
-// renewal (ExtendLease/RecordHeartbeat). Unknown IDs are ignored: the task
-// already transferred to a commit or was released.
-func (w *Worker) refreshLease(taskID int64) {
+// renewal (ExtendLease/RecordHeartbeat). Unknown IDs — and entries stamped
+// by another invocation — are ignored: the task already transferred to a
+// commit, was released, or was reclaimed and re-tracked by a new
+// generation, whose own renewal maintains its expiry.
+func (w *Worker) refreshLease(taskID int64, tok claimToken) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, ok := w.inFlight[taskID]; ok {
-		w.inFlight[taskID] = time.Now().Add(w.leaseDuration())
+	if e, ok := w.inFlight[taskID]; ok && e.epoch == tok.epoch && e.seq == tok.seq {
+		w.inFlight[taskID] = inFlightEntry{expiry: time.Now().Add(w.leaseDuration()), epoch: e.epoch, seq: e.seq}
 	}
+}
+
+// owns reports whether tok still stamps the in-flight entry for taskID: a
+// stale invocation whose entry was overwritten by a reclaim (same task ID,
+// new generation or new claim) must stop renewing and must not remove or
+// release the entry.
+func (w *Worker) owns(taskID int64, tok claimToken) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	e, ok := w.inFlight[taskID]
+	return ok && e.epoch == tok.epoch && e.seq == tok.seq
 }
 
 // claimCommitOwnership transfers taskID out of the in-flight set so a
@@ -351,10 +413,17 @@ func (w *Worker) refreshLease(taskID int64) {
 // commit, and these paths require a live execution context with active
 // renewal. Callers whose commit then fails leave the task untracked, so the
 // lease expires naturally instead of being released promptly.
-func (w *Worker) claimCommitOwnership(taskID int64) bool {
+//
+// The token gates the transfer: a stale invocation (previous Start
+// generation, or an earlier claim that lost its lease to a reclaim) whose
+// task ID was re-tracked by a new invocation must not steal the new
+// entry — that would untrack the new generation's claim and let a later
+// release hand its task to a peer while it still runs.
+func (w *Worker) claimCommitOwnership(taskID int64, tok claimToken) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, ok := w.inFlight[taskID]; !ok {
+	e, ok := w.inFlight[taskID]
+	if !ok || e.epoch != tok.epoch || e.seq != tok.seq {
 		return false
 	}
 	delete(w.inFlight, taskID)
@@ -366,8 +435,8 @@ func (w *Worker) claimCommitOwnership(taskID int64) bool {
 // Shutdown already released the lease to a peer: the caller must skip its
 // task-ID-only store op and return (ctx.Err() preserves shutdown/cancel
 // visibility for logging) to avoid clobbering the new owner.
-func (w *Worker) beginResultCommit(taskID int64) bool {
-	if w.claimCommitOwnership(taskID) {
+func (w *Worker) beginResultCommit(taskID int64, tok claimToken) bool {
+	if w.claimCommitOwnership(taskID, tok) {
 		return true
 	}
 	w.opts.Logger.Debug("skipping stale activity commit; lease already released",
@@ -382,8 +451,8 @@ func (w *Worker) beginResultCommit(taskID int64) bool {
 // shutdown-grace expiry racing the commit must not stop renewal mid-commit,
 // or a commit longer than the remaining lease races a peer reclaim and the
 // task-ID-only store op clobbers the peer's task.
-func (w *Worker) beginDetachedCommit(taskID int64, committing *atomic.Bool) bool {
-	if !w.beginResultCommit(taskID) {
+func (w *Worker) beginDetachedCommit(taskID int64, tok claimToken, committing *atomic.Bool) bool {
+	if !w.beginResultCommit(taskID, tok) {
 		return false
 	}
 	committing.Store(true)
@@ -399,21 +468,25 @@ func (w *Worker) beginDetachedCommit(taskID int64, committing *atomic.Bool) bool
 // leases are keyed by task ID alone and a second release would clear the
 // peer's fresh lease and enable duplicate execution.
 //
-// Presence alone is not ownership: when the Start parent is canceled without
-// Shutdown, renewal stops but a cancel-ignoring activity can keep running
-// past LeaseDuration, letting a peer reclaim the task. A locally expired
-// lease therefore reports false (after still removing the entry) so the
-// caller does not clear a potentially peer-owned lease; the task is already
-// reclaimable via expiry.
-func (w *Worker) claimReleaseOwnership(taskID int64) bool {
+// Presence alone is not ownership, and neither is a matching task ID: the
+// entry must still carry this invocation's token. When the Start parent is
+// canceled without Shutdown, renewal stops but a cancel-ignoring activity
+// can keep running past LeaseDuration, letting a peer reclaim the task —
+// and across a worker restart the new generation re-tracks the same task
+// ID. A locally expired lease therefore reports false (after still
+// removing the entry, but only when the token matches) so the caller does
+// not clear a potentially peer-owned lease; the task is already
+// reclaimable via expiry. A token mismatch reports false without touching
+// the entry: a newer invocation owns it now.
+func (w *Worker) claimReleaseOwnership(taskID int64, tok claimToken) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	expiry, ok := w.inFlight[taskID]
-	if !ok {
+	e, ok := w.inFlight[taskID]
+	if !ok || e.epoch != tok.epoch || e.seq != tok.seq {
 		return false
 	}
 	delete(w.inFlight, taskID)
-	if time.Now().After(expiry) {
+	if time.Now().After(e.expiry) {
 		w.opts.Logger.Debug("skipping lease release; local lease expired",
 			"task_id", taskID)
 		return false
@@ -441,8 +514,8 @@ func (w *Worker) releaseInFlight(ctx context.Context) {
 	now := time.Now()
 	w.mu.Lock()
 	ids := make([]int64, 0, len(w.inFlight))
-	for id, expiry := range w.inFlight {
-		if now.After(expiry) {
+	for id, e := range w.inFlight {
+		if now.After(e.expiry) {
 			// Lease already expired locally: a peer may have reclaimed it,
 			// and releasing by task ID alone would clear the peer's fresh
 			// lease. Drop without releasing; expiry already makes it
@@ -649,9 +722,9 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 			actor.dispatch(func() {
 				w.opts.Metrics.AddWorkflowTask(ctx, 1)
 				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
-				w.track(t.ID)
+				tok := w.track(t.ID)
 				p, herr := w.handleWorkflow(ctx, t)
-				w.untrack(t.ID)
+				w.untrack(t.ID, tok)
 				if herr != nil {
 					w.recordStoreError(ctx, "commit_workflow", herr,
 						"instance_id", t.InstanceID, "task_id", t.ID)
@@ -718,10 +791,10 @@ func (w *Worker) tickActivities(ctx context.Context) {
 		w.opts.Metrics.AddActivityTask(ctx, 1)
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
-		w.track(t.ID)
+		tok := w.track(t.ID)
 		done, ok := w.trackActivity()
 		if !ok {
-			w.untrack(t.ID)
+			w.untrack(t.ID, tok)
 			<-w.actSem
 			// Detached: Shutdown already canceled the poll ctx and this ID
 			// is untracked, so releaseInFlight cannot cover it; a canceled
@@ -732,20 +805,23 @@ func (w *Worker) tickActivities(ctx context.Context) {
 			relCancel()
 			continue
 		}
-		go func(t backend.Task, execCtx context.Context) {
+		go func(t backend.Task, execCtx context.Context, tok claimToken) {
 			defer done()
 			defer func() { <-w.actSem }()
-			defer w.untrack(t.ID)
+			defer w.untrack(t.ID, tok)
 			// Execution outlives the poll loop ctx across Shutdown grace so
 			// within-grace completions can still commit (see Shutdown).
 			// execCtx is the generation captured before dispatch: a stale
 			// claim from a previous run aborts via the canceled context
-			// instead of running under the new run.
-			if herr := w.handleActivity(execCtx, t); herr != nil {
+			// instead of running under the new run. Its in-flight token
+			// additionally fences every removal: even a cancellation-
+			// ignoring stale invocation cannot delete or release an entry
+			// re-tracked by the new generation for the same task ID.
+			if herr := w.handleActivity(execCtx, t, tok); herr != nil {
 				w.opts.Logger.Debug("activity task error",
 					"instance_id", t.InstanceID, "task_id", t.ID, "err", herr)
 			}
-		}(t, execCtx)
+		}(t, execCtx, tok)
 	}
 	// Do not wait: long activities must not block the next tick's timers
 	// or workflow progress. Concurrency stays bounded by actSem and Lease
@@ -788,20 +864,20 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 		w.opts.Metrics.AddActivityTask(ctx, 1)
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
-		w.track(t.ID)
+		tok := w.track(t.ID)
 		done, global := w.trackActivity()
-		go func(t backend.Task) {
+		go func(t backend.Task, tok claimToken) {
 			defer wg.Done()
 			if global {
 				defer done()
 			}
 			defer func() { <-w.actSem }()
-			defer w.untrack(t.ID)
-			if herr := w.handleActivity(ctx, t); herr != nil {
+			defer w.untrack(t.ID, tok)
+			if herr := w.handleActivity(ctx, t, tok); herr != nil {
 				w.opts.Logger.Debug("activity task error",
 					"instance_id", t.InstanceID, "task_id", t.ID, "err", herr)
 			}
-		}(t)
+		}(t, tok)
 	}
 	wg.Wait()
 }
@@ -1202,7 +1278,7 @@ func (w *Worker) fitAdvancementToBudget(adv *backend.Advancement, commands []jou
 	return nil
 }
 
-func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
+func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimToken) error {
 	// Result commits use a bounded detached context created immediately
 	// before each result operation. Shutdown cancels the poll loop ctx
 	// immediately and the execution ctx after its grace; committing with
@@ -1215,8 +1291,11 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	// Grace already expired before we started: don't execute, release for a peer.
 	if ctx.Err() != nil {
 		// Only the in-flight owner releases: Shutdown's releaseInFlight
-		// may have already released (and a peer re-claimed) this lease.
-		if w.claimReleaseOwnership(t.ID) {
+		// may have already released (and a peer re-claimed) this lease,
+		// or a new generation may have re-tracked the same task ID after
+		// a restart. The token keeps a stale invocation from releasing
+		// the new generation's lease.
+		if w.claimReleaseOwnership(t.ID, tok) {
 			commitCtx, commitCancel := w.commitContext(ctx)
 			_ = w.backend.ReleaseLease(commitCtx, t.ID)
 			commitCancel()
@@ -1242,13 +1321,13 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	renewDone := make(chan struct{})
 	go func() {
 		defer close(renewDone)
-		w.extendLeaseLoop(ctx, t.ID, done, &committing)
+		w.extendLeaseLoop(ctx, t.ID, tok, done, &committing)
 	}()
 
 	act, err := w.reg.activity(t.Name)
 	if err != nil {
 		if errors.Is(err, ErrActivityNotRegistered) {
-			if !w.beginDetachedCommit(t.ID, &committing) {
+			if !w.beginDetachedCommit(t.ID, tok, &committing) {
 				return ctx.Err()
 			}
 			commitCtx, commitCancel := w.commitContext(ctx)
@@ -1256,7 +1335,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 			commitCancel()
 			return rerr
 		}
-		if !w.beginDetachedCommit(t.ID, &committing) {
+		if !w.beginDetachedCommit(t.ID, tok, &committing) {
 			return ctx.Err()
 		}
 		commitCtx, commitCancel := w.commitContext(ctx)
@@ -1290,7 +1369,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		Record: func(ctx context.Context, details []byte) error {
 			err := w.backend.RecordHeartbeat(ctx, t.ID, w.opts.LeaseDuration, details)
 			if err == nil {
-				w.refreshLease(t.ID)
+				w.refreshLease(t.ID, tok)
 			}
 			return err
 		},
@@ -1327,7 +1406,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		// duplicate execution.
 		committing.Store(false)
 		<-renewDone
-		if w.claimReleaseOwnership(t.ID) {
+		if w.claimReleaseOwnership(t.ID, tok) {
 			commitCtx, commitCancel := w.commitContext(ctx)
 			_ = w.backend.ReleaseLease(commitCtx, t.ID)
 			commitCancel()
@@ -1339,7 +1418,12 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	}
 	if err != nil {
 		if IsNonRetryable(err) || (t.MaxAttempts > 0 && t.Attempt >= t.MaxAttempts) {
-			if !w.beginDetachedCommit(t.ID, &committing) {
+			if !w.beginDetachedCommit(t.ID, tok, &committing) {
+				// Shutdown's release already handed this lease to a peer
+				// (or a new generation re-tracked it): leave detached
+				// mode and join renewal before returning so no detached
+				// ExtendLease lands post-release.
+				w.exitDetachedCommit(ctx, renewDone, &committing)
 				return ctx.Err()
 			}
 			commitCtx, commitCancel := w.commitContext(ctx)
@@ -1355,7 +1439,10 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		}.Backoff(t.Attempt)
 		w.opts.Logger.Info("activity retry",
 			"instance_id", t.InstanceID, "activity", t.Name, "attempt", t.Attempt, "delay", delay)
-		if !w.beginDetachedCommit(t.ID, &committing) {
+		if !w.beginDetachedCommit(t.ID, tok, &committing) {
+			// See above: ownership lost between the live-ctx check and the
+			// commit transfer — stop renewal before returning.
+			w.exitDetachedCommit(ctx, renewDone, &committing)
 			return ctx.Err()
 		}
 		commitCtx, commitCancel := w.commitContext(ctx)
@@ -1368,7 +1455,10 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		commitCancel()
 		return nil
 	}
-	if !w.beginDetachedCommit(t.ID, &committing) {
+	if !w.beginDetachedCommit(t.ID, tok, &committing) {
+		// See above: ownership lost between the live-ctx check and the
+		// commit transfer — stop renewal before returning.
+		w.exitDetachedCommit(ctx, renewDone, &committing)
 		return ctx.Err()
 	}
 	commitCtx, commitCancel := w.commitContext(ctx)
@@ -1383,6 +1473,26 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	}
 	commitCancel()
 	return nil
+}
+
+// exitDetachedCommit leaves detached-commit renewal mode after losing
+// commit ownership (see claimCommitOwnership): the committing flag was set
+// before the cancel check so renewal stays alive through the commit, but
+// with no commit following renewal must stop first. Clearing the flag
+// alone is not enough — the renewal loop may already be inside
+// renewUntilDone (or about to enter it on ctx.Done) and would issue a
+// detached ExtendLease after Shutdown's release already landed (re-hiding
+// the task for a full lease or modifying a peer's fresh lease). Joining
+// waits for the loop to return, and every ExtendLease it issued completes
+// before that return. The join is only needed when the execution context
+// is done: with a live ctx the loop cannot be in detached mode (entry
+// requires ctx.Done) and the cleared flag prevents any future entry, so
+// the loop exits on done at handler return.
+func (w *Worker) exitDetachedCommit(ctx context.Context, renewDone <-chan struct{}, committing *atomic.Bool) {
+	committing.Store(false)
+	if ctx.Err() != nil {
+		<-renewDone
+	}
 }
 
 // invokeActivity runs a user activity function, converting panics into
@@ -1463,7 +1573,7 @@ func (w *Worker) nackIncompatible(ctx context.Context, t backend.Task, reason st
 	return w.backend.NackTask(ctx, t, delay)
 }
 
-func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan struct{}, committing *atomic.Bool) {
+func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, tok claimToken, done <-chan struct{}, committing *atomic.Bool) {
 	d := w.opts.LeaseDuration / 2
 	if d <= 0 {
 		return
@@ -1485,13 +1595,24 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan 
 			// Exiting here would let a commit longer than the remaining
 			// lease race a peer reclaim, and the task-ID-only commit
 			// would then clobber the peer's task.
-			w.renewUntilDone(ctx, taskID, done, ticker, committing)
+			w.renewUntilDone(ctx, taskID, tok, done, ticker, committing)
 			return
 		case <-ticker.C:
+			// A stale invocation whose entry was overwritten by a
+			// reclaim (new generation or new claim of the same task ID)
+			// must stop renewing: extending the new owner's lease
+			// hides it from nobody but masks the ownership loss and
+			// refreshes an expiry the new invocation maintains
+			// itself. Detached-commit mode is exempt: its entry was
+			// transferred out by its own commit, so absence is
+			// expected while the commit still needs renewal.
+			if !w.owns(taskID, tok) && (committing == nil || !committing.Load()) {
+				return
+			}
 			if err := w.backend.ExtendLease(ctx, taskID, w.opts.LeaseDuration); err != nil {
 				w.recordStoreError(ctx, "extend_lease", err, "task_id", taskID)
 			} else {
-				w.refreshLease(taskID)
+				w.refreshLease(taskID, tok)
 			}
 		}
 	}
@@ -1509,7 +1630,7 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan 
 // leaves detached mode. Without these checks the loop would only exit on
 // done (closed at handler return, i.e. after the release) and a detached
 // renewal could land after the ReleaseLease.
-func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, done <-chan struct{}, ticker *time.Ticker, committing *atomic.Bool) {
+func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, tok claimToken, done <-chan struct{}, ticker *time.Ticker, committing *atomic.Bool) {
 	// Renew immediately on entering detached mode instead of waiting for
 	// the next tick: the transition can coincide with a renewal tick that
 	// used the now-canceled ctx and failed, and the next tick is a
@@ -1525,7 +1646,7 @@ func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, done <-chan s
 	if committing == nil || !committing.Load() {
 		return
 	}
-	w.renewOnceDetached(ctx, taskID)
+	w.renewOnceDetached(ctx, taskID, tok)
 	for {
 		if committing == nil || !committing.Load() {
 			return
@@ -1542,20 +1663,20 @@ func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, done <-chan s
 			if committing == nil || !committing.Load() {
 				return
 			}
-			w.renewOnceDetached(ctx, taskID)
+			w.renewOnceDetached(ctx, taskID, tok)
 		}
 	}
 }
 
 // renewOnceDetached extends taskID once with a context detached from
 // execution cancellation, bounded by the lease duration.
-func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64) {
+func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimToken) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.leaseDuration())
 	defer cancel()
 	if err := w.backend.ExtendLease(rctx, taskID, w.opts.LeaseDuration); err != nil {
 		w.recordStoreError(rctx, "extend_lease", err, "task_id", taskID)
 	} else {
-		w.refreshLease(taskID)
+		w.refreshLease(taskID, tok)
 	}
 }
 
