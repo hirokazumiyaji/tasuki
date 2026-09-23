@@ -17,7 +17,7 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{MaxAdvancementEffects: 80, FairDispatch: true}
+	return backend.Capabilities{MaxAdvancementEffects: 80, FairDispatch: true, CleansTerminalState: true, SupportsBulkCleanup: true}
 }
 
 // dynamoTxnItemLimit is the DynamoDB TransactWriteItems item cap. A combined

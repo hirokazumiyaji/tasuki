@@ -13,7 +13,7 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{SweepsTerminalInbox: true}
+	return backend.Capabilities{SweepsTerminalInbox: true, CleansTerminalState: true, SupportsBulkCleanup: true}
 }
 
 // readInboxSeq returns the instance's inbox counter (0, false when unset).

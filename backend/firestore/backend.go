@@ -17,7 +17,7 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{MaxAdvancementEffects: 400, FairDispatch: true, SweepsTerminalInbox: true}
+	return backend.Capabilities{MaxAdvancementEffects: 400, FairDispatch: true, SweepsTerminalInbox: true, CleansTerminalState: true, SupportsBulkCleanup: true}
 }
 func (b *Backend) col(name string) *gcf.CollectionRef  { return b.client.Collection(name) }
 func (b *Backend) ref(col, id string) *gcf.DocumentRef { return b.col(col).Doc(id) }
@@ -223,6 +223,12 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 }
 func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	now := nowUTC()
+	// The status flip rides in a small transaction so the write count never
+	// scales with the instance's accumulated rows: deleting every child
+	// document inline would breach the 500-write transaction cap once inbox
+	// or dedupe rows accumulate (see #299). Residual rows are swept
+	// post-commit in paginated batches below (cleanupTerminalDocs), which
+	// converges over arbitrarily many rows without ever buffering them all.
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		s, err := tx.Get(b.ref("wf_instances", id))
 		if isNotFound(err) {
@@ -234,36 +240,25 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		if !s.Exists() {
 			return backend.ErrNotFound
 		}
-		var refs []*gcf.DocumentRef
-		// NOTE: instances with more than ~500 child documents exceed the
-		// Firestore transaction write cap here; chunked deletes are a
-		// follow-up to #299 (backendtest BulkTerminatePurge skips until then).
-		for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox"} {
-			it := tx.Documents(b.col(col).Where("instance_id", "==", id))
-			for {
-				d, e := it.Next()
-				if e == iterator.Done {
-					break
-				}
-				if e != nil {
-					it.Stop()
-					return e
-				}
-				refs = append(refs, d.Ref)
-			}
-			it.Stop()
-		}
-		if err = tx.Update(b.ref("wf_instances", id), []gcf.Update{{Path: "status", Value: "terminated"}, {Path: "updated_at", Value: now}, {Path: "completed_at", Value: now}}); err != nil {
-			return err
-		}
-		for _, r := range refs {
-			if e := tx.Delete(r); e != nil {
-				return e
-			}
-		}
-		return nil
+		return tx.Update(b.ref("wf_instances", id), []gcf.Update{{Path: "status", Value: "terminated"}, {Path: "updated_at", Value: now}, {Path: "completed_at", Value: now}})
 	})
 	if err != nil {
+		return err
+	}
+	// Await the sweep before returning so claimed tasks observe no
+	// leftovers and a redelivered DedupeID inserts anew (conformance
+	// SignalDedupe): the sweep uses a detached context so parent
+	// cancellation cannot strand survivors. Terminal instances are
+	// immutable, so the non-transactional sweep cannot race with
+	// advancement commits (a concurrent CompleteActivity either commits
+	// before the flip and is swept, or reads the flipped status and
+	// inserts nothing); purge reaps anything left by a failed sweep.
+	// The status flip above already committed, so subscribers must wake
+	// even when the sweep fails: GetInstance permanently reports
+	// terminated while a skipped notifyTerminal would leave waiters
+	// asleep until a retry.
+	if err := b.cleanupTerminalDocsWithRetry(context.Background(), id); err != nil {
+		b.notifyTerminal(id)
 		return err
 	}
 	b.notifyTerminal(id)
