@@ -673,35 +673,57 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		}(t, leaseDone, stopRenewal)
 	}
 	wg.Wait()
-	// Pending tasks stayed tracked through the flush (see above): successes
-	// are untracked inside flushWorkflowCommits. Commits that failed under
-	// a canceled tick context are released explicitly for a prompt peer
-	// retry instead of waiting for lease expiry (a canceled flush is
-	// rejected before touching the store, so the lease is still ours
-	// unless Shutdown's releaseInFlight already released it — the release
-	// below is ownership-gated for that race). Live-context failures
-	// (conflict/transient) are untracked without release: the task may be
-	// superseded, and the lease expires naturally.
-	failed := w.flushWorkflowCommits(ctx, pending)
-	if len(failed) > 0 {
-		if ctx.Err() != nil {
-			for _, p := range failed {
-				// Only the in-flight owner releases (see
-				// claimWorkflowRelease): Shutdown's releaseInFlight may
-				// have released this pending task mid-flush and a peer
-				// may have re-claimed it, and backends match the lease
-				// by ID/key alone, so an unconditional release would
-				// clear the peer's lease.
-				if w.claimWorkflowRelease(p.task) {
-					w.releaseWorkflowLease(p.task)
-				} else {
-					w.opts.Logger.Debug("skipping workflow lease release; not in-flight owner",
-						"instance_id", p.task.InstanceID, "task_id", p.adv.TaskID)
-				}
+	// A canceled tick must not flush: a turn may have completed (pending)
+	// while wg.Wait() waited for a slower sibling, and Shutdown cancels
+	// the tick context before this flush. Context-aware backends reject
+	// the canceled flush, but ctx-insensitive ones (memory and similar)
+	// still persist the advancement — though documented behavior says
+	// canceled turns are abandoned and released for a peer retry.
+	// Dispose instead: ownership-gated, kind-routed releases (see
+	// claimWorkflowRelease) so a Shutdown releaseInFlight that already
+	// released (and a peer re-claimed) lease is never cleared twice.
+	if ctx.Err() != nil {
+		for _, p := range pending {
+			if w.claimWorkflowRelease(p.task) {
+				w.releaseWorkflowLease(p.task)
+			} else {
+				w.opts.Logger.Debug("skipping workflow lease release; not in-flight owner",
+					"instance_id", p.task.InstanceID, "task_id", p.adv.TaskID)
 			}
-		} else {
-			for _, p := range failed {
-				w.untrackPending(p)
+		}
+	} else {
+		// Live tick: flush. Pending tasks stayed tracked through the
+		// flush (see above): successes are untracked inside
+		// flushWorkflowCommits. Commits that failed under a tick
+		// canceled mid-flush are released explicitly for a prompt peer
+		// retry instead of waiting for lease expiry (a canceled flush
+		// is rejected before touching the store, so the lease is still
+		// ours unless Shutdown's releaseInFlight already released it —
+		// the release below is ownership-gated for that race).
+		// Live-context failures (conflict/transient) are untracked
+		// without release: the task may be superseded, and the lease
+		// expires naturally.
+		failed := w.flushWorkflowCommits(ctx, pending)
+		if len(failed) > 0 {
+			if ctx.Err() != nil {
+				for _, p := range failed {
+					// Only the in-flight owner releases (see
+					// claimWorkflowRelease): Shutdown's releaseInFlight may
+					// have released this pending task mid-flush and a peer
+					// may have re-claimed it, and backends match the lease
+					// by ID/key alone, so an unconditional release would
+					// clear the peer's lease.
+					if w.claimWorkflowRelease(p.task) {
+						w.releaseWorkflowLease(p.task)
+					} else {
+						w.opts.Logger.Debug("skipping workflow lease release; not in-flight owner",
+							"instance_id", p.task.InstanceID, "task_id", p.adv.TaskID)
+					}
+				}
+			} else {
+				for _, p := range failed {
+					w.untrackPending(p)
+				}
 			}
 		}
 	}
