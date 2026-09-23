@@ -500,32 +500,26 @@ type advancementPrep struct {
 	taskRef  *gcf.DocumentRef
 	inst     *backend.Instance
 	hasInbox bool
+	// dedupeSnapshot holds the terminal advancement's dedupe keys as read
+	// inside the commit transaction (see readAdvancementTx). The post-commit
+	// sweep deletes exactly these IDs.
+	dedupeSnapshot []string
 }
 
 func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
 	if len(advs) == 0 {
 		return nil
 	}
-	// Snapshot pre-commit dedupe keys for terminal advancements BEFORE the
-	// commit transaction. The post-commit sweep deletes exactly these IDs,
-	// so classification follows transaction serialization order rather
-	// than SendToInbox client timestamps (see sweepSignalDedupeIDs). A
-	// listing failure aborts before any mutation, so the worker simply
-	// retries the advancement.
-	snapshots := make(map[string][]string, len(advs))
-	for _, adv := range advs {
-		if adv.Terminal == nil {
-			continue
-		}
-		if _, ok := snapshots[adv.InstanceID]; ok {
-			continue
-		}
-		ids, err := b.listSignalDedupeIDs(ctx, adv.InstanceID)
-		if err != nil {
-			return err
-		}
-		snapshots[adv.InstanceID] = ids
-	}
+	// Dedupe keys for terminal advancements are snapshotted INSIDE the commit
+	// transaction (see readAdvancementTx): the snapshot is a serializable
+	// read, so a SendToInbox serializing before the terminal commit is
+	// included in the post-commit sweep instead of lingering until purge
+	// (where a later ID reuse would mistake it for a duplicate of a
+	// promised post-terminal event). Keys created after the snapshot stay
+	// for purge. The sweep itself still runs after the commit: a terminal
+	// commit with hundreds of keys must not scale one transaction past the
+	// 500-write limit.
+	var snapshots map[string][]string
 	now := nowUTC()
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		// Firestore requires all reads before any writes in a transaction.
@@ -542,6 +536,19 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			if err := b.writeAdvancementTx(tx, adv, preps[i], now, alloc); err != nil {
 				return err
 			}
+		}
+		// Capture the snapshots from this attempt only: the transaction
+		// function may run more than once, and only the committing
+		// attempt's reads classify the sweep.
+		snapshots = make(map[string][]string, len(advs))
+		for i, adv := range advs {
+			if adv.Terminal == nil {
+				continue
+			}
+			if _, ok := snapshots[adv.InstanceID]; ok {
+				continue
+			}
+			snapshots[adv.InstanceID] = preps[i].dedupeSnapshot
 		}
 		return b.flushInboxSeqs(tx, alloc)
 	})
@@ -647,7 +654,19 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 		}
 	}
 	inboxIter.Stop()
-	return advancementPrep{instRef: instSnap.Ref, taskRef: taskRef, inst: inst, hasInbox: hasInbox}, nil
+	prep := advancementPrep{instRef: instSnap.Ref, taskRef: taskRef, inst: inst, hasInbox: hasInbox}
+	if adv.Terminal != nil {
+		// Snapshot the dedupe keys inside the commit transaction (still the
+		// read phase: no writes have been buffered yet). A SendToInbox
+		// serializing before this commit is included in the post-commit
+		// sweep; anything landing after stays for purge.
+		ids, err := listSignalDedupeIDsTx(tx, b.col("wf_signal_dedupe"), adv.InstanceID)
+		if err != nil {
+			return advancementPrep{}, err
+		}
+		prep.dedupeSnapshot = ids
+	}
+	return prep, nil
 }
 
 func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancement, prep advancementPrep, now time.Time, alloc *inboxSeqAlloc) error {
@@ -871,8 +890,20 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		if err := seedInboxSeqTx(b, tx, alloc, instanceID); err != nil {
 			return err
 		}
+		// Terminal sends must not be swallowed by pre-terminal dedupe keys:
+		// a SendToInbox racing a terminal transition (CommitAdvancements or
+		// TerminateInstance) can observe a key snapshotted for the
+		// post-commit sweep, skip its inbox insert as a duplicate, and then
+		// lose the signal when the sweep deletes the key. Sends that commit
+		// while the instance is already terminal always insert their event;
+		// the key is created when absent so a later retry still dedupes
+		// within this incarnation, but an existing key never suppresses the
+		// insert. (Same-batch duplicates still collapse to one insert so a
+		// batch never issues conflicting Creates.)
+		terminal := str(isnap.Data(), "status") != "running"
 		// Firestore requires all reads before writes; also skip same-batch DedupeID dups.
 		skip := make([]bool, len(items))
+		createKey := make([]bool, len(items))
 		created := map[string]bool{}
 		for i, it := range items {
 			if it.DedupeID == "" {
@@ -888,16 +919,21 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				return err
 			}
 			if err == nil && snap.Exists() {
+				created[it.DedupeID] = true
+				if terminal {
+					continue
+				}
 				skip[i] = true
 				continue
 			}
 			created[it.DedupeID] = true
+			createKey[i] = true
 		}
 		for i, it := range items {
 			if skip[i] {
 				continue
 			}
-			if it.DedupeID != "" {
+			if it.DedupeID != "" && createKey[i] {
 				if err := tx.Create(b.ref("wf_signal_dedupe", signalDedupeID(instanceID, it.DedupeID)), map[string]any{
 					"instance_id": instanceID,
 					"dedupe_id":   it.DedupeID,

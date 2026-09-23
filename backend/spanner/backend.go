@@ -603,28 +603,28 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if len(advs) == 0 {
 		return nil
 	}
-	// Snapshot pre-commit dedupe keys for terminal advancements BEFORE the
-	// commit. The post-commit sweep deletes exactly these IDs, so
-	// classification follows transaction serialization order rather than
-	// SendToInbox client timestamps (see sweepSignalDedupeIDs). A listing
-	// failure aborts before any mutation, so the worker simply retries the
-	// advancement.
-	snapshots := make(map[string][]string, len(advs))
-	for _, adv := range advs {
-		if adv.Terminal == nil {
-			continue
-		}
-		if _, ok := snapshots[adv.InstanceID]; ok {
-			continue
-		}
-		ids, err := b.listSignalDedupeIDs(ctx, adv.InstanceID)
-		if err != nil {
-			return err
-		}
-		snapshots[adv.InstanceID] = ids
-	}
+	// Dedupe keys for terminal advancements are snapshotted INSIDE the commit
+	// transaction (serializable read): a SendToInbox serializing before the
+	// terminal commit is included in the post-commit sweep instead of
+	// lingering until purge (where a later ID reuse would mistake it for a
+	// duplicate of a promised post-terminal event). Keys created after the
+	// snapshot read stay for purge. The sweep itself still runs after the
+	// commit so the mutation count never scales with accumulated keys.
+	var snapshots map[string][]string
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// Reset per attempt: the transaction function may run more than
+		// once, and only the committing attempt's reads classify the sweep.
+		snapshots = make(map[string][]string, len(advs))
 		for _, adv := range advs {
+			if adv.Terminal != nil {
+				if _, ok := snapshots[adv.InstanceID]; !ok {
+					ids, err := querySignalDedupeIDsTx(ctx, txn, adv.InstanceID)
+					if err != nil {
+						return err
+					}
+					snapshots[adv.InstanceID] = ids
+				}
+			}
 			if err := b.commitAdvancementTxn(ctx, txn, adv); err != nil {
 				return err
 			}
@@ -1151,6 +1151,15 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		var muts []*spanner.Mutation
 		// Track DedupeIDs reserved in this transaction: ReadRow only sees committed
 		// rows, so same-batch duplicates would otherwise emit colliding InsertMaps.
+		// Terminal sends must not be swallowed by pre-terminal dedupe keys: a
+		// SendToInbox racing a terminal transition (CommitAdvancements or
+		// TerminateInstance) can observe a key snapshotted for the post-commit
+		// sweep, skip its inbox insert as a duplicate, and then lose the
+		// signal when the sweep deletes the key. Sends that commit while the
+		// instance is already terminal always insert their event; the key is
+		// created when absent, but an existing key never suppresses the
+		// insert.
+		terminal := status != "running"
 		created := map[string]bool{}
 		for _, it := range items {
 			if it.DedupeID != "" {
@@ -1160,15 +1169,18 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, it.DedupeID}, []string{"dedupe_id"})
 				if err == nil {
 					created[it.DedupeID] = true
-					continue
+					if !terminal {
+						continue
+					}
+				} else {
+					if !isNotFound(err) {
+						return err
+					}
+					muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
+						"instance_id": instanceID, "dedupe_id": it.DedupeID, "created_at": now,
+					}))
+					created[it.DedupeID] = true
 				}
-				if !isNotFound(err) {
-					return err
-				}
-				muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-					"instance_id": instanceID, "dedupe_id": it.DedupeID, "created_at": now,
-				}))
-				created[it.DedupeID] = true
 			}
 			payload := inboxPayload(it.Event)
 			seq++

@@ -105,9 +105,10 @@ func (b *Backend) sweepTerminateDocs(ctx context.Context, id string) error {
 }
 
 // listSignalDedupeIDs returns every dedupe key currently stored for one
-// instance. CommitAdvancements snapshots this set immediately before the
-// terminal commit; the post-commit sweep then deletes exactly those IDs
-// (see sweepSignalDedupeIDs).
+// instance. It serves tests that seed keys directly; CommitAdvancements
+// snapshots inside its commit transaction instead (see
+// querySignalDedupeIDsTx), and the post-commit sweep then deletes exactly
+// those IDs (see sweepSignalDedupeIDs).
 func (b *Backend) listSignalDedupeIDs(ctx context.Context, id string) ([]string, error) {
 	iter := b.client.Single().Query(ctx, spanner.Statement{
 		SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id`,
@@ -131,26 +132,49 @@ func (b *Backend) listSignalDedupeIDs(ctx context.Context, id string) ([]string,
 	}
 }
 
+// querySignalDedupeIDsTx reads the same key set inside a read-write
+// transaction. CommitAdvancements uses this so the snapshot is a
+// serializable read: a SendToInbox serializing before the terminal commit is
+// included in the post-commit sweep instead of lingering until purge.
+func querySignalDedupeIDsTx(ctx context.Context, txn *spanner.ReadWriteTransaction, id string) ([]string, error) {
+	iter := txn.Query(ctx, spanner.Statement{
+		SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id`,
+		Params: map[string]any{"id": id},
+	})
+	defer iter.Stop()
+	var out []string
+	for {
+		row, err := iter.Next()
+		if err == iterator.Done {
+			return out, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		var k string
+		if err := row.Columns(&k); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+}
+
 // sweepSignalDedupeIDs removes exactly the given dedupe keys in paged
 // transactions. Called best-effort after terminal advancements commit with
-// the pre-commit snapshot from listSignalDedupeIDs.
+// the in-transaction snapshot from querySignalDedupeIDsTx.
 //
 // Keys are classified by transaction serialization order, not client
 // timestamps: a SendToInbox that captures created_at before the terminal
 // commit, loses the race, and retry-commits after it would otherwise stamp
 // a pre-commit time and be swept wrongly (deleting its key while the inbox
 // event remains, so a later retry duplicates the signal). Snapshot IDs can
-// never match such keys: only IDs visible before the terminal commit are
+// never match such keys: only IDs visible to the terminal commit are
 // removed, and keys first appearing after are preserved even when their
 // client timestamp predates the commit.
 //
-// Two boundary caveats (carried forward from the timestamp design):
-//   - Snapshot edge: a send serializing between the snapshot listing and
-//     the terminal commit is preserved for purge even though it logically
-//     predates the commit. Safe direction: cleanup is delayed, never
-//     wrongful.
-//   - Listing race: a concurrent send landing mid-listing can be missed by
-//     the snapshot and likewise stays for purge.
+// One residual edge (safe direction: cleanup is delayed, never wrongful): a
+// send committing after the snapshot read but before the terminal commit
+// lands is preserved for purge even though it logically predates the commit.
 //
 // The sweep stays synchronous so a redelivered DedupeID inserts anew once
 // CommitAdvancements returns, but runs under a bounded context so a stuck

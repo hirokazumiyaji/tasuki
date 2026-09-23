@@ -93,11 +93,12 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 // proceeds only while the instance doc still carries the listed created_at;
 // the delete commits only for that same incarnation (a concurrent purge that
 // deleted first, or a replacement created since, makes this purge stand down
-// uncounted); the second sweep proceeds only while the doc stays absent and
-// stops at the first sign of a replacement. Stragglers that slip past a
-// stopped second sweep leak, and are reaped with the replacement's own purge
-// once it is terminal — leaked rows are always preferable to deleting a live
-// incarnation's documents.
+// uncounted); the second sweep proceeds only while the doc stays absent. When
+// the second sweep stops at a replacement, provably-old stragglers are still
+// reaped (see reapReplacedStragglers) instead of leaking into the
+// replacement. Stragglers that cannot be proven old leak, and are reaped with
+// the replacement's own purge once it is terminal — leaked rows are always
+// preferable to deleting a live incarnation's documents.
 func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, error) {
 	own := func(ctx context.Context) error { return b.checkPurgeVictim(ctx, v) }
 	if err := b.purgeInstanceDocs(ctx, v.id, own); err != nil {
@@ -121,6 +122,16 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 	gone := func(ctx context.Context) error { return b.checkPurgeAbsent(ctx, v.id) }
 	if err := b.purgeInstanceDocs(ctx, v.id, gone); err != nil {
 		if errors.Is(err, errPurgeSuperseded) {
+			// A replacement incarnation appeared after this purge deleted
+			// the victim: an inbox row (or dedupe key) that committed
+			// between the first sweep and the delete belongs to the old
+			// incarnation, but the fence above leaves it for the
+			// replacement's LoadWorkflow to consume. Reap the rows that
+			// provably predate the replacement instead of leaking them.
+			// This purge still owns the victim delete, so it stays counted.
+			if rerr := b.reapReplacedStragglers(ctx, v.id); rerr != nil {
+				return true, rerr
+			}
 			return true, nil
 		}
 		return false, err
@@ -193,6 +204,95 @@ func (b *Backend) deletePurgedInstanceDoc(ctx context.Context, v purgeVictim) (b
 		return false, err
 	}
 	return deleted, nil
+}
+
+// reapReplacedStragglers deletes child rows that provably belong to the
+// purged incarnation after the second sweep stopped at a replacement (see
+// purgeOneInstance). Only wf_signal_dedupe and wf_inbox can gain rows while
+// the victim is terminal — SendToInbox inserts both and wakes nothing once
+// the instance is terminal. Task, timer and journal rows are written only on
+// behalf of the running victim, so the aborted sweep left none of those
+// behind and their collections are not reaped here.
+func (b *Backend) reapReplacedStragglers(ctx context.Context, id string) error {
+	for _, col := range []string{"wf_signal_dedupe", "wf_inbox"} {
+		if err := b.reapStragglerCollection(ctx, col, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// stragglerDoc is one child document buffered for the incarnation check.
+type stragglerDoc struct {
+	ref       *gcf.DocumentRef
+	createdAt time.Time
+}
+
+// reapStragglerCollection deletes one collection's rows that predate the
+// current incarnation. The incarnation is re-resolved before every batch
+// commit: absent means every buffered row is old; present means only rows
+// stamped strictly before the replacement's created_at are old. Both stamps
+// come from the same clock, and a straggler committed before the victim
+// delete strictly predates a replacement created after it. Rows without a
+// usable stamp, or tied with the replacement, are preserved: leaking is
+// always preferable to deleting a live incarnation's rows.
+func (b *Backend) reapStragglerCollection(ctx context.Context, col, id string) error {
+	flush := func(pending []stragglerDoc) error {
+		if len(pending) == 0 {
+			return nil
+		}
+		snap, err := b.ref("wf_instances", id).Get(ctx)
+		absent := isNotFound(err) || (err == nil && !snap.Exists())
+		if err != nil && !absent {
+			return err
+		}
+		var cutoff time.Time
+		if !absent {
+			cutoff = timestamp(snap.Data(), "created_at")
+		}
+		batch := b.client.Batch()
+		n := 0
+		for _, d := range pending {
+			if !absent && (d.createdAt.IsZero() || !d.createdAt.Before(cutoff)) {
+				continue
+			}
+			batch.Delete(d.ref)
+			n++
+		}
+		if n == 0 {
+			return nil
+		}
+		_, err = batch.Commit(ctx)
+		return err
+	}
+	var pending []stragglerDoc
+	flushPending := func() error {
+		if err := flush(pending); err != nil {
+			return err
+		}
+		pending = pending[:0]
+		return nil
+	}
+	it := b.col(col).Where("instance_id", "==", id).Documents(ctx)
+	for {
+		dsnap, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			it.Stop()
+			return err
+		}
+		pending = append(pending, stragglerDoc{ref: dsnap.Ref, createdAt: timestamp(dsnap.Data(), "created_at")})
+		if len(pending) == firestoreSweepBatchSize {
+			if err := flushPending(); err != nil {
+				it.Stop()
+				return err
+			}
+		}
+	}
+	it.Stop()
+	return flushPending()
 }
 
 // purgeInstanceDocs removes every child document of one instance. Batches
