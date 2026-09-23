@@ -385,12 +385,17 @@ func TestTerminalLegacyV1UserRowDelivers(t *testing.T) {
 	}
 }
 
-// An inert pre-upgrade marker row left in wf_signal_dedupe must never match
-// a user-key probe (Codex round 11 on #296): user probes skip
-// marker-shaped candidates, so a non-terminal first send with a
-// marker-shaped DedupeID inserts instead of deduping against the leftover
-// marker. On the old code the send is swallowed and this fails.
-func TestNonTerminalSendBypassesStaleMarkerRow(t *testing.T) {
+// A marker-shaped legacy user row on a RUNNING instance is unambiguously a
+// user key (Codex round 12 on #296, superseding the round-11 bypass rule):
+// live markers live in their own table, and a running instance cannot own a
+// post-terminal marker — so a pre-escape verbatim row for a marker-shaped
+// DedupeID (e.g. "__post_terminal__:x") is that DedupeID's live guard. A
+// running send with the same DedupeID must dedupe against the raw legacy
+// candidate instead of writing a second escaped key and duplicating the
+// event. Terminal instances keep the marker-only rule (see
+// TestTerminalLegacyV1UserRowDelivers). On the old skipping code both sends
+// insert and this fails.
+func TestRunningSendHonorsMarkerShapedLegacyKey(t *testing.T) {
 	dsn := guardTestDSN(t)
 	ctx := context.Background()
 	b, err := New(ctx, dsn)
@@ -405,14 +410,17 @@ func TestNonTerminalSendBypassesStaleMarkerRow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const id = "nonterminal-stale-marker-row"
+	const id = "running-marker-shaped-legacy-key"
 	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
 		t.Fatal(err)
 	}
-	// Inert pre-upgrade marker row for "y", exactly as the old code wrote
-	// it: the raw user-key probe for "__post_terminal__v1:y" used to hit it.
+	// Legacy user rows stored verbatim pre-escape: unversioned and v1
+	// marker-shaped alike.
 	if _, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		return txn.BufferWrite([]*spanner.Mutation{
+			spanner.InsertMap("wf_signal_dedupe", map[string]any{
+				"instance_id": id, "dedupe_id": "__post_terminal__:x", "created_at": nowUTC(),
+			}),
 			spanner.InsertMap("wf_signal_dedupe", map[string]any{
 				"instance_id": id, "dedupe_id": "__post_terminal__v1:y", "created_at": nowUTC(),
 			}),
@@ -421,20 +429,26 @@ func TestNonTerminalSendBypassesStaleMarkerRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	ev := journal.Event{Type: journal.TypeSignalReceived, Name: "sig", Payload: []byte(`{}`)}
-	// First send with the marker-shaped DedupeID must insert under its
-	// escaped user key, not dedupe against the stale marker row.
+	// Running sends with the marker-shaped DedupeIDs must dedupe against
+	// the raw legacy rows, not insert under escaped keys.
+	if err := b.SendToInbox(ctx, id, ev, "__post_terminal__:x"); err != nil {
+		t.Fatal(err)
+	}
 	if err := b.SendToInbox(ctx, id, ev, "__post_terminal__v1:y"); err != nil {
 		t.Fatal(err)
 	}
-	if n := terminalTestInboxLen(t, b, ctx, id); n != 1 {
-		t.Fatalf("send swallowed by stale marker row: inbox=%d want 1 (signal lost)", n)
+	if n := terminalTestInboxLen(t, b, ctx, id); n != 0 {
+		t.Fatalf("running sends duplicated against legacy user rows: inbox=%d want 0 (dedupe hit)", n)
 	}
-	// Ordinary dedupe still works for the exotic ID.
+	// Resends stay deduped too.
+	if err := b.SendToInbox(ctx, id, ev, "__post_terminal__:x"); err != nil {
+		t.Fatal(err)
+	}
 	if err := b.SendToInbox(ctx, id, ev, "__post_terminal__v1:y"); err != nil {
 		t.Fatal(err)
 	}
-	if n := terminalTestInboxLen(t, b, ctx, id); n != 1 {
-		t.Fatalf("exotic-ID resend duplicated the signal: inbox=%d want 1", n)
+	if n := terminalTestInboxLen(t, b, ctx, id); n != 0 {
+		t.Fatalf("exotic-ID resends duplicated the signal: inbox=%d want 0", n)
 	}
 }
 

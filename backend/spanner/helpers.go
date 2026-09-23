@@ -178,9 +178,10 @@ func postTerminalDedupeMarker(dedupeID string) string {
 // free of a "__" prefix (unescaped) or starts with "____" (escaped), and the
 // encoding is injective, so distinct user IDs still map to distinct keys.
 // (Pre-escape verbatim rows such as "__post_terminal__:x" predate this
-// namespacing; since the round-11 marker move, marker-shaped rows in
-// wf_signal_dedupe are inert pre-upgrade leftovers that user-key probes skip
-// — see isPostTerminalMarkerKey.)
+// namespacing; since the round-11 marker move, live markers never share the
+// dedupe keyspace — see isPostTerminalMarkerKey — and since round 12 running
+// probes honor the raw legacy candidate as the live guard for a
+// marker-shaped DedupeID.)
 //
 // Long IDs that would exceed the STRING(255) budget hash into a bounded
 // "__hash__:" form instead (Codex round 8 on #327); the mapping applies on
@@ -204,11 +205,14 @@ func escapeDedupeID(dedupeID string) string {
 // classifies only inert pre-upgrade rows. It serves two conservative
 // purposes: the terminate sweep preserves such rows (deleting a pre-upgrade
 // marker while its inbox event remains would duplicate its retry), and
-// user-key probes skip marker-shaped candidates (such a row is an inert
-// marker or a legacy verbatim row — never the live guard for the probed
-// DedupeID; skipping duplicates at worst, never drops). User keys written
-// by current code — verbatim, "__"-escaped ("____.."), or hashed
-// ("__hash__:..") — never carry these prefixes.
+// terminal base-key probes skip marker-shaped candidates (such a row is an
+// inert marker or a legacy verbatim row — never the live guard for the
+// probed DedupeID; skipping duplicates at worst, never drops). Running
+// probes honor every candidate instead (Codex round 12 on #296): a running
+// instance cannot own a post-terminal marker, so a marker-shaped row there
+// is unambiguously a legacy user key. User keys written by current code —
+// verbatim, "__"-escaped ("____.."), or hashed ("__hash__:..") — never carry
+// these prefixes.
 func isPostTerminalMarkerKey(stored string) bool {
 	return strings.HasPrefix(stored, dedupeMarkerPrefix) ||
 		strings.HasPrefix(stored, dedupeHashedMarkerPrefix) ||
@@ -217,10 +221,11 @@ func isPostTerminalMarkerKey(stored string) bool {
 }
 
 // dedupeKeyCandidates lists the stored user-key forms to probe on
-// dedupe-check reads, legacy raw first (Codex round 8 on #327). Callers skip
-// marker-shaped candidates (see isPostTerminalMarkerKey): since the
-// round-11 move those can only be inert pre-upgrade rows, never the live
-// guard.
+// dedupe-check reads, legacy raw first (Codex round 8 on #327). Terminal
+// base-key probes skip marker-shaped candidates (see
+// isPostTerminalMarkerKey); running probes honor every candidate, since a
+// marker-shaped row on a running instance is unambiguously a legacy user
+// key (Codex round 12 on #296).
 func dedupeKeyCandidates(dedupeID string) []string {
 	var out []string
 	seen := map[string]bool{}

@@ -934,6 +934,24 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 	if inst.Status != "running" {
 		return advancementPrep{}, backend.ErrConflict
 	}
+	// Fence child creation on purge markers (Codex round 12 on #296): only
+	// direct CreateInstance checked the marker, so a child — or a
+	// Continue-As-New successor, which is also an adv.Children entry —
+	// reusing a purged ID recreated the instance while the old incarnation's
+	// rows were still pending, and the replacement consumed purged signals.
+	// The check rides in the read phase (Firestore rejects reads after
+	// writes in a transaction) alongside the other advancement reads; a hit
+	// fails the advancement with ErrConflict so the worker retries after
+	// purge recovery clears the marker.
+	for _, ch := range adv.Children {
+		msnap, merr := tx.Get(b.ref(purgeMarkersCollection, ch.ID))
+		if merr != nil && !isNotFound(merr) {
+			return advancementPrep{}, merr
+		}
+		if merr == nil && msnap.Exists() {
+			return advancementPrep{}, backend.ErrConflict
+		}
+	}
 	if adv.ParentNotify != nil && inst.ParentID != "" {
 		if err := seedInboxSeqTx(b, tx, alloc, inst.ParentID); err != nil {
 			return advancementPrep{}, err
@@ -1280,15 +1298,17 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			}
 			// Probe every stored user-key form, legacy raw first (Codex round 8
 			// on #327): pre-escape rows stored "__" IDs verbatim.
-			// Marker-shaped candidates are skipped (see the terminal base
-			// check above): markers live outside the dedupe keyspace, so
-			// such a row is an inert pre-upgrade marker or a legacy
-			// verbatim row — never this DedupeID's live guard.
+			// Marker-shaped candidates are honored here (Codex round 12 on
+			// #296): live markers live outside the dedupe keyspace, and a
+			// running instance cannot own a post-terminal marker, so a
+			// marker-shaped row on a running instance is unambiguously a
+			// legacy user key (e.g. DedupeID "__post_terminal__:x" stored
+			// raw pre-escape). Skipping it would miss the guard, write a
+			// second escaped key, and duplicate the event. Terminal
+			// instances keep the marker-only rule (see the terminal base
+			// check above).
 			baseHit := false
 			for _, bk := range dedupeKeyCandidates(it.DedupeID) {
-				if isPostTerminalMarkerKey(bk) {
-					continue
-				}
 				snap, err := tx.Get(b.ref("wf_signal_dedupe", instanceID+":"+bk))
 				if err != nil && !isNotFound(err) {
 					return err

@@ -890,6 +890,20 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	for _, inboxID := range adv.DrainedInbox {
 		muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{inboxID}))
 	}
+	// Fence child creation on purge markers (Codex round 12 on #296): only
+	// direct CreateInstance checked the marker, so a child — or a
+	// Continue-As-New successor, which is also an adv.Children entry —
+	// reusing a purged ID recreated the instance while the old incarnation's
+	// rows were still pending, and the replacement consumed purged signals.
+	// A hit fails the advancement with ErrConflict so the worker retries
+	// after purge recovery clears the marker.
+	for _, ch := range adv.Children {
+		if _, merr := txn.ReadRow(ctx, "wf_purge_markers", spanner.Key{ch.ID}, []string{"instance_id"}); merr == nil {
+			return backend.ErrConflict
+		} else if !isNotFound(merr) {
+			return merr
+		}
+	}
 	for _, ch := range adv.Children {
 		q := ch.Queue
 		if q == "" {
@@ -1306,16 +1320,16 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				} else {
 					// Probe every stored user-key form, legacy raw first (Codex
 					// round 8 on #327): pre-escape rows stored "__" IDs verbatim.
-					// Marker-shaped candidates are skipped (see the terminal
-					// base check above): markers live outside the dedupe
-					// keyspace, so such a row is an inert pre-upgrade marker
-					// or a legacy verbatim row — never this DedupeID's live
-					// guard.
+					// Marker-shaped candidates are honored here (Codex round 12
+					// on #296): live markers live in their own table, and a
+					// running instance cannot own a post-terminal marker, so a
+					// marker-shaped row on a running instance is unambiguously
+					// a legacy user key (e.g. DedupeID "__post_terminal__:x"
+					// stored raw pre-escape). Skipping it would miss the guard
+					// and duplicate the event. Terminal instances keep the
+					// marker-only rule (see the terminal base check above).
 					baseHit := false
 					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
-						if isPostTerminalMarkerKey(bk) {
-							continue
-						}
 						_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, bk}, []string{"dedupe_id"})
 						if err == nil {
 							baseHit = true

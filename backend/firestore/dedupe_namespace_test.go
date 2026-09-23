@@ -24,9 +24,12 @@ func TestDedupeMarkerNamespaceDisjoint(t *testing.T) {
 	for _, u := range adversarial {
 		for _, bk := range dedupeKeyCandidates(u) {
 			if strings.HasPrefix(bk, "__post_terminal__") {
-				// Marker-shaped user candidates are skipped by every probe
-				// (see isPostTerminalMarkerKey): they can only match inert
-				// pre-upgrade rows, never the live guard.
+				// Marker-shaped user candidates live in the collection
+				// disjointness check only (see isPostTerminalMarkerKey):
+				// they can only match legacy verbatim rows, never a live
+				// marker document. (Codex round 12 on #296: running probes
+				// honor the raw legacy candidate as the live guard; only
+				// terminal base-key probes skip marker shapes.)
 				continue
 			}
 			for _, m := range adversarial {

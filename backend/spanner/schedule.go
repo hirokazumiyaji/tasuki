@@ -113,6 +113,19 @@ func (b *Backend) ClaimDueSchedules(ctx context.Context, limit int) ([]backend.D
 
 		for _, r := range claimed {
 			scheduledAt := r.nextRunAt.UTC()
+			instID := backend.ScheduleInstanceID(r.id, scheduledAt)
+			// Fence scheduled-instance creation on purge markers (Codex
+			// round 12 on #296): same hazard as child creation —
+			// recreating a purged ID while its marker is live lets the
+			// replacement consume the old incarnation's leftover rows.
+			// Skip this fire before the cursor advance below, so it stays
+			// due and is retried after purge recovery clears the marker;
+			// other due schedules in this transaction still claim normally.
+			if _, merr := txn.ReadRow(ctx, "wf_purge_markers", spanner.Key{instID}, []string{"instance_id"}); merr == nil {
+				continue
+			} else if !isNotFound(merr) {
+				return merr
+			}
 			// Conditional advance of next_run_at (claim exclusivity).
 			next, err := backend.NextCronTime(r.cron, scheduledAt)
 			if err != nil {
@@ -131,7 +144,6 @@ func (b *Backend) ClaimDueSchedules(ctx context.Context, limit int) ([]backend.D
 			if n == 0 {
 				continue
 			}
-			instID := backend.ScheduleInstanceID(r.id, scheduledAt)
 			inputBytes := jsonBytes(r.input)
 			created := true
 			err = txn.BufferWrite([]*spanner.Mutation{

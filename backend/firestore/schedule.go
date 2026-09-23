@@ -84,13 +84,27 @@ func (b *Backend) ClaimDueSchedules(ctx context.Context, limit int) ([]backend.D
 				return backend.ErrConflict
 			}
 			existing, err := tx.Get(b.ref("wf_instances", instanceID))
-			if err != nil {
+			if err != nil && !isNotFound(err) {
 				return err
+			}
+			// Fence scheduled-instance creation on purge markers (Codex
+			// round 12 on #296): same hazard as child creation — recreating
+			// a purged ID while its marker is live lets the replacement
+			// consume the old incarnation's leftover rows. Fail with
+			// ErrConflict so this fire is skipped (the schedule cursor
+			// stays untouched) and retried after purge recovery clears the
+			// marker.
+			msnap, merr := tx.Get(b.ref(purgeMarkersCollection, instanceID))
+			if merr != nil && !isNotFound(merr) {
+				return merr
+			}
+			if merr == nil && msnap.Exists() {
+				return backend.ErrConflict
 			}
 			if err = tx.Update(d.Ref, []gcf.Update{{Path: "next_run_at", Value: next}, {Path: "updated_at", Value: now}}); err != nil {
 				return err
 			}
-			if existing.Exists() {
+			if err == nil && existing.Exists() {
 				return nil
 			}
 			inst := backend.NewInstance{ID: instanceID, Name: s.Workflow, Queue: s.Queue, Input: s.Input}
