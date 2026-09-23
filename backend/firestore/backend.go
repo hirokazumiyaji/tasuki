@@ -1083,6 +1083,10 @@ func (b *Backend) ensureWorkflowTaskForced(ctx context.Context, instanceID strin
 	return b.ensureWorkflowTaskWithForce(ctx, instanceID, true)
 }
 
+// ensureWorkflowTaskWithForce creates the singleton workflow task while the
+// instance is still running. The status read and inbox probe below are
+// pre-checks only; the authoritative gate is createWorkflowTaskIfRunning,
+// which re-checks the status inside the creation transaction.
 func (b *Backend) ensureWorkflowTaskWithForce(ctx context.Context, instanceID string, force bool) error {
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil {
@@ -1105,7 +1109,40 @@ func (b *Backend) ensureWorkflowTaskWithForce(ctx context.Context, instanceID st
 			return err
 		}
 	}
-	_, err = b.ref("wf_tasks", wfTaskID(instanceID)).Create(ctx, workflowTaskDoc(instanceID, inst.Queue, newID(), nowUTC()))
+	return b.createWorkflowTaskIfRunning(ctx, instanceID)
+}
+
+// createWorkflowTaskIfRunning creates the singleton workflow task only while
+// the instance is still running, in ONE transaction: the instance row is
+// re-read and the Create aborts unless status is still "running", mirroring
+// DynamoDB's putWorkflowTaskIfRunning (ConditionCheck status=running + Put).
+//
+// This closes the recreate-after-cleanup race: CompleteActivity/FireDueTimers
+// commit the inbox and read the instance as running, then a terminal
+// transition can commit (and its sweep delete every task) before the Create
+// below executes. A bare Create has no status condition and would recreate
+// the workflow task after the cleanup — the claim gate still prevents
+// execution, but the row lingers and the cleanup already reported success
+// with residue. A concurrent terminal commit touching the instance row aborts
+// the transaction (retried internally, then re-read as terminal), so a
+// terminal sweep is never undone by a stale ensure.
+//
+// A missing instance or a non-running status is success (the terminal sweep
+// owns cleanup now), as is AlreadyExists from a concurrent ensure.
+func (b *Backend) createWorkflowTaskIfRunning(ctx context.Context, instanceID string) error {
+	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		snap, gerr := tx.Get(b.ref("wf_instances", instanceID))
+		if isNotFound(gerr) {
+			return nil
+		}
+		if gerr != nil {
+			return gerr
+		}
+		if str(snap.Data(), "status") != "running" {
+			return nil
+		}
+		return tx.Create(b.ref("wf_tasks", wfTaskID(instanceID)), workflowTaskDoc(instanceID, str(snap.Data(), "queue"), newID(), nowUTC()))
+	})
 	if status.Code(err) == codes.AlreadyExists {
 		return nil
 	}

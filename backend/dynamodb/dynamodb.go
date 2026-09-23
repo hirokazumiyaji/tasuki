@@ -342,9 +342,11 @@ func (b *Backend) ensureTable(ctx context.Context, d tableDef) error {
 				return fmt.Errorf("dynamodb enable stream %s: %w", d.name, uerr)
 			}
 		}
-		if err := b.ensureMissingGSIs(ctx, d, desc); err != nil {
-			return err
-		}
+		// No second ensureMissingGSIs here: the pass above is authoritative
+		// — it creates missing GSIs and waits for the backfill. A repeat
+		// with the same stale desc would recompute the same missing set,
+		// issue a redundant UpdateTable, and wait up to gsiWaitTimeout
+		// again during backfill.
 		return nil
 	}
 	var nfe *types.ResourceNotFoundException
