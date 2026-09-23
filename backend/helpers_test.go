@@ -355,6 +355,154 @@ func TestFairPickerScanContinuesPastRejectedCap(t *testing.T) {
 	}
 }
 
+func TestFairOverflowDropsPastCap(t *testing.T) {
+	// Premise for the refill requery (issue #294 P2): with Limit=2 and
+	// MaxPerInstance=1 over FIFO A1..A2002, one pass picks A1, retains
+	// A2..A2001 (bounded by FairRejectedCap), and drops A2002 while reporting
+	// the overflow — the scan cursor has advanced past A2002, so only a
+	// requery from the pre-overflow position can recover it within the claim.
+	p := backend.NewFairPicker(2, 1).TrackRejected()
+	total := backend.FairRejectedCap + 2
+	for i := 1; i <= total; i++ {
+		p.Offer(backend.FairTaskRef{ID: int64(i), InstanceID: "A"})
+	}
+	if len(p.Picked()) != 1 || p.Picked()[0].ID != 1 {
+		t.Fatalf("picked=%v, want [A1]", p.Picked())
+	}
+	if len(p.Rejected()) != backend.FairRejectedCap || !p.RejectedCapped() {
+		t.Fatalf("rejected=%d capped=%v, want %d and capped",
+			len(p.Rejected()), p.RejectedCapped(), backend.FairRejectedCap)
+	}
+	for _, r := range p.Rejected() {
+		if r.ID == int64(total) {
+			t.Fatalf("A%d must be dropped past the cap, not retained", total)
+		}
+	}
+}
+
+func TestFairOverflowRequeryMirror(t *testing.T) {
+	// Covers the issue #294 P2 at the refill-loop level without a live DB:
+	// Limit=2, MaxPerInstance=1 over FIFO A1..A2002 (FairRejectedCap+2 rows
+	// from one instance) with A1..A2001 lost to concurrent locks. The first
+	// pass picks A1, retains A2..A2001, and drops A2002 past FairRejectedCap;
+	// the refill then chews through the retained carry one lost pick per
+	// pass. runRefill mirrors the postgres/mysql refill loops (pending carry
+	// with FairRejectedCap bound, monotonic keyset cursor, lock step,
+	// pre-overflow cursor snapshot, attempted-ID skip); with requery disabled
+	// it returns empty (the reported bug), with the single bounded requery
+	// pass it recovers the never-attempted A2002.
+	const limit, perInstance = 2, 1
+	total := backend.FairRejectedCap + 2
+	feed := make([]backend.FairTaskRef, 0, total)
+	for i := 0; i < total; i++ {
+		feed = append(feed, backend.FairTaskRef{ID: int64(i + 1), InstanceID: "A"})
+	}
+	// lockLost mirrors losing the SKIP LOCKED race: every row the claim can
+	// reach except the overflow-dropped tail is contended.
+	lockLost := func(id int64) bool { return id <= int64(total-1) }
+
+	runRefill := func(requery bool) []backend.FairTaskRef {
+		cursor := 0 // index of the next unscanned feed row (keyset cursor)
+		var lastID int64
+		first := true
+		var out, claimed, pending []backend.FairTaskRef
+		var overflowSnapValid, overflowSeen, requeryDone bool
+		var overflowSnapID int64
+		attempted := map[int64]struct{}{}
+		passes := 0
+		startOverflowRequery := func() bool {
+			if len(out) != 0 || !overflowSeen || !overflowSnapValid || requeryDone {
+				return false
+			}
+			requeryDone = true
+			first = false
+			cursor = int(overflowSnapID) // IDs are 1-based sequential
+			pending = nil
+			return true
+		}
+		for len(out) < limit {
+			passes++
+			if passes > 2*total+10 {
+				t.Fatalf("refill loop did not terminate (requery=%v)", requery)
+			}
+			picker := backend.NewFairPicker(limit-len(out), perInstance).TrackRejected()
+			picker.Seed(claimed)
+			offered := 0
+			for _, r := range pending {
+				if picker.Full() {
+					break
+				}
+				picker.Offer(r)
+				offered++
+			}
+			if !picker.Full() {
+				for !picker.Full() && cursor < len(feed) {
+					r := feed[cursor]
+					cursor++
+					if !overflowSeen && !picker.RejectedCapped() {
+						overflowSnapID, overflowSnapValid = lastID, !first
+					}
+					first = false
+					lastID = r.ID
+					if _, dup := attempted[r.ID]; !(requery && requeryDone && dup) {
+						offerFull := picker.Offer(r)
+						if picker.RejectedCapped() {
+							overflowSeen = true
+						}
+						if offerFull {
+							break
+						}
+					}
+				}
+			}
+			scanExhausted := !picker.Full()
+			picked := picker.Picked()
+			iterRejected := picker.Rejected()
+			for _, r := range picked {
+				attempted[r.ID] = struct{}{}
+			}
+			if len(picked) == 0 {
+				if requery && startOverflowRequery() {
+					continue
+				}
+				break
+			}
+			prevOut := len(out)
+			for _, r := range picked {
+				if lockLost(r.ID) {
+					continue
+				}
+				out = append(out, r)
+				claimed = append(claimed, r)
+			}
+			if len(out) >= limit {
+				break
+			}
+			if scanExhausted {
+				if lost := len(picked) - (len(out) - prevOut); lost == 0 || len(iterRejected) == 0 {
+					if requery && startOverflowRequery() {
+						continue
+					}
+					break
+				}
+			}
+			pending = append(iterRejected, pending[offered:]...)
+			if len(pending) > backend.FairRejectedCap {
+				pending = pending[:backend.FairRejectedCap]
+			}
+		}
+		return out
+	}
+
+	if got := runRefill(false); len(got) != 0 {
+		t.Fatalf("pre-fix refill: got %v, want empty (overflow-dropped tail unreachable)", got)
+	}
+	got := runRefill(true)
+	if len(got) != 1 || got[0].ID != int64(total) || got[0].InstanceID != "A" {
+		t.Fatalf("requery refill: got %v, want [A%d]", got, total)
+	}
+}
+
 func TestNormalizePurgeStatuses(t *testing.T) {
 	got, err := backend.NormalizePurgeStatuses(nil)
 	if err != nil {

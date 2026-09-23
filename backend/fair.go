@@ -180,4 +180,9 @@ func (p *FairPicker) Rejected() []FairTaskRef { return p.rejected }
 // began dropping rejections during this pass. It is informational only:
 // callers keep paging (the scan, not the retention, reaches the victims past
 // the flood); refill paths carry the retained rows forward bounded by the cap.
+// When every retained row is then lost to concurrent locks with nothing
+// secured, the postgres/mysql refill loops re-issue one bounded candidate
+// requery from the pre-overflow cursor position instead of returning empty,
+// so overflow-dropped rows get a second chance within the same claim; rows
+// still dropped after that resurface on a later poll.
 func (p *FairPicker) RejectedCapped() bool { return p.rejectedOverflow }

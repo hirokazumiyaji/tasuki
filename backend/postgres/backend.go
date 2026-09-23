@@ -270,6 +270,42 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		claimed []backend.FairTaskRef
 		pending []backend.FairTaskRef
 	)
+	// Overflow-requery state (issue #294 follow-up): when scan-phase rejected
+	// retention overflows FairRejectedCap, rows past the cap are dropped while
+	// the SQL cursor advances past them. If every retained candidate is then
+	// lost to concurrent locks, the dropped tail would stay unclaimed for this
+	// claim even though it may hold eligible rows (e.g. Limit=2,
+	// MaxPerInstance=1 over A1..A2002 with A1..A2001 locked: A2002 is dropped
+	// by the cap and never revisited). Remember the pre-overflow keyset
+	// position and the IDs already attempted, so the claim can re-issue one
+	// bounded requery pass from the snapshot instead of returning empty. One
+	// extra pass only, to preserve termination; rows dropped by a requery pass
+	// itself stay claimable for a later poll, which restarts from the head.
+	var (
+		overflowSnapValid bool
+		overflowSnapVis   time.Time
+		overflowSnapID    int64
+		overflowSeen      bool
+		requeryDone       bool
+		attempted         map[int64]struct{}
+	)
+	// startOverflowRequery arms the single bounded requery pass from the
+	// pre-overflow snapshot when the claim would otherwise return empty after
+	// retention overflowed. It reports whether the caller should continue to
+	// the extra pass instead of breaking. At either break point the retained
+	// carry is exhausted (a pass that leaves un-offered pending rows behind
+	// either fills the picker or keeps scanning), so resetting the keyset
+	// cursor to the snapshot and dropping the empty carry loses nothing.
+	startOverflowRequery := func() bool {
+		if len(out) != 0 || !overflowSeen || !overflowSnapValid || requeryDone {
+			return false
+		}
+		requeryDone = true
+		first = false
+		lastVis, lastID = overflowSnapVis, overflowSnapID
+		pending = nil
+		return true
+	}
 	for len(out) < req.Limit {
 		picker := backend.NewFairPicker(req.Limit-len(out), req.MaxPerInstance).TrackRejected()
 		picker.Seed(claimed)
@@ -320,11 +356,30 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 						return nil, err
 					}
 					page++
+					// Snapshot the pre-row cursor while retention is intact, so
+					// an overflow-triggered requery can resume from the last
+					// retained position. First snapshot wins: it covers the
+					// largest dropped tail. Only SQL scan rows reach here;
+					// pending-phase re-offers never advance the cursor, and the
+					// pending carry is bounded by FairRejectedCap so it cannot
+					// overflow on its own.
+					if !overflowSeen && !picker.RejectedCapped() {
+						overflowSnapVis, overflowSnapID, overflowSnapValid = lastVis, lastID, !first
+					}
 					first = false
 					lastVis, lastID = vis, r.ID
-					if picker.Offer(r) {
-						full = true
-						break
+					// The single overflow-requery pass skips IDs already put
+					// through the lock step this claim, so never-attempted
+					// dropped rows get priority in the bounded pass.
+					if _, dup := attempted[r.ID]; !(requeryDone && dup) {
+						offerFull := picker.Offer(r)
+						if picker.RejectedCapped() {
+							overflowSeen = true
+						}
+						if offerFull {
+							full = true
+							break
+						}
 					}
 				}
 				if err := rows.Err(); err != nil {
@@ -342,7 +397,18 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		scanExhausted := !picker.Full()
 		picked := picker.Picked()
 		iterRejected := picker.Rejected()
+		// Record every pick attempt so the overflow requery below can skip
+		// IDs already put through the lock step this claim.
+		for _, r := range picked {
+			if attempted == nil {
+				attempted = make(map[int64]struct{})
+			}
+			attempted[r.ID] = struct{}{}
+		}
 		if len(picked) == 0 {
+			if startOverflowRequery() {
+				continue
+			}
 			break
 		}
 
@@ -408,6 +474,14 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 			// No unscanned rows remain, so the only way to make progress is
 			// to revisit rejected candidates freed by lost picks.
 			if lost := len(picked) - (len(out) - prevOut); lost == 0 || len(iterRejected) == 0 {
+				// Overflow may have dropped eligible rows past the cursor
+				// (see above): with nothing secured this claim, re-issue one
+				// bounded scan from the pre-overflow snapshot instead of
+				// returning empty. Rows dropped by the requery pass itself
+				// stay claimable for a later poll.
+				if startOverflowRequery() {
+					continue
+				}
 				break
 			}
 		}
