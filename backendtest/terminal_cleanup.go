@@ -249,10 +249,9 @@ func testTerminateCompleteRace(t *testing.T, newBackend Factory) {
 			if completeErr != nil && !isBenignRaceErr(completeErr) {
 				t.Fatalf("round %d: CompleteActivity: %v", r, completeErr)
 			}
-			// Force the terminal end state, then require it to be clean.
-			if err := b.TerminateInstance(ctx, id); err != nil {
-				t.Fatalf("round %d: second TerminateInstance: %v", r, err)
-			}
+			// Inspect the race outcome before any second termination can
+			// repair it: the first TerminateInstance must already have left
+			// a terminal instance with no remnants behind.
 			inst, err := b.GetInstance(ctx, id)
 			if err != nil || inst.Status != "terminated" {
 				t.Fatalf("round %d: status: %v %#v", r, err, inst)
@@ -260,27 +259,12 @@ func testTerminateCompleteRace(t *testing.T, newBackend Factory) {
 			if !strict {
 				t.Skip("terminal cleanup not implemented (see #291)")
 			}
-			st, err := b.LoadWorkflow(ctx, id)
-			if err != nil {
-				t.Fatalf("round %d: load: %v", r, err)
+			assertRaceClean(t, b, r, id)
+			// Force the terminal end state, then require it to stay clean.
+			if err := b.TerminateInstance(ctx, id); err != nil {
+				t.Fatalf("round %d: second TerminateInstance: %v", r, err)
 			}
-			if len(st.Inbox) != 0 {
-				t.Fatalf("round %d: terminated %s has %d inbox rows", r, id, len(st.Inbox))
-			}
-			for _, kind := range []string{"activity", "workflow"} {
-				tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
-					Kind: kind, Queues: []string{"default"}, Limit: 100,
-					Lease: time.Minute, WorkerID: "race-check",
-				})
-				if err != nil {
-					t.Fatalf("round %d: claim %s: %v", r, kind, err)
-				}
-				for _, task := range tasks {
-					if task.InstanceID == id {
-						t.Fatalf("round %d: %s task %d survived terminate of %s", r, kind, task.ID, id)
-					}
-				}
-			}
+			assertRaceClean(t, b, r, id)
 		}()
 	}
 }
@@ -290,6 +274,34 @@ func isBenignRaceErr(err error) bool {
 		errors.Is(err, backend.ErrSuperseded) ||
 		errors.Is(err, backend.ErrNotFound) ||
 		errors.Is(err, backend.ErrConflict)
+}
+
+// assertRaceClean checks the post-race terminal invariant: no inbox rows and
+// no claimable tasks for the instance.
+func assertRaceClean(t *testing.T, b backend.Backend, r int, id string) {
+	t.Helper()
+	ctx := context.Background()
+	st, err := b.LoadWorkflow(ctx, id)
+	if err != nil {
+		t.Fatalf("round %d: load: %v", r, err)
+	}
+	if len(st.Inbox) != 0 {
+		t.Fatalf("round %d: terminated %s has %d inbox rows", r, id, len(st.Inbox))
+	}
+	for _, kind := range []string{"activity", "workflow"} {
+		tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+			Kind: kind, Queues: []string{"default"}, Limit: 100,
+			Lease: time.Minute, WorkerID: "race-check",
+		})
+		if err != nil {
+			t.Fatalf("round %d: claim %s: %v", r, kind, err)
+		}
+		for _, task := range tasks {
+			if task.InstanceID == id {
+				t.Fatalf("round %d: %s task %d survived terminate of %s", r, kind, task.ID, id)
+			}
+		}
+	}
 }
 
 func requireTerminalCleanup(t *testing.T, b backend.Backend) {

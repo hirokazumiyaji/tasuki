@@ -606,6 +606,20 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if len(advs) == 0 {
 		return nil
 	}
+	// Reject duplicate instances up front: the loop below applies every
+	// advancement in one read-write transaction with the same pre-mutation
+	// reads, so two advancements for the same instance both pass the
+	// ExpectedSeq check and then collide on the second journal insert
+	// (a native AlreadyExists commit error, not ErrConflict). Preflight
+	// keeps the batch all-or-nothing with a conflict error (see backendtest
+	// CommitAdvancementsAtomic).
+	seen := make(map[string]struct{}, len(advs))
+	for _, adv := range advs {
+		if _, dup := seen[adv.InstanceID]; dup {
+			return backend.ErrConflict
+		}
+		seen[adv.InstanceID] = struct{}{}
+	}
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		for _, adv := range advs {
 			if err := b.commitAdvancementTxn(ctx, txn, adv); err != nil {

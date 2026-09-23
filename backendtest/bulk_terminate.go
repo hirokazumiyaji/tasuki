@@ -79,7 +79,10 @@ func testBulkTerminatePurge(t *testing.T, newBackend Factory) {
 	}
 	adv := backend.Advancement{
 		InstanceID: id, TaskID: tasks[0].ID, ExpectedSeq: st.NextSeq,
-		DrainedInbox: inboxIDs(st.Inbox),
+		// DrainedInbox stays empty on purpose: the 600 inbox rows must
+		// survive this commit so TerminateInstance below sweeps them in
+		// chunks over the backend write cap. Draining them here would
+		// leave the bulk inbox sweep untested.
 	}
 	for i := 0; i < 10; i++ {
 		seq := st.NextSeq + int64(i)
@@ -139,12 +142,4 @@ func testBulkTerminatePurge(t *testing.T, newBackend Factory) {
 	if _, err := b.GetInstance(ctx, id); !errors.Is(err, backend.ErrNotFound) {
 		t.Fatalf("want ErrNotFound after purge, got %v", err)
 	}
-}
-
-func inboxIDs(inbox []backend.InboxEvent) []int64 {
-	ids := make([]int64, 0, len(inbox))
-	for _, item := range inbox {
-		ids = append(ids, item.ID)
-	}
-	return ids
 }
