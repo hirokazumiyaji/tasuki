@@ -685,6 +685,13 @@ func (w *Worker) tickActivities(ctx context.Context) {
 	if limit <= 0 || limit > avail {
 		limit = avail
 	}
+	// Capture the execution context before claiming: it identifies this
+	// run's generation. If Shutdown's grace expires and the worker restarts
+	// before a dispatched goroutine runs, the goroutine must use the
+	// captured (canceled) context and abort instead of fetching the new
+	// run's live context and executing an already-released task (whose
+	// side effects fencing cannot undo).
+	execCtx := w.execContext(ctx)
 	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
 		Kind: "activity", Queues: w.opts.Queues, Limit: limit,
 		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
@@ -725,17 +732,20 @@ func (w *Worker) tickActivities(ctx context.Context) {
 			relCancel()
 			continue
 		}
-		go func(t backend.Task) {
+		go func(t backend.Task, execCtx context.Context) {
 			defer done()
 			defer func() { <-w.actSem }()
 			defer w.untrack(t.ID)
 			// Execution outlives the poll loop ctx across Shutdown grace so
 			// within-grace completions can still commit (see Shutdown).
-			if herr := w.handleActivity(w.execContext(ctx), t); herr != nil {
+			// execCtx is the generation captured before dispatch: a stale
+			// claim from a previous run aborts via the canceled context
+			// instead of running under the new run.
+			if herr := w.handleActivity(execCtx, t); herr != nil {
 				w.opts.Logger.Debug("activity task error",
 					"instance_id", t.InstanceID, "task_id", t.ID, "err", herr)
 			}
-		}(t)
+		}(t, execCtx)
 	}
 	// Do not wait: long activities must not block the next tick's timers
 	// or workflow progress. Concurrency stays bounded by actSem and Lease
@@ -1471,20 +1481,43 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan 
 // is bounded by the lease duration and the commit itself is bounded by its
 // commit context, so this loop always terminates when the commit returns.
 func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, done <-chan struct{}, ticker *time.Ticker) {
+	// Renew immediately on entering detached mode instead of waiting for
+	// the next tick: the transition can coincide with a renewal tick that
+	// used the now-canceled ctx and failed, and the next tick is a
+	// half-lease away (== the original lease expiry for the first
+	// renewal). Waiting would let a peer reclaim the still-committing
+	// task mid-commit and the task-ID-only commit would then clobber the
+	// peer's task.
+	select {
+	case <-done:
+		return
+	default:
+	}
+	w.renewOnceDetached(ctx, taskID)
 	for {
 		select {
 		case <-done:
 			return
 		case <-ticker.C:
-			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.leaseDuration())
-			err := w.backend.ExtendLease(rctx, taskID, w.opts.LeaseDuration)
-			if err != nil {
-				w.recordStoreError(rctx, "extend_lease", err, "task_id", taskID)
-			} else {
-				w.refreshLease(taskID)
+			select {
+			case <-done:
+				return
+			default:
 			}
-			cancel()
+			w.renewOnceDetached(ctx, taskID)
 		}
+	}
+}
+
+// renewOnceDetached extends taskID once with a context detached from
+// execution cancellation, bounded by the lease duration.
+func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.leaseDuration())
+	defer cancel()
+	if err := w.backend.ExtendLease(rctx, taskID, w.opts.LeaseDuration); err != nil {
+		w.recordStoreError(rctx, "extend_lease", err, "task_id", taskID)
+	} else {
+		w.refreshLease(taskID)
 	}
 }
 
