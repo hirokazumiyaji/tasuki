@@ -313,7 +313,14 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 	)
 	// startOverflowRequery arms the next bounded requery pass from the
 	// pre-overflow snapshot when the batch would otherwise return
-	// underfilled after retention overflowed. It reports whether the caller
+	// underfilled after retention overflowed AND a lock loss actually freed
+	// quota (lost>0 at the call site). When every pick succeeded (lost==0)
+	// no slot was freed, so a requery would rescan the same dropped tail
+	// against the same per-instance caps and return an identical result —
+	// up to 2x the scan cost for nothing. Call sites therefore gate on
+	// lost>0 and skip the requery (break) when nothing was lost; the
+	// dropped rows stay claimable for a later poll starting from the head.
+	// It reports whether the caller
 	// should continue to the extra pass instead of breaking. At either break
 	// point the retained carry is exhausted (a pass that leaves un-offered
 	// pending rows behind either fills the picker or keeps scanning), so
@@ -447,9 +454,11 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 			attempted[r.ID] = struct{}{}
 		}
 		if len(picked) == 0 {
-			if startOverflowRequery() {
-				continue
-			}
+			// No picks means no lock losses freed quota (lost==0 by
+			// definition): an overflow requery would re-offer the dropped
+			// tail against identical caps and return the same empty pick,
+			// so skip it and break. Dropped rows stay claimable for later
+			// polls.
 			break
 		}
 
@@ -513,8 +522,17 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		}
 		if scanExhausted {
 			// No unscanned rows remain, so the only way to make progress is
-			// to revisit rejected candidates freed by lost picks.
-			if lost := len(picked) - (len(out) - prevOut); lost == 0 || len(iterRejected) == 0 {
+			// to revisit rejected candidates freed by lost picks. When no
+			// pick was lost (lost==0) every pick succeeded and no quota was
+			// freed: the dropped overflow tail would face the same caps and
+			// reproduce the same pick, so skip the wasteful full rescan
+			// (up to 2x) and return underfilled. Only a loss frees a slot
+			// that can admit a previously rejected/dropped row.
+			lost := len(picked) - (len(out) - prevOut)
+			if lost == 0 {
+				break
+			}
+			if len(iterRejected) == 0 {
 				// Overflow may have dropped eligible rows past the cursor
 				// (see above): with the batch still underfilled, re-issue a
 				// bounded scan from the pre-overflow snapshot instead of

@@ -1050,6 +1050,159 @@ func TestFairOverflowRequeryNoProgressStops(t *testing.T) {
 	}
 }
 
+func TestFairOverflowRequerySkipsWithoutLoss(t *testing.T) {
+	// Covers the round-10 P2 (issue #294): the overflow requery must only
+	// fire when a lock loss actually freed quota (lost>0). When every pick
+	// succeeded (lost==0) no slot was freed, so rescanning the dropped tail
+	// against identical caps returns an identical result — up to 2x the scan
+	// cost for nothing. Limit=2, MaxPerInstance=1 over FIFO A1..A2002
+	// (FairRejectedCap+2 rows, one instance) with NO lock losses: pass 1
+	// picks A1, retains A2..A2001, drops A2002 past the cap, secures A1
+	// (lost==0) with the batch underfilled. The pre-fix decision
+	// (lost==0 → requery) arms a wasteful second segment with an identical
+	// outcome; the fixed decision (lost==0 → break) skips it.
+	const limit, perInstance = 2, 1
+	total := backend.FairRejectedCap + 2
+	feed := make([]backend.FairTaskRef, 0, total)
+	for i := 0; i < total; i++ {
+		feed = append(feed, backend.FairTaskRef{ID: int64(i + 1), InstanceID: "A"})
+	}
+	// No losses: every picked row wins its lock.
+	lockLost := func(id int64) bool { return false }
+
+	// runRefill mirrors the postgres/mysql refill loops; skipWithoutLoss
+	// selects the round-10 call-site gating (true = fixed, false = pre-fix).
+	runRefill := func(skipWithoutLoss bool) (out []backend.FairTaskRef, arms int) {
+		cursor := 0
+		var lastID int64
+		first := true
+		var claimed, pending []backend.FairTaskRef
+		var overflowSnapValid, overflowSeen bool
+		var overflowSnapID int64
+		var requeryPasses, requeryAttempted, requeryOut int
+		attempted := map[int64]struct{}{}
+		startOverflowRequery := func() bool {
+			if len(out) >= limit || !overflowSeen || !overflowSnapValid || requeryPasses >= backend.MaxOverflowRequeryPasses {
+				return false
+			}
+			if requeryPasses > 0 && len(attempted) <= requeryAttempted && len(out) <= requeryOut {
+				return false
+			}
+			requeryPasses++
+			arms++
+			requeryAttempted, requeryOut = len(attempted), len(out)
+			overflowSeen = false
+			first = false
+			cursor = int(overflowSnapID)
+			overflowSnapValid = false
+			pending = nil
+			return true
+		}
+		passes := 0
+		for len(out) < limit {
+			passes++
+			if passes > 4*len(feed)+20 {
+				t.Fatalf("refill loop did not terminate (skip=%v)", skipWithoutLoss)
+			}
+			picker := backend.NewFairPicker(limit-len(out), perInstance).TrackRejected()
+			picker.Seed(claimed)
+			offered := 0
+			for _, r := range pending {
+				if picker.Full() {
+					break
+				}
+				picker.Offer(r)
+				offered++
+			}
+			if !picker.Full() {
+				for !picker.Full() && cursor < len(feed) {
+					r := feed[cursor]
+					cursor++
+					if !overflowSeen && !picker.RejectedCapped() {
+						overflowSnapID, overflowSnapValid = lastID, !first
+					}
+					first = false
+					lastID = r.ID
+					if _, dup := attempted[r.ID]; !(requeryPasses > 0 && dup) {
+						offerFull := picker.Offer(r)
+						if picker.RejectedCapped() {
+							overflowSeen = true
+						}
+						if offerFull {
+							break
+						}
+					}
+				}
+			}
+			scanExhausted := !picker.Full()
+			picked := picker.Picked()
+			iterRejected := picker.Rejected()
+			for _, r := range picked {
+				attempted[r.ID] = struct{}{}
+			}
+			if len(picked) == 0 {
+				// Fixed gating: no picks → no losses → skip (break).
+				// Pre-fix gating requeried here.
+				if !skipWithoutLoss && startOverflowRequery() {
+					continue
+				}
+				break
+			}
+			prevOut := len(out)
+			for _, r := range picked {
+				if lockLost(r.ID) {
+					continue
+				}
+				out = append(out, r)
+				claimed = append(claimed, r)
+			}
+			if len(out) >= limit {
+				break
+			}
+			if scanExhausted {
+				lost := len(picked) - (len(out) - prevOut)
+				if skipWithoutLoss {
+					// Fixed: lost==0 skips the rescan outright.
+					if lost == 0 {
+						break
+					}
+					if len(iterRejected) == 0 && startOverflowRequery() {
+						continue
+					}
+					break
+				}
+				if lost == 0 || len(iterRejected) == 0 {
+					if startOverflowRequery() {
+						continue
+					}
+					break
+				}
+			}
+			pending = append(iterRejected, pending[offered:]...)
+			if len(pending) > backend.FairRejectedCap {
+				pending = pending[:backend.FairRejectedCap]
+			}
+		}
+		return out, arms
+	}
+
+	// Pre-fix shape: arms the wasteful rescan (reproduces the finding).
+	if _, arms := runRefill(false); arms == 0 {
+		t.Fatal("pre-fix decision: want ≥1 requery arm on lost==0 with overflow (reproduces the wasteful rescan)")
+	}
+	// Fixed contract: identical result with no rescan.
+	got, arms := runRefill(true)
+	if len(got) != 1 || got[0].ID != 1 {
+		t.Fatalf("fixed decision: got %v, want [A1] (same result, no rescan)", got)
+	}
+	if arms != 0 {
+		t.Fatalf("fixed decision: arms=%d, want 0 (skip requery when every pick succeeded)", arms)
+	}
+	// Underfilled-with-losses behavior is preserved by the existing
+	// TestFairOverflowRequeryMirror/Underfilled/SuccessiveSegments suites
+	// (all lossy); this gate only skips the lost==0 rescan.
+}
+
 func TestFairPickerRelease(t *testing.T) {
 	mk := func(id int64, inst string) backend.FairTaskRef {
 		return backend.FairTaskRef{ID: id, InstanceID: inst}
