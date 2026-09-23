@@ -1,3 +1,5 @@
+//go:build tasuki_all
+
 package chaos_test
 
 import (
@@ -53,9 +55,11 @@ func TestChaos_KillWorkers_Spanner(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	workerDir := filepath.Join(filepath.Dir(thisFile), "cmd", "worker")
 	bin := filepath.Join(t.TempDir(), "chaos-worker-spanner")
-	build := exec.Command("go", "build", "-o", bin, ".")
+	build := exec.Command("go", "build", "-race", "-tags", "tasuki_all", "-o", bin, ".")
 	build.Dir = workerDir
-	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	// Race-instrument the spawned workers too: -race on the test binary
+	// only covers the test process, while workflow execution happens here.
+	build.Env = append(os.Environ(), "CGO_ENABLED=1")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build worker: %v\n%s", err, out)
 	}
@@ -67,11 +71,15 @@ func TestChaos_KillWorkers_Spanner(t *testing.T) {
 	startWorker := func(i int) *proc {
 		id := fmt.Sprintf("sw-%d-%d", i, time.Now().UnixNano())
 		cmd := exec.Command(bin)
+		// GORACE=halt_on_error=1 makes a race report terminate the worker
+		// immediately (race exit 66) so Wait observes it before any
+		// deliberate SIGKILL, which waitKilledWorker accepts.
 		cmd.Env = append(os.Environ(),
 			"TASUKI_BACKEND=spanner",
 			"TASUKI_SPANNER_DSN="+dsn,
 			"SPANNER_EMULATOR_HOST="+os.Getenv("SPANNER_EMULATOR_HOST"),
 			"WORKER_ID="+id,
+			"GORACE=halt_on_error=1",
 		)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -87,7 +95,7 @@ func TestChaos_KillWorkers_Spanner(t *testing.T) {
 		for _, w := range workers {
 			if w.cmd.Process != nil {
 				_ = w.cmd.Process.Kill()
-				_, _ = w.cmd.Process.Wait()
+				waitKilledWorker(t, w.cmd.Process)
 			}
 		}
 	}()
@@ -114,7 +122,7 @@ func TestChaos_KillWorkers_Spanner(t *testing.T) {
 			idx := rng.Intn(len(workers))
 			w := workers[idx]
 			_ = w.cmd.Process.Signal(syscall.SIGKILL)
-			_, _ = w.cmd.Process.Wait()
+			waitKilledWorker(t, w.cmd.Process)
 			workers[idx] = startWorker(idx)
 		}
 		time.Sleep(50 * time.Millisecond)

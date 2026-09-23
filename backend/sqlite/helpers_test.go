@@ -25,6 +25,27 @@ func TestParseTime_Formats(t *testing.T) {
 	}
 }
 
+func TestIsDuplicateColumnError(t *testing.T) {
+	if isDuplicateColumnError(nil) {
+		t.Fatal("nil is not a duplicate-column error")
+	}
+	if !isDuplicateColumnError(errors.New("duplicate column name: heartbeat")) {
+		t.Fatal("want duplicate column")
+	}
+	// Any other ALTER failure (missing table, permissions, syntax) must
+	// NOT be classified as duplicate-column: Migrate aborts on those
+	// instead of silently ignoring them.
+	for _, msg := range []string{
+		"no such table: wf_tasks",
+		"permission denied",
+		"near \"ADD\": syntax error",
+	} {
+		if isDuplicateColumnError(errors.New(msg)) {
+			t.Fatalf("%q must not be a duplicate-column error", msg)
+		}
+	}
+}
+
 func TestIsUniqueViolationAndScanners(t *testing.T) {
 	if isUniqueViolation(nil) || isUniqueViolation(errors.New("other")) {
 		t.Fatal("false cases")

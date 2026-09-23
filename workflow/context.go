@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"encoding/json"
+	"fmt"
 	"runtime"
 	"time"
 
@@ -22,17 +23,26 @@ func (jsonCodec) Marshal(v any) ([]byte, error)      { return json.Marshal(v) }
 func (jsonCodec) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
 
 type Context struct {
-	events      []journal.Event
-	cmdIndex    int
-	commands    []journal.Event
-	nextSeq     int64
-	now         time.Time
-	completions map[int64]journal.Event
-	canceled    bool
-	suspended   bool
-	info            WorkflowInfo
-	consumedSignals map[int64]bool
-	codec           Codec
+	events   []journal.Event
+	cmdIndex int
+	commands []journal.Event
+	// recorded is the precomputed command subsequence of events, built once
+	// in NewContext so recordOrReplay/peekCommand index in O(1) instead of
+	// rescanning all events per command (O(N^2) replay).
+	recorded []journal.Event
+	// signals holds per-name signal queues in journal order, built once in
+	// NewContext; signalPos tracks the consumed cursor per name so
+	// takeSignal/peekSignal are O(1) amortized instead of scanning events.
+	signals          map[string][]journal.Event
+	signalPos        map[string]int
+	nextSeq          int64
+	now              time.Time
+	completions      map[int64]journal.Event
+	canceled         bool
+	suspended        bool
+	info             WorkflowInfo
+	consumedSignals  map[int64]bool
+	codec            Codec
 	queryMode        bool
 	queryInvoking    bool
 	queryHandlers    map[string]queryHandler
@@ -44,12 +54,14 @@ type Context struct {
 
 func NewContext(events []journal.Event, now time.Time) *Context {
 	ctx := &Context{
-		events:      events,
-		now:         now,
+		events:          events,
+		now:             now,
 		completions:     map[int64]journal.Event{},
 		nextSeq:         1,
 		consumedSignals: map[int64]bool{},
 		codec:           jsonCodec{},
+		signals:         map[string][]journal.Event{},
+		signalPos:       map[string]int{},
 	}
 	for _, e := range events {
 		if e.Type == journal.TypeWorkflowStarted {
@@ -60,6 +72,12 @@ func NewContext(events []journal.Event, now time.Time) *Context {
 	for _, e := range events {
 		if e.Seq >= ctx.nextSeq {
 			ctx.nextSeq = e.Seq + 1
+		}
+		if e.Type.IsCommand() {
+			ctx.recorded = append(ctx.recorded, e)
+		}
+		if e.Type == journal.TypeSignalReceived {
+			ctx.signals[e.Name] = append(ctx.signals[e.Name], e)
 		}
 		if e.Type.IsCompletion() && e.RefSeq != 0 {
 			ctx.completions[e.RefSeq] = e
@@ -98,10 +116,9 @@ func WasSuspended(c *Context) bool { return c.suspended }
 func ClearSuspended(c *Context) { c.suspended = false }
 
 func (c *Context) recordOrReplay(cmd journal.Command, payload []byte) journal.Event {
-	recordedCmds := c.recordedCommands()
-	for c.cmdIndex < len(recordedCmds) {
-		rec := recordedCmds[c.cmdIndex]
-		// Old code skips version markers it does not understand.
+	for c.cmdIndex < len(c.recorded) {
+		rec := c.recorded[c.cmdIndex]
+		// Skip version markers this call site does not understand.
 		if cmd.Type != journal.TypeVersionMarker && rec.Type == journal.TypeVersionMarker {
 			c.cmdIndex++
 			continue
@@ -132,13 +149,7 @@ func (c *Context) recordOrReplay(cmd journal.Command, payload []byte) journal.Ev
 }
 
 func (c *Context) recordedCommands() []journal.Event {
-	out := make([]journal.Event, 0)
-	for _, e := range c.events {
-		if e.Type.IsCommand() {
-			out = append(out, e)
-		}
-	}
-	return out
+	return c.recorded
 }
 
 func (c *Context) awaitCompletion(seq int64) (journal.Event, bool) {
@@ -171,6 +182,54 @@ func AsDeterminismPanic(r any) (error, bool) {
 // Sleep schedules a durable timer. If the timer has not fired in the journal, the
 // workflow goroutine suspends via runtime.Goexit.
 func Sleep(ctx *Context, d time.Duration) error {
+	return sleepAt(ctx, ctx.now.Add(d))
+}
+
+// SleepUntil schedules a durable timer that fires at the given absolute time.
+// The deadline is recorded verbatim in the journal and never passes through
+// time.Duration, so deadlines beyond the ~290-year duration range are preserved
+// instead of saturating via time.Time.Sub. A Now checkpoint is still recorded
+// first to anchor determinism and keep the journal shape
+// (now_recorded + timer_created) compatible with existing histories.
+// A deadline at or before Now is clamped to Now before persisting: zero or
+// pre-year-1000 times recorded verbatim break MySQL DATETIME(6) inserts
+// (minimum year 1000) under strict mode, turning a wake into a retry. The
+// clamped timer stays already-due and fires on the next tick.
+//
+// A deadline whose UTC-normalized instant falls outside the portable backend
+// range (MySQL DATETIME(6): years 1000-9999) is rejected with
+// ErrDeadlineOutOfRange instead of recorded: for example,
+// 9999-12-31 23:00 -02:00 passes the clamp check and marshals successfully,
+// but backends insert tm.FireAt.UTC() (year 10000), so every commit would fail
+// and retry indefinitely. Failing fast surfaces the bug to the developer.
+func SleepUntil(ctx *Context, t time.Time) error {
+	now := Now(ctx)
+	if !t.After(now) {
+		t = now
+	}
+	if err := checkPortableDeadline(t); err != nil {
+		return err
+	}
+	// Normalize to UTC before encoding: the check above accepts any instant
+	// whose UTC year is portable, but time.Time.MarshalJSON rejects a local
+	// year outside 0-9999 (e.g. year-10000 +02:00 rendering 9999-12-31T23:00Z).
+	return sleepAt(ctx, t.UTC())
+}
+
+// checkPortableDeadline rejects timer deadlines whose UTC instant cannot be
+// stored by every backend. MySQL DATETIME(6) ('1000-01-01' to '9999-12-31')
+// is the narrowest timer column; other backends accept wider ranges. The
+// check runs on the UTC-normalized time because backends insert FireAt.UTC(),
+// so a local wall clock inside years 1000-9999 can still overflow (e.g.
+// 9999-12-31 23:00 -02:00 is year 10000 in UTC).
+func checkPortableDeadline(t time.Time) error {
+	if y := t.UTC().Year(); y < 1000 || y > 9999 {
+		return fmt.Errorf("%w: %s", ErrDeadlineOutOfRange, t.UTC().Format(time.RFC3339Nano))
+	}
+	return nil
+}
+
+func sleepAt(ctx *Context, fireAt time.Time) error {
 	// Replay an already-recorded timer before applying cancel, so command matching stays aligned.
 	if rec, ok := ctx.peekCommand(); ok && rec.Type == journal.TypeTimerCreated {
 		ev := ctx.recordOrReplay(journal.Command{Type: journal.TypeTimerCreated}, rec.Payload)
@@ -186,7 +245,7 @@ func Sleep(ctx *Context, d time.Duration) error {
 	if ctx.canceled {
 		return ErrCanceled
 	}
-	payload, err := json.Marshal(timerPayload{FireAt: ctx.now.Add(d)})
+	payload, err := json.Marshal(timerPayload{FireAt: fireAt})
 	if err != nil {
 		return err
 	}
@@ -203,39 +262,32 @@ type timerPayload struct {
 }
 
 func (c *Context) takeSignal(name string) (journal.Event, bool) {
-	for _, e := range c.events {
-		if e.Type != journal.TypeSignalReceived || e.Name != name {
-			continue
-		}
-		if c.consumedSignals[e.Seq] {
-			continue
-		}
-		c.consumedSignals[e.Seq] = true
-		return e, true
+	q := c.signals[name]
+	pos := c.signalPos[name]
+	if pos >= len(q) {
+		return journal.Event{}, false
 	}
-	return journal.Event{}, false
+	ev := q[pos]
+	c.signalPos[name] = pos + 1
+	c.consumedSignals[ev.Seq] = true
+	return ev, true
 }
 
 func (c *Context) peekSignal(name string) (journal.Event, bool) {
-	for _, e := range c.events {
-		if e.Type != journal.TypeSignalReceived || e.Name != name {
-			continue
-		}
-		if c.consumedSignals[e.Seq] {
-			continue
-		}
-		return e, true
+	q := c.signals[name]
+	pos := c.signalPos[name]
+	if pos >= len(q) {
+		return journal.Event{}, false
 	}
-	return journal.Event{}, false
+	return q[pos], true
 }
 
 func (c *Context) peekCommand() (journal.Event, bool) {
-	cmds := c.recordedCommands()
 	// skip already-handled index; also surface markers
-	if c.cmdIndex >= len(cmds) {
+	if c.cmdIndex >= len(c.recorded) {
 		return journal.Event{}, false
 	}
-	return cmds[c.cmdIndex], true
+	return c.recorded[c.cmdIndex], true
 }
 
 func (c *Context) skipCommand() {

@@ -16,11 +16,11 @@
 | spanner | `.../backend/spanner` | Spanner ストア |
 | sqlite | `.../backend/sqlite` | SQLite ストア |
 
-root は既定ビルドで backend サブモジュールに依存しない。`internal/backendopen` は既定で memory のみを内蔵し、他 backend は `-tags tasuki_all` ビルド（workspace 内）で登録される。examples の非 memory 系（m1/m3/m4）と `chaos/cmd/worker` も `tasuki_all` タグ付きのため、既定の `GOWORK=off go list ./...` は root のみで成功する。
+root は既定ビルドで backend サブモジュールに依存しない。`internal/backendopen` は既定で memory のみを内蔵し、他 backend は `-tags tasuki_all` ビルド（workspace 内）で登録される。examples の非 memory 系（m1/m3/m4）、`chaos` テスト、`chaos/cmd/worker` も `tasuki_all` タグ付きのため、既定の `GOWORK=off go list ./...` と `GOWORK=off go vet ./...`（テスト含む）は root のみで成功する。
 
 ## 最小 Go バージョン
 
-- 宣言: root `go 1.24`、`go.work` も `go 1.24`（CI `1.24.x` と一致）。
+- 宣言: root `go 1.24`、backend 各モジュール `go 1.24`、`go.work` も `go 1.24`（CI `1.24.x` と一致）。
 - 検証: `GOTOOLCHAIN=local go build ./...`（workspace 外の Go 1.24 環境で確認）。
 
 ## 依存バージョン
@@ -49,6 +49,9 @@ root は既定ビルドで backend サブモジュールに依存しない。`in
 
 ## CI
 
-- `root` ジョブ: `go test ./...`（workspace）。
-- `gowork-check` ジョブ: `GOWORK=off GOPROXY=off go list ./...` + `GOTOOLCHAIN=local go build ./...` で独立性を検証。
-- 各 backend ジョブ: 対応する `backend/<name>` ディレクトリで `go test`。
+- `root` ジョブ: `go test ./... -race`（workspace。fuzz の seed は単体テストとしてここで実行）。
+- `gowork-check` ジョブ: `GOWORK=off GOPROXY=off go list ./...` + `GOWORK=off go build ./...` + `GOWORK=off go vet ./...`（テスト含む）+ `GOTOOLCHAIN=local go build ./...` + `GOWORK=off GOPROXY=off go mod tidy -e` の差分ゼロ検証で独立性を検証し、`go test -tags tasuki_all ./contrib/... ./examples/...` も実行。
+- 各 backend ジョブ: 対応する `backend/<name>` ディレクトリで `go test ./... -race`。
+- 各 chaos ジョブ: `kill -9` カオスを `-race` + `-tags tasuki_all` 付きで実行（インフラ不要の `chaos-sqlite` を含む）。
+- `lint`/`vuln` ジョブ: root と backend に `staticcheck`（必須）と参考表示の `govulncheck`。
+- `fuzz-nightly` ジョブ: nightly schedule（または手動 dispatch）のみ実行。各 codec/engine ターゲットに `-fuzz -fuzztime` 60 秒。

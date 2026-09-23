@@ -12,7 +12,11 @@ import (
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
-func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilities{} }
+func (b *Backend) Capabilities() backend.Capabilities {
+	return backend.Capabilities{FairDispatch: true}
+}
+
+var _ backend.SchemaValidator = (*Backend)(nil)
 
 func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
 	queue := inst.Queue
@@ -97,22 +101,7 @@ func (b *Backend) GetJournal(ctx context.Context, id string, afterSeq int64) ([]
 }
 
 func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) ([]backend.Instance, error) {
-	limit := f.Limit
-	if limit <= 0 {
-		limit = 100
-	}
-	query := `
-		SELECT id, name, queue, status, input, result, failure, next_seq,
-		       COALESCE(parent_id, ''), COALESCE(parent_seq, 0), COALESCE(search_attributes, '{}'), COALESCE(memo, '{}')
-		FROM wf_instances
-		WHERE (? = '' OR status = ?)
-		  AND (? = '' OR name = ?)
-		ORDER BY created_at, id`
-	args := []any{f.Status, f.Status, f.Name, f.Name}
-	if len(f.SearchAttributes) == 0 {
-		query += ` LIMIT ? OFFSET ?`
-		args = append(args, limit, f.Offset)
-	}
+	query, args := listInstancesQuery(f)
 	rows, err := b.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -131,24 +120,40 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 		inst.Failure = scanJSONText(failure)
 		inst.SearchAttributes = scanSearchAttrs(searchAttrs)
 		inst.Memo = scanSearchAttrs(memo)
-		if !backend.MatchesSearchAttributes(inst.SearchAttributes, f.SearchAttributes) {
-			continue
-		}
 		out = append(out, inst)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	return out, rows.Err()
+}
+
+// listInstancesQuery builds the ListInstances SELECT with SQL-side
+// SearchAttributes filtering (one json_each literal lookup per key, ANDed)
+// and an unconditional LIMIT/OFFSET, so filtered listings only read the
+// requested page instead of the full table. Keys are matched with plain `=`
+// against json_each.key, so unrestricted key strings — including ones that
+// look like JSON paths (`$.tenant`), or that carry dots, quotes, or
+// backslashes — are always treated as literal object keys. (`->>` cannot be
+// used here: its right operand is parsed as a JSON path when it begins with
+// `$`, so a filter for literal key `$.tenant` would read key `tenant`.)
+// A NULL search_attributes column never matches a non-empty filter.
+func listInstancesQuery(f backend.InstanceFilter) (string, []any) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 100
 	}
-	if len(f.SearchAttributes) > 0 {
-		if f.Offset >= len(out) {
-			return nil, nil
-		}
-		out = out[f.Offset:]
-		if len(out) > limit {
-			out = out[:limit]
-		}
+	query := `
+		SELECT id, name, queue, status, input, result, failure, next_seq,
+		       COALESCE(parent_id, ''), COALESCE(parent_seq, 0), COALESCE(search_attributes, '{}'), COALESCE(memo, '{}')
+		FROM wf_instances
+		WHERE (? = '' OR status = ?)
+		  AND (? = '' OR name = ?)`
+	args := []any{f.Status, f.Status, f.Name, f.Name}
+	for _, k := range sortedSearchAttributeKeys(f.SearchAttributes) {
+		query += ` AND (EXISTS (SELECT 1 FROM json_each(COALESCE(search_attributes, '{}')) WHERE key = ? AND value = ?))`
+		args = append(args, k, f.SearchAttributes[k])
 	}
-	return out, nil
+	query += ` ORDER BY created_at, id LIMIT ? OFFSET ?`
+	args = append(args, limit, f.Offset)
+	return query, args
 }
 
 func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
@@ -171,9 +176,15 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	if n == 0 {
 		return backend.ErrNotFound
 	}
-	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE instance_id = ?`, id)
-	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_timers WHERE instance_id = ?`, id)
-	_, _ = conn.ExecContext(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = ?`, id)
+	if _, err = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE instance_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, `DELETE FROM wf_timers WHERE instance_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = ?`, id); err != nil {
+		return err
+	}
 	if err := commitConn(ctx, conn); err != nil {
 		return err
 	}
@@ -425,9 +436,20 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 	return nil
 }
 
-func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
-	res, err := b.db.ExecContext(ctx, `
-		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ?`, nowStr(), taskID)
+func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
+	var res sql.Result
+	var err error
+	if t.WorkerID != "" {
+		// Conditional on the claim ownership token: a stale worker whose
+		// task was reclaimed (new worker/attempt) matches zero rows and
+		// reports ErrNotFound instead of clearing the fresh lease.
+		res, err = b.db.ExecContext(ctx, `
+		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ? AND worker_id = ? AND attempt = ?`,
+			nowStr(), t.ID, t.WorkerID, t.Attempt)
+	} else {
+		res, err = b.db.ExecContext(ctx, `
+		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ?`, nowStr(), t.ID)
+	}
 	if err != nil {
 		return err
 	}
@@ -443,8 +465,20 @@ func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
 }
 
 func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {
-	res, err := b.db.ExecContext(ctx, `
+	var res sql.Result
+	var err error
+	if t.WorkerID != "" {
+		// Conditional on the claim ownership token (see ReleaseLease): a
+		// stale worker whose task was reclaimed (new worker/attempt)
+		// matches zero rows and reports ErrNotFound instead of clearing
+		// the fresh lease.
+		res, err = b.db.ExecContext(ctx, `
+		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ? AND worker_id = ? AND attempt = ?`,
+			formatTime(nowUTC().Add(delay)), t.ID, t.WorkerID, t.Attempt)
+	} else {
+		res, err = b.db.ExecContext(ctx, `
 		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ?`, formatTime(nowUTC().Add(delay)), t.ID)
+	}
 	if err != nil {
 		return err
 	}

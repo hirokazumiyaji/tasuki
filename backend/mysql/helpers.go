@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -50,6 +51,21 @@ func execIndexBackfill(ctx context.Context, q queryExecer, stmt string) error {
 		}
 	}
 	return nil
+}
+
+// isDuplicateColumnError reports whether err is a duplicate-column error
+// (MySQL error 1060). Only this class of ALTER TABLE ... ADD COLUMN failure
+// may be tolerated by Migrate; everything else (permissions, missing table,
+// syntax) must abort the migration.
+func isDuplicateColumnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		return mysqlErr.Number == 1060
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "duplicate column")
 }
 
 func beginTx(ctx context.Context, db *sql.DB) (*sql.Conn, error) {
@@ -108,6 +124,17 @@ func inClause(n int) string {
 		parts[i] = "?"
 	}
 	return strings.Join(parts, ", ")
+}
+
+// sortedSearchAttributeKeys returns the filter keys in sorted order so the
+// generated SQL is deterministic.
+func sortedSearchAttributeKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 type activityPayload struct {

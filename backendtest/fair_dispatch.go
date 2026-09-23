@@ -10,7 +10,11 @@ import (
 )
 
 // RunFairDispatch exercises ClaimRequest.MaxPerInstance on backends that
-// implement fair dispatch (postgres, mysql, sqlite, memory).
+// implement fair dispatch (postgres, mysql, sqlite, memory, dynamodb,
+// firestore).
+//
+// Backends that do not advertise Capabilities.FairDispatch (e.g. spanner)
+// skip explicitly instead of failing on FIFO behavior.
 //
 // The scenario is head-of-line blocking: instance "fair-flood" enqueues five
 // activity tasks before two single-task instances. A capped batch must
@@ -19,6 +23,9 @@ func RunFairDispatch(t *testing.T, newBackend Factory) {
 	t.Helper()
 	ctx := context.Background()
 	b := newBackend(t)
+	if !b.Capabilities().FairDispatch {
+		t.Skip("backend does not support fair dispatch (Capabilities.FairDispatch=false)")
+	}
 	setNow(b, time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
 
 	const queue = "fq"
@@ -27,34 +34,50 @@ func RunFairDispatch(t *testing.T, newBackend Factory) {
 		if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: queue}); err != nil {
 			t.Fatal(err)
 		}
-		tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
-			Kind: "workflow", Queues: []string{queue}, Limit: 1,
-			Lease: time.Minute, WorkerID: "fair",
-		})
-		if err != nil || len(tasks) != 1 {
-			t.Fatalf("claim wf %s: %v %#v", id, err, tasks)
-		}
-		st, err := b.LoadWorkflow(ctx, id)
-		if err != nil {
-			t.Fatal(err)
-		}
-		adv := backend.Advancement{
-			InstanceID:  id,
-			TaskID:      tasks[0].ID,
-			ExpectedSeq: st.NextSeq,
-		}
-		for i := 0; i < activities; i++ {
-			seq := st.NextSeq + int64(i)
-			adv.NewEvents = append(adv.NewEvents, journal.Event{
-				Seq: seq, Type: journal.TypeActivityScheduled, Name: "step",
+		// Backends with tight advancement budgets (e.g. DynamoDB's
+		// transaction item limit) cannot enqueue a large flood in one
+		// advancement (each activity costs a journal write plus a task
+		// write). Chunk the flood, chaining ExpectedSeq and forcing a
+		// follow-up workflow task between chunks, so every backend
+		// enqueues the same FIFO scenario.
+		const chunk = 25
+		for done := 0; done < activities; {
+			tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+				Kind: "workflow", Queues: []string{queue}, Limit: 1,
+				Lease: time.Minute, WorkerID: "fair",
 			})
-			adv.ActivityTasks = append(adv.ActivityTasks, backend.NewTask{
-				Kind: "activity", Queue: queue, InstanceID: id, Name: "step",
-				Seq: seq, Input: []byte(`{}`),
-			})
-		}
-		if err := b.CommitAdvancement(ctx, adv); err != nil {
-			t.Fatal(err)
+			if err != nil || len(tasks) != 1 {
+				t.Fatalf("claim wf %s: %v %#v", id, err, tasks)
+			}
+			st, err := b.LoadWorkflow(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			n := activities - done
+			if n > chunk {
+				n = chunk
+			}
+			adv := backend.Advancement{
+				InstanceID:  id,
+				TaskID:      tasks[0].ID,
+				ExpectedSeq: st.NextSeq,
+				// Keep the singleton workflow task alive between chunks.
+				EnsureWorkflowTask: done+n < activities,
+			}
+			for i := 0; i < n; i++ {
+				seq := st.NextSeq + int64(i)
+				adv.NewEvents = append(adv.NewEvents, journal.Event{
+					Seq: seq, Type: journal.TypeActivityScheduled, Name: "step",
+				})
+				adv.ActivityTasks = append(adv.ActivityTasks, backend.NewTask{
+					Kind: "activity", Queue: queue, InstanceID: id, Name: "step",
+					Seq: seq, Input: []byte(`{}`),
+				})
+			}
+			if err := b.CommitAdvancement(ctx, adv); err != nil {
+				t.Fatal(err)
+			}
+			done += n
 		}
 	}
 	spawn("fair-flood", 7)
