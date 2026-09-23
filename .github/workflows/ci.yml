@@ -57,9 +57,18 @@ jobs:
         # through job-level continue-on-error).
         id: root
         continue-on-error: true
+        env:
+          # Scan the standalone root module, not the workspace-wide MVS
+          # build list (which may select higher versions than the root pins,
+          # omitting real vulns).
+          GOWORK: off
         run: govulncheck ./...
       - name: Run govulncheck (backend modules)
         if: always()
+        env:
+          # Same workspace isolation per backend invocation: each module's
+          # own dependency graph, not the workspace-wide build list.
+          GOWORK: off
         run: |
           # Aggregate the root scan with the backend scans. With
           # continue-on-error the root step's conclusion is success even on
