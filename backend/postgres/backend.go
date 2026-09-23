@@ -271,7 +271,7 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		pending []backend.FairTaskRef
 	)
 	for len(out) < req.Limit {
-		picker := backend.NewFairPicker(req.Limit-len(out), req.MaxPerInstance)
+		picker := backend.NewFairPicker(req.Limit-len(out), req.MaxPerInstance).TrackRejected()
 		picker.Seed(claimed)
 		// Reconsider candidates rejected by an earlier pass first: they are
 		// FIFO-earlier than the scan cursor and may now fit under the cap

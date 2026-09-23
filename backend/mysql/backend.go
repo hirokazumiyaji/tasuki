@@ -352,7 +352,7 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 	var accepted []backend.FairTaskRef
 	var pending []backend.FairTaskRef
 	for len(accepted) < req.Limit {
-		picker := backend.NewFairPicker(req.Limit-len(accepted), req.MaxPerInstance)
+		picker := backend.NewFairPicker(req.Limit-len(accepted), req.MaxPerInstance).TrackRejected()
 		picker.Seed(accepted)
 		// Reconsider candidates rejected by an earlier pass first: they are
 		// FIFO-earlier than the scan cursor and may now fit under the cap.

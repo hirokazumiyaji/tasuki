@@ -113,7 +113,7 @@ func TestFairPick(t *testing.T) {
 		}
 	}
 	// Paging stops as soon as the batch fills.
-	p := backend.NewFairPicker(2, 1)
+	p := backend.NewFairPicker(2, 1).TrackRejected()
 	for _, r := range mk("AAAB") {
 		if p.Offer(r) {
 			break
@@ -151,6 +151,37 @@ func TestFairPick(t *testing.T) {
 	}
 	if of := backend.FairOverfetch(5000); of < 5000 || of > 8192 {
 		t.Fatalf("overfetch %d", of)
+	}
+}
+
+func TestFairPickerRejectedOptIn(t *testing.T) {
+	mk := func(spec string) []backend.FairTaskRef {
+		var out []backend.FairTaskRef
+		for i, c := range []byte(spec) {
+			out = append(out, backend.FairTaskRef{ID: int64(i + 1), InstanceID: string(c)})
+		}
+		return out
+	}
+	// Default off: over-cap candidates are dropped without accumulating,
+	// so single-pass callers (SQLite) pay O(1) extra memory.
+	off := backend.NewFairPicker(2, 1)
+	for _, r := range mk("AAAB") {
+		if off.Offer(r) {
+			break
+		}
+	}
+	if got := off.Rejected(); len(got) != 0 {
+		t.Fatalf("default Rejected = %v, want empty (opt-in required)", got)
+	}
+	// Opted in: the same feed retains the over-cap rows.
+	on := backend.NewFairPicker(2, 1).TrackRejected()
+	for _, r := range mk("AAAB") {
+		if on.Offer(r) {
+			break
+		}
+	}
+	if got := len(on.Rejected()); got != 2 {
+		t.Fatalf("tracked Rejected len = %d, want 2", got)
 	}
 }
 

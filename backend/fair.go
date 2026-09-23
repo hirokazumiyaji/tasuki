@@ -63,12 +63,17 @@ func FairPick(refs []FairTaskRef, limit, perInstance int) []FairTaskRef {
 // the queue; paging stops once Full reports true, so a batch can be filled
 // from arbitrarily deep in the queue without buffering the whole candidate
 // pool in memory.
+//
+// Rejected retention is opt-in (TrackRejected) and off by default: callers
+// that never refill (e.g. SQLite's single-pass scan) pay nothing, while
+// refill paths (postgres, mysql) opt in to carry rejected rows forward.
 type FairPicker struct {
-	limit       int
-	perInstance int
-	counts      map[string]int
-	picked      []FairTaskRef
-	rejected    []FairTaskRef
+	limit         int
+	perInstance   int
+	counts        map[string]int
+	picked        []FairTaskRef
+	rejected      []FairTaskRef
+	trackRejected bool
 }
 
 // NewFairPicker starts a fair selection of up to limit tasks with at most
@@ -83,17 +88,29 @@ func NewFairPicker(limit, perInstance int) *FairPicker {
 	}
 }
 
+// TrackRejected opts into retaining per-instance-cap rejections for
+// Rejected, and returns the picker for chaining. It must be called before
+// offering candidates. Callers that refill after losing picked rows to
+// concurrent locks (postgres, mysql) need this; single-pass callers leave it
+// off so rejected backlog scanned past an over-quota flood never accumulates.
+func (p *FairPicker) TrackRejected() *FairPicker {
+	p.trackRejected = true
+	return p
+}
+
 // Offer feeds one candidate in FIFO order. It reports whether the batch is
 // full after considering the candidate, so callers can stop paging early.
-// Candidates rejected by the per-instance cap are retained for Rejected, so a
-// refill pass can reconsider them if picked rows are later lost to concurrent
-// lock contention.
+// Candidates rejected by the per-instance cap are retained for Rejected only
+// when TrackRejected was opted into, so a refill pass can reconsider them if
+// picked rows are later lost to concurrent lock contention.
 func (p *FairPicker) Offer(ref FairTaskRef) bool {
 	if len(p.picked) >= p.limit {
 		return true
 	}
 	if p.counts[ref.InstanceID] >= p.perInstance {
-		p.rejected = append(p.rejected, ref)
+		if p.trackRejected {
+			p.rejected = append(p.rejected, ref)
+		}
 		return false
 	}
 	p.counts[ref.InstanceID]++
@@ -118,7 +135,12 @@ func (p *FairPicker) Seed(refs []FairTaskRef) {
 func (p *FairPicker) Picked() []FairTaskRef { return p.picked }
 
 // Rejected returns the candidates skipped by the per-instance cap, in FIFO
-// order. Callers that refill after losing picked rows to concurrent locks
-// must carry these forward: a rejected row can become eligible once the pick
-// that blocked it is lost.
+// order. It is nil unless TrackRejected was opted into. Callers that refill
+// after losing picked rows to concurrent locks must carry these forward: a
+// rejected row can become eligible once the pick that blocked it is lost.
+//
+// Each entry is a compact FairTaskRef (ID plus owning instance ID; no
+// payloads), retained only within one claim pass over the candidate scan and
+// dropped with the per-pass picker afterwards, so retention is bounded by the
+// rows scanned in that pass rather than the whole queue.
 func (p *FairPicker) Rejected() []FairTaskRef { return p.rejected }
