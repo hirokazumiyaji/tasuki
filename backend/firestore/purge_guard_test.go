@@ -60,7 +60,7 @@ func TestPurgeVictimGuards(t *testing.T) {
 
 	// The conditional delete must stand down for a stale incarnation,
 	// leaving the doc (and the seq counter) untouched.
-	if done, _, err := b.deletePurgedInstanceDoc(ctx, stale); err != nil || done {
+	if done, _, _, err := b.deletePurgedInstanceDoc(ctx, stale); err != nil || done {
 		t.Fatalf("stale delete: done=%v err=%v", done, err)
 	}
 	if _, err := b.GetInstance(ctx, id); err != nil {
@@ -73,10 +73,10 @@ func TestPurgeVictimGuards(t *testing.T) {
 	if err := b.SendToInbox(ctx, id, journal.Event{Type: journal.TypeSignalReceived, Name: "sig"}, "guard-key"); err != nil {
 		t.Fatal(err)
 	}
-	if done, residual, err := b.deletePurgedInstanceDoc(ctx, victim); err != nil || !done {
+	if done, residual, _, err := b.deletePurgedInstanceDoc(ctx, victim); err != nil || !done {
 		t.Fatalf("own delete: done=%v err=%v", done, err)
 	} else {
-		if residual == nil || len(residual.dedupe) != 1 || residual.dedupe[0].ref.ID != signalDedupeID(id, "guard-key") {
+		if residual == nil || len(residual.dedupe) != 1 || residual.dedupe[0].ref.ID != id+":"+escapeDedupeID("guard-key") {
 			t.Fatalf("own delete must snapshot the straggler dedupe row in-txn, got %+v", residual)
 		}
 		if len(residual.inbox) != 1 {
@@ -90,7 +90,7 @@ func TestPurgeVictimGuards(t *testing.T) {
 		t.Fatalf("absent doc must pass the second-sweep guard: %v", err)
 	}
 	// A concurrent purge that arrives after the delete owns nothing.
-	if done, _, err := b.deletePurgedInstanceDoc(ctx, victim); err != nil || done {
+	if done, _, _, err := b.deletePurgedInstanceDoc(ctx, victim); err != nil || done {
 		t.Fatalf("loser delete: done=%v err=%v", done, err)
 	}
 }

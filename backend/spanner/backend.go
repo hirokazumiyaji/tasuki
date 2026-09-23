@@ -64,6 +64,23 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 	now := nowUTC()
 	taskID := newID()
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// Fence ID reuse while crash recovery is pending: a previous
+		// incarnation's purge wrote its marker atomically with the victim
+		// delete and has not finished its trailing sweep (the marker is
+		// cleared only after the second sweep/reap). Creating a replacement
+		// now would let it consume the old incarnation's leftover inbox
+		// rows long before its own purge. Fail fast so the caller retries;
+		// the next PurgeInstances resumes the crashed cleanup via the
+		// marker (sweep + clear) and unblocks the ID. The check rides in
+		// this same transaction: the victim-delete transaction is the
+		// serialization point, so a delete committing after this read
+		// aborts the create on the conflicting instance-row write, and a
+		// delete that committed first leaves its marker visible here.
+		if _, merr := txn.ReadRow(ctx, "wf_purge_markers", spanner.Key{inst.ID}, []string{"instance_id"}); merr == nil {
+			return backend.ErrAlreadyExists
+		} else if !isNotFound(merr) {
+			return merr
+		}
 		muts := []*spanner.Mutation{
 			spanner.InsertMap("wf_instances", map[string]any{
 				"id":         inst.ID,
@@ -1237,35 +1254,38 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				}
 				if terminal {
 					// Retry check first: marker present means this DedupeID
-					// already inserted post-terminal. Only the versioned
-					// marker form is probed (Codex round 9 on #327):
-					// legacy unversioned rows shaped like markers are
-					// pre-upgrade user keys by construction (markers are
-					// only written versioned), so they must never suppress
-					// a send.
-					markerExists := false
-					for _, mk := range dedupeMarkerCandidates(it.DedupeID) {
-						_, merr := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, mk}, []string{"dedupe_id"})
-						if merr == nil {
-							markerExists = true
-							break
-						}
-						if !isNotFound(merr) {
-							return merr
-						}
-					}
-					if markerExists {
+					// already inserted post-terminal. Markers live in their
+					// own table (see postTerminalMarkersTable), never in
+					// the dedupe keyspace: no legacy verbatim user row —
+					// however marker-shaped — can match this probe, and
+					// pre-upgrade marker rows left behind in
+					// wf_signal_dedupe are inert (a pre-upgrade retry may
+					// duplicate once, never drop; purge reaps the rows).
+					_, merr := txn.ReadRow(ctx, postTerminalMarkersTable, spanner.Key{instanceID, dedupeMarkerKey(it.DedupeID)}, []string{"marker_key"})
+					if merr == nil {
 						created[it.DedupeID] = true
 						continue
 					}
+					if !isNotFound(merr) {
+						return merr
+					}
 					// First post-terminal send: stamp the marker; create
-					// the base key too when absent for sweep consistency (any
-					// encoding, including legacy raw rows, counts as present).
-					muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-						"instance_id": instanceID, "dedupe_id": dedupeMarkerKey(it.DedupeID), "created_at": now,
+					// the base key too when absent for sweep consistency
+					// (any non-marker encoding, including legacy raw rows,
+					// counts as present). Marker-shaped candidates are
+					// never user keys: markers live in their own table
+					// now, so a row shaped like one is either an inert
+					// pre-upgrade marker or a legacy verbatim row no probe
+					// may mistake for this DedupeID's guard (skipping it
+					// duplicates at worst, never drops).
+					muts = append(muts, spanner.InsertMap(postTerminalMarkersTable, map[string]any{
+						"instance_id": instanceID, "marker_key": dedupeMarkerKey(it.DedupeID), "created_at": now,
 					}))
 					baseExists := false
 					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
+						if isPostTerminalMarkerKey(bk) {
+							continue
+						}
 						_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, bk}, []string{"dedupe_id"})
 						if err == nil {
 							baseExists = true
@@ -1286,8 +1306,16 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				} else {
 					// Probe every stored user-key form, legacy raw first (Codex
 					// round 8 on #327): pre-escape rows stored "__" IDs verbatim.
+					// Marker-shaped candidates are skipped (see the terminal
+					// base check above): markers live outside the dedupe
+					// keyspace, so such a row is an inert pre-upgrade marker
+					// or a legacy verbatim row — never this DedupeID's live
+					// guard.
 					baseHit := false
 					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
+						if isPostTerminalMarkerKey(bk) {
+							continue
+						}
 						_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, bk}, []string{"dedupe_id"})
 						if err == nil {
 							baseHit = true

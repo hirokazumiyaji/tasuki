@@ -314,6 +314,130 @@ func TestTerminalLegacyUserRowDelivers(t *testing.T) {
 	}
 }
 
+// A legacy verbatim user row shaped like a VERSIONED marker
+// ("__post_terminal__v1:x") must never match the retry-marker probe for "x"
+// (Codex round 11 on #296): old code stored DedupeIDs verbatim, so a user ID
+// of "__post_terminal__v1:x" occupies the very row the v1 marker probe for
+// "x" reads, and prefixes cannot separate them. Markers now live outside
+// the dedupe keyspace, so the probe never consults wf_signal_dedupe. The
+// legacy row is seeded directly to bypass the escaped write path. On the old
+// in-dedupe code the terminal send is swallowed and this fails.
+func TestTerminalLegacyV1UserRowDelivers(t *testing.T) {
+	dsn := guardTestDSN(t)
+	ctx := context.Background()
+	b, err := New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	const id = "terminal-legacy-v1-user-row"
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	// Legacy user key stored verbatim (no "__" escape): the exact row the
+	// old v1 marker probe for "x" used to hit.
+	if _, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return txn.BufferWrite([]*spanner.Mutation{
+			spanner.InsertMap("wf_signal_dedupe", map[string]any{
+				"instance_id": id, "dedupe_id": "__post_terminal__v1:x", "created_at": nowUTC(),
+			}),
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ev := journal.Event{Type: journal.TypeSignalReceived, Name: "sig", Payload: []byte(`{}`)}
+	// Terminal transition with the legacy row still present.
+	if _, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return txn.BufferWrite([]*spanner.Mutation{
+			spanner.UpdateMap("wf_instances", map[string]any{
+				"id": id, "status": "terminated",
+				"updated_at": nowUTC(), "completed_at": nowUTC(),
+			}),
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The first post-terminal send of "x" must insert, not dedupe against
+	// the legacy "__post_terminal__v1:x" user row.
+	if err := b.SendToInbox(ctx, id, ev, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if n := terminalTestInboxLen(t, b, ctx, id); n != 1 {
+		t.Fatalf("terminal send swallowed by legacy v1 user row: inbox=%d want 1 (signal lost)", n)
+	}
+	// Retry idempotency via the moved marker still holds, and the marker
+	// lives outside the dedupe keyspace.
+	if err := b.SendToInbox(ctx, id, ev, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if n := terminalTestInboxLen(t, b, ctx, id); n != 1 {
+		t.Fatalf("terminal retry duplicated the signal: inbox=%d want 1 (idempotency lost)", n)
+	}
+	if _, merr := b.client.Single().ReadRow(ctx, postTerminalMarkersTable, spanner.Key{id, dedupeMarkerKey("x")}, []string{"marker_key"}); merr != nil {
+		t.Fatalf("retry marker for %q must live in %s (err=%v)", "x", postTerminalMarkersTable, merr)
+	}
+}
+
+// An inert pre-upgrade marker row left in wf_signal_dedupe must never match
+// a user-key probe (Codex round 11 on #296): user probes skip
+// marker-shaped candidates, so a non-terminal first send with a
+// marker-shaped DedupeID inserts instead of deduping against the leftover
+// marker. On the old code the send is swallowed and this fails.
+func TestNonTerminalSendBypassesStaleMarkerRow(t *testing.T) {
+	dsn := guardTestDSN(t)
+	ctx := context.Background()
+	b, err := New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	const id = "nonterminal-stale-marker-row"
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	// Inert pre-upgrade marker row for "y", exactly as the old code wrote
+	// it: the raw user-key probe for "__post_terminal__v1:y" used to hit it.
+	if _, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return txn.BufferWrite([]*spanner.Mutation{
+			spanner.InsertMap("wf_signal_dedupe", map[string]any{
+				"instance_id": id, "dedupe_id": "__post_terminal__v1:y", "created_at": nowUTC(),
+			}),
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ev := journal.Event{Type: journal.TypeSignalReceived, Name: "sig", Payload: []byte(`{}`)}
+	// First send with the marker-shaped DedupeID must insert under its
+	// escaped user key, not dedupe against the stale marker row.
+	if err := b.SendToInbox(ctx, id, ev, "__post_terminal__v1:y"); err != nil {
+		t.Fatal(err)
+	}
+	if n := terminalTestInboxLen(t, b, ctx, id); n != 1 {
+		t.Fatalf("send swallowed by stale marker row: inbox=%d want 1 (signal lost)", n)
+	}
+	// Ordinary dedupe still works for the exotic ID.
+	if err := b.SendToInbox(ctx, id, ev, "__post_terminal__v1:y"); err != nil {
+		t.Fatal(err)
+	}
+	if n := terminalTestInboxLen(t, b, ctx, id); n != 1 {
+		t.Fatalf("exotic-ID resend duplicated the signal: inbox=%d want 1", n)
+	}
+}
+
 // When the purge second sweep stops at a replacement incarnation, the
 // version-conditioned reap must preserve a dedupe key the replacement
 // recreated after the snapshot (Codex round 6 on #327): dedupe keys are

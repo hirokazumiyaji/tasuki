@@ -96,24 +96,29 @@ func TestDedupeKeyCandidatesLegacyFirst(t *testing.T) {
 	}
 }
 
-func TestDedupeMarkerCandidatesForms(t *testing.T) {
-	// Marker probes check the versioned form only (Codex round 9 on #327):
-	// legacy unversioned rows must never match, so a pre-upgrade verbatim
-	// user key "__post_terminal__:x" cannot swallow the post-terminal send
-	// of "x". On the old dual-read code the legacy form was probed and this
-	// fails.
-	if got := dedupeMarkerCandidates("x"); len(got) != 1 || got[0] != "__post_terminal__v1:x" {
-		t.Fatalf("marker candidates(x) = %q", got)
-	}
-	for _, mk := range dedupeMarkerCandidates("x") {
-		if mk == "__post_terminal__:x" {
-			t.Fatalf("versioned marker probe matches legacy user row %q", mk)
+func TestPostTerminalMarkerDocSeparation(t *testing.T) {
+	// Since the round-11 marker move, retry markers live in
+	// postTerminalMarkersTable, never in wf_signal_dedupe — so a legacy
+	// verbatim user row may be STRING-equal to a marker key (e.g.
+	// "__post_terminal__v1:x" for the marker of "x") without colliding:
+	// user-key probes skip marker-shaped candidates and marker probes never
+	// consult wf_signal_dedupe. Pin the operative invariant: every user
+	// candidate that string-matches a marker key is marker-shaped, hence
+	// skipped by every probe. On the old in-dedupe code the raw candidate
+	// was consulted and this fails.
+	adversarial := []string{"", "x", "__post_terminal__:x", "__post_terminal__v1:x", "__x"}
+	for _, u := range adversarial {
+		for _, bk := range dedupeKeyCandidates(u) {
+			for _, m := range adversarial {
+				if bk == dedupeMarkerKey(m) && !isPostTerminalMarkerKey(bk) {
+					t.Fatalf("user candidate %q (for %q) matches marker key for %q yet is not probe-skipped", bk, u, m)
+				}
+			}
 		}
 	}
 	long := strings.Repeat("k", 300)
-	got := dedupeMarkerCandidates(long)
-	if len(got) != 1 || got[0] != dedupeMarkerKey(long) {
-		t.Fatalf("long marker candidates = %q, want [versioned-hashed]", got)
+	if got := dedupeMarkerKey(long); got == "" {
+		t.Fatal("long marker key must be non-empty (bounded hashed form)")
 	}
 }
 

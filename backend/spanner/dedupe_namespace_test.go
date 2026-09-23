@@ -6,10 +6,13 @@ import (
 )
 
 // User-supplied DedupeIDs must never share a row with an internal
-// post-terminal retry marker (Codex round 6 on #327): without namespacing, a
-// pre-terminal send with DedupeID "__post_terminal__:x" occupied the very
-// row the marker check for user ID "x" reads, so the first post-terminal
-// send of "x" was swallowed as a retry (lost signal).
+// post-terminal retry marker (Codex round 6 on #327, round 11 on #296):
+// since the round-11 marker move, markers live in
+// postTerminalMarkersTable while user keys live in wf_signal_dedupe, so the
+// two can never collide no matter how adversarial the DedupeID — including
+// "__post_terminal__v1:x", whose legacy verbatim row used to occupy the very
+// row the v1 marker probe for "x" reads (old code stored DedupeIDs
+// verbatim). On the old in-dedupe code this fails.
 func TestDedupeMarkerNamespaceDisjoint(t *testing.T) {
 	adversarial := []string{
 		"", "x", "_x", "__x", "___x", "__post_terminal__:", "__post_terminal__:x",
@@ -17,25 +20,29 @@ func TestDedupeMarkerNamespaceDisjoint(t *testing.T) {
 		"____post_terminal__:x", "__post_terminal__:__post_terminal__:x",
 		"post_terminal__:x", "a:b", "x:y:z",
 	}
-	users := map[string]string{}
 	for _, u := range adversarial {
-		users[u] = dedupeKey(u)
-	}
-	for _, m := range adversarial {
-		marker := dedupeMarkerKey(m)
-		for u, key := range users {
-			if key == marker {
-				t.Fatalf("user key %q (for %q) collides with marker for %q", key, u, m)
+		for _, bk := range dedupeKeyCandidates(u) {
+			if strings.HasPrefix(bk, "__post_terminal__") {
+				// Marker-shaped user candidates are skipped by every probe
+				// (see isPostTerminalMarkerKey): they can only match inert
+				// pre-upgrade rows, never the live guard.
+				continue
+			}
+			for _, m := range adversarial {
+				if bk == dedupeMarkerKey(m) {
+					t.Fatalf("user key %q (for %q) collides with marker key for %q", bk, u, m)
+				}
 			}
 		}
 	}
 	// Injectivity: distinct user IDs still map to distinct rows.
 	seen := map[string]string{}
 	for _, u := range adversarial {
-		if prev, dup := seen[users[u]]; dup {
-			t.Fatalf("user IDs %q and %q share row %q", prev, u, users[u])
+		key := dedupeKey(u)
+		if prev, dup := seen[key]; dup {
+			t.Fatalf("user IDs %q and %q share row %q", prev, u, key)
 		}
-		seen[users[u]] = u
+		seen[key] = u
 	}
 	// Escape is minimal: ordinary IDs are stored verbatim.
 	for _, u := range []string{"", "x", "pay-42", "a:b"} {
@@ -44,23 +51,28 @@ func TestDedupeMarkerNamespaceDisjoint(t *testing.T) {
 		}
 	}
 	if !strings.HasPrefix(dedupeMarkerKey("x"), "__post_terminal__v1:") {
-		t.Fatal("marker lost its versioned prefix")
+		t.Fatal("marker lost its versioned derivation")
 	}
 }
 
-// A pre-upgrade verbatim user row ("__post_terminal__:x", stored before the
-// round-6 escape) must never match the marker probe for "x" (Codex round 9
-// on #327): the dual-read mistook it for a retry marker and dropped the
-// first post-terminal send of "x". Versioned probes exclude legacy forms by
-// construction; on the old code this fails.
+// A pre-upgrade verbatim user row must never match the retry-marker probe
+// (Codex round 9 on #327, round 11 on #296): marker checks consult
+// postTerminalMarkersTable only, so rows in wf_signal_dedupe — legacy
+// "__post_terminal__:x" and v1-shaped "__post_terminal__v1:x" alike — can
+// never swallow a post-terminal send. On the old in-dedupe probe this fails
+// for the v1-shaped row.
 func TestDedupeMarkerProbeExcludesLegacyUserRow(t *testing.T) {
-	const legacyRow = "__post_terminal__:x"
-	for _, mk := range dedupeMarkerCandidates("x") {
-		if mk == legacyRow {
-			t.Fatalf("marker probe for %q matches legacy user row %q", "x", legacyRow)
+	// Marker checks consult postTerminalMarkersTable only, so a legacy
+	// verbatim user row can never match the retry-marker probe — even when
+	// it is STRING-equal to the marker key (Codex round 11 on #296: old
+	// code stored DedupeIDs verbatim, so "__post_terminal__v1:x" collides
+	// textually with the marker for "x"). The table boundary, not a prefix,
+	// separates them. The behavioral proof is
+	// TestTerminalLegacyV1UserRowDelivers; here pin that every such
+	// textual match is a probe-skipped marker shape.
+	for _, legacyRow := range []string{"__post_terminal__:x", "__post_terminal__v1:x"} {
+		if got := dedupeMarkerKey("x"); got == legacyRow && !isPostTerminalMarkerKey(legacyRow) {
+			t.Fatalf("textual marker match %q is not probe-skipped", legacyRow)
 		}
-	}
-	if got := dedupeMarkerKey("x"); got == legacyRow {
-		t.Fatalf("versioned marker %q collides with legacy user row", got)
 	}
 }

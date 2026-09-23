@@ -210,13 +210,16 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 	// instance (in-flight writers lose the race and retry into ErrNotFound).
 	// A writer that committed between the sweep above and this delete is
 	// reaped by the second pass below.
-	deleted, residual, err := b.deletePurgedInstanceDoc(ctx, v)
+	deleted, residual, purgedAt, err := b.deletePurgedInstanceDoc(ctx, v)
 	if err != nil {
 		return false, err
 	}
 	if !deleted {
 		return false, nil
 	}
+	// The marker version this purge just committed: the conditional clear
+	// below removes exactly it, never a newer incarnation's marker.
+	ownMarker := purgeMarker{id: v.id, createdAt: v.createdAt, purgedAt: purgedAt}
 	second := purgeFence{victim: v, absent: true}
 	if err := b.purgeInstanceDocs(ctx, second); err != nil {
 		if errors.Is(err, errPurgeSuperseded) {
@@ -233,7 +236,7 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 			// The residual reap is the last step owning victim rows: only
 			// now is the durable marker cleared. A crash before this point
 			// resumes via resumeStalePurgeMarkers.
-			if cerr := b.clearPurgeMarker(ctx, v.id); cerr != nil {
+			if cerr := b.clearPurgeMarker(ctx, ownMarker); cerr != nil {
 				return true, cerr
 			}
 			return true, nil
@@ -242,24 +245,46 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 	}
 	// The second sweep is the last step owning victim rows: only now is the
 	// durable marker cleared (see above for the crash window this closes).
-	if err := b.clearPurgeMarker(ctx, v.id); err != nil {
+	if err := b.clearPurgeMarker(ctx, ownMarker); err != nil {
 		return true, err
 	}
 	return true, nil
 }
 
 // clearPurgeMarker removes a victim's purge marker after its trailing
-// sweep/reap completed. The victim rows are already gone, so a crash after
-// this point needs no recovery; a failure here surfaces (leaving the marker)
-// instead of reporting success while a resume stays pending. A later purge
-// then finds an empty victim (no rows, no instance doc) and clears the
-// marker idempotently. Note the purge count edge: the victim was fully
-// purged but a marker-clear failure returns before it is counted, so the
-// count misses one instance across the failing call and its healing resume
-// (which never counts resumes).
-func (b *Backend) clearPurgeMarker(ctx context.Context, id string) error {
-	_, err := b.ref(purgeMarkersCollection, id).Delete(ctx)
-	return err
+// sweep/reap completed — but only the marker for the completed incarnation.
+// The delete is conditioned on the marker still carrying the victim's
+// created_at AND purged_at (read-check-delete in one transaction): a purge
+// that finishes a page, loses the ID to a replacement, and watches another
+// purge delete the replacement and overwrite the marker must not delete the
+// newer incarnation's marker. A mismatch leaves the row alone (its own purge
+// owns it now); a missing row is success.
+//
+// The victim rows are already gone, so a crash after this point needs no
+// recovery; a failure here surfaces (leaving the marker) instead of
+// reporting success while a resume stays pending. A later purge then finds
+// an empty victim (no rows, no instance doc) and clears the marker
+// idempotently. Note the purge count edge: the victim was fully purged but
+// a marker-clear failure returns before it is counted, so the count misses
+// one instance across the failing call and its healing resume (which never
+// counts resumes).
+func (b *Backend) clearPurgeMarker(ctx context.Context, marker purgeMarker) error {
+	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		snap, err := tx.Get(b.ref(purgeMarkersCollection, marker.id))
+		if isNotFound(err) || (err == nil && !snap.Exists()) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		cur, ok := decodePurgeMarker(snap.Ref.ID, snap.Data())
+		if !ok || !cur.createdAt.Equal(marker.createdAt) || !cur.purgedAt.Equal(marker.purgedAt) {
+			// A newer incarnation's purge overwrote the marker after this
+			// purge's victim delete: leave it for its own purge.
+			return nil
+		}
+		return tx.Delete(snap.Ref)
+	})
 }
 
 // resumeStalePurgeMarkers completes victim cleanups whose process crashed
@@ -314,7 +339,7 @@ func (b *Backend) resumeOnePurgeMarker(ctx context.Context, marker purgeMarker, 
 		// Replacement incarnation: rows are ambiguous, so they stay for the
 		// replacement's own purge. Drop only the marker itself once stale.
 		if purgeMarkerExpired(now, marker.purgedAt) {
-			return b.clearPurgeMarker(ctx, marker.id)
+			return b.clearPurgeMarker(ctx, marker)
 		}
 		return nil
 	}
@@ -328,7 +353,7 @@ func (b *Backend) resumeOnePurgeMarker(ctx context.Context, marker purgeMarker, 
 		}
 		return err
 	}
-	return b.clearPurgeMarker(ctx, marker.id)
+	return b.clearPurgeMarker(ctx, marker)
 }
 
 // checkPurgeVictim enforces the first-sweep fence: the victim doc must still
@@ -418,10 +443,11 @@ func (b *Backend) checkFenceTx(tx *gcf.Transaction, fence purgeFence) error {
 // and resume. The marker Set overwrites any stale marker from an earlier
 // incarnation's crashed purge — keyed by victim ID, so the latest
 // incarnation always wins.
-func (b *Backend) deletePurgedInstanceDoc(ctx context.Context, v purgeVictim) (bool, *residualStragglers, error) {
+func (b *Backend) deletePurgedInstanceDoc(ctx context.Context, v purgeVictim) (bool, *residualStragglers, time.Time, error) {
 	var (
 		deleted  bool
 		residual residualStragglers
+		purgedAt time.Time
 	)
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		// Reset per attempt: the transaction function may run more than
@@ -447,8 +473,12 @@ func (b *Backend) deletePurgedInstanceDoc(ctx context.Context, v purgeVictim) (b
 		}
 		// Stamp per attempt (see SendToInboxBatch): a retried transaction
 		// must not commit with a purged_at captured before a conflicting
-		// commit. All reads precede this first write.
-		if err := tx.Set(b.ref(purgeMarkersCollection, v.id), purgeMarkerDoc(v, nowUTC())); err != nil {
+		// commit. All reads precede this first write. Truncated to
+		// microseconds so the committed value round-trips exactly and the
+		// conditional clearPurgeMarker below can match it (Firestore
+		// timestamps carry microsecond precision).
+		purgedAt = nowUTC().Truncate(time.Microsecond)
+		if err := tx.Set(b.ref(purgeMarkersCollection, v.id), purgeMarkerDoc(v, purgedAt)); err != nil {
 			return err
 		}
 		if err := tx.Delete(b.ref("wf_inbox_seq", v.id)); err != nil {
@@ -458,12 +488,12 @@ func (b *Backend) deletePurgedInstanceDoc(ctx context.Context, v purgeVictim) (b
 		return tx.Delete(b.ref("wf_instances", v.id))
 	})
 	if errors.Is(err, errPurgeSuperseded) {
-		return false, nil, nil
+		return false, nil, time.Time{}, nil
 	}
 	if err != nil {
-		return false, nil, err
+		return false, nil, time.Time{}, err
 	}
-	return deleted, &residual, nil
+	return deleted, &residual, purgedAt, nil
 }
 
 // residualStragglers holds exact document references observed after the
@@ -637,9 +667,12 @@ func (b *Backend) reapResidualStragglers(ctx context.Context, r *residualStraggl
 // commit while iterating so a large journal or inbox never buffers fully in
 // memory. The fence holds the ID-reuse fence through every page: a tripped
 // fence aborts the sweep so a replacement incarnation's documents are never
-// deleted.
+// deleted. Post-terminal retry markers live in their own collection (see
+// postTerminalMarkersCollection) and are swept here like any other child:
+// without this, a purged instance's markers would survive and suppress the
+// next incarnation's sends under the same DedupeIDs.
 func (b *Backend) purgeInstanceDocs(ctx context.Context, fence purgeFence) error {
-	for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox", "wf_journal"} {
+	for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox", "wf_journal", postTerminalMarkersCollection} {
 		if err := b.deleteDocsByInstanceFenced(ctx, col, fence); err != nil {
 			return err
 		}

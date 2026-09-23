@@ -51,6 +51,17 @@ CREATE TABLE wf_signal_dedupe (
   created_at TIMESTAMP NOT NULL
 ) PRIMARY KEY (instance_id, dedupe_id);
 
+-- Post-terminal retry markers live outside the dedupe keyspace (Codex round
+-- 11 on #296): one row per (instance, marker key). Swept with the victim's
+-- other children at purge; without this a purged instance's markers would
+-- survive and suppress the next incarnation's sends under the same
+-- DedupeIDs.
+CREATE TABLE wf_post_terminal_markers (
+  instance_id STRING(255) NOT NULL,
+  marker_key STRING(255) NOT NULL,
+  created_at TIMESTAMP NOT NULL
+) PRIMARY KEY (instance_id, marker_key);
+
 CREATE TABLE wf_tasks (
   id INT64 NOT NULL,
   kind STRING(32) NOT NULL,

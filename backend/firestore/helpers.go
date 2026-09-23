@@ -41,12 +41,28 @@ func signalDedupeID(instanceID, dedupeID string) string {
 	return instanceID + ":" + escapeDedupeID(dedupeID)
 }
 
-// signalDedupeMarkerID derives the document ID of the post-terminal send
-// marker for a DedupeID. Markers live in the same wf_signal_dedupe
-// collection as user keys, so the two namespaces must be disjoint for every
-// user-supplied DedupeID (see escapeDedupeID): the marker is derived from the
-// RAW DedupeID and never passed through the user-key escape.
-func signalDedupeMarkerID(instanceID, dedupeID string) string {
+// postTerminalMarkersCollection holds post-terminal retry markers OUTSIDE
+// the dedupe keyspace (Codex round 11 on #327). Markers used to live as rows
+// of wf_signal_dedupe under a "__post_terminal__..:" prefix, but prefixes
+// are insufficient: a legacy verbatim user row (old code stored DedupeIDs
+// verbatim, so a user ID of "__post_terminal__v1:x" occupies the very
+// document the v1 marker probe for "x" reads) collides with the marker in
+// both probe directions — the user probe drops a genuine send on a marker
+// row, the marker probe drops one on a legacy user row. A disjoint
+// collection ends the ambiguity structurally: user-key probes never consult
+// it, marker probes never consult wf_signal_dedupe. Rows predating the move
+// stay inert in wf_signal_dedupe (never probed as markers; user probes skip
+// marker-shaped candidates) and drain via purge; the terminate sweep keeps
+// preserving them exactly as before.
+//
+// The document ID reuses the versioned marker derivation
+// (postTerminalDedupeMarker) so long IDs keep their bounded hashed form and
+// the stored dedupe_id field keeps its shape for operators.
+const postTerminalMarkersCollection = "wf_post_terminal_markers"
+
+// postTerminalMarkerDocID derives the document ID of the post-terminal send
+// marker for a DedupeID in postTerminalMarkersCollection.
+func postTerminalMarkerDocID(instanceID, dedupeID string) string {
 	return instanceID + ":" + postTerminalDedupeMarker(dedupeID)
 }
 
@@ -92,19 +108,15 @@ func hashDedupeID(dedupeID string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// escapeDedupeID encodes a user-supplied DedupeID for storage so it can never
-// collide with an internal post-terminal marker (Codex round 6 on #327, with
-// the round-9 versioned marker namespace). A user DedupeID of
-// "__post_terminal__v1:x" would otherwise share its document with the retry
-// marker for user ID "x". IDs starting with "__" gain one extra "__" prefix,
-// so every stored user key is either free of a "__" prefix (unescaped) or
-// starts with "____" (escaped, since the raw ID already started with "__"),
-// while every marker starts with "__post_terminal__v1:" ("__" followed by
-// 'p'): the two sets are disjoint, and the encoding is injective, so
+// escapeDedupeID encodes a user-supplied DedupeID for storage. IDs starting
+// with "__" gain one extra "__" prefix, so every stored user key is either
+// free of a "__" prefix (unescaped) or starts with "____" (escaped, since
+// the raw ID already started with "__"), and the encoding is injective, so
 // distinct user IDs still map to distinct keys and normal dedupe is
-// unaffected. (Pre-escape verbatim rows such as "__post_terminal__:x" predate
-// this namespacing; marker probes exclude them by version — see
-// dedupeMarkerCandidates.)
+// unaffected. (Pre-escape verbatim rows such as "__post_terminal__:x"
+// predate this namespacing; since the round-11 marker move, marker-shaped
+// rows in wf_signal_dedupe are inert pre-upgrade leftovers that user-key
+// probes skip — see isPostTerminalMarkerKey.)
 //
 // Long IDs that would exceed the Spanner column budget (Codex round 8 on
 // #327) hash into a bounded form instead: the hashed encoding applies the
@@ -127,22 +139,18 @@ func escapeDedupeID(dedupeID string) string {
 }
 
 // postTerminalDedupeMarker derives the post-terminal send marker for a
-// DedupeID. Terminal sends always insert their event (round-4 lost-send
-// fix: a send racing the terminal transition must not be swallowed by a
-// pre-terminal dedupe key snapshotted for the post-commit sweep), but
-// retries must still dedupe: the first post-terminal send creates this
-// marker alongside the event, and later retries with the same DedupeID see
-// the marker and skip. Only the marker suppresses a terminal insert; the
-// pre-terminal base key never does. User keys pass through escapeDedupeID on
-// storage, so the versioned "__post_terminal__v1:" marker namespace can
-// never collide with a user DedupeID, however adversarial.
+// DedupeID. Since the round-11 move, markers are stored as documents of
+// postTerminalMarkersCollection (see postTerminalMarkerDocID), not as
+// wf_signal_dedupe rows: the derivation below only shapes the document ID
+// suffix and the stored dedupe_id field, so no user key — however crafted —
+// can share a document with a marker. (History: terminal sends always insert
+// their event, but retries must still dedupe: the first post-terminal send
+// creates the marker alongside the event, and later retries with the same
+// DedupeID see the marker and skip. Only the marker suppresses a terminal
+// insert; the pre-terminal base key never does.)
 //
 // The marker carries the round-9 namespace version (not the legacy
-// "__post_terminal__:" prefix): pre-upgrade user rows stored verbatim under
-// the legacy prefix are indistinguishable from legacy markers, so probing
-// them would drop genuine post-terminal sends. Marker probes
-// (dedupeMarkerCandidates) check versioned forms only; rows predating the
-// versioning (legacy user keys and pre-upgrade markers alike) never match.
+// "__post_terminal__:" prefix).
 //
 // Long IDs hash into a bounded marker form under the same transparency rule
 // as user keys (Codex round 8 on #327). The hashed marker prefix differs
@@ -155,17 +163,17 @@ func postTerminalDedupeMarker(dedupeID string) string {
 	return dedupeHashedMarkerPrefixV1 + hashDedupeID(dedupeID)
 }
 
-// isPostTerminalMarkerKey reports whether a stored wf_signal_dedupe key is a
-// post-terminal retry marker (versioned or legacy-hashed/unhashed form).
-// User keys — verbatim, "__"-escaped ("____.."), or hashed ("__hash__:..")
-// — never carry these prefixes. The terminate sweep uses this to preserve
-// markers (Codex round 8 on #327). Legacy-prefixed rows are still classified
-// as markers here (conservative preserve): a pre-upgrade verbatim user row
-// such as "__post_terminal__:x" is ambiguous with a pre-upgrade marker, and
-// preserving it merely delays its cleanup to purge, while sweeping a genuine
-// pre-upgrade marker would duplicate its retry. SendToInbox marker probes do
-// NOT use this function — they check versioned forms only
-// (dedupeMarkerCandidates), so the ambiguity never drops a send.
+// isPostTerminalMarkerKey reports whether a stored wf_signal_dedupe key is
+// shaped like a post-terminal retry marker (versioned or legacy-hashed/
+// unhashed form). Since the round-11 move, live markers never live in
+// wf_signal_dedupe; this classifies only inert pre-upgrade rows. It serves
+// two conservative purposes: the terminate sweep preserves such rows
+// (deleting a pre-upgrade marker while its inbox event remains would
+// duplicate its retry), and user-key probes skip marker-shaped candidates
+// (such a row is an inert marker or a legacy verbatim row — never the live
+// guard for the probed DedupeID; skipping duplicates at worst, never
+// drops). User keys written by current code — verbatim, "__"-escaped
+// ("____.."), or hashed ("__hash__:..") — never carry these prefixes.
 func isPostTerminalMarkerKey(stored string) bool {
 	return strings.HasPrefix(stored, dedupeMarkerPrefix) ||
 		strings.HasPrefix(stored, dedupeHashedMarkerPrefix) ||
@@ -180,7 +188,9 @@ func isPostTerminalMarkerKey(stored string) bool {
 // duplicates the event. Long-ID rows written between round 6 and the round-8
 // hash could also hold the over-budget escaped form on Firestore (Spanner
 // would have rejected it), so all three forms are probed. Writes always use
-// the current escapeDedupeID form.
+// the current escapeDedupeID form. Callers skip marker-shaped candidates
+// (see isPostTerminalMarkerKey): since the round-11 move those can only be
+// inert pre-upgrade rows, never the live guard.
 func dedupeKeyCandidates(dedupeID string) []string {
 	var out []string
 	seen := map[string]bool{}
@@ -214,17 +224,6 @@ func cutPrefix(s, prefix string) (string, bool) {
 		return s, false
 	}
 	return s[len(prefix):], true
-}
-
-// dedupeMarkerCandidates lists the stored marker forms to probe on terminal
-// retry checks: the current versioned form only (Codex round 9 on #327).
-// Writes always use postTerminalDedupeMarker. Legacy unversioned rows —
-// pre-upgrade verbatim user keys like "__post_terminal__:x" as well as
-// pre-upgrade markers — never match, so a legacy user row cannot swallow a
-// genuine post-terminal send (safe direction: a pre-upgrade marker that is
-// now ignored may duplicate one retry instead of dropping a send).
-func dedupeMarkerCandidates(dedupeID string) []string {
-	return []string{postTerminalDedupeMarker(dedupeID)}
 }
 
 type activityPayload struct {

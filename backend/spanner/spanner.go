@@ -228,6 +228,23 @@ CREATE TABLE wf_purge_markers (
 			return err
 		}
 	}
+	// Post-terminal retry markers live in their own table since the
+	// round-11 marker move (Codex round 11 on #296): same incremental
+	// backfill pattern for pre-move databases.
+	postMarkerExists, err := b.tableExists(ctx, "wf_post_terminal_markers")
+	if err != nil {
+		return err
+	}
+	if !postMarkerExists {
+		if err := b.applyDDL(ctx, []string{`
+CREATE TABLE wf_post_terminal_markers (
+  instance_id STRING(255) NOT NULL,
+  marker_key STRING(255) NOT NULL,
+  created_at TIMESTAMP NOT NULL
+) PRIMARY KEY (instance_id, marker_key)`}); err != nil {
+			return err
+		}
+	}
 	if err := b.ensureSearchAttributesColumn(ctx); err != nil {
 		return err
 	}
@@ -347,6 +364,7 @@ func (b *Backend) Reset(ctx context.Context) error {
 		{table: "wf_inbox", sql: `SELECT id FROM wf_inbox`, kind: "int64"},
 		{table: "wf_inbox_seq", sql: `SELECT instance_id FROM wf_inbox_seq`, kind: "string"},
 		{table: "wf_signal_dedupe", sql: `SELECT instance_id, dedupe_id FROM wf_signal_dedupe`, kind: "strpair"},
+		{table: "wf_post_terminal_markers", sql: `SELECT instance_id, marker_key FROM wf_post_terminal_markers`, kind: "strpair"},
 		{table: "wf_purge_markers", sql: `SELECT instance_id FROM wf_purge_markers`, kind: "string"},
 		{table: "wf_journal", sql: `SELECT instance_id, seq FROM wf_journal`, kind: "pair"},
 		{table: "wf_instances", sql: `SELECT id FROM wf_instances`, kind: "string"},
