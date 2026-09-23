@@ -101,33 +101,89 @@ func (b *Backend) sweepTerminateDocs(ctx context.Context, id string) error {
 	if err := b.deleteTimersForInstance(ctx, id, nil); err != nil {
 		return err
 	}
-	return b.sweepSignalDedupe(ctx, id, nil, time.Time{})
+	return b.deleteAllSignalDedupe(ctx, id, nil)
 }
 
-// sweepSignalDedupe removes an instance's dedupe keys created at or before
-// cutoff in paged transactions. Called best-effort after terminal
-// advancements commit.
-//
-// Only pre-commit keys are removed: notifyTerminal fires before this sweep,
-// so a concurrent SendToInbox with a new DedupeID can land inside the sweep
-// window. Deleting that key while its inbox event remains would let a later
-// retry of the same DedupeID duplicate the signal, so keys stamped after the
-// terminal commit are left for purge. A zero cutoff disables the bound (the
-// terminate path, where notify fires after the sweep and the full key set
-// must go).
-func (b *Backend) sweepSignalDedupe(ctx context.Context, id string, guard sweepGuard, cutoff time.Time) error {
-	stmt := func() spanner.Statement {
-		if cutoff.IsZero() {
-			return spanner.Statement{
-				SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id LIMIT @limit`,
-				Params: map[string]any{"id": id, "limit": int64(spannerSweepBatchSize)},
-			}
+// listSignalDedupeIDs returns every dedupe key currently stored for one
+// instance. CommitAdvancements snapshots this set immediately before the
+// terminal commit; the post-commit sweep then deletes exactly those IDs
+// (see sweepSignalDedupeIDs).
+func (b *Backend) listSignalDedupeIDs(ctx context.Context, id string) ([]string, error) {
+	iter := b.client.Single().Query(ctx, spanner.Statement{
+		SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id`,
+		Params: map[string]any{"id": id},
+	})
+	defer iter.Stop()
+	var out []string
+	for {
+		row, err := iter.Next()
+		if err == iterator.Done {
+			return out, nil
 		}
-		return spanner.Statement{
-			SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id AND created_at <= @cutoff LIMIT @limit`,
-			Params: map[string]any{"id": id, "limit": int64(spannerSweepBatchSize), "cutoff": cutoff},
+		if err != nil {
+			return nil, err
+		}
+		var k string
+		if err := row.Columns(&k); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+}
+
+// sweepSignalDedupeIDs removes exactly the given dedupe keys in paged
+// transactions. Called best-effort after terminal advancements commit with
+// the pre-commit snapshot from listSignalDedupeIDs.
+//
+// Keys are classified by transaction serialization order, not client
+// timestamps: a SendToInbox that captures created_at before the terminal
+// commit, loses the race, and retry-commits after it would otherwise stamp
+// a pre-commit time and be swept wrongly (deleting its key while the inbox
+// event remains, so a later retry duplicates the signal). Snapshot IDs can
+// never match such keys: only IDs visible before the terminal commit are
+// removed, and keys first appearing after are preserved even when their
+// client timestamp predates the commit.
+//
+// Two boundary caveats (carried forward from the timestamp design):
+//   - Snapshot edge: a send serializing between the snapshot listing and
+//     the terminal commit is preserved for purge even though it logically
+//     predates the commit. Safe direction: cleanup is delayed, never
+//     wrongful.
+//   - Listing race: a concurrent send landing mid-listing can be missed by
+//     the snapshot and likewise stays for purge.
+//
+// The sweep stays synchronous so a redelivered DedupeID inserts anew once
+// CommitAdvancements returns, but runs under a bounded context so a stuck
+// store delays only this cleanup, never the caller. Purge reaps leftovers.
+func (b *Backend) sweepSignalDedupeIDs(ctx context.Context, id string, guard sweepGuard, ids []string) error {
+	for _, chunk := range chunkStrings(ids, spannerSweepBatchSize) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := checkGuard(ctx, guard); err != nil {
+			return err
+		}
+		keys := chunk
+		err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			var muts []*spanner.Mutation
+			for _, k := range keys {
+				muts = append(muts, spanner.Delete("wf_signal_dedupe", spanner.Key{id, k}))
+			}
+			return txn.BufferWrite(muts)
+		})
+		if err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+// deleteAllSignalDedupe removes every dedupe key of one instance in paged
+// transactions. Used by the terminate and purge paths, where the sweep is
+// awaited (terminate) or fenced (purge) and the full key set must go —
+// unlike the commit path there is no post-sweep send window that snapshot
+// classification needs to protect.
+func (b *Backend) deleteAllSignalDedupe(ctx context.Context, id string, guard sweepGuard) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -138,7 +194,10 @@ func (b *Backend) sweepSignalDedupe(ctx context.Context, id string, guard sweepG
 		var keys []string
 		err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 			keys = keys[:0]
-			iter := txn.Query(ctx, stmt())
+			iter := txn.Query(ctx, spanner.Statement{
+				SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id LIMIT @limit`,
+				Params: map[string]any{"id": id, "limit": int64(spannerSweepBatchSize)},
+			})
 			defer iter.Stop()
 			for {
 				row, err := iter.Next()

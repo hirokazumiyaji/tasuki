@@ -506,6 +506,26 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if len(advs) == 0 {
 		return nil
 	}
+	// Snapshot pre-commit dedupe keys for terminal advancements BEFORE the
+	// commit transaction. The post-commit sweep deletes exactly these IDs,
+	// so classification follows transaction serialization order rather
+	// than SendToInbox client timestamps (see sweepSignalDedupeIDs). A
+	// listing failure aborts before any mutation, so the worker simply
+	// retries the advancement.
+	snapshots := make(map[string][]string, len(advs))
+	for _, adv := range advs {
+		if adv.Terminal == nil {
+			continue
+		}
+		if _, ok := snapshots[adv.InstanceID]; ok {
+			continue
+		}
+		ids, err := b.listSignalDedupeIDs(ctx, adv.InstanceID)
+		if err != nil {
+			return err
+		}
+		snapshots[adv.InstanceID] = ids
+	}
 	now := nowUTC()
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		// Firestore requires all reads before any writes in a transaction.
@@ -528,6 +548,16 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if err != nil {
 		return err
 	}
+	// Wake terminal subscribers immediately after the successful commit,
+	// before the fallible ensureWorkflowTask loop below: the terminal
+	// status already committed, and a transient ensure error returns early
+	// while the advancement only retries on conflict. Notification must
+	// never be skipped because post-commit cleanup errored.
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			b.notifyTerminal(adv.InstanceID)
+		}
+	}
 	for _, adv := range advs {
 		if adv.ParentNotify != nil {
 			inst, _ := b.GetInstance(ctx, adv.InstanceID)
@@ -548,22 +578,13 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		}
 	}
 	b.notifyTasks()
-	// Wake terminal subscribers before the best-effort dedupe sweep below:
-	// the terminal status already committed, and the sweep can stall on a
-	// degraded store. Terminal notification must never wait behind unbounded
-	// cleanup.
-	for _, adv := range advs {
-		if adv.Terminal != nil {
-			b.notifyTerminal(adv.InstanceID)
-		}
-	}
 	for _, adv := range advs {
 		if adv.Terminal != nil {
 			// Dedupe rows are deliberately cleaned outside the advancement
 			// transaction: a terminal commit with hundreds of dedupe keys
 			// would otherwise exceed the 500-write transaction limit.
 			// Best-effort (DynamoDB parity); leftovers are reaped by purge.
-			// Only keys predating the terminal commit (now) are removed: a
+			// Only keys snapshotted before the commit are removed: a
 			// concurrent SendToInbox with a new DedupeID can land after
 			// notifyTerminal fired above, and sweeping its key while the
 			// inbox event remains would duplicate a later retry.
@@ -571,7 +592,7 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			// anew once this call returns, but runs under a bounded context
 			// so a stuck store delays only this cleanup, never the caller.
 			cctx, cancel := context.WithTimeout(context.Background(), signalDedupeSweepTimeout)
-			_ = b.sweepSignalDedupe(cctx, adv.InstanceID, now)
+			_ = b.sweepSignalDedupeIDs(cctx, snapshots[adv.InstanceID])
 			cancel()
 		}
 	}
@@ -822,9 +843,12 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	if err != nil {
 		return err
 	}
-	now := nowUTC()
 	var inserted int
 	err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		// Stamp inside the transaction (per attempt): a transaction that
+		// loses a race and retries must not commit with a created_at
+		// captured before the conflicting commit.
+		now := nowUTC()
 		inserted = 0
 		// Read the parent inside the transaction: PurgeInstances deletes
 		// wf_instances after sweeping children, and Firestore aborts a

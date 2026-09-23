@@ -603,6 +603,26 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if len(advs) == 0 {
 		return nil
 	}
+	// Snapshot pre-commit dedupe keys for terminal advancements BEFORE the
+	// commit. The post-commit sweep deletes exactly these IDs, so
+	// classification follows transaction serialization order rather than
+	// SendToInbox client timestamps (see sweepSignalDedupeIDs). A listing
+	// failure aborts before any mutation, so the worker simply retries the
+	// advancement.
+	snapshots := make(map[string][]string, len(advs))
+	for _, adv := range advs {
+		if adv.Terminal == nil {
+			continue
+		}
+		if _, ok := snapshots[adv.InstanceID]; ok {
+			continue
+		}
+		ids, err := b.listSignalDedupeIDs(ctx, adv.InstanceID)
+		if err != nil {
+			return err
+		}
+		snapshots[adv.InstanceID] = ids
+	}
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		for _, adv := range advs {
 			if err := b.commitAdvancementTxn(ctx, txn, adv); err != nil {
@@ -614,6 +634,17 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if err != nil {
 		return err
 	}
+	// Wake terminal subscribers immediately after the successful commit,
+	// before the fallible ensureWorkflowTaskIfInbox loop below: the
+	// terminal status already committed, and a transient ensure error
+	// returns early while the advancement only retries on conflict.
+	// Notification must never be skipped because post-commit cleanup
+	// errored.
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			b.notifyTerminal(adv.InstanceID)
+		}
+	}
 	for _, adv := range advs {
 		if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 			return ensureWorkflowTaskIfInbox(ctx, txn, adv.InstanceID)
@@ -622,21 +653,12 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		}
 	}
 	b.notifyTasks()
-	// Wake terminal subscribers before the best-effort dedupe sweep below:
-	// the terminal status already committed, and the sweep can stall on a
-	// degraded store. Terminal notification must never wait behind unbounded
-	// cleanup.
-	for _, adv := range advs {
-		if adv.Terminal != nil {
-			b.notifyTerminal(adv.InstanceID)
-		}
-	}
 	for _, adv := range advs {
 		if adv.Terminal != nil {
 			// Dedupe cleanup stays out of the advancement transaction so the
 			// mutation count never scales with accumulated dedupe keys.
 			// Best-effort (DynamoDB/Firestore parity); purge reaps leftovers.
-			// Only keys predating the terminal commit are removed: a
+			// Only keys snapshotted before the commit are removed: a
 			// concurrent SendToInbox with a new DedupeID can land after
 			// notifyTerminal fired above, and sweeping its key while the
 			// inbox event remains would duplicate a later retry. The sweep
@@ -644,11 +666,7 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			// this call returns, but runs under a bounded context so a
 			// stuck store delays only this cleanup, never the caller.
 			cctx, cancel := context.WithTimeout(context.Background(), signalDedupeSweepTimeout)
-			if cutoff := b.terminalCutoff(cctx, adv.InstanceID); !cutoff.IsZero() {
-				_ = b.sweepSignalDedupe(cctx, adv.InstanceID, nil, cutoff)
-			}
-			// A zero cutoff means the instance row is already gone
-			// (concurrent purge): purge owns the leftover rows then.
+			_ = b.sweepSignalDedupeIDs(cctx, adv.InstanceID, nil, snapshots[adv.InstanceID])
 			cancel()
 		}
 	}
@@ -658,25 +676,6 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 func (b *Backend) withRW(ctx context.Context, fn func(context.Context, *spanner.ReadWriteTransaction) error) error {
 	_, err := b.client.ReadWriteTransaction(ctx, fn)
 	return err
-}
-
-// terminalCutoff returns the terminal-transition time the advancement commit
-// recorded on the instance row. The post-commit dedupe sweep removes only
-// keys created at or before it, so a concurrent send landing after the
-// commit keeps its key (and a later retry still dedupes). Zero means the
-// instance row is already gone — a concurrent purge owns the leftovers — or
-// the read failed, in which case the best-effort sweep is skipped and purge
-// reaps everything.
-func (b *Backend) terminalCutoff(ctx context.Context, id string) time.Time {
-	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"completed_at"})
-	if err != nil {
-		return time.Time{}
-	}
-	var ts spanner.NullTime
-	if err := row.Columns(&ts); err != nil || !ts.Valid {
-		return time.Time{}
-	}
-	return ts.Time
 }
 
 func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWriteTransaction, adv backend.Advancement) error {
@@ -1126,9 +1125,13 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	if len(items) > backend.InboxBatchLimit(b.Capabilities()) {
 		return backend.ErrBatchTooLarge
 	}
-	now := nowUTC()
 	var inserted int
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// Stamp inside the transaction (per attempt): a transaction that
+		// loses a race and retries must not commit with a created_at
+		// captured before the conflicting commit.
+		now := nowUTC()
+		inserted = 0
 		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"status", "queue"})
 		if err != nil {
 			if isNotFound(err) {

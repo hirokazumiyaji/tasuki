@@ -879,15 +879,23 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	// the result for non-running instances, so this is cleanup-only; if the
 	// sweep already removed the task it reports superseded, which is also
 	// safe to ignore.
-	if inst, err := w.backend.GetInstance(ctx, t.InstanceID); err == nil {
-		if inst.Status != "running" {
-			_ = w.backend.CompleteActivity(ctx, t.ID, journal.Event{
-				Type:   journal.TypeActivityCompleted,
-				RefSeq: t.Seq,
-			})
+	// The fence fails CLOSED: a transient GetInstance error returns without
+	// invoking user code (the lease expires and the task redelivers), so a
+	// possibly-terminated instance never runs activities on a read failure.
+	// Only a definitive ErrNotFound (instance reaped: terminal residue) is
+	// dropped silently.
+	inst, err := w.backend.GetInstance(ctx, t.InstanceID)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotFound) {
 			return nil
 		}
-	} else if errors.Is(err, backend.ErrNotFound) {
+		return err
+	}
+	if inst.Status != "running" {
+		_ = w.backend.CompleteActivity(ctx, t.ID, journal.Event{
+			Type:   journal.TypeActivityCompleted,
+			RefSeq: t.Seq,
+		})
 		return nil
 	}
 	act, err := w.reg.activity(t.Name)

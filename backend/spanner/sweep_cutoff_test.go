@@ -11,12 +11,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// The post-commit dedupe sweep must preserve keys created after the terminal
-// transition (Codex round 2 on #327). notifyTerminal fires before the sweep,
-// so a concurrent SendToInbox with a new DedupeID can land inside the sweep
-// window; deleting its key while the inbox event remains would duplicate a
-// later retry of the same DedupeID.
-func TestSweepSignalDedupePreservesPostCommitKeys(t *testing.T) {
+// The post-commit dedupe sweep must preserve keys first appearing after the
+// pre-commit snapshot (Codex round 3 on #327). Classification follows
+// transaction serialization order, not SendToInbox client timestamps: a send
+// that captures created_at before the terminal commit, loses the race, and
+// retry-commits after it must keep its key — deleting it while the inbox
+// event remains would duplicate a later retry of the same DedupeID.
+func TestSweepSignalDedupeSnapshotPreservesPostCommitKeys(t *testing.T) {
 	dsn := guardTestDSN(t)
 	ctx := context.Background()
 	b, err := New(ctx, dsn)
@@ -31,11 +32,10 @@ func TestSweepSignalDedupePreservesPostCommitKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const id = "dedupe-cutoff"
+	const id = "dedupe-snapshot"
 	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
 		t.Fatal(err)
 	}
-	commit := time.Now().UTC()
 	put := func(dedupeID string, createdAt time.Time) {
 		t.Helper()
 		_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
@@ -49,17 +49,34 @@ func TestSweepSignalDedupePreservesPostCommitKeys(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	put("pre-commit", commit.Add(-time.Second))
-	put("post-commit", commit.Add(time.Second))
+	put("pre-commit", time.Now().UTC().Add(-time.Second))
 
-	if err := b.sweepSignalDedupe(ctx, id, nil, commit); err != nil {
+	// Snapshot the pre-commit set, exactly as CommitAdvancements does before
+	// its terminal commit.
+	snapshot, err := b.listSignalDedupeIDs(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 1 || snapshot[0] != "pre-commit" {
+		t.Fatalf("snapshot = %v, want the single pre-commit key", snapshot)
+	}
+
+	// A racing send landing after the snapshot — even one stamping a stale
+	// pre-commit client timestamp after losing a transaction race — must be
+	// preserved: its key was never in the committed set.
+	put("post-commit", time.Now().UTC().Add(-time.Second))
+	put("post-commit-fresh", time.Now().UTC().Add(time.Second))
+
+	if err := b.sweepSignalDedupeIDs(ctx, id, nil, snapshot); err != nil {
 		t.Fatal(err)
 	}
 	if b.dedupeKeyExists(ctx, id, "pre-commit") {
 		t.Fatal("pre-commit dedupe key survived the sweep")
 	}
-	if !b.dedupeKeyExists(ctx, id, "post-commit") {
-		t.Fatal("post-commit dedupe key was swept; a later retry would duplicate the signal")
+	for _, key := range []string{"post-commit", "post-commit-fresh"} {
+		if !b.dedupeKeyExists(ctx, id, key) {
+			t.Fatalf("post-snapshot dedupe key %q was swept; a later retry would duplicate the signal", key)
+		}
 	}
 }
 

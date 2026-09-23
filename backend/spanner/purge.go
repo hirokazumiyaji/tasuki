@@ -199,7 +199,7 @@ func (b *Backend) deleteInstanceChildren(ctx context.Context, id string, guard s
 	if err := b.deleteTimersForInstance(ctx, id, guard); err != nil {
 		return err
 	}
-	if err := b.sweepSignalDedupe(ctx, id, guard, time.Time{}); err != nil {
+	if err := b.deleteAllSignalDedupe(ctx, id, guard); err != nil {
 		return err
 	}
 	if err := b.deleteInboxForInstance(ctx, id, guard); err != nil {
