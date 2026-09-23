@@ -59,7 +59,10 @@ func TestEncryptedCodec_EndToEnd(t *testing.T) {
 		if err := json.Unmarshal(data, &env); err != nil {
 			t.Fatalf("payload of %s is not JSON: %v", evType, err)
 		}
-		if env["tasuki_enc"] != float64(1) {
+		// Default writes stay on Enc 1 for rolling-upgrade safety; accept
+		// either envelope version here (version-specific paths are covered
+		// in codec tests).
+		if ver := env["tasuki_enc"]; ver != float64(1) && ver != float64(2) {
 			t.Fatalf("payload of %s is not encrypted: %s", evType, data)
 		}
 	}

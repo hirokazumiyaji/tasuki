@@ -11,16 +11,16 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
 )
 
-// countIDReleaseBackend counts ReleaseLease calls on the ID-keyed backend
+// countIDReleaseBackend counts ReleaseLease calls on the fenced backend
 // API while delegating to memory.
 type countIDReleaseBackend struct {
 	backend.Backend
 	releases atomic.Int32
 }
 
-func (b *countIDReleaseBackend) ReleaseLease(ctx context.Context, taskID int64) error {
+func (b *countIDReleaseBackend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	b.releases.Add(1)
-	return b.Backend.ReleaseLease(ctx, taskID)
+	return b.Backend.ReleaseLease(ctx, t)
 }
 
 // TestWorker_StaleGenerationClaimFenced is a regression test for the

@@ -44,9 +44,9 @@ func (b *joinOrderBackend) ExtendLease(ctx context.Context, taskID int64, d time
 	return b.Backend.ExtendLease(ctx, taskID, d)
 }
 
-func (b *joinOrderBackend) ReleaseLease(ctx context.Context, taskID int64) error {
+func (b *joinOrderBackend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	b.record("release-enter")
-	err := b.Backend.ReleaseLease(ctx, taskID)
+	err := b.Backend.ReleaseLease(ctx, t)
 	b.record("release-exit")
 	return err
 }

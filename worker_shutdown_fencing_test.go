@@ -33,9 +33,9 @@ func (b *commitGateBackend) CompleteActivity(ctx context.Context, taskID int64, 
 	return b.Backend.CompleteActivity(ctx, taskID, ev)
 }
 
-func (b *commitGateBackend) ReleaseLease(ctx context.Context, id int64) error {
+func (b *commitGateBackend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	b.releases.Add(1)
-	return b.Backend.ReleaseLease(ctx, id)
+	return b.Backend.ReleaseLease(ctx, t)
 }
 
 // TestWorker_ShutdownDuringCommitDoesNotRelease covers the shutdown-expiry /

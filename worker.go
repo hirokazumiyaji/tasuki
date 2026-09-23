@@ -26,13 +26,14 @@ type Worker struct {
 	done   chan struct{}
 	// inFlight tracks claimed task IDs with their local lease-expiry
 	// estimate (claim time + LeaseDuration, refreshed on each successful
-	// renewal). Backend leases are keyed by task ID alone with no
-	// ownership fencing, so the mere presence of an entry is NOT proof
-	// this worker still owns the lease: once the local expiry passes the
-	// lease may have been reclaimed by a peer and releasing by ID would
-	// clear the peer's fresh lease. Release paths must honor the expiry;
-	// result commits additionally transfer ownership out of this map
-	// before touching the store (see claimCommitOwnership).
+	// renewal) plus the claimed task itself. The local expiry is a fast
+	// path: once it passes, the lease may have been reclaimed by a peer
+	// and local release paths must not fire (see claimReleaseOwnership).
+	// The stored task additionally carries the claim token (worker +
+	// attempt) so backend ReleaseLease calls stay fenced even when the
+	// local estimate has not yet expired. Result commits transfer
+	// ownership out of this map before touching the store (see
+	// claimCommitOwnership).
 	//
 	// Entries are stamped with the claiming invocation's token (start
 	// epoch + per-claim sequence): a Start-parent cancel followed by a
@@ -54,6 +55,19 @@ type Worker struct {
 	// reclaim after local expiry with spare concurrency) still hold
 	// distinct tokens.
 	claimSeq uint64
+
+	// wfClaim records the local wall-clock claim time of each workflow
+	// task claimed by tickWorkflows. NackTask is fenced on the claim token
+	// (worker + attempt, like ReleaseLease), so a stale delayed nack in
+	// requeueWorkflowTask is rejected by the backend without touching a
+	// peer's fresh lease. The local lease-expiry estimate (claim time +
+	// LeaseDuration) stays as a fast path: once it has passed, a peer may
+	// have reclaimed the task, so the stale worker skips the nack call
+	// entirely and expiry reclaims naturally. Entries survive untrack
+	// (cleared after the tick flush) so the post-commit requeue path can
+	// still gate on them.
+	wfClaimMu sync.Mutex
+	wfClaim   map[int64]time.Time
 
 	stickyMu sync.Mutex
 	sticky   map[string]stickyEntry
@@ -94,6 +108,7 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		opts:     opts,
 		reg:      newRegistry(opts.Codec),
 		inFlight: map[int64]inFlightEntry{},
+		wfClaim:  map[int64]time.Time{},
 		sticky:   map[string]stickyEntry{},
 		instLock: map[string]*workflowActor{},
 		wfSem:    make(chan struct{}, opts.WorkflowConcurrency),
@@ -101,12 +116,14 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 	}
 }
 
-// inFlightEntry is one tracked claim: the local lease-expiry estimate plus
-// the claiming invocation's token (see claimToken).
+// inFlightEntry is one tracked claim: the local lease-expiry estimate, the
+// claiming invocation's token (see claimToken), and the claimed task itself
+// (carrying the worker + attempt claim token for fenced backend releases).
 type inFlightEntry struct {
 	expiry time.Time
 	epoch  uint64
 	seq    uint64
+	task   backend.Task
 }
 
 // claimToken identifies one claim invocation: the worker Start generation
@@ -147,6 +164,10 @@ func (w *Worker) StartWithError(parent context.Context) error {
 		if err := ValidateSchema(parent, w.backend); err != nil {
 			return fmt.Errorf("tasuki: schema validation failed: %w", err)
 		}
+	}
+	if w.opts.MaxPerInstance > 0 && !w.backend.Capabilities().FairDispatch {
+		w.opts.Logger.Warn("tasuki: MaxPerInstance is set but the backend ignores it (no fair dispatch support); claims fall back to FIFO",
+			"max_per_instance", w.opts.MaxPerInstance)
 	}
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
@@ -372,6 +393,21 @@ func (w *Worker) trackAt(taskID int64, at time.Time) claimToken {
 	return tok
 }
 
+// trackTaskAt is trackAt for production claim sites: it additionally stamps
+// the claimed task into the entry so shutdown and no-slot release paths can
+// issue fenced ReleaseLease calls carrying the claim token (worker +
+// attempt). trackAt (without the task) stays for tests and paths where only
+// the lease-expiry estimate matters; unfenced Task{ID} fallbacks still
+// release correctly since backend fencing predicates skip empty fields.
+func (w *Worker) trackTaskAt(t backend.Task, at time.Time) claimToken {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.claimSeq++
+	tok := claimToken{epoch: w.epoch, seq: w.claimSeq}
+	w.inFlight[t.ID] = inFlightEntry{expiry: at.Add(w.leaseDuration()), epoch: tok.epoch, seq: tok.seq, task: t}
+	return tok
+}
+
 func (w *Worker) untrack(taskID int64, tok claimToken) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -410,7 +446,7 @@ func (w *Worker) refreshLeaseAt(taskID int64, tok claimToken, at time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if e, ok := w.inFlight[taskID]; ok && e.epoch == tok.epoch && e.seq == tok.seq {
-		w.inFlight[taskID] = inFlightEntry{expiry: at.Add(w.leaseDuration()), epoch: e.epoch, seq: e.seq}
+		w.inFlight[taskID] = inFlightEntry{expiry: at.Add(w.leaseDuration()), epoch: e.epoch, seq: e.seq, task: e.task}
 	}
 }
 
@@ -498,9 +534,11 @@ func (w *Worker) beginDetachedCommit(taskID int64, tok claimToken, committing *a
 // releaseInFlight and the handler's shutdown-release path both funnel through
 // in-flight ownership so only one of them releases a given lease: an activity
 // that ignores cancellation and returns after Shutdown already released (and
-// a peer re-claimed) its lease must not ReleaseLease again, since backend
-// leases are keyed by task ID alone and a second release would clear the
-// peer's fresh lease and enable duplicate execution.
+// a peer re-claimed) its lease must not ReleaseLease again. The backend
+// release is fenced on the claim token (worker + attempt) as a second
+// layer, but a stale second release must still be suppressed locally: not
+// all paths carry fencing, and a second release widens the reclaim race
+// that enables duplicate execution.
 //
 // Presence alone is not ownership, and neither is a matching task ID: the
 // entry must still carry this invocation's token. When the Start parent is
@@ -547,13 +585,13 @@ func (w *Worker) releaseContext(ctx context.Context) (context.Context, context.C
 func (w *Worker) releaseInFlight(ctx context.Context) {
 	now := time.Now()
 	w.mu.Lock()
-	ids := make([]int64, 0, len(w.inFlight))
+	tasks := make([]backend.Task, 0, len(w.inFlight))
 	for id, e := range w.inFlight {
 		if now.After(e.expiry) {
 			// Lease already expired locally: a peer may have reclaimed it,
-			// and releasing by task ID alone would clear the peer's fresh
-			// lease. Drop without releasing; expiry already makes it
-			// claimable.
+			// and releasing would risk clearing the peer's fresh lease
+			// (even fenced, the local estimate says ownership is gone).
+			// Drop without releasing; expiry already makes it claimable.
 			w.opts.Logger.Debug("shutdown lease release skipped; local lease expired",
 				"task_id", id)
 			delete(w.inFlight, id)
@@ -562,22 +600,29 @@ func (w *Worker) releaseInFlight(ctx context.Context) {
 		// Tasks with a result commit underway are absent: handleActivity
 		// transfers ownership out via claimCommitOwnership before touching
 		// the store, so they are never released from under their commit.
-		ids = append(ids, id)
+		t := e.task
+		if t.ID == 0 {
+			t = backend.Task{ID: id}
+		}
+		tasks = append(tasks, t)
 		delete(w.inFlight, id)
 	}
 	w.mu.Unlock()
-	for _, id := range ids {
+	for _, t := range tasks {
 		select {
 		case <-ctx.Done():
 			w.opts.Logger.Warn("shutdown lease release timed out",
-				"released", 0, "remaining", len(ids), "error", ctx.Err())
+				"released", 0, "remaining", len(tasks), "error", ctx.Err())
 			w.opts.Metrics.AddStoreError(context.Background(), "release_lease")
 			return
 		default:
 		}
-		if err := w.backend.ReleaseLease(ctx, id); err != nil {
+		// Fenced by the tracked claim token: if the task was reclaimed by
+		// a peer while shutting down, the backend reports ErrNotFound and
+		// the fresh lease is left intact.
+		if err := w.backend.ReleaseLease(ctx, t); err != nil && !errors.Is(err, backend.ErrNotFound) {
 			w.opts.Logger.Warn("shutdown lease release failed",
-				"task_id", id, "error", err)
+				"task_id", t.ID, "error", err)
 			w.opts.Metrics.AddStoreError(context.Background(), "release_lease")
 			select {
 			case <-ctx.Done():
@@ -730,6 +775,13 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 	if len(wtasks) == 0 {
 		return
 	}
+	// Record local claim times so the delayed nack can be fenced against
+	// a reclaim race (see requeueWorkflowTask). Cleared after the flush
+	// below; entries are wall-clock only, never store time.
+	for _, t := range wtasks {
+		w.trackWfClaim(t.ID)
+	}
+	defer w.clearWfClaims(wtasks)
 	var wg sync.WaitGroup
 	var pendingMu sync.Mutex
 	var pending []pendingWorkflowCommit
@@ -742,9 +794,10 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 			// No slot: make the task visible again promptly for peers.
 			// Detached: the poll ctx may be canceled by a concurrent
 			// Shutdown, and the task was never tracked (releaseInFlight
-			// cannot cover it).
+			// cannot cover it). Fenced on the just-claimed token, so this
+			// only releases our own claim.
 			relCtx, relCancel := w.releaseContext(ctx)
-			_ = w.backend.ReleaseLease(relCtx, t.ID)
+			_ = w.backend.ReleaseLease(relCtx, t)
 			relCancel()
 			continue
 		}
@@ -759,13 +812,21 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 			actor.dispatch(func() {
 				w.opts.Metrics.AddWorkflowTask(ctx, 1)
 				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
-				tok := w.trackAt(t.ID, claimStart)
+				tok := w.trackTaskAt(t, claimStart)
 				p, herr := w.handleWorkflow(ctx, t)
 				w.untrack(t.ID, tok)
 				if herr != nil {
 					w.recordStoreError(ctx, "commit_workflow", herr,
 						"instance_id", t.InstanceID, "task_id", t.ID)
 					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", herr)
+					if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {
+						w.dropSticky(t.InstanceID)
+					}
+					// Contention releases immediately for fast replay;
+					// anything else backs off via delayed nack so a
+					// persistently failing task does not spin the poll
+					// loop (see requeueWorkflowTask).
+					w.requeueWorkflowTask(ctx, t, herr)
 					return
 				}
 				if p != nil {
@@ -821,8 +882,9 @@ func (w *Worker) tickActivities(ctx context.Context) {
 		default:
 			// Detached (see releaseContext): the poll ctx may be canceled
 			// by a concurrent Shutdown and the task was never tracked.
+			// Fenced on the just-claimed token.
 			relCtx, relCancel := w.releaseContext(ctx)
-			_ = w.backend.ReleaseLease(relCtx, t.ID)
+			_ = w.backend.ReleaseLease(relCtx, t)
 			relCancel()
 			continue
 		}
@@ -832,7 +894,7 @@ func (w *Worker) tickActivities(ctx context.Context) {
 		w.opts.Metrics.AddActivityTask(ctx, 1)
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
-		tok := w.trackAt(t.ID, claimStart)
+		tok := w.trackTaskAt(t, claimStart)
 		done, ok := w.trackActivity()
 		if !ok {
 			w.untrack(t.ID, tok)
@@ -840,9 +902,9 @@ func (w *Worker) tickActivities(ctx context.Context) {
 			// Detached: Shutdown already canceled the poll ctx and this ID
 			// is untracked, so releaseInFlight cannot cover it; a canceled
 			// ctx would make context-aware stores reject the release and
-			// stall the task until lease expiry.
+			// stall the task until lease expiry. Fenced on the claim token.
 			relCtx, relCancel := w.releaseContext(ctx)
-			_ = w.backend.ReleaseLease(relCtx, t.ID)
+			_ = w.backend.ReleaseLease(relCtx, t)
 			relCancel()
 			continue
 		}
@@ -898,8 +960,9 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 		default:
 			// Detached (see releaseContext): the poll ctx may be canceled
 			// by a concurrent Shutdown and the task was never tracked.
+			// Fenced on the just-claimed token.
 			relCtx, relCancel := w.releaseContext(ctx)
-			_ = w.backend.ReleaseLease(relCtx, t.ID)
+			_ = w.backend.ReleaseLease(relCtx, t)
 			relCancel()
 			continue
 		}
@@ -907,7 +970,7 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 		w.opts.Metrics.AddActivityTask(ctx, 1)
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
-		tok := w.trackAt(t.ID, claimStart)
+		tok := w.trackTaskAt(t, claimStart)
 		done, global := w.trackActivity()
 		go func(t backend.Task, tok claimToken) {
 			defer wg.Done()
@@ -1034,6 +1097,7 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 			instanceID:  t.InstanceID,
 			baseJournal: state.Journal,
 			adv:         adv,
+			task:        t,
 		}
 	}
 
@@ -1340,7 +1404,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		// the new generation's lease.
 		if w.claimReleaseOwnership(t.ID, tok) {
 			commitCtx, commitCancel := w.commitContext(ctx)
-			_ = w.backend.ReleaseLease(commitCtx, t.ID)
+			_ = w.backend.ReleaseLease(commitCtx, t)
 			commitCancel()
 		}
 		return ctx.Err()
@@ -1359,8 +1423,8 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 	// renewDone closes when the renewal loop exits so the shutdown-release
 	// path below can JOIN it before releasing (see below): joining
 	// guarantees no ExtendLease is in flight that could land after the
-	// ReleaseLease and re-hide the task for a full lease (or modify a
-	// peer's fresh lease — backend lease ops are keyed by task ID alone).
+	// ReleaseLease and re-hide the task for a full lease (or slip past the
+	// release fencing onto a peer's fresh lease).
 	renewDone := make(chan struct{})
 	go func() {
 		defer close(renewDone)
@@ -1461,7 +1525,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		<-renewDone
 		if w.claimReleaseOwnership(t.ID, tok) {
 			commitCtx, commitCancel := w.commitContext(ctx)
-			_ = w.backend.ReleaseLease(commitCtx, t.ID)
+			_ = w.backend.ReleaseLease(commitCtx, t)
 			commitCancel()
 		}
 		return ctx.Err()

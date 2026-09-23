@@ -19,9 +19,9 @@ type countingReleaseBackend struct {
 	releases atomic.Int32
 }
 
-func (b *countingReleaseBackend) ReleaseLease(ctx context.Context, id int64) error {
+func (b *countingReleaseBackend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	b.releases.Add(1)
-	return b.Backend.ReleaseLease(ctx, id)
+	return b.Backend.ReleaseLease(ctx, t)
 }
 
 // TestWorker_StaleHandlerDoesNotClearPeerLease covers the Shutdown/handler
@@ -133,13 +133,13 @@ func (b *blockingClaimBackend) ClaimTasks(ctx context.Context, req backend.Claim
 	return b.Backend.ClaimTasks(ctx, req)
 }
 
-func (b *blockingClaimBackend) ReleaseLease(ctx context.Context, id int64) error {
+func (b *blockingClaimBackend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	if ctx.Err() != nil {
 		b.releaseDead.Add(1)
 		return ctx.Err()
 	}
 	b.releaseLive.Add(1)
-	return b.Backend.ReleaseLease(ctx, id)
+	return b.Backend.ReleaseLease(ctx, t)
 }
 
 func (b *blockingClaimBackend) inFlightClaims() int {
