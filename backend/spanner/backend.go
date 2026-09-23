@@ -448,10 +448,7 @@ func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Durati
 	// lease moved on; report ErrNotFound so the worker treats the renewal
 	// as stale.
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		n, err := txn.Update(ctx, spanner.Statement{
-			SQL:    `UPDATE wf_tasks SET visible_at = @v WHERE id = @id AND worker_id = @w AND attempt = @a`,
-			Params: map[string]any{"v": nowUTC().Add(d), "id": t.ID, "w": t.WorkerID, "a": t.Attempt},
-		})
+		n, err := txn.Update(ctx, extendLeaseStatement(nowUTC().Add(d), t))
 		if err != nil {
 			return err
 		}
@@ -461,6 +458,18 @@ func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Durati
 		return nil
 	})
 	return err
+}
+
+// extendLeaseStatement builds the conditional renewal DML for the claimed
+// task generation. Like fencedReleaseStatement, the attempt bind must be
+// INT64 (Go int64): the Spanner client rejects a native Go int for an
+// INT64 column, which would fail the renewal and leave the task to
+// expire instead of being renewed.
+func extendLeaseStatement(v time.Time, t backend.Task) spanner.Statement {
+	return spanner.Statement{
+		SQL:    `UPDATE wf_tasks SET visible_at = @v WHERE id = @id AND worker_id = @w AND attempt = @a`,
+		Params: map[string]any{"v": v, "id": t.ID, "w": t.WorkerID, "a": int64(t.Attempt)},
+	}
 }
 
 func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {

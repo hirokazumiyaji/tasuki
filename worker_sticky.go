@@ -165,6 +165,23 @@ func (w *Worker) clearWfClaims(tasks []backend.Task) {
 	}
 }
 
+// refreshWfClaim moves a workflow task's local claim time forward after a
+// successful lease renewal (see extendLeaseLoop), so the delayed nack in
+// requeueWorkflowTask measures staleness against the renewed lease — not
+// the original claim. Unknown IDs are ignored: activity turns share the
+// renewal loop but never enter wfClaim, and flushed claims were already
+// dropped by clearWfClaims. Without the refresh, a turn renewed past its
+// original claim time that then fails non-contentiously skips its nack
+// (the precheck sees the original time as expired) and stays hidden
+// until lease expiry instead of backing off for a retry delay.
+func (w *Worker) refreshWfClaim(taskID int64) {
+	w.wfClaimMu.Lock()
+	defer w.wfClaimMu.Unlock()
+	if _, ok := w.wfClaim[taskID]; ok {
+		w.wfClaim[taskID] = time.Now()
+	}
+}
+
 // wfLeaseExpired reports whether the local lease-expiry estimate for a
 // claimed workflow task has passed. Unknown IDs (direct commitWorkflow /
 // requeueWorkflowTask calls outside tickWorkflows, e.g. unit tests) report

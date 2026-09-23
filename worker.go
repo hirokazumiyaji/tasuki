@@ -1547,6 +1547,12 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 					return
 				}
 				w.recordStoreError(ctx, "extend_lease", err, "task_id", t.ID)
+			} else {
+				// The store lease moved forward: the local
+				// claim-time estimate used by the delayed nack
+				// (see requeueWorkflowTask) must move with it
+				// (see refreshWfClaim).
+				w.refreshWfClaim(t.ID)
 			}
 		}
 	}

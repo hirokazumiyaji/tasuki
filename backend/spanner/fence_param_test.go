@@ -8,11 +8,11 @@ import (
 )
 
 // TestFencedStatementsEncodeAttemptAsInt64 is a regression test for the
-// INT64 finding: fenced release/nack bind Go backend.Task.Attempt (int)
-// against the Spanner attempt INT64 column. A native Go int param makes the
-// Spanner client reject the DML, so the release/nack fails and the task
-// stays hidden until lease expiry. Both builders must encode attempt as
-// int64.
+// INT64 finding: fenced release/nack/renewal bind Go backend.Task.Attempt
+// (int) against the Spanner attempt INT64 column. A native Go int param
+// makes the Spanner client reject the DML, so the release/nack/renewal
+// fails and the task stays hidden until lease expiry. All builders must
+// encode attempt as int64.
 func TestFencedStatementsEncodeAttemptAsInt64(t *testing.T) {
 	claimed := backend.Task{ID: 7, WorkerID: "w1", Attempt: 3}
 	now := time.Now().UTC()
@@ -21,9 +21,13 @@ func TestFencedStatementsEncodeAttemptAsInt64(t *testing.T) {
 	}{
 		"release": {fencedReleaseStatement(now, claimed).Params},
 		"nack":    {fencedNackStatement(now, claimed, time.Second).Params},
+		"renew":   {extendLeaseStatement(now, claimed).Params},
 	}
 	for name, s := range stmts {
 		p, ok := s.params["attempt"]
+		if name == "renew" {
+			p, ok = s.params["a"]
+		}
 		if !ok {
 			t.Fatalf("%s: missing attempt param", name)
 		}
