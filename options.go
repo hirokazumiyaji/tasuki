@@ -24,6 +24,10 @@ type WorkerOptions struct {
 	JournalWarnThreshold int // 0 → 10000; <0 disabled
 	// IncompatibleRetryDelay is how long to hide a task after an incompatible Worker nacks it.
 	// Unset (0) defaults to 5s; negative means immediate re-visibility.
+	// It also backs off failed workflow tasks: non-contention handle/commit
+	// errors (store failures, oversized-advancement budget diagnostics) nack
+	// with this delay instead of an immediate lease release, so a
+	// persistently failing task does not reclaim-fail-notify in a tight loop.
 	IncompatibleRetryDelay time.Duration
 	// MaxPerInstance caps how many tasks of one instance a single claim batch
 	// returns (fair dispatch; see docs/08-fair-dispatch.md). 0 disables the

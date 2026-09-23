@@ -127,7 +127,7 @@ func TestCommitWorkflow_ConflictDropsSticky(t *testing.T) {
 	if err != nil || len(tasks) != 1 {
 		t.Fatalf("%v", err)
 	}
-	err = w.commitWorkflow(ctx, "cf1", st.Journal, backend.Advancement{
+	err = w.commitWorkflow(ctx, tasks[0], st.Journal, backend.Advancement{
 		InstanceID:  "cf1",
 		TaskID:      tasks[0].ID,
 		ExpectedSeq: st.NextSeq - 1, // stale
@@ -168,6 +168,7 @@ func TestFlushWorkflowCommits_Batch(t *testing.T) {
 		pending = append(pending, pendingWorkflowCommit{
 			instanceID:  tsk.InstanceID,
 			baseJournal: st.Journal,
+			task:        tsk,
 			adv: backend.Advancement{
 				InstanceID:  tsk.InstanceID,
 				TaskID:      tsk.ID,
@@ -243,34 +244,43 @@ func TestLoadWorkflowState_StickyMergeMismatch(t *testing.T) {
 func TestFlushWorkflowCommits_BatchConflictDropsSticky(t *testing.T) {
 	ctx := context.Background()
 	b := memory.New()
-	b.SetNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	b.SetNow(now)
 	w := NewWorker(b, WorkerOptions{Queues: []string{"default"}})
 	for _, id := range []string{"bc1", "bc2"} {
 		if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
 			t.Fatal(err)
 		}
 	}
+	// Production-like lease: without a lease release the conflicted task
+	// would stay invisible for the full LeaseDuration.
 	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
-		Kind: "workflow", Queues: []string{"default"}, Limit: 2, Lease: time.Second, WorkerID: "w1",
+		Kind: "workflow", Queues: []string{"default"}, Limit: 2, Lease: 30 * time.Second, WorkerID: "w1",
 	})
 	if err != nil || len(tasks) != 2 {
 		t.Fatalf("%v %#v", err, tasks)
 	}
+	byInst := map[string]backend.Task{}
+	for _, tsk := range tasks {
+		byInst[tsk.InstanceID] = tsk
+	}
 	pending := make([]pendingWorkflowCommit, 0, 2)
-	for i, tsk := range tasks {
-		st, err := w.loadWorkflowState(ctx, tsk.InstanceID)
+	for _, id := range []string{"bc1", "bc2"} {
+		tsk := byInst[id]
+		st, err := w.loadWorkflowState(ctx, id)
 		if err != nil {
 			t.Fatal(err)
 		}
 		exp := st.NextSeq
-		if i == 1 {
-			exp = 999 // force batch conflict
+		if id == "bc2" {
+			exp = 999 // force batch conflict on one instance
 		}
 		pending = append(pending, pendingWorkflowCommit{
-			instanceID:  tsk.InstanceID,
+			instanceID:  id,
 			baseJournal: st.Journal,
+			task:        tsk,
 			adv: backend.Advancement{
-				InstanceID:  tsk.InstanceID,
+				InstanceID:  id,
 				TaskID:      tsk.ID,
 				ExpectedSeq: exp,
 				NewEvents: []journal.Event{
@@ -280,10 +290,30 @@ func TestFlushWorkflowCommits_BatchConflictDropsSticky(t *testing.T) {
 		})
 	}
 	w.flushWorkflowCommits(ctx, pending)
-	for _, id := range []string{"bc1", "bc2"} {
-		if _, ok := w.stickyGet(id); ok {
-			t.Fatalf("%s sticky should be dropped after batch failure", id)
-		}
+	// Healthy instance advances in the same tick via per-instance fallback.
+	st1, err := b.LoadWorkflow(ctx, "bc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st1.Journal) < 2 {
+		t.Fatalf("bc1 should advance despite bc2 conflict, journal=%d", len(st1.Journal))
+	}
+	if _, ok := w.stickyGet("bc1"); !ok {
+		t.Fatal("bc1 sticky should be kept after successful fallback commit")
+	}
+	// Conflicted instance drops sticky and its task is immediately
+	// reclaimable without waiting out the 30s lease.
+	if _, ok := w.stickyGet("bc2"); ok {
+		t.Fatal("bc2 sticky should be dropped after conflict")
+	}
+	reclaimed, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 2, Lease: 30 * time.Second, WorkerID: "w2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].InstanceID != "bc2" {
+		t.Fatalf("want bc2 task immediately reclaimable, got %+v", reclaimed)
 	}
 }
 

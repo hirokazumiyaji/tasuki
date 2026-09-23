@@ -380,8 +380,39 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 	}
 	return b.updateTask(ctx, taskID, false, fields)
 }
-func (b *Backend) ReleaseLease(ctx context.Context, id int64) error {
-	if err := b.updateTask(ctx, id, false, []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}}); err != nil {
+func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
+	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
+	// kind like NackTask does. The release is fenced on the claim ownership
+	// token: a stale worker whose task was reclaimed or atomically refreshed
+	// sees a mismatch and reports ErrNotFound instead of clearing the fresh
+	// lease.
+	ref := b.ref("wf_tasks", actTaskID(t.ID))
+	if t.Kind == "workflow" && t.InstanceID != "" {
+		ref = b.ref("wf_tasks", wfTaskID(t.InstanceID))
+	}
+	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		s, e := tx.Get(ref)
+		if isNotFound(e) {
+			return backend.ErrNotFound
+		}
+		if e != nil {
+			return e
+		}
+		if !s.Exists() {
+			return backend.ErrNotFound
+		}
+		m := s.Data()
+		if t.Kind == "workflow" && t.InstanceID != "" {
+			if t.ID != 0 && i64(m, "id") != t.ID {
+				return backend.ErrNotFound
+			}
+		}
+		if t.WorkerID != "" && (str(m, "worker_id") != t.WorkerID || int(i64(m, "attempt")) != t.Attempt) {
+			return backend.ErrNotFound
+		}
+		return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}})
+	})
+	if err != nil {
 		return err
 	}
 	b.notifyTasks()
@@ -401,6 +432,19 @@ func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Durat
 			return e
 		}
 		if !s.Exists() {
+			return backend.ErrNotFound
+		}
+		// Fence the nack on the claim ownership token (see ReleaseLease):
+		// a stale worker whose task was reclaimed or atomically refreshed
+		// sees a mismatch and reports ErrNotFound instead of clearing the
+		// fresh lease.
+		m := s.Data()
+		if t.Kind == "workflow" && t.InstanceID != "" {
+			if t.ID != 0 && i64(m, "id") != t.ID {
+				return backend.ErrNotFound
+			}
+		}
+		if t.WorkerID != "" && (str(m, "worker_id") != t.WorkerID || int(i64(m, "attempt")) != t.Attempt) {
 			return backend.ErrNotFound
 		}
 		return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(delay)}, {Path: "worker_id", Value: gcf.Delete}})
