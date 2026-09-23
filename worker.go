@@ -94,6 +94,35 @@ type Worker struct {
 	execCtx    context.Context
 	execCancel context.CancelFunc
 
+	// renewWg counts in-flight ORDINARY lease-renewal store calls (the
+	// ticker path in extendLeaseLoop while no detached commit owns the
+	// task). Shutdown joins it before releasing leases (see
+	// shutdownRenewalJoin): a renewal already issued when the grace
+	// expires completes despite the execution-context cancel (backends
+	// may ignore cancellation), and without the join it lands after the
+	// ReleaseLease — re-hiding the released task for a full lease or
+	// extending a peer's fresh lease through the ID-only ExtendLease.
+	// Detached-commit renewals (see renewOnceDetached) are not counted:
+	// their entries transferred out of inFlight at commit entry, so no
+	// shutdown release can land on them.
+	renewWg sync.WaitGroup
+	// renewStop, once set at Shutdown grace expiry, stops new ordinary
+	// renewals: the ticker path claims its join slot BEFORE reading this
+	// flag, so a slot claimed after Shutdown's drain always observes the
+	// flag and issues nothing. Reset on every Start. Detached-commit
+	// cover renewals ignore it (their commit needs the cover and their
+	// entries are out of the release set).
+	renewStop atomic.Bool
+	// detMu guards detGuard. Lock order with mu is mu-then-detMu, taken
+	// together only in beginDetachedCommit; renewOnceDetached and
+	// dropDetachedGuard take detMu alone and never nest mu inside it.
+	detMu sync.Mutex
+	// detGuard records, for each task with a detached result commit in
+	// flight, the worker-side lease-continuity deadline (see
+	// detachedGuard). Created atomically with the commit transfer in
+	// beginDetachedCommit, dropped at handler return.
+	detGuard map[int64]detachedGuard
+
 	recoverMu   sync.Mutex
 	lastRecover time.Time
 
@@ -108,6 +137,7 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		opts:     opts,
 		reg:      newRegistry(opts.Codec),
 		inFlight: map[int64]inFlightEntry{},
+		detGuard: map[int64]detachedGuard{},
 		wfClaim:  map[int64]time.Time{},
 		sticky:   map[string]stickyEntry{},
 		instLock: map[string]*workflowActor{},
@@ -136,6 +166,33 @@ type inFlightEntry struct {
 type claimToken struct {
 	epoch uint64
 	seq   uint64
+}
+
+// detachedGuard is the worker-side lease-continuity record for one
+// detached result commit. No backend offers a conditional (claim-token
+// fenced) ExtendLease — every ExtendLease and every result op
+// (Complete/Retry/fail) addresses the task by ID alone — so a renewal
+// that SUCCEEDS after the lease moved on (expiry + peer reclaim +
+// earlier failed renewals) extends the PEER's lease, and the stale
+// commit that follows modifies the peer's task. Error handling alone
+// cannot catch that: success is the dangerous case.
+//
+// The guard closes it worker-side. It is seeded at commit entry with
+// the entry's local lease-expiry estimate and refreshed on every
+// successful detached renewal (see renewOnceDetached), chaining the
+// deadline forward while renewals succeed continuously. A success whose
+// call started after the deadline means the backend lease may have
+// expired and been reclaimed in the gap — this call just extended the
+// peer's lease — so the renewal reports lease loss and the commit
+// aborts instead of touching the store (success-without-ownership is
+// treated as lost, never committed). The local estimate is
+// conservative-early (measured from before each store call, like
+// trackAt/refreshLeaseAt), so a live lease always verifies: only a
+// genuine renewal gap trips the guard.
+type detachedGuard struct {
+	epoch    uint64
+	seq      uint64
+	deadline time.Time
 }
 
 func (w *Worker) Start(parent context.Context) {
@@ -179,6 +236,7 @@ func (w *Worker) StartWithError(parent context.Context) error {
 	w.epoch++
 	w.actMu.Lock()
 	w.stopping = false
+	w.renewStop.Store(false)
 	// Execution observes the Start parent (so parent cancel still aborts
 	// activities and lease renewal) but uses its own cancel separate from
 	// the poll loop ctx, so Shutdown's immediate loop cancellation does not
@@ -290,8 +348,38 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 	}
 	relCtx, relCancel := context.WithTimeout(context.Background(), releaseTimeout)
 	defer relCancel()
+	// Join ordinary lease renewal before releasing (round-9 P1a): a
+	// renewal already issued when the grace expired completes despite the
+	// cancel above and would otherwise land after the ReleaseLease below
+	// (see shutdownRenewalJoin).
+	w.shutdownRenewalJoin(relCtx)
 	w.releaseInFlight(relCtx)
 	return waitErr
+}
+
+// shutdownRenewalJoin stops new ordinary lease renewals and waits for
+// in-flight renewal store calls to settle before Shutdown releases
+// leases. Grace expiry while extendLeaseLoop is inside ExtendLease
+// leaves a call that completes despite the execution-context cancel;
+// releasing first lets that renewal land after the ReleaseLease,
+// re-hiding the released task for a full lease (or extending a peer's
+// fresh lease through the ID-only ExtendLease). The join guarantees
+// every such call completed before any release is issued.
+//
+// Ordering with the ticker path: Shutdown sets renewStop BEFORE
+// draining renewWg, while the loop claims its WaitGroup slot BEFORE
+// reading renewStop. A slot claimed before the drain is waited for; a
+// slot claimed after always observes the flag and issues nothing — so
+// no renewal can slip past the join in either direction. The wait is
+// bounded by ctx (the release budget): on timeout the release below is
+// skipped and leases expire naturally, which is safe but slower.
+//
+// Only ordinary renewals participate: detached-commit cover renewals
+// belong to entries already transferred out of inFlight, so the release
+// below cannot land on them, and their commits need the cover.
+func (w *Worker) shutdownRenewalJoin(ctx context.Context) {
+	w.renewStop.Store(true)
+	waitForWaitGroup(&w.renewWg, ctx)
 }
 
 // waitForWaitGroup blocks until wg drains or ctx ends.
@@ -461,6 +549,23 @@ func (w *Worker) owns(taskID int64, tok claimToken) bool {
 	return ok && e.epoch == tok.epoch && e.seq == tok.seq
 }
 
+// ownsFresh reports whether tok still stamps the in-flight entry for
+// taskID AND the local lease estimate has not yet expired. The ordinary
+// renewal path must gate on both: past local expiry a peer may have
+// reclaimed the task, and an ID-only ExtendLease would then extend the
+// peer's lease — hiding the peer's task for a full lease while masking
+// our own ownership loss. An unfresh lease is left for natural expiry
+// reclaim instead of being renewed (round-9 P1b).
+func (w *Worker) ownsFresh(taskID int64, tok claimToken) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	e, ok := w.inFlight[taskID]
+	if !ok || e.epoch != tok.epoch || e.seq != tok.seq {
+		return false
+	}
+	return time.Now().Before(e.expiry)
+}
+
 // claimCommitOwnership transfers taskID out of the in-flight set so a
 // concurrent Shutdown releaseInFlight cannot hand the task to a peer while
 // this worker's detached result commit is still running. It reports whether
@@ -524,9 +629,37 @@ func (w *Worker) beginDetachedCommit(taskID int64, tok claimToken, committing *a
 			"task_id", taskID)
 		return false
 	}
+	// Seed the detached-renewal continuity guard (see detachedGuard)
+	// from the entry's local lease-expiry estimate. detMu nests inside
+	// mu here — the only place both are held — while guard readers take
+	// detMu alone, so the order never inverts. The guard is stored BEFORE
+	// detached mode is entered below: a renewal loop that observes the
+	// flag is guaranteed to observe the guard, so it can never mistake a
+	// covered commit for an unowned task and skip its renewal.
+	w.detMu.Lock()
+	defer w.detMu.Unlock()
+	if w.detGuard == nil {
+		w.detGuard = map[int64]detachedGuard{}
+	}
+	w.detGuard[taskID] = detachedGuard{epoch: tok.epoch, seq: tok.seq, deadline: e.expiry}
 	committing.Store(true)
 	delete(w.inFlight, taskID)
 	return true
+}
+
+// dropDetachedGuard removes taskID's continuity guard when the token
+// matches: the detached commit finished (committed, aborted, or
+// released) and no further renewal may extend the lease. A stale
+// invocation must not drop a newer generation's guard for the same
+// task ID. Called at handler return; a renewal loop still in flight
+// past that point finds no guard and — with the entry gone too —
+// reports lease loss instead of extending a possibly-moved-on lease.
+func (w *Worker) dropDetachedGuard(taskID int64, tok claimToken) {
+	w.detMu.Lock()
+	defer w.detMu.Unlock()
+	if g, ok := w.detGuard[taskID]; ok && g.epoch == tok.epoch && g.seq == tok.seq {
+		delete(w.detGuard, taskID)
+	}
 }
 
 // claimReleaseOwnership atomically removes taskID from the in-flight set,
@@ -1420,6 +1553,11 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 	var committing atomic.Bool
 	done := make(chan struct{})
 	defer close(done)
+	// Drop the detached-renewal continuity guard at handler return (see
+	// dropDetachedGuard). Registered before the commit-scoped stop funcs
+	// below, so it runs after they joined their cover loops: every
+	// renewal issued for this commit still finds its guard.
+	defer w.dropDetachedGuard(t.ID, tok)
 	// renewDone closes when the renewal loop exits so the shutdown-release
 	// path below can JOIN it before releasing (see below): joining
 	// guarantees no ExtendLease is in flight that could land after the
@@ -1864,15 +2002,47 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, tok claimTok
 			// itself. Detached-commit mode is exempt: its entry was
 			// transferred out by its own commit, so absence is
 			// expected while the commit still needs renewal.
-			if !w.owns(taskID, tok) && (committing == nil || !committing.Load()) {
-				return
+			detached := committing != nil && committing.Load()
+			if !detached {
+				// Ordinary renewal must still own a FRESH lease (see
+				// ownsFresh): past the local expiry a peer may have
+				// reclaimed the task, and an ID-only ExtendLease
+				// would then extend the peer's lease — hiding the
+				// peer's task while masking our ownership loss.
+				// The task is left for natural expiry reclaim.
+				if !w.ownsFresh(taskID, tok) {
+					return
+				}
+				// Shutdown passed grace expiry: no new ordinary
+				// renewals. Claim the join slot BEFORE reading the
+				// flag (see shutdownRenewalJoin) so no renewal slips
+				// past Shutdown's release in either direction.
+				w.renewWg.Add(1)
+				if w.renewStop.Load() {
+					w.renewWg.Done()
+					return
+				}
+				// Conservative lease base (see refreshLeaseAt).
+				renewStart := time.Now()
+				rerr := w.backend.ExtendLease(ctx, taskID, w.opts.LeaseDuration)
+				w.renewWg.Done()
+				if rerr != nil {
+					w.recordStoreError(ctx, "extend_lease", rerr, "task_id", taskID)
+				} else {
+					w.refreshLeaseAt(taskID, tok, renewStart)
+				}
+				continue
 			}
-			// Conservative lease base (see refreshLeaseAt).
-			renewStart := time.Now()
-			if err := w.backend.ExtendLease(ctx, taskID, w.opts.LeaseDuration); err != nil {
-				w.recordStoreError(ctx, "extend_lease", err, "task_id", taskID)
-			} else {
-				w.refreshLeaseAt(taskID, tok, renewStart)
+			// Detached-commit cover: the entry transferred out at
+			// commit entry, so no shutdown release can land on this
+			// task. The renewal is continuity-gated (see
+			// renewOnceDetached): once the lease moved on, cover
+			// stops instead of extending a peer's lease, and the
+			// loop exits.
+			if derr := w.renewOnceDetached(ctx, taskID, tok); derr != nil {
+				if errors.Is(derr, errLeaseLost) {
+					return
+				}
 			}
 		}
 	}
@@ -1906,7 +2076,17 @@ func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, tok claimToke
 	if committing == nil || !committing.Load() {
 		return
 	}
-	w.renewOnceDetached(ctx, taskID, tok)
+	// A lost lease stops the cover outright: the guard reports loss
+	// when the lease moved on (see renewOnceDetached), and every
+	// further success would only extend the peer's lease. Transient
+	// errors keep the cover alive — the next tick may succeed while
+	// the lease is still ours, and the guard's gap detection catches a
+	// move-on before any commit.
+	if err := w.renewOnceDetached(ctx, taskID, tok); err != nil {
+		if errors.Is(err, errLeaseLost) {
+			return
+		}
+	}
 	for {
 		if committing == nil || !committing.Load() {
 			return
@@ -1923,7 +2103,11 @@ func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, tok claimToke
 			if committing == nil || !committing.Load() {
 				return
 			}
-			w.renewOnceDetached(ctx, taskID, tok)
+			if err := w.renewOnceDetached(ctx, taskID, tok); err != nil {
+				if errors.Is(err, errLeaseLost) {
+					return
+				}
+			}
 		}
 	}
 }
@@ -1935,7 +2119,43 @@ func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, tok claimToke
 // running an ID-only store op that could modify a peer's task (round-8
 // P1b). Background loops log-and-continue via this return; the
 // pre-commit handoff treats any error as lease loss.
+//
+// A SUCCESS can also prove loss (round-9 P1b): with the guard seeded at
+// commit entry (see detachedGuard), a call that started after the
+// continuity deadline may have extended a peer's lease after an
+// expiry-and-reclaim gap. That success reports errLeaseLost — the commit
+// aborts, and cover loops stop — instead of refreshing anything.
 func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimToken) error {
+	w.detMu.Lock()
+	g, ok := w.detGuard[taskID]
+	w.detMu.Unlock()
+	if ok && (g.epoch != tok.epoch || g.seq != tok.seq) {
+		// A stale invocation's loop (previous generation, or an
+		// earlier claim whose task ID was re-tracked): another
+		// invocation owns the detached commit now. Issue nothing.
+		return fmt.Errorf("%w: detached renewal superseded", errLeaseLost)
+	}
+	if !ok {
+		// No detached commit owns this renewal. Only a pre-transfer
+		// direct use with the entry still present may proceed (the
+		// renewal-handoff tests drive ensureCommitRenewal without a
+		// transfer); a stale loop past handler return — guard
+		// dropped, entry gone — must not extend a lease that may
+		// have moved on.
+		if !w.owns(taskID, tok) {
+			return fmt.Errorf("%w: no detached commit owns task", errLeaseLost)
+		}
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.leaseDuration())
+		defer cancel()
+		// Conservative lease base (see refreshLeaseAt).
+		renewStart := time.Now()
+		if err := w.backend.ExtendLease(rctx, taskID, w.opts.LeaseDuration); err != nil {
+			w.recordStoreError(rctx, "extend_lease", err, "task_id", taskID)
+			return err
+		}
+		w.refreshLeaseAt(taskID, tok, renewStart)
+		return nil
+	}
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.leaseDuration())
 	defer cancel()
 	// Conservative lease base (see refreshLeaseAt).
@@ -1944,7 +2164,28 @@ func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimT
 		w.recordStoreError(rctx, "extend_lease", err, "task_id", taskID)
 		return err
 	}
-	w.refreshLeaseAt(taskID, tok, renewStart)
+	// Gap detection on the call-start instant: starting after the
+	// continuity deadline means the backend lease may have expired and
+	// been reclaimed since the last success, so this call just extended
+	// the peer's lease. Drop the guard so cover loops stop too, refresh
+	// nothing, and report loss so the commit aborts. A live lease always
+	// verifies (the estimate is conservative-early); only a genuine
+	// renewal gap trips this, trading a retry for never modifying a
+	// peer's task.
+	w.detMu.Lock()
+	defer w.detMu.Unlock()
+	cur, ok := w.detGuard[taskID]
+	if !ok || cur.epoch != tok.epoch || cur.seq != tok.seq {
+		return fmt.Errorf("%w: detached commit finished during renewal", errLeaseLost)
+	}
+	if !renewStart.Before(cur.deadline) {
+		delete(w.detGuard, taskID)
+		w.opts.Logger.Debug("detached renewal started after lease continuity deadline; treating as lease loss",
+			"task_id", taskID)
+		return fmt.Errorf("%w: detached renewal after lease continuity deadline", errLeaseLost)
+	}
+	cur.deadline = renewStart.Add(w.leaseDuration())
+	w.detGuard[taskID] = cur
 	return nil
 }
 

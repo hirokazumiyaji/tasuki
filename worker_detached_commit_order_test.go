@@ -185,7 +185,14 @@ func TestWorker_DetachedCommitRenewalEnteredBeforeCancelCheck(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond) // renewal loop parked in select
 	close(hook.doneCh)                // cancel lands inside the check window
-	time.Sleep(200 * time.Millisecond)
+	// Let the renewal loop observe the cancel and exit (renewDone
+	// closes) before the check passes. This hold plus the handler's
+	// earlier run must stay well within the lease: the detached-renewal
+	// continuity guard (round-9 P1b) treats a beyond-lease gap with no
+	// successful renewal as lease loss and aborts the commit, since a
+	// real backend would have expired the lease in the gap. Cancel
+	// determinism comes from the hook gate above, not from this sleep.
+	time.Sleep(50 * time.Millisecond)
 	close(hook.errRelease) // check passes; the detached commit starts
 	select {
 	case <-store.commitEntered:

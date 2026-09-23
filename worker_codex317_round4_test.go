@@ -57,11 +57,19 @@ func TestExtendLeaseLoopRenewsImmediatelyOnDetachedEntry(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var committing atomic.Bool
-	committing.Store(true) // detached commit already in flight before the cancel
+	// A detached commit is always entered via beginDetachedCommit, which
+	// also seeds the renewal continuity guard: mirror the production
+	// setup so the loop's cover renewal is owned (round-9 P1b).
+	tok := w.track(42)
+	defer w.untrack(42, tok)
+	defer w.dropDetachedGuard(42, tok)
+	if !w.beginDetachedCommit(42, tok, &committing) {
+		t.Fatal("beginDetachedCommit failed on a tracked entry")
+	}
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go func() { defer wg.Done(); w.extendLeaseLoop(ctx, 42, claimToken{}, done, &committing) }()
+	go func() { defer wg.Done(); w.extendLeaseLoop(ctx, 42, tok, done, &committing) }()
 	// No tick can have fired yet (5s period): the loop must be quiet.
 	time.Sleep(200 * time.Millisecond)
 	if n := store.extendCount(); n != 0 {
