@@ -1426,9 +1426,14 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 	// ReleaseLease and re-hide the task for a full lease (or slip past the
 	// release fencing onto a peer's fresh lease).
 	renewDone := make(chan struct{})
+	// detachedEntered closes when the renewal loop enters detached mode
+	// (see extendLeaseLoop): the commit handoff waits for it or renewDone
+	// when the execution context is canceled, so an open renewDone alone
+	// never proves the loop is alive (round-8 P1a).
+	detachedEntered := make(chan struct{})
 	go func() {
 		defer close(renewDone)
-		w.extendLeaseLoop(ctx, t.ID, tok, done, &committing)
+		w.extendLeaseLoop(ctx, t.ID, tok, done, &committing, detachedEntered)
 	}()
 
 	act, err := w.reg.activity(t.Name)
@@ -1438,7 +1443,12 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 				w.exitDetachedCommit(ctx, renewDone, &committing)
 				return ctx.Err()
 			}
-			defer w.ensureCommitRenewal(ctx, t.ID, tok, renewDone)()
+			stopCommitRenewal, herr := w.ensureCommitRenewal(ctx, t.ID, tok, renewDone, detachedEntered)
+			if herr != nil {
+				w.exitDetachedCommit(ctx, renewDone, &committing)
+				return herr
+			}
+			defer stopCommitRenewal()
 			commitCtx, commitCancel := w.commitContext(ctx)
 			rerr := w.nackIncompatible(commitCtx, t, "unregistered_activity", err)
 			commitCancel()
@@ -1448,7 +1458,12 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			w.exitDetachedCommit(ctx, renewDone, &committing)
 			return ctx.Err()
 		}
-		defer w.ensureCommitRenewal(ctx, t.ID, tok, renewDone)()
+		stopCommitRenewal, herr := w.ensureCommitRenewal(ctx, t.ID, tok, renewDone, detachedEntered)
+		if herr != nil {
+			w.exitDetachedCommit(ctx, renewDone, &committing)
+			return herr
+		}
+		defer stopCommitRenewal()
 		commitCtx, commitCancel := w.commitContext(ctx)
 		rerr := w.failActivity(commitCtx, t, err)
 		commitCancel()
@@ -1543,7 +1558,12 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 				w.exitDetachedCommit(ctx, renewDone, &committing)
 				return ctx.Err()
 			}
-			defer w.ensureCommitRenewal(ctx, t.ID, tok, renewDone)()
+			stopCommitRenewal, herr := w.ensureCommitRenewal(ctx, t.ID, tok, renewDone, detachedEntered)
+			if herr != nil {
+				w.exitDetachedCommit(ctx, renewDone, &committing)
+				return herr
+			}
+			defer stopCommitRenewal()
 			commitCtx, commitCancel := w.commitContext(ctx)
 			rerr := w.failActivity(commitCtx, t, err)
 			commitCancel()
@@ -1563,7 +1583,12 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			w.exitDetachedCommit(ctx, renewDone, &committing)
 			return ctx.Err()
 		}
-		defer w.ensureCommitRenewal(ctx, t.ID, tok, renewDone)()
+		stopCommitRenewal, herr := w.ensureCommitRenewal(ctx, t.ID, tok, renewDone, detachedEntered)
+		if herr != nil {
+			w.exitDetachedCommit(ctx, renewDone, &committing)
+			return herr
+		}
+		defer stopCommitRenewal()
 		commitCtx, commitCancel := w.commitContext(ctx)
 		w.opts.Metrics.AddActivityRetry(commitCtx, 1)
 		if rerr := w.backend.RetryActivity(commitCtx, t.ID, delay); rerr != nil {
@@ -1580,7 +1605,12 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		w.exitDetachedCommit(ctx, renewDone, &committing)
 		return ctx.Err()
 	}
-	defer w.ensureCommitRenewal(ctx, t.ID, tok, renewDone)()
+	stopCommitRenewal, herr := w.ensureCommitRenewal(ctx, t.ID, tok, renewDone, detachedEntered)
+	if herr != nil {
+		w.exitDetachedCommit(ctx, renewDone, &committing)
+		return herr
+	}
+	defer stopCommitRenewal()
 	commitCtx, commitCancel := w.commitContext(ctx)
 	if cerr := w.backend.CompleteActivity(commitCtx, t.ID, journal.Event{
 		Type:    journal.TypeActivityCompleted,
@@ -1594,6 +1624,13 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 	commitCancel()
 	return nil
 }
+
+// errLeaseLost marks a detached result commit skipped because its
+// pre-commit detached renewal failed: the lease may have expired and a
+// peer may own the task, so touching the store (ID-only Complete/Retry)
+// could modify the peer's task. The task is left untracked for natural
+// expiry reclaim instead.
+var errLeaseLost = errors.New("tasuki: lease lost; skipping detached commit")
 
 // exitDetachedCommit leaves detached-commit renewal mode after losing
 // commit ownership (see beginDetachedCommit): the transfer failed, so no
@@ -1615,32 +1652,72 @@ func (w *Worker) exitDetachedCommit(ctx context.Context, renewDone <-chan struct
 	}
 }
 
-// ensureCommitRenewal returns a stop func for the result commit that just
-// won detached-commit ownership (see beginDetachedCommit). When the
-// inherited renewal loop is still running, detached mode (entered
-// atomically with the transfer) keeps it alive through the commit, so the
-// stop func is a no-op. But the loop may already have exited: it observes
-// execution cancellation and — with the flag necessarily still clear
-// before the transfer — returns, so a cancel that lands between the
-// handler's live-context check and the transfer leaves a won commit with
-// no renewal. In that case the stop func governs a scoped detached
-// renewal (see renewUntilDone, which renews immediately on entry) that
-// lives exactly for the commit: the caller defers it, so it stops before
-// handler return and no renewal can outlive the commit and touch a
-// successor's lease (e.g. overwrite a RetryActivity delay).
+// ensureCommitRenewal performs the true renewal-loop handoff for a result
+// commit that just won detached-commit ownership (see beginDetachedCommit).
+// It returns a stop func governing the commit-scoped renewal, or an error
+// when the commit must be aborted (detached-renewal failure).
 //
-// renewDone is only closed by the inherited loop's return, and done (which
-// also ends that loop) closes at handler return — after every commit — so
-// a closed renewDone here unambiguously means the inherited loop is gone.
-func (w *Worker) ensureCommitRenewal(ctx context.Context, taskID int64, tok claimToken, renewDone <-chan struct{}) func() {
-	select {
-	case <-renewDone:
-	default:
-		return func() {}
+// Handoff synchronization (round-8 P1a): when the execution context is
+// canceled, an open renewDone does NOT prove the loop is alive — the loop
+// may have read committing==false and be paused before closing renewDone
+// while beginDetachedCommit concurrently sets the flag. The commit path
+// therefore joins/confirms the old loop's fate before proceeding: it waits
+// for renewDone close (loop exited) OR the explicit detached-entry ack
+// (loop entered detached renewal and will cover the commit). With a live
+// execution context no wait is needed: the loop cannot have been asked to
+// exit via ctx.Done, done is still open (handler hasn't returned), and the
+// just-set flag exempts the ticker ownership check, so the loop is alive.
+//
+// Renewal-failure abort (round-8 P1b): after the fate is known, a
+// synchronous detached renewal runs BEFORE the store commit. Any failure
+// (transient error, timeout, ErrNotFound) is treated as loss of commit
+// ownership: the caller must skip its ID-only store op and return the
+// error (lease expiry reclaims naturally) instead of letting a slow
+// commit outlive the lease onto a peer's task. Only logging and
+// continuing would leave the commit uncovered.
+//
+// If the old loop exited, the stop func governs a scoped replacement
+// renewal (see renewUntilDone, which renews immediately on entry) started
+// synchronously after the successful pre-commit renewal, living exactly
+// for the commit: the caller defers it, so it stops before handler return
+// (done closes after every commit) and no renewal outlives the commit to
+// touch a successor's lease (e.g. overwrite a RetryActivity delay). When
+// the inherited loop is still running, detached mode keeps it alive and
+// the stop func is a no-op.
+func (w *Worker) ensureCommitRenewal(ctx context.Context, taskID int64, tok claimToken, renewDone <-chan struct{}, detachedEntered ...<-chan struct{}) (func(), error) {
+	var detachedAck <-chan struct{}
+	if len(detachedEntered) > 0 {
+		detachedAck = detachedEntered[0]
+	}
+	// Join the old loop's fate when cancellation makes its liveness
+	// ambiguous. Both channels are closed exactly once by the loop (ack on
+	// detached entry, renewDone on return); done stays open until handler
+	// return, so a detached ack cannot be followed by an exit before the
+	// commit below.
+	if ctx.Err() != nil && renewDone != nil && detachedAck != nil {
+		select {
+		case <-renewDone:
+		case <-detachedAck:
+		}
+	}
+	// Synchronous pre-commit renewal: proves the lease is still ours and
+	// covers the handoff gap before the store op. Failure aborts the
+	// commit (see errLeaseLost).
+	if err := w.renewOnceDetached(ctx, taskID, tok); err != nil {
+		return nil, fmt.Errorf("%w: pre-commit renewal failed: %v", errLeaseLost, err)
+	}
+	if renewDone != nil {
+		select {
+		case <-renewDone:
+		default:
+			return func() {}, nil
+		}
+	} else {
+		return func() {}, nil
 	}
 	d := w.leaseDuration() / 2
 	if d <= 0 {
-		return func() {}
+		return func() {}, nil
 	}
 	done := make(chan struct{})
 	ticker := time.NewTicker(d)
@@ -1656,7 +1733,7 @@ func (w *Worker) ensureCommitRenewal(ctx context.Context, taskID int64, tok clai
 		close(done)
 		wg.Wait()
 		ticker.Stop()
-	}
+	}, nil
 }
 
 // invokeActivity runs a user activity function, converting panics into
@@ -1737,7 +1814,11 @@ func (w *Worker) nackIncompatible(ctx context.Context, t backend.Task, reason st
 	return w.backend.NackTask(ctx, t, delay)
 }
 
-func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, tok claimToken, done <-chan struct{}, committing *atomic.Bool) {
+func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, tok claimToken, done <-chan struct{}, committing *atomic.Bool, detachedEntered ...chan struct{}) {
+	var detachedCh chan struct{}
+	if len(detachedEntered) > 0 {
+		detachedCh = detachedEntered[0]
+	}
 	d := w.opts.LeaseDuration / 2
 	if d <= 0 {
 		return
@@ -1759,6 +1840,19 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, tok claimTok
 			// Exiting here would let a commit longer than the remaining
 			// lease race a peer reclaim, and the task-ID-only commit
 			// would then clobber the peer's task.
+			//
+			// Signal the handoff BEFORE entering detached renewal: the
+			// commit path waits for this ack (or renewDone close) when
+			// the execution context is canceled, so an open renewDone
+			// alone never proves the loop is alive (round-8 P1a). The
+			// close happens exactly once, on the single detached entry.
+			if detachedCh != nil {
+				select {
+				case <-detachedCh:
+				default:
+					close(detachedCh)
+				}
+			}
 			w.renewUntilDone(ctx, taskID, tok, done, ticker, committing)
 			return
 		case <-ticker.C:
@@ -1835,17 +1929,23 @@ func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, tok claimToke
 }
 
 // renewOnceDetached extends taskID once with a context detached from
-// execution cancellation, bounded by the lease duration.
-func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimToken) {
+// execution cancellation, bounded by the lease duration. It reports the
+// renewal error (also recorded): a detached-renewal failure means commit
+// ownership may be lost, and the commit path must abort instead of
+// running an ID-only store op that could modify a peer's task (round-8
+// P1b). Background loops log-and-continue via this return; the
+// pre-commit handoff treats any error as lease loss.
+func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimToken) error {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.leaseDuration())
 	defer cancel()
 	// Conservative lease base (see refreshLeaseAt).
 	renewStart := time.Now()
 	if err := w.backend.ExtendLease(rctx, taskID, w.opts.LeaseDuration); err != nil {
 		w.recordStoreError(rctx, "extend_lease", err, "task_id", taskID)
-	} else {
-		w.refreshLeaseAt(taskID, tok, renewStart)
+		return err
 	}
+	w.refreshLeaseAt(taskID, tok, renewStart)
+	return nil
 }
 
 // TaskRecoverer is implemented by backends that can re-create workflow tasks
