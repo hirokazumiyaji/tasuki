@@ -193,6 +193,14 @@ type detachedGuard struct {
 	epoch    uint64
 	seq      uint64
 	deadline time.Time
+	// cancel aborts the in-flight result store op when a detached
+	// renewal reports lease loss mid-commit (see cancelDetachedCommit):
+	// the commit runs on an independent detached context, so without
+	// the cancel a loss observed during the call would still let the
+	// ID-only Complete/Retry touch a peer's reclaimed task
+	// (round-10 P1b). Stashed by the commit path while its store op
+	// runs, cleared after; nil when no commit is active.
+	cancel context.CancelFunc
 }
 
 func (w *Worker) Start(parent context.Context) {
@@ -659,6 +667,115 @@ func (w *Worker) dropDetachedGuard(taskID int64, tok claimToken) {
 	defer w.detMu.Unlock()
 	if g, ok := w.detGuard[taskID]; ok && g.epoch == tok.epoch && g.seq == tok.seq {
 		delete(w.detGuard, taskID)
+	}
+}
+
+// tripDetachedGuard drops taskID's continuity guard after a lease-loss
+// observation and aborts the in-flight result store op, if any. The
+// commit runs on an independent detached context precisely so execution
+// cancellation does not kill it, but a loss observed DURING the store
+// call must still stop the ID-only Complete/Retry before it touches a
+// peer's reclaimed task (round-10 P1b): the stashed commit cancel (see
+// guardedDetachedCommit) is captured under the same lock hold as the
+// deletion, so a concurrent commit gate cannot stash a new cancel in
+// between, and fired after unlocking. Context cancellation is
+// best-effort — a backend that ignores it still applies the op — so the
+// pre-op gate remains the primary defense; the cancel covers the
+// gate→op window and long-blocked calls. The token check keeps a stale
+// generation from tripping or canceling its successor's commit.
+func (w *Worker) tripDetachedGuard(taskID int64, tok claimToken) {
+	w.detMu.Lock()
+	var cancel context.CancelFunc
+	if g, ok := w.detGuard[taskID]; ok && g.epoch == tok.epoch && g.seq == tok.seq {
+		cancel = g.cancel
+		delete(w.detGuard, taskID)
+	}
+	w.detMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// guardedDetachedCommit runs op — one detached result store op
+// (Complete/Retry/fail/nack) — after re-verifying the lease still holds,
+// and drops the continuity guard once the op returns so no renewal can
+// start after the commit (round-10 P1a).
+//
+// The gate closes the pre-commit-check gap (round-10 P1b): the
+// synchronous pre-commit renewal in ensureCommitRenewal proves the
+// lease only at its instant, while a periodic cover renewal may have
+// reported lease loss (tripping and dropping the guard) any time up to
+// the store call. Gating immediately before executing rechecks,
+// including the continuity deadline itself — an op delayed past it may
+// already have lost the backend lease to a peer even with the guard
+// still present — and skips the ID-only store op when the lease moved
+// on, instead of modifying a peer's task on an independent commit
+// context. A missing or superseded guard, or a stale deadline, reports
+// errLeaseLost and issues nothing.
+//
+// While the op runs, its commit-context cancel is stashed in the guard
+// (see tripDetachedGuard) so a loss observed mid-call still aborts a
+// context-aware backend op; it is cleared before returning, so a later
+// trip cannot cancel an unrelated context.
+func (w *Worker) guardedDetachedCommit(taskID int64, tok claimToken, commitCancel context.CancelFunc, op func() error) error {
+	w.detMu.Lock()
+	g, ok := w.detGuard[taskID]
+	if !ok || g.epoch != tok.epoch || g.seq != tok.seq {
+		w.detMu.Unlock()
+		w.opts.Logger.Debug("skipping detached commit; lease lost since the pre-commit renewal",
+			"task_id", taskID)
+		return fmt.Errorf("%w: detached commit gate found lease lost", errLeaseLost)
+	}
+	if !time.Now().Before(g.deadline) {
+		delete(w.detGuard, taskID)
+		w.detMu.Unlock()
+		w.opts.Logger.Debug("skipping detached commit; continuity deadline passed before the store op",
+			"task_id", taskID)
+		return fmt.Errorf("%w: detached commit gate found lease expired", errLeaseLost)
+	}
+	g.cancel = commitCancel
+	w.detGuard[taskID] = g
+	w.detMu.Unlock()
+	err := op()
+	// Clear the stashed cancel and drop the guard: with the store op
+	// done, further cover would only overwrite what the commit just
+	// wrote (a RetryActivity delay, a nack's visible_at). The renewal
+	// loops observe the missing guard and exit without issuing (the
+	// entry is gone too), and the handler's deferred guard drop becomes
+	// a no-op.
+	w.detMu.Lock()
+	if g, ok := w.detGuard[taskID]; ok && g.epoch == tok.epoch && g.seq == tok.seq {
+		g.cancel = nil
+		delete(w.detGuard, taskID)
+	}
+	w.detMu.Unlock()
+	return err
+}
+
+// joinCommitStop wraps a commit-scoped stop func from
+// ensureCommitRenewal so the deferred stop also terminates AND joins
+// the inherited renewal loop before the handler drops its guard
+// (round-10 P1a): it runs the scoped teardown, signals the inherited
+// loop to exit by closing done, and waits for the loop's return —
+// every ExtendLease the loop issued completes before that return, so
+// none can land after the commit's store op and overwrite what it
+// wrote (a RetryActivity delay, a nack's visible_at). The close and
+// the wait run exactly once, so double-deferred stops cannot panic on
+// a second channel close; a nil or already-closed renewDone (scoped
+// replacement case) makes the wait return immediately. Call it at
+// every commit site that defers a stop from ensureCommitRenewal.
+func joinCommitStop(stop func(), closeDone func(), renewDone <-chan struct{}) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if stop != nil {
+				stop()
+			}
+			closeDone()
+			if renewDone != nil {
+				<-renewDone
+			}
+		})
 	}
 }
 
@@ -1552,7 +1669,13 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 	// would otherwise run without renewal.
 	var committing atomic.Bool
 	done := make(chan struct{})
-	defer close(done)
+	// closeDone terminates the inherited renewal loop; it runs at most
+	// once — the commit stops below close it early so they can JOIN the
+	// loop before the guard drops (see joinCommitStop) — with this
+	// deferred call as the backstop for non-commit exits.
+	var doneOnce sync.Once
+	closeDone := func() { doneOnce.Do(func() { close(done) }) }
+	defer closeDone()
 	// Drop the detached-renewal continuity guard at handler return (see
 	// dropDetachedGuard). Registered before the commit-scoped stop funcs
 	// below, so it runs after they joined their cover loops: every
@@ -1586,9 +1709,11 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 				w.exitDetachedCommit(ctx, renewDone, &committing)
 				return herr
 			}
-			defer stopCommitRenewal()
+			defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)
 			commitCtx, commitCancel := w.commitContext(ctx)
-			rerr := w.nackIncompatible(commitCtx, t, "unregistered_activity", err)
+			rerr := w.guardedDetachedCommit(t.ID, tok, commitCancel, func() error {
+				return w.nackIncompatible(commitCtx, t, "unregistered_activity", err)
+			})
 			commitCancel()
 			return rerr
 		}
@@ -1601,9 +1726,11 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			w.exitDetachedCommit(ctx, renewDone, &committing)
 			return herr
 		}
-		defer stopCommitRenewal()
+		defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)
 		commitCtx, commitCancel := w.commitContext(ctx)
-		rerr := w.failActivity(commitCtx, t, err)
+		rerr := w.guardedDetachedCommit(t.ID, tok, commitCancel, func() error {
+			return w.failActivity(commitCtx, t, err)
+		})
 		commitCancel()
 		return rerr
 	}
@@ -1701,9 +1828,11 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 				w.exitDetachedCommit(ctx, renewDone, &committing)
 				return herr
 			}
-			defer stopCommitRenewal()
+			defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)
 			commitCtx, commitCancel := w.commitContext(ctx)
-			rerr := w.failActivity(commitCtx, t, err)
+			rerr := w.guardedDetachedCommit(t.ID, tok, commitCancel, func() error {
+				return w.failActivity(commitCtx, t, err)
+			})
 			commitCancel()
 			return rerr
 		}
@@ -1726,10 +1855,12 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			w.exitDetachedCommit(ctx, renewDone, &committing)
 			return herr
 		}
-		defer stopCommitRenewal()
+		defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)
 		commitCtx, commitCancel := w.commitContext(ctx)
 		w.opts.Metrics.AddActivityRetry(commitCtx, 1)
-		if rerr := w.backend.RetryActivity(commitCtx, t.ID, delay); rerr != nil {
+		if rerr := w.guardedDetachedCommit(t.ID, tok, commitCancel, func() error {
+			return w.backend.RetryActivity(commitCtx, t.ID, delay)
+		}); rerr != nil {
 			w.recordStoreError(commitCtx, "retry_activity", rerr, "instance_id", t.InstanceID, "activity", t.Name)
 			commitCancel()
 			return rerr
@@ -1748,12 +1879,14 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		w.exitDetachedCommit(ctx, renewDone, &committing)
 		return herr
 	}
-	defer stopCommitRenewal()
+	defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)
 	commitCtx, commitCancel := w.commitContext(ctx)
-	if cerr := w.backend.CompleteActivity(commitCtx, t.ID, journal.Event{
-		Type:    journal.TypeActivityCompleted,
-		RefSeq:  t.Seq,
-		Payload: out,
+	if cerr := w.guardedDetachedCommit(t.ID, tok, commitCancel, func() error {
+		return w.backend.CompleteActivity(commitCtx, t.ID, journal.Event{
+			Type:    journal.TypeActivityCompleted,
+			RefSeq:  t.Seq,
+			Payload: out,
+		})
 	}); cerr != nil {
 		w.recordStoreError(commitCtx, "complete_activity", cerr, "instance_id", t.InstanceID, "activity", t.Name)
 		commitCancel()
@@ -1821,7 +1954,10 @@ func (w *Worker) exitDetachedCommit(ctx context.Context, renewDone <-chan struct
 // (done closes after every commit) and no renewal outlives the commit to
 // touch a successor's lease (e.g. overwrite a RetryActivity delay). When
 // the inherited loop is still running, detached mode keeps it alive and
-// the stop func is a no-op.
+// the stop func is a no-op — the post-commit join of that loop lives in
+// the deferred wrapper instead (see joinCommitStop): terminating the
+// inherited loop here, inside the handoff, would leave the commit that
+// follows uncovered.
 func (w *Worker) ensureCommitRenewal(ctx context.Context, taskID int64, tok claimToken, renewDone <-chan struct{}, detachedEntered ...<-chan struct{}) (func(), error) {
 	var detachedAck <-chan struct{}
 	if len(detachedEntered) > 0 {
@@ -2120,11 +2256,24 @@ func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, tok claimToke
 // P1b). Background loops log-and-continue via this return; the
 // pre-commit handoff treats any error as lease loss.
 //
-// A SUCCESS can also prove loss (round-9 P1b): with the guard seeded at
-// commit entry (see detachedGuard), a call that started after the
-// continuity deadline may have extended a peer's lease after an
-// expiry-and-reclaim gap. That success reports errLeaseLost — the commit
-// aborts, and cover loops stop — instead of refreshing anything.
+// A SUCCESS can also prove loss (round-9 P1b, extended round-10 P1c):
+// with the guard seeded at commit entry (see detachedGuard), a call
+// that started after the continuity deadline may have extended a peer's
+// lease after an expiry-and-reclaim gap — and so may a call that
+// started before the deadline but only COMPLETED after it, blocked in
+// the backend past the reclaim. The ID-only ExtendLease reports
+// success in both cases while extending the peer's lease, so the
+// start instant alone cannot prove ownership: continuity must hold
+// through renewal completion. Either trip drops the guard so cover
+// loops stop too, refreshes nothing, and reports errLeaseLost so the
+// commit aborts. A live lease always verifies (the estimate is
+// conservative-early); only a genuine renewal gap trips this, trading
+// a retry for never modifying a peer's task.
+//
+// A backend ErrNotFound (task row gone) trips the guard the same way
+// and cancels the in-flight commit: the commit gate then observes the
+// loss and skips its ID-only store op instead of touching a peer's
+// task (round-10 P1b).
 func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimToken) error {
 	w.detMu.Lock()
 	g, ok := w.detGuard[taskID]
@@ -2162,8 +2311,17 @@ func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimT
 	renewStart := time.Now()
 	if err := w.backend.ExtendLease(rctx, taskID, w.opts.LeaseDuration); err != nil {
 		w.recordStoreError(rctx, "extend_lease", err, "task_id", taskID)
+		if errors.Is(err, backend.ErrNotFound) {
+			// The task row is gone: the lease definitively moved
+			// on. Trip the guard so the commit gate observes the
+			// loss and cover loops stop, and cancel the in-flight
+			// commit (round-10 P1b).
+			w.tripDetachedGuard(taskID, tok)
+			return fmt.Errorf("%w: detached renewal found task gone: %v", errLeaseLost, err)
+		}
 		return err
 	}
+	completedAt := time.Now()
 	// Gap detection on the call-start instant: starting after the
 	// continuity deadline means the backend lease may have expired and
 	// been reclaimed since the last success, so this call just extended
@@ -2173,19 +2331,46 @@ func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimT
 	// renewal gap trips this, trading a retry for never modifying a
 	// peer's task.
 	w.detMu.Lock()
-	defer w.detMu.Unlock()
 	cur, ok := w.detGuard[taskID]
 	if !ok || cur.epoch != tok.epoch || cur.seq != tok.seq {
+		w.detMu.Unlock()
 		return fmt.Errorf("%w: detached commit finished during renewal", errLeaseLost)
 	}
 	if !renewStart.Before(cur.deadline) {
+		tripCancel := cur.cancel
 		delete(w.detGuard, taskID)
+		w.detMu.Unlock()
 		w.opts.Logger.Debug("detached renewal started after lease continuity deadline; treating as lease loss",
 			"task_id", taskID)
+		// A loss observed mid-commit must also stop the in-flight
+		// store op (round-10 P1b); nothing is stashed yet on the
+		// pre-commit path, so this is nil there.
+		if tripCancel != nil {
+			tripCancel()
+		}
 		return fmt.Errorf("%w: detached renewal after lease continuity deadline", errLeaseLost)
+	}
+	// Continuity through completion (round-10 P1c): a call that started
+	// before the deadline but only completed after it — blocked in the
+	// backend past the reclaim — extended the peer's lease despite
+	// reporting success, and the success must not refresh the deadline
+	// into a stale commit. No backend offers a claim-token-fenced
+	// ExtendLease (see detachedGuard), so this worker-side
+	// success-followed-by-loss trips the same way as the start gap.
+	if !completedAt.Before(cur.deadline) {
+		tripCancel := cur.cancel
+		delete(w.detGuard, taskID)
+		w.detMu.Unlock()
+		w.opts.Logger.Debug("detached renewal completed after lease continuity deadline; treating as lease loss",
+			"task_id", taskID)
+		if tripCancel != nil {
+			tripCancel()
+		}
+		return fmt.Errorf("%w: detached renewal completed after lease continuity deadline", errLeaseLost)
 	}
 	cur.deadline = renewStart.Add(w.leaseDuration())
 	w.detGuard[taskID] = cur
+	w.detMu.Unlock()
 	return nil
 }
 
