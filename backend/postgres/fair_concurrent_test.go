@@ -308,6 +308,119 @@ func TestFairClaimRevisitsRejectedWhenPickedLocksLost(t *testing.T) {
 	}
 }
 
+// TestFairClaimRefillPreservesFIFOOrder covers the issue #294 round-11 P2:
+// FIFO A1,A2,B1 with Limit=2 and MaxPerInstance=1 picks A1,B1 and rejects
+// A2. A concurrent claimer locks only A1, so pass 1 secures B1 and the
+// refill secures the revisited A2. The batch must come back in FIFO (scan)
+// order [A2 B1], not lock order [B1 A2] (docs/08-fair-dispatch.md: the
+// MaxPerInstance batch preserves FIFO ordering).
+func TestFairClaimRefillPreservesFIFOOrder(t *testing.T) {
+	dsn := dsnOrSkip(t)
+	ctx := context.Background()
+	b, err := postgres.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	const queue = "fifo"
+	spawn := func(id string, activities int) {
+		t.Helper()
+		if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: queue}); err != nil {
+			t.Fatal(err)
+		}
+		wf, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+			Kind: "workflow", Queues: []string{queue}, Limit: 1,
+			Lease: time.Minute, WorkerID: "fifo",
+		})
+		if err != nil || len(wf) != 1 {
+			t.Fatalf("claim wf %s: %v %#v", id, err, wf)
+		}
+		st, err := b.LoadWorkflow(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		adv := backend.Advancement{InstanceID: id, TaskID: wf[0].ID, ExpectedSeq: st.NextSeq}
+		for i := 0; i < activities; i++ {
+			seq := st.NextSeq + int64(i)
+			adv.NewEvents = append(adv.NewEvents, journal.Event{
+				Seq: seq, Type: journal.TypeActivityScheduled, Name: "step",
+			})
+			adv.ActivityTasks = append(adv.ActivityTasks, backend.NewTask{
+				Kind: "activity", Queue: queue, InstanceID: id, Name: "step",
+				Seq: seq, Input: []byte(`{}`),
+			})
+		}
+		if err := b.CommitAdvancement(ctx, adv); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// FIFO order must be A1,A2,B1: flood instance enqueues two activities
+	// before the victim enqueues one.
+	spawn("fifo-A", 2)
+	spawn("fifo-B", 1)
+
+	rows, err := b.Pool().Query(ctx, `
+		SELECT id, instance_id FROM wf_tasks
+		WHERE kind = 'activity' AND queue = $1
+		ORDER BY visible_at, id`, queue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type cand struct {
+		id  int64
+		ins string
+	}
+	var cands []cand
+	for rows.Next() {
+		var c cand
+		if err := rows.Scan(&c.id, &c.ins); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		cands = append(cands, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 3 || cands[0].ins != "fifo-A" || cands[1].ins != "fifo-A" || cands[2].ins != "fifo-B" {
+		t.Fatalf("FIFO order = %#v, want [fifo-A fifo-A fifo-B]", cands)
+	}
+
+	// Blocker locks only the first pick (A1), like a concurrent fair
+	// claimer that scanned the same IDs first. Pass 1 secures B1; the
+	// refill must revisit A2 and return the batch in FIFO order [A2 B1].
+	btx, err := b.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer btx.Rollback(ctx)
+	if _, err := btx.Exec(ctx, `SELECT id FROM wf_tasks WHERE id = $1 FOR UPDATE`, cands[0].id); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "activity", Queues: []string{queue}, Limit: 2,
+		Lease: time.Minute, WorkerID: "fifo-w", MaxPerInstance: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("claimed %d tasks, want 2 (A2 plus B1)", len(tasks))
+	}
+	if tasks[0].ID != cands[1].id || tasks[1].ID != cands[2].id {
+		t.Fatalf("claim order = [%d %d], want FIFO [%d %d] (A2 B1)",
+			tasks[0].ID, tasks[1].ID, cands[1].id, cands[2].id)
+	}
+}
 // TestFairClaimPreservesUnvisitedTail covers the issue #294 P1 follow-up:
 // FIFO A1,A2,A3,B1 with Limit=2 and MaxPerInstance=1 picks A1,B1 and rejects
 // A2,A3 on the first pass. A1 and A2 are locked by a concurrent claimer, so

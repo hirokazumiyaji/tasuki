@@ -1,5 +1,7 @@
 package backend
 
+import "sort"
+
 // FairTaskRef identifies a claimable task by id and owning instance; backends
 // feed their FIFO-ordered candidates into FairPick.
 type FairTaskRef struct {
@@ -225,3 +227,47 @@ func (p *FairPicker) Rejected() []FairTaskRef { return p.rejected }
 // chance within the same claim; rows still dropped after that resurface on a
 // later poll.
 func (p *FairPicker) RejectedCapped() bool { return p.rejectedOverflow }
+
+// FairScanOrder records the first-seen scan position of each candidate ID so
+// a multi-pass claim can restore FIFO (scan) order before returning.
+//
+// Refill paths (postgres, mysql) secure rows across passes: pass 1 may lock
+// a later row (e.g. B1) while an earlier row (e.g. A2, rejected by the
+// per-instance cap behind pick A1) is only secured on a refill pass after A1
+// is lost to a concurrent lock. Appending secured rows in lock order would
+// return [B1 A2], violating the documented FIFO guarantee. Noting every
+// scanned candidate in arrival order and sorting the secured batch by that
+// position restores [A2 B1]. FIFO order is scan order: candidates come from
+// a (visible_at, id) ordered scan, and first-seen positions are stable across
+// passes — re-offered pending rows keep their earlier position, and requery
+// rescans never move an ID earlier.
+type FairScanOrder struct {
+	pos  map[int64]int64
+	next int64
+}
+
+// Note records id's scan position on first sight; later re-offers of the
+// same ID keep the earlier position.
+func (o *FairScanOrder) Note(id int64) {
+	if o.pos == nil {
+		o.pos = make(map[int64]int64)
+	}
+	if _, ok := o.pos[id]; !ok {
+		o.pos[id] = o.next
+		o.next++
+	}
+}
+
+// Rank returns id's scan position for ordering secured batches. IDs never
+// noted sort last; this is defensive only — every secured row was scanned.
+func (o *FairScanOrder) Rank(id int64) int64 {
+	if p, ok := o.pos[id]; ok {
+		return p
+	}
+	return int64(^uint64(0) >> 1)
+}
+
+// SortRefs reorders refs into FIFO (scan) order, stable for ties.
+func (o *FairScanOrder) SortRefs(refs []FairTaskRef) {
+	sort.SliceStable(refs, func(i, j int) bool { return o.Rank(refs[i].ID) < o.Rank(refs[j].ID) })
+}

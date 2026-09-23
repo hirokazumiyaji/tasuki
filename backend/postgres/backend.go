@@ -281,6 +281,14 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		claimed []backend.FairTaskRef
 		pending []backend.FairTaskRef
 	)
+	// scanOrder records every scanned candidate's first-seen position so the
+	// secured batch can be restored to FIFO (scan) order before returning:
+	// refill passes secure later rows first (e.g. pass 1 locks B1 while the
+	// FIFO-earlier A2 is only secured on a refill after the pick that
+	// blocked it is lost), and returning lock order would emit [B1 A2].
+	// Re-offered pending rows were noted on their original scan pass, so
+	// they keep their earlier position here.
+	var scanOrder backend.FairScanOrder
 	// Overflow-requery state (issue #294 follow-up): when scan-phase rejected
 	// retention overflows FairRejectedCap, rows past the cap are dropped while
 	// the SQL cursor advances past them. If every retained candidate is then
@@ -416,6 +424,7 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 					}
 					first = false
 					lastVis, lastID = vis, r.ID
+					scanOrder.Note(r.ID)
 					// Overflow-requery passes skip IDs already put through the
 					// lock step this claim, so never-attempted dropped rows
 					// get priority in each bounded segment.
@@ -559,6 +568,20 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 			// to FairRejectedCap rows. Overflow rows stay claimable and
 			// resurface on a later poll, which restarts from the head.
 			pending = pending[:backend.FairRejectedCap]
+		}
+	}
+	// Restore FIFO (scan) order: refill passes secure later rows before
+	// earlier ones (e.g. B1 on pass 1, A2 on the refill), so lock order is
+	// not queue order. out[i] corresponds to claimed[i]; reorder both by
+	// first-seen scan position.
+	if len(out) > 1 {
+		scanOrder.SortRefs(claimed)
+		byID := make(map[int64]backend.Task, len(out))
+		for _, t := range out {
+			byID[t.ID] = t
+		}
+		for i, r := range claimed {
+			out[i] = byID[r.ID]
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
