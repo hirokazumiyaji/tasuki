@@ -12,8 +12,7 @@ type FairTaskRef struct {
 // so each page's extra scan stays cheap. Fair claiming pages through
 // candidates until the batch fills, so a victim further down the queue is
 // still found.
-func FairOverfetch(limit int) int {
-	of := limit * 4
+func FairOverfetch(limit int) int {	of := limit * 4
 	if of < 64 {
 		of = 64
 	}
@@ -25,6 +24,16 @@ func FairOverfetch(limit int) int {
 	}
 	return of
 }
+
+// FairRejectedCap bounds how many per-instance-cap rejections one FairPicker
+// retains for Rejected (and, by extension, how many rows refill claimers
+// carry across passes). Refill paths scan to the end of the ready queue, so
+// an unbounded carry would retain O(queue) refs on a flooded instance;
+// overflow beyond the cap is dropped and stays claimable for a later poll,
+// which restarts its scan from the head. Sized in the low thousands: large
+// enough that ordinary refills never notice it, small enough that the carry
+// stays cheap.
+const FairRejectedCap = 2000
 
 // FairPick picks up to limit candidates with at most perInstance tasks per
 // instance, preserving input (FIFO) order. perInstance <= 0 keeps plain FIFO
@@ -68,12 +77,13 @@ func FairPick(refs []FairTaskRef, limit, perInstance int) []FairTaskRef {
 // that never refill (e.g. SQLite's single-pass scan) pay nothing, while
 // refill paths (postgres, mysql) opt in to carry rejected rows forward.
 type FairPicker struct {
-	limit         int
-	perInstance   int
-	counts        map[string]int
-	picked        []FairTaskRef
-	rejected      []FairTaskRef
-	trackRejected bool
+	limit            int
+	perInstance      int
+	counts           map[string]int
+	picked           []FairTaskRef
+	rejected         []FairTaskRef
+	rejectedOverflow bool
+	trackRejected    bool
 }
 
 // NewFairPicker starts a fair selection of up to limit tasks with at most
@@ -93,6 +103,8 @@ func NewFairPicker(limit, perInstance int) *FairPicker {
 // offering candidates. Callers that refill after losing picked rows to
 // concurrent locks (postgres, mysql) need this; single-pass callers leave it
 // off so rejected backlog scanned past an over-quota flood never accumulates.
+// Retention is capped at FairRejectedCap rows per pass: callers must stop
+// paging once RejectedCapped reports true.
 func (p *FairPicker) TrackRejected() *FairPicker {
 	p.trackRejected = true
 	return p
@@ -102,14 +114,20 @@ func (p *FairPicker) TrackRejected() *FairPicker {
 // full after considering the candidate, so callers can stop paging early.
 // Candidates rejected by the per-instance cap are retained for Rejected only
 // when TrackRejected was opted into, so a refill pass can reconsider them if
-// picked rows are later lost to concurrent lock contention.
+// picked rows are later lost to concurrent lock contention. Retention stops
+// at FairRejectedCap: further rejections are dropped (see RejectedCapped) so
+// a flood-sized backlog never accumulates in memory.
 func (p *FairPicker) Offer(ref FairTaskRef) bool {
 	if len(p.picked) >= p.limit {
 		return true
 	}
 	if p.counts[ref.InstanceID] >= p.perInstance {
 		if p.trackRejected {
-			p.rejected = append(p.rejected, ref)
+			if len(p.rejected) < FairRejectedCap {
+				p.rejected = append(p.rejected, ref)
+			} else {
+				p.rejectedOverflow = true
+			}
 		}
 		return false
 	}
@@ -141,6 +159,16 @@ func (p *FairPicker) Picked() []FairTaskRef { return p.picked }
 //
 // Each entry is a compact FairTaskRef (ID plus owning instance ID; no
 // payloads), retained only within one claim pass over the candidate scan and
-// dropped with the per-pass picker afterwards, so retention is bounded by the
-// rows scanned in that pass rather than the whole queue.
+// dropped with the per-pass picker afterwards. Retention is capped at
+// FairRejectedCap rows per pass (see RejectedCapped): beyond that, rejections
+// are dropped and the scan stops, leaving the unscanned tail (and the
+// dropped rows, which stay claimable) to a later poll that restarts from the
+// head, so retention is O(cap) rather than O(queue).
 func (p *FairPicker) Rejected() []FairTaskRef { return p.rejected }
+
+// RejectedCapped reports whether rejected retention hit FairRejectedCap and
+// began dropping rejections during this pass. Callers paging candidates must
+// stop scanning when it reports true (the durable keyset cursor stays where
+// it is, so the next poll resumes behind it) instead of buffering the whole
+// backlog.
+func (p *FairPicker) RejectedCapped() bool { return p.rejectedOverflow }

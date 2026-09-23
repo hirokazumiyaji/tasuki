@@ -185,6 +185,53 @@ func TestFairPickerRejectedOptIn(t *testing.T) {
 	}
 }
 
+func TestFairPickerRejectedCap(t *testing.T) {
+	// Retention is bounded: a flood-sized backlog must not accumulate O(queue)
+	// refs in the picker or the cross-pass carry.
+	p := backend.NewFairPicker(2, 1).TrackRejected()
+	const flood = backend.FairRejectedCap + 500
+	full := false
+	for i := 0; i < flood+2; i++ {
+		inst := "A"
+		if i >= flood+1 {
+			inst = "B"
+		}
+		if p.Offer(backend.FairTaskRef{ID: int64(i + 1), InstanceID: inst}) {
+			full = true
+			break
+		}
+	}
+	if !full {
+		t.Fatal("want the batch to fill via B once offered")
+	}
+	if got := len(p.Rejected()); got != backend.FairRejectedCap {
+		t.Fatalf("Rejected len = %d, want cap %d", got, backend.FairRejectedCap)
+	}
+	if !p.RejectedCapped() {
+		t.Fatal("want RejectedCapped after overflowing the carry bound")
+	}
+	// Below the cap nothing is dropped and the flag stays clear.
+	q := backend.NewFairPicker(2, 1).TrackRejected()
+	for _, r := range []backend.FairTaskRef{{ID: 1, InstanceID: "A"}, {ID: 2, InstanceID: "A"}, {ID: 3, InstanceID: "B"}} {
+		if q.Offer(r) {
+			break
+		}
+	}
+	if len(q.Rejected()) != 1 || q.RejectedCapped() {
+		t.Fatalf("below-cap Rejected = %v capped=%v, want 1 row and no cap", q.Rejected(), q.RejectedCapped())
+	}
+	// Default-off pickers never retain and never report the cap.
+	off := backend.NewFairPicker(2, 1)
+	for i := 0; i < flood; i++ {
+		if off.Offer(backend.FairTaskRef{ID: int64(i + 1), InstanceID: "A"}) {
+			break
+		}
+	}
+	if len(off.Rejected()) != 0 || off.RejectedCapped() {
+		t.Fatalf("opt-out Rejected = %v capped=%v, want empty", off.Rejected(), off.RejectedCapped())
+	}
+}
+
 func TestNormalizePurgeStatuses(t *testing.T) {
 	got, err := backend.NormalizePurgeStatuses(nil)
 	if err != nil {

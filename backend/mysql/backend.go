@@ -364,6 +364,11 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 			picker.Offer(r)
 			offered++
 		}
+		// capped stops the scan mid-queue once rejected retention hits
+		// FairRejectedCap: the keyset cursor (lastVis, lastID) stays
+		// where it is, so the unscanned tail is picked up by a refill
+		// or a later poll instead of buffered in memory.
+		capped := false
 		if !picker.Full() {
 			for !picker.Full() {
 				query := prefix
@@ -400,20 +405,25 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 						full = true
 						break
 					}
+					if picker.RejectedCapped() {
+						capped = true
+						break
+					}
 				}
 				if err := rows.Err(); err != nil {
 					rows.Close()
 					return nil, err
 				}
 				rows.Close()
-				if full || page < pageSize {
+				if full || capped || page < pageSize {
 					break
 				}
 			}
 		}
 		// The paging loop only stops short of a full picker at the end of
-		// the queue; a full picker may still have unscanned rows behind it.
-		scanExhausted := !picker.Full()
+		// the queue (or at the rejected-retention cap); a full picker may
+		// still have unscanned rows behind it.
+		scanExhausted := !picker.Full() && !capped
 		picked := picker.Picked()
 		iterRejected := picker.Rejected()
 		if len(picked) == 0 {
@@ -477,6 +487,12 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 		// rejects A2,A3; locking A2 then losing it to a concurrent claim
 		// must still revisit the unvisited A3).
 		pending = append(iterRejected, pending[offered:]...)
+		if len(pending) > backend.FairRejectedCap {
+			// Bound the cross-pass carry as well: each pass contributes up
+			// to FairRejectedCap rows. Overflow rows stay claimable and
+			// resurface on a later poll, which restarts from the head.
+			pending = pending[:backend.FairRejectedCap]
+		}
 	}
 	if len(accepted) == 0 {
 		return nil, nil
