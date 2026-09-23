@@ -98,6 +98,18 @@ go run ./examples/m3-sqlite/
 go run ./analyzers/determinism/cmd/determinism -- ./...
 ```
 
+`*workflow.Context` レシーバを持つワークフロー関数内の非決定的呼び出しを検出する:
+`go` 文、`time.Now/Since/Until/Sleep/After/AfterFunc/NewTimer/NewTicker/Tick`
+（時刻は `workflow.Now`、タイマーは `workflow.Sleep` を使用）、`math/rand`・
+`math/rand/v2`・`crypto/rand`（`workflow.SideEffect` または `workflow.NewUUID` を使用）、
+`os.Getenv/LookupEnv/Environ/Hostname/Getpid/Getppid/Getwd/Executable` と `os.Args`
+（入力やアクティビティ経由で渡す）、`sync`・`sync/atomic`・`runtime`、
+`net`・`net/http`・`os/exec`（I/O はアクティビティで行う）、チャネル操作（`select`・
+送受信・`make(chan ...)`・チャネルに対する `range` は `workflow.Execute`/`ExecuteAsync` と `workflow.Await` を使用）
+および map に対する `range`（順序がランダム）。`workflow.SideEffect`/`NewUUID`/
+`SetQueryHandler` に渡すクロージャは除外される（`SetUpdateHandler` のハンドラは解析対象）。
+ワークフローから呼ばれるヘルパー関数は解析しないため、決定的に保つこと。
+
 ## 閲覧 UI（contrib）
 
 インスタンス一覧・ジャーナルビューア。詳細ページでは running インスタンスを Cancel / Terminate / Signal できる（Cancel・Terminate は確認チェック、Signal は name + JSON。いずれも CSRF。Cancel は協調キャンセル、Terminate は即時終了）。
