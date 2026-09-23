@@ -130,6 +130,44 @@ func TestFairPick(t *testing.T) {
 	}
 }
 
+func TestFairPickerRelease(t *testing.T) {
+	mk := func(id int64, inst string) backend.FairTaskRef {
+		return backend.FairTaskRef{ID: id, InstanceID: inst}
+	}
+	p := backend.NewFairPicker(2, 1)
+	p.Offer(mk(1, "a"))
+	p.Offer(mk(2, "b"))
+	if !p.Full() {
+		t.Fatal("want full")
+	}
+	// Unknown IDs are a no-op.
+	if p.Release(mk(99, "z")) {
+		t.Fatal("unknown release must return false")
+	}
+	if !p.Full() {
+		t.Fatal("no-op release must not change fullness")
+	}
+	// A lost claim race frees its slot: Full clears and the same instance
+	// may be picked again by a later queue.
+	if !p.Release(mk(1, "a")) {
+		t.Fatal("want release")
+	}
+	if p.Full() {
+		t.Fatal("want room after release")
+	}
+	if full := p.Offer(mk(3, "a")); !full {
+		t.Fatal("replacement pick should fill the batch")
+	}
+	got := p.Picked()
+	if len(got) != 2 || got[0].ID != 2 || got[1].ID != 3 {
+		t.Fatalf("picked=%v", got)
+	}
+	// Double release removes at most one entry.
+	if !p.Release(mk(2, "b")) || p.Release(mk(2, "b")) {
+		t.Fatal("second release of the same ID must return false")
+	}
+}
+
 func TestNormalizePurgeStatuses(t *testing.T) {
 	got, err := backend.NormalizePurgeStatuses(nil)
 	if err != nil {

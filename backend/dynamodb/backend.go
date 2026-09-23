@@ -17,7 +17,7 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{MaxAdvancementEffects: 80}
+	return backend.Capabilities{MaxAdvancementEffects: 80, FairDispatch: true}
 }
 
 func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
@@ -366,31 +366,249 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 	}
 	now, visible := nowUTC(), nowUTC().Add(req.Lease)
 	result := []backend.Task{}
+	// Share one picker across queues so MaxPerInstance caps the whole claim
+	// batch, not each queue independently.
+	var picker *backend.FairPicker
+	if req.MaxPerInstance > 0 {
+		picker = backend.NewFairPicker(req.Limit, req.MaxPerInstance)
+	}
 	for _, queue := range req.Queues {
 		if len(result) >= req.Limit {
 			break
 		}
-		out, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_tasks")), IndexName: aws.String("claim_gsi"),
-			KeyConditionExpression: aws.String("gsi_pk = :g AND visible_at <= :now"), ExpressionAttributeValues: map[string]types.AttributeValue{":g": avS(claimGSI(req.Kind, queue)), ":now": avN(timeToN(now))},
-			Limit: aws.Int32(int32(req.Limit - len(result)))})
-		if err != nil {
-			return nil, err
+		if picker != nil && picker.Full() {
+			break
 		}
-		for _, item := range out.Items {
-			old := fromN(item["visible_at"])
-			updated, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": item["task_pk"]},
-				UpdateExpression: aws.String("SET visible_at = :v, worker_id = :w ADD attempt :one"), ConditionExpression: aws.String("visible_at = :old"),
-				ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(visible)), ":w": avS(req.WorkerID), ":one": avN(1), ":old": avN(old)}, ReturnValues: types.ReturnValueAllNew})
-			if conditional(err) {
-				continue
-			}
+		// skip holds IDs already attempted from this queue. A conflicted
+		// candidate's stale GSI image can resurface on a re-query before
+		// the index catches up, so refills must exclude attempted IDs
+		// instead of reselecting the same stale entry. It stays small:
+		// only attempted (picked) IDs are recorded, never every examined
+		// row, and entries behind the committed cursor are pruned on each
+		// refill (see below), so it is bounded by the current page's
+		// attempts rather than the whole stale backlog.
+		skip := map[int64]struct{}{}
+		// cursor carries the claim_gsi scan position across conflict
+		// refills within this queue: each page is read once per
+		// ClaimTasks call instead of restarting from the head on every
+		// refill (which re-reads the whole prefix per conflict and turns
+		// long stale runs quadratic). exhausted marks the partition end
+		// so a refill never restarts from nil and the loop terminates.
+		var cursor map[string]types.AttributeValue
+		exhausted := false
+		for len(result) < req.Limit && (picker == nil || !picker.Full()) && !exhausted {
+			cands, next, done, err := b.listClaimCandidates(ctx, req.Kind, queue, now, req.Limit-len(result), picker, skip, cursor)
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, decodeTask(updated.Attributes))
+			cursor, exhausted = next, done
+			// Prune attempted IDs behind the committed cursor: the GSI scan
+			// is forward-only, so rows before the resume point cannot recur
+			// on the next refill. Every existing entry sorts before next —
+			// picks come from rows at or before the resume key and earlier
+			// pages are further behind (this holds for the pageStart
+			// re-fetch too: it still sits ahead of every previous page) —
+			// so dropping them cannot reselect, and the next fetch starts
+			// at/after next. Only the current page's attempts are re-added
+			// below, bounding skip to O(batch) under prolonged GSI lag
+			// instead of O(stale backlog). Termination is unchanged:
+			// exhausted plus the empty/release breaks below.
+			clear(skip)
+			if len(cands) == 0 {
+				break
+			}
+			released := false
+			for _, item := range cands {
+				id := fromN(item["id"])
+				skip[id] = struct{}{}
+				old := fromN(item["visible_at"])
+				updated, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": item["task_pk"]},
+					UpdateExpression: aws.String("SET visible_at = :v, worker_id = :w ADD attempt :one"), ConditionExpression: aws.String("visible_at = :old"),
+					ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(visible)), ":w": avS(req.WorkerID), ":one": avN(1), ":old": avN(old)}, ReturnValues: types.ReturnValueAllNew})
+				if conditional(err) {
+					// Another worker leased this candidate first, or the GSI
+					// returned a stale entry: free its picker slot so Full
+					// below does not stop later candidates and queues from
+					// filling the batch, then re-query this queue for a
+					// replacement (the loop above) instead of moving on.
+					if picker != nil {
+						picker.Release(backend.FairTaskRef{ID: id, InstanceID: fromS(item["instance_id"])})
+						released = true
+					}
+					continue
+				}
+				if err != nil {
+					return nil, err
+				}
+				result = append(result, decodeTask(updated.Attributes))
+				if len(result) >= req.Limit {
+					break
+				}
+			}
+			if !released {
+				break
+			}
 		}
 	}
 	return result, nil
+}
+
+// listClaimCandidates returns FIFO-ordered claim_gsi items for one queue.
+// With a nil picker it returns the first remaining items; otherwise it pages
+// through the GSI (page window FairOverfetch) feeding the shared picker, so a
+// victim hidden behind a flooding instance is still found beyond the first
+// page. The picker is shared across the outer queue loop in ClaimTasks so the
+// per-instance cap applies to the whole claim batch, and only candidates
+// picked during this call are returned (earlier queues' picks are not
+// re-attempted). Callers claim the returned items with a visible_at re-check:
+// items leased concurrently fail the conditional update, must be released
+// from the picker via Release (so Full does not stop later queues), and are
+// skipped; the caller then re-queries for replacements, passing attempted IDs
+// in skip so a stale GSI image is never reselected.
+//
+// No unbounded dedup set is kept here: pagination via LastEvaluatedKey
+// advances monotonically over the GSI partition, so each matching item is
+// visited exactly once per scan and repeats are impossible without concurrent
+// writes shifting page boundaries. The only cross-row state is byID, which
+// retains payloads solely for picker-accepted candidates (bounded by the
+// batch size) and doubles as a guard against double-offering an accepted ID
+// if a concurrent update ever surfaces a duplicate within one scan.
+//
+// The caller threads cursor through conflict refills (it is both the resume
+// point and, via exhausted, the termination signal), so refills continue past
+// already-consumed pages instead of re-reading the prefix: every page is
+// fetched once per ClaimTasks call and the loop ends when the partition is
+// exhausted. When the batch fills mid-page the cursor points after the last
+// examined item (not the page end), so a refill re-examines the unexamined
+// page suffix instead of skipping it. Attempted IDs stay in skip so a stale
+// GSI image of a released candidate is never reselected after its slot is
+// freed; only the current page's attempts are retained, entries behind the
+// committed cursor being pruned on each refill (they cannot recur past the
+// forward-only resume point), which bounds skip to O(batch). Trade-off: rows rejected by the fair cap before a conflict freed a
+// slot are picked up on a later poll rather than in the same call; liveness
+// holds because they stay claimable.
+// claimResumeKey rebuilds the ExclusiveStartKey that resumes a claim_gsi
+// Query after item: the table HASH key (task_pk) plus the index HASH+RANGE
+// keys (gsi_pk, visible_at). It lets a refill continue after the last
+// examined item of a partially consumed page instead of skipping the
+// unexamined page suffix. Nil when the item lacks those attributes (never
+// for claim candidates, which always carry them); callers then re-fetch the
+// page rather than skip rows.
+func claimResumeKey(item map[string]types.AttributeValue) map[string]types.AttributeValue {
+	tpk, ok1 := item["task_pk"]
+	gpk, ok2 := item["gsi_pk"]
+	vis, ok3 := item["visible_at"]
+	if !ok1 || !ok2 || !ok3 || tpk == nil || gpk == nil || vis == nil {
+		return nil
+	}
+	return map[string]types.AttributeValue{"task_pk": tpk, "gsi_pk": gpk, "visible_at": vis}
+}
+
+func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker, skip map[int64]struct{}, cursor map[string]types.AttributeValue) ([]map[string]types.AttributeValue, map[string]types.AttributeValue, bool, error) {
+	queryPage := func(start map[string]types.AttributeValue, pageLimit int32) (*dynamodb.QueryOutput, error) {
+		return b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_tasks")), IndexName: aws.String("claim_gsi"),
+			KeyConditionExpression: aws.String("gsi_pk = :g AND visible_at <= :now"), ExpressionAttributeValues: map[string]types.AttributeValue{":g": avS(claimGSI(kind, queue)), ":now": avN(timeToN(now))},
+			Limit: aws.Int32(pageLimit), ExclusiveStartKey: start})
+	}
+	if picker == nil {
+		// Single-pass path: the caller never refills without a picker
+		// (refills follow a conflict Release), so cursor is always nil
+		// here; it is threaded only for signature symmetry.
+		out, err := queryPage(cursor, int32(remaining))
+		if err != nil {
+			return nil, cursor, false, err
+		}
+		if len(skip) == 0 {
+			return out.Items, out.LastEvaluatedKey, false, nil
+		}
+		items := out.Items[:0]
+		for _, item := range out.Items {
+			if _, ok := skip[fromN(item["id"])]; !ok {
+				items = append(items, item)
+			}
+		}
+		return items, out.LastEvaluatedKey, false, nil
+	}
+	pageSize := backend.FairOverfetch(remaining)
+	// byID retains full payloads only for picker-accepted candidates so
+	// rejected backlog scanned past an over-quota flood does not accumulate
+	// in memory.
+	// fresh counts the picks made during this call: the shared picker may
+	// already hold earlier queues' picks, which must not be re-attempted
+	// (a re-attempt would fail its own conditional update and wrongly
+	// release an already-successful claim).
+	byID := map[int64]map[string]types.AttributeValue{}
+	fresh := len(picker.Picked())
+	start := cursor
+	exhausted := false
+	for !picker.Full() {
+		pageStart := start
+		out, err := queryPage(start, int32(pageSize))
+		if err != nil {
+			return nil, start, false, err
+		}
+		if len(out.Items) == 0 {
+			start = out.LastEvaluatedKey
+			exhausted = start == nil
+			break
+		}
+		examined := -1
+		for i, item := range out.Items {
+			examined = i
+			id := fromN(item["id"])
+			if _, ok := skip[id]; ok {
+				continue
+			}
+			if _, ok := byID[id]; ok {
+				continue
+			}
+			before := len(picker.Picked())
+			full := picker.Offer(backend.FairTaskRef{ID: id, InstanceID: fromS(item["instance_id"])})
+			if len(picker.Picked()) > before {
+				byID[id] = item
+			}
+			if full {
+				break
+			}
+		}
+		if picker.Full() {
+			// Batch filled: the refill after a claim conflict resumes
+			// after the last EXAMINED item, not after the whole fetched
+			// page, so the unexamined page suffix is re-examined instead
+			// of skipped. The resume key carries the table HASH key plus
+			// the claim_gsi HASH+RANGE keys of that item.
+			if examined >= 0 && examined < len(out.Items)-1 {
+				if key := claimResumeKey(out.Items[examined]); key != nil {
+					start = key
+				} else {
+					// Unreachable: claim items always carry these
+					// attributes. Re-fetch the page rather than skip the
+					// suffix; the skip set dedups the re-examined prefix
+					// and attempted IDs keep growing, so the loop still
+					// terminates.
+					start = pageStart
+				}
+				break
+			}
+			start = out.LastEvaluatedKey
+			// Batch filled exactly at the page end, or the page is the
+			// partition tail: unscanned rows may remain behind.
+			break
+		}
+		start = out.LastEvaluatedKey
+		if start == nil {
+			exhausted = true
+			break
+		}
+	}
+	picked := picker.Picked()[fresh:]
+	items := make([]map[string]types.AttributeValue, 0, len(picked))
+	for _, r := range picked {
+		if item, ok := byID[r.ID]; ok {
+			items = append(items, item)
+		}
+	}
+	return items, start, exhausted, nil
 }
 
 func decodeTask(m map[string]types.AttributeValue) backend.Task {

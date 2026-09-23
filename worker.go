@@ -103,6 +103,10 @@ func (w *Worker) StartWithError(parent context.Context) error {
 			return fmt.Errorf("tasuki: schema validation failed: %w", err)
 		}
 	}
+	if w.opts.MaxPerInstance > 0 && !w.backend.Capabilities().FairDispatch {
+		w.opts.Logger.Warn("tasuki: MaxPerInstance is set but the backend ignores it (no fair dispatch support); claims fall back to FIFO",
+			"max_per_instance", w.opts.MaxPerInstance)
+	}
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
 	w.cancel = cancel

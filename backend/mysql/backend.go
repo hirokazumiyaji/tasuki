@@ -12,7 +12,9 @@ import (
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
-func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilities{} }
+func (b *Backend) Capabilities() backend.Capabilities {
+	return backend.Capabilities{FairDispatch: true}
+}
 
 var _ backend.SchemaValidator = (*Backend)(nil)
 
