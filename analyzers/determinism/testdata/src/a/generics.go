@@ -98,3 +98,26 @@ func BadUnionRecvMakeChan[C chan int | <-chan int](ctx *workflow.Context, _ stru
 	_ = make(C) // want `make\(chan`
 	return nil
 }
+
+// Exact (non-union) constraints carry the concrete type directly as the
+// embedded constraint term rather than a union; range and make over them
+// must still resolve.
+
+func BadExactChanRange[C chan int](ctx *workflow.Context, ch C) error {
+	for v := range ch { // want `ranging over a channel is not allowed`
+		_ = v
+	}
+	return nil
+}
+
+func BadExactMapRange[M map[string]int](ctx *workflow.Context, m M) error {
+	for k := range m { // want `ranging over a map is not allowed`
+		_ = k
+	}
+	return nil
+}
+
+func BadExactMakeChan[C chan int](ctx *workflow.Context, _ struct{}) error {
+	_ = make(C) // want `make\(chan`
+	return nil
+}

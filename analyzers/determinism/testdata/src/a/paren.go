@@ -25,3 +25,8 @@ func BadParenRand(ctx *workflow.Context, _ struct{}) error {
 	_ = (rand.Intn)(10) // want `math/rand`
 	return nil
 }
+
+func BadParenMakeChan(ctx *workflow.Context, _ struct{}) error {
+	_ = (make)(chan int) // want `make\(chan`
+	return nil
+}

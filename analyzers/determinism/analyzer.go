@@ -296,7 +296,9 @@ func checkCall(pass *analysis.Pass, call *ast.CallExpr) {
 	// make(chan ...) is channel creation, but only when make resolves to the
 	// predeclared builtin: a shadowing local or package-level func (e.g.
 	// make := func(chan int) int...; make(ch)) must not match this rule.
-	if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "make" && len(call.Args) > 0 {
+	// The callee is unwrapped first so parenthesized builtins such as
+	// (make)(chan int) are still recognized.
+	if ident, ok := unwrapParen(call.Fun).(*ast.Ident); ok && ident.Name == "make" && len(call.Args) > 0 {
 		if obj, ok := pass.TypesInfo.Uses[ident]; ok {
 			if _, ok := obj.(*types.Builtin); ok {
 				if _, ok := call.Args[0].(*ast.ChanType); ok {
@@ -359,6 +361,23 @@ func checkMapRange(pass *analysis.Pass, x *ast.RangeStmt) {
 	}
 }
 
+// appendEmbeddedTerms flattens one embedded constraint term into underlying
+// core types. Union constraints expand per member; exact (non-union) terms
+// such as `C chan int` or `M map[string]int` resolve directly instead of
+// being treated as opaque. Non-channel/map terms (e.g. method signatures)
+// are kept as-is; callers classify them and yield nil when they do not form
+// a single range/make-compatible core type.
+func appendEmbeddedTerms(terms []types.Type, embedded types.Type) []types.Type {
+	et := types.Unalias(embedded)
+	if union, ok := et.(*types.Union); ok {
+		for j := 0; j < union.Len(); j++ {
+			terms = append(terms, types.Unalias(union.Term(j).Type()).Underlying())
+		}
+		return terms
+	}
+	return append(terms, et.Underlying())
+}
+
 // coreRangeType resolves the range-relevant type of a range operand. Named
 // types (e.g. `type M map[string]int`) never match the Map/Chan switch on
 // their own, so non-type-parameter operands are classified by their
@@ -391,14 +410,7 @@ func coreRangeType(t types.Type) types.Type {
 	}
 	var terms []types.Type
 	for i := 0; i < iface.NumEmbeddeds(); i++ {
-		union, ok := iface.EmbeddedType(i).(*types.Union)
-		if !ok {
-			// Named or otherwise opaque constraint: core unknown.
-			return nil
-		}
-		for j := 0; j < union.Len(); j++ {
-			terms = append(terms, types.Unalias(union.Term(j).Type()).Underlying())
-		}
+		terms = appendEmbeddedTerms(terms, iface.EmbeddedType(i))
 	}
 	if len(terms) == 0 {
 		return nil
@@ -467,14 +479,7 @@ func coreMakeChanType(t types.Type) types.Type {
 	}
 	var terms []types.Type
 	for i := 0; i < iface.NumEmbeddeds(); i++ {
-		union, ok := iface.EmbeddedType(i).(*types.Union)
-		if !ok {
-			// Named or otherwise opaque constraint: core unknown.
-			return nil
-		}
-		for j := 0; j < union.Len(); j++ {
-			terms = append(terms, types.Unalias(union.Term(j).Type()).Underlying())
-		}
+		terms = appendEmbeddedTerms(terms, iface.EmbeddedType(i))
 	}
 	if len(terms) == 0 {
 		return nil
