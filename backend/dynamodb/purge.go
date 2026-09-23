@@ -58,7 +58,10 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 
 	purged := 0
 	for _, id := range ids {
-		if err := b.deleteTasksForInstance(ctx, id); err != nil {
+		// Purge is the backstop for hot-path residue (see
+		// verifyTasksFirstPageByScan), so it always runs the full task
+		// cleanup, not the bounded per-completion sweep.
+		if err := b.deleteTasksForInstanceFull(ctx, id); err != nil {
 			return purged, err
 		}
 		if err := b.deleteTimersForInstance(ctx, id); err != nil {

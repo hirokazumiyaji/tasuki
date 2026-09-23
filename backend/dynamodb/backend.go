@@ -190,7 +190,10 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if err := b.deleteTasksForInstance(ctx, id); err != nil {
+	// Terminate always runs the full task cleanup (not the bounded
+	// hot-path sweep): an explicit termination must leave no claimable
+	// rows behind for the terminated ID.
+	if err := b.deleteTasksForInstanceFull(ctx, id); err != nil {
 		return err
 	}
 	if err := b.deleteTimersForInstance(ctx, id); err != nil {
@@ -204,8 +207,7 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 }
 
 func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
-	n, err := b.deleteTasksForInstanceByGSI(ctx, id)
-	if err != nil {
+	if _, err := b.deleteTasksForInstanceByGSI(ctx, id); err != nil {
 		if !isMissingIndexError(err) {
 			return err
 		}
@@ -216,61 +218,86 @@ func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
 		return scanErr
 	}
 	// The GSI is eventually consistent: a sweep can report a partial match
-	// while lagging rows are still invisible to the index, and nothing
-	// revisits them afterwards (the claim-time status gate stops execution
-	// but not the leak). Confirm against strongly consistent state with a
-	// full paginated Scan on every sweep, not just zero-row results: a
-	// single page would leave lagging tasks past 1000 items/1 MiB behind
-	// with no later pass revisiting them.
-	_ = n
-	return b.verifyTasksEmptyByScan(ctx, id)
+	// while lagging rows are still invisible to the index. Confirm with one
+	// bounded strongly-consistent Scan page (see
+	// verifyTasksFirstPageByScan): the common case stays cheap and lagging
+	// rows in the page are reaped synchronously.
+	return b.verifyTasksFirstPageByScan(ctx, id)
 }
 
-// gsiVerifyScanLimit caps each strongly-consistent verification Scan page.
-// The sweep follows LastEvaluatedKey until the whole table is checked, so a
-// lagging task anywhere in the table is reaped instead of leaking until
-// purge. Cost: every terminal completion pays a full strongly-consistent
-// table Scan (one page per gsiVerifyScanLimit evaluated items), proportional
-// to fleet size rather than the instance's rows. The GSI sweep first keeps
-// the common case cheap (no writes when nothing lags); the scan only reads.
-const gsiVerifyScanLimit = 1000
-
-// verifyTasksEmptyByScan deletes every one of the instance's tasks visible
-// to a strongly-consistent Scan. It runs after every GSI-based sweep —
-// including partial matches, where lagging rows are invisible to the index
-// but present in strongly consistent state — so the common no-task
-// completion pays one bounded read per page and a lagging task beyond the
-// first page (past 1000 items/1 MiB) is still reaped instead of leaking
-// until purge with no later pass revisiting it.
-func (b *Backend) verifyTasksEmptyByScan(ctx context.Context, id string) error {
-	var start map[string]types.AttributeValue
-	for {
-		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{
-			TableName:         aws.String(b.table("wf_tasks")),
-			Limit:             aws.Int32(gsiVerifyScanLimit),
-			ConsistentRead:    aws.Bool(true),
-			ExclusiveStartKey: start,
-		})
-		if err != nil {
+// deleteTasksForInstanceFull removes one instance's tasks with no bound on
+// verification cost: the GSI sweep first, then a fully-paginated
+// strongly-consistent Scan that reaps every lagging row anywhere in the
+// table. Only the rare paths that must leave nothing behind use it —
+// TerminateInstance and PurgeInstances — never the per-completion hot path
+// (see deleteTasksForInstance for why the hot path stays bounded).
+func (b *Backend) deleteTasksForInstanceFull(ctx context.Context, id string) error {
+	if _, err := b.deleteTasksForInstanceByGSI(ctx, id); err != nil {
+		if !isMissingIndexError(err) {
 			return err
 		}
-		for _, m := range out.Items {
-			if fromS(m["instance_id"]) != id {
-				continue
-			}
-			pk, ok := m["task_pk"]
-			if !ok {
-				continue
-			}
-			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
-				return err
-			}
-		}
-		if out.LastEvaluatedKey == nil {
-			return nil
-		}
-		start = out.LastEvaluatedKey
+		// Without a queryable index the Scan below is the whole cleanup.
 	}
+	_, err := b.deleteTasksForInstanceByScan(ctx, id)
+	return err
+}
+
+// gsiVerifyScanLimit bounds the strongly-consistent verification Scan page
+// on the terminal hot path. Only one page is read per terminal
+// advancement: verification cost stays O(instance rows + one page) instead
+// of scaling with fleet work (see verifyTasksFirstPageByScan).
+const gsiVerifyScanLimit = 1000
+
+// verifyTasksFirstPageByScan deletes the instance's tasks visible to a
+// single strongly-consistent Scan page.
+//
+// DESIGN (Codex round 7 on #328): the previous fully-paginated
+// verification Scan ran after every terminal advancement and scaled with
+// the fleet's queued work — every completion paid a full
+// strongly-consistent table Scan, and throttling mid-scan errored the
+// cleanup after the terminal status had already committed. Scoping the
+// verification to the instance is not directly possible — the base table's
+// partition key is the task ID, so no strongly-consistent instance-keyed
+// read exists — and the GSI rows already returned prove nothing about
+// lagging rows the index has not caught up with. The honest trade-off:
+//
+//   - The GSI sweep (instance-keyed Query, fully paginated over the
+//     instance's own rows) removes everything the index has observed, and
+//     this single strong page reaps lagging rows visible to consistent
+//     state near the head of the table.
+//   - Correctness never depends on the sweep: a lagging row that survives
+//     cannot execute — ClaimTasks gates the lease on instance status in
+//     the same transaction (claimTaskItem) plus a post-claim re-check, so
+//     residue is inert.
+//   - The leak lifetime is bounded by the paths that always run the full
+//     cleanup: TerminateInstance (deleteTasksForInstanceFull) and retention
+//     PurgeInstances, plus best-effort deletion when residue is met by a
+//     later claim.
+//
+// A lagging task beyond this page therefore waits for one of those
+// backstops instead of forcing every completion to scan the fleet.
+func (b *Backend) verifyTasksFirstPageByScan(ctx context.Context, id string) error {
+	out, err := b.client.Scan(ctx, &dynamodb.ScanInput{
+		TableName:      aws.String(b.table("wf_tasks")),
+		Limit:          aws.Int32(gsiVerifyScanLimit),
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return err
+	}
+	for _, m := range out.Items {
+		if fromS(m["instance_id"]) != id {
+			continue
+		}
+		pk, ok := m["task_pk"]
+		if !ok {
+			continue
+		}
+		if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // deleteTasksForInstanceByGSI removes one instance's tasks via the
@@ -1114,7 +1141,76 @@ func (b *Backend) ensureWorkflowTask(ctx context.Context, instanceID string) err
 	if err != nil || len(inbox.Items) == 0 {
 		return err
 	}
-	_, err = b.client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(b.table("wf_tasks")), Item: workflowTaskItem(instanceID, inst.Queue, newID(), nowUTC()), ConditionExpression: aws.String("attribute_not_exists(task_pk)")})
+	item := workflowTaskItem(instanceID, inst.Queue, newID(), nowUTC())
+	if terr := b.putWorkflowTaskIfRunning(ctx, instanceID, item); terr != nil {
+		if isTransactionUnsupported(terr) {
+			// Stores without TransactWriteItems support fall back to a
+			// status re-check immediately before the Put (see
+			// putWorkflowTaskLegacy): narrower race, documented residual.
+			return b.putWorkflowTaskLegacy(ctx, instanceID, item)
+		}
+		return terr
+	}
+	return nil
+}
+
+// putWorkflowTaskIfRunning creates the singleton workflow task only while
+// the instance is still running, in ONE transaction: a ConditionCheck on
+// the instance row (status = "running"; a missing row fails the check,
+// matching instanceRunning's terminal treatment) plus the Put guarded on
+// attribute_not_exists(task_pk).
+//
+// This closes the recreate-after-cleanup race: CompleteActivity's inbox
+// commit and the status read above can both serialize before a terminal
+// transition whose sweep then finishes before the task Put executes. A
+// bare PutItem has no status condition and would recreate the workflow
+// task after the cleanup — the row lingers (the claim gate still prevents
+// execution, but nothing reaps it). The transactional Put aborts instead,
+// so a terminal sweep is never undone by a stale ensure.
+//
+// A conditional failure (instance left running, or the singleton already
+// exists) is success: either the terminal sweep owns the task now or
+// another ensure already created it.
+func (b *Backend) putWorkflowTaskIfRunning(ctx context.Context, instanceID string, item map[string]types.AttributeValue) error {
+	_, err := b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{ConditionCheck: &types.ConditionCheck{
+			TableName:           aws.String(b.table("wf_instances")),
+			Key:                 map[string]types.AttributeValue{"id": avS(instanceID)},
+			ConditionExpression: aws.String("#s = :running"),
+			ExpressionAttributeNames: map[string]string{
+				"#s": "status",
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":running": avS("running"),
+			},
+		}},
+		{Put: &types.Put{
+			TableName:           aws.String(b.table("wf_tasks")),
+			Item:                item,
+			ConditionExpression: aws.String("attribute_not_exists(task_pk)"),
+		}},
+	}})
+	if conditional(err) {
+		return nil
+	}
+	return err
+}
+
+// putWorkflowTaskLegacy is the ensure fallback for stores without
+// TransactWriteItems support: it re-reads the instance status immediately
+// before the Put and skips a terminal instance, narrowing the
+// read-then-Put gap to the minimum a bare PutItem allows. A residual race
+// remains — a termination committing between the re-read and the Put still
+// recreates the row — and is documented rather than hidden: the lingered
+// row cannot execute (claimTaskItem's atomic status ConditionCheck plus
+// the post-claim instanceRunning gate fence it) and is reaped by the next
+// TerminateInstance full cleanup or retention purge.
+func (b *Backend) putWorkflowTaskLegacy(ctx context.Context, instanceID string, item map[string]types.AttributeValue) error {
+	running, err := b.instanceRunning(ctx, instanceID)
+	if err != nil || !running {
+		return err
+	}
+	_, err = b.client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(b.table("wf_tasks")), Item: item, ConditionExpression: aws.String("attribute_not_exists(task_pk)")})
 	if conditional(err) {
 		return nil
 	}
