@@ -249,6 +249,71 @@ func TestTerminalMarkerNamespaceCollision(t *testing.T) {
 	}
 }
 
+// A pre-upgrade verbatim user row ("__post_terminal__:x", stored before the
+// round-6 escape) must never match the versioned retry-marker probe for "x"
+// (Codex round 9 on #327): the round-8 dual-read mistook it for a marker and
+// dropped the first post-terminal send of "x" (lost signal). The legacy row
+// is seeded directly to bypass the escaped write path. On the old code the
+// terminal send is swallowed and this fails.
+func TestTerminalLegacyUserRowDelivers(t *testing.T) {
+	dsn := guardTestDSN(t)
+	ctx := context.Background()
+	b, err := New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	const id = "terminal-legacy-user-row"
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-upgrade user key stored verbatim (no "__" escape): the exact row
+	// the round-8 marker probe for "x" used to hit.
+	if _, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return txn.BufferWrite([]*spanner.Mutation{
+			spanner.InsertMap("wf_signal_dedupe", map[string]any{
+				"instance_id": id, "dedupe_id": "__post_terminal__:x", "created_at": nowUTC(),
+			}),
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ev := journal.Event{Type: journal.TypeSignalReceived, Name: "sig", Payload: []byte(`{}`)}
+	// Terminal transition with the legacy row still present.
+	if _, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return txn.BufferWrite([]*spanner.Mutation{
+			spanner.UpdateMap("wf_instances", map[string]any{
+				"id": id, "status": "terminated",
+				"updated_at": nowUTC(), "completed_at": nowUTC(),
+			}),
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The first post-terminal send of "x" must insert, not dedupe against
+	// the legacy "__post_terminal__:x" user row.
+	if err := b.SendToInbox(ctx, id, ev, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if n := terminalTestInboxLen(t, b, ctx, id); n != 1 {
+		t.Fatalf("terminal send swallowed by legacy user row: inbox=%d want 1 (signal lost)", n)
+	}
+	// Retry idempotency via the versioned marker still holds.
+	if err := b.SendToInbox(ctx, id, ev, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if n := terminalTestInboxLen(t, b, ctx, id); n != 1 {
+		t.Fatalf("terminal retry duplicated the signal: inbox=%d want 1 (idempotency lost)", n)
+	}
+}
+
 // When the purge second sweep stops at a replacement incarnation, the
 // version-conditioned reap must preserve a dedupe key the replacement
 // recreated after the snapshot (Codex round 6 on #327): dedupe keys are

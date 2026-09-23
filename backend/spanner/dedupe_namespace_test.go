@@ -13,6 +13,7 @@ import (
 func TestDedupeMarkerNamespaceDisjoint(t *testing.T) {
 	adversarial := []string{
 		"", "x", "_x", "__x", "___x", "__post_terminal__:", "__post_terminal__:x",
+		"__post_terminal__v1:", "__post_terminal__v1:x",
 		"____post_terminal__:x", "__post_terminal__:__post_terminal__:x",
 		"post_terminal__:x", "a:b", "x:y:z",
 	}
@@ -42,7 +43,24 @@ func TestDedupeMarkerNamespaceDisjoint(t *testing.T) {
 			t.Fatalf("ordinary ID %q remapped to %q", u, got)
 		}
 	}
-	if !strings.HasPrefix(dedupeMarkerKey("x"), "__post_terminal__:") {
-		t.Fatal("marker lost its prefix")
+	if !strings.HasPrefix(dedupeMarkerKey("x"), "__post_terminal__v1:") {
+		t.Fatal("marker lost its versioned prefix")
+	}
+}
+
+// A pre-upgrade verbatim user row ("__post_terminal__:x", stored before the
+// round-6 escape) must never match the marker probe for "x" (Codex round 9
+// on #327): the dual-read mistook it for a retry marker and dropped the
+// first post-terminal send of "x". Versioned probes exclude legacy forms by
+// construction; on the old code this fails.
+func TestDedupeMarkerProbeExcludesLegacyUserRow(t *testing.T) {
+	const legacyRow = "__post_terminal__:x"
+	for _, mk := range dedupeMarkerCandidates("x") {
+		if mk == legacyRow {
+			t.Fatalf("marker probe for %q matches legacy user row %q", "x", legacyRow)
+		}
+	}
+	if got := dedupeMarkerKey("x"); got == legacyRow {
+		t.Fatalf("versioned marker %q collides with legacy user row", got)
 	}
 }

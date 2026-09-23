@@ -1195,8 +1195,11 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			}
 			if terminal {
 				// Retry check first: a marker means this DedupeID already
-				// inserted post-terminal, so dedupe the retry. All stored
-				// marker forms are probed (Codex round 8 on #327).
+				// inserted post-terminal, so dedupe the retry. Only the
+				// versioned marker form is probed (Codex round 9 on #327):
+				// legacy unversioned rows shaped like markers are
+				// pre-upgrade user keys by construction (markers are only
+				// written versioned), so they must never suppress a send.
 				markerExists := false
 				for _, mk := range dedupeMarkerCandidates(it.DedupeID) {
 					msnap, merr := tx.Get(b.ref("wf_signal_dedupe", instanceID+":"+mk))

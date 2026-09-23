@@ -22,13 +22,14 @@ func TestDedupeKeysBoundedByColumnLimit(t *testing.T) {
 			}
 		}
 	}
-	// Short IDs keep the exact historical encoding (verbatim / "__"-escape /
-	// "prefix+raw" marker): hashing only kicks in over budget.
+	// Short IDs keep the exact historical user encoding (verbatim /
+	// "__"-escape); markers carry the round-9 namespace version, so hashing
+	// only kicks in over budget.
 	for _, raw := range []string{"", "x", "pay-42", "a:b"} {
 		if got := escapeDedupeID(raw); got != raw {
 			t.Fatalf("short ID %q remapped to %q", raw, got)
 		}
-		if got := postTerminalDedupeMarker(raw); got != "__post_terminal__:"+raw {
+		if got := postTerminalDedupeMarker(raw); got != "__post_terminal__v1:"+raw {
 			t.Fatalf("short marker for %q = %q", raw, got)
 		}
 	}
@@ -109,21 +110,34 @@ func TestDedupeKeyCandidatesLegacyFirst(t *testing.T) {
 }
 
 func TestDedupeMarkerCandidatesForms(t *testing.T) {
-	if got := dedupeMarkerCandidates("x"); len(got) != 1 || got[0] != "__post_terminal__:x" {
+	// Marker probes check the versioned form only (Codex round 9 on #327):
+	// legacy unversioned rows must never match, so a pre-upgrade verbatim
+	// user key "__post_terminal__:x" cannot swallow the post-terminal send
+	// of "x". On the old dual-read code the legacy form was probed and this
+	// fails.
+	if got := dedupeMarkerCandidates("x"); len(got) != 1 || got[0] != "__post_terminal__v1:x" {
 		t.Fatalf("marker candidates(x) = %q", got)
+	}
+	for _, mk := range dedupeMarkerCandidates("x") {
+		if mk == "__post_terminal__:x" {
+			t.Fatalf("versioned marker probe matches legacy user row %q", mk)
+		}
 	}
 	long := strings.Repeat("k", 300)
 	got := dedupeMarkerCandidates(long)
-	if len(got) != 2 || got[0] != "__post_terminal__:"+long || got[1] != postTerminalDedupeMarker(long) {
-		t.Fatalf("long marker candidates = %q, want [unhashed hashed]", got)
+	if len(got) != 1 || got[0] != postTerminalDedupeMarker(long) {
+		t.Fatalf("long marker candidates = %q, want [versioned-hashed]", got)
 	}
 }
 
-// Marker detection drives the terminate-sweep fence (Codex round 8 on #327).
+// Marker detection drives the terminate-sweep fence (Codex round 8 on #327)
+// and stays conservative: legacy-prefixed rows are still classified as
+// markers so the sweep preserves (rather than reaps) ambiguous rows.
 func TestIsPostTerminalMarkerKey(t *testing.T) {
 	for _, k := range []string{
 		"__post_terminal__:x",
 		"__post_terminal__:" + strings.Repeat("k", 300),
+		postTerminalDedupeMarker("x"),
 		postTerminalDedupeMarker(strings.Repeat("k", 300)),
 	} {
 		if !isPostTerminalMarkerKey(k) {
