@@ -44,6 +44,11 @@ type Backend interface {
 	// numeric ID alone misses workflow tasks (ErrNotFound) and a shutdown
 	// abandon stalls peers until lease expiry. Callers pass the claimed
 	// task, mirroring ExtendLease/NackTask.
+	//
+	// Releases are fenced to the claimed generation (worker_id + attempt):
+	// when the lease moved on (peer reclaim after a delayed renewal, or a
+	// successor turn), the release has no effect and reports ErrNotFound.
+	// Workers treat that as already-released, not an error.
 	ReleaseLease(ctx context.Context, t Task) error
 	// NackTask clears the lease and defers visibility by delay (store clock).
 	// Used when a Worker cannot process the task (incompatible code/registry).

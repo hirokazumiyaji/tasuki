@@ -382,8 +382,33 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 	}
 	return b.updateTask(ctx, taskID, update, values, "")
 }
+// releaseFence fences a lease release to the claimed task generation: a
+// renewal delayed past the lease (or a shutdown release racing a peer
+// reclaim) must not clear a successor's lease. The update applies only
+// while the item still carries the claimed numeric id and claim ownership
+// (worker + attempt); otherwise the lease moved on and the release reports
+// ErrNotFound so the worker treats it as already-released.
+func releaseFence(t backend.Task, visible int64) (string, map[string]types.AttributeValue) {
+	return "attribute_exists(task_pk) AND id = :id AND worker_id = :w AND attempt = :a",
+		map[string]types.AttributeValue{
+			":v": avN(visible),
+			":id": avN(t.ID), ":w": avS(t.WorkerID), ":a": avN(int64(t.Attempt)),
+		}
+}
+
 func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
-	if err := b.updateTaskPK(ctx, releaseTaskPK(t), "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC()))}, ""); err != nil {
+	cond, values := releaseFence(t, timeToN(nowUTC()))
+	_, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(b.table("wf_tasks")),
+		Key:                       map[string]types.AttributeValue{"task_pk": avS(releaseTaskPK(t))},
+		UpdateExpression:          aws.String("SET visible_at = :v REMOVE worker_id"),
+		ConditionExpression:       aws.String(cond),
+		ExpressionAttributeValues: values,
+	})
+	if conditional(err) {
+		return backend.ErrNotFound
+	}
+	if err != nil {
 		return err
 	}
 	b.notifyTasks()

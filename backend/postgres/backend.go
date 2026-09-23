@@ -388,8 +388,13 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 }
 
 func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
+	// Fenced to the claimed generation (worker_id + attempt): a renewal
+	// delayed past the lease (or a shutdown release racing a peer
+	// reclaim) must not clear a successor's lease. Zero rows means the
+	// lease moved on; report ErrNotFound so the worker treats it as
+	// already-released.
 	tag, err := b.pool.Exec(ctx, `
-		UPDATE wf_tasks SET visible_at = now(), worker_id = NULL WHERE id = $1`, t.ID)
+		UPDATE wf_tasks SET visible_at = now(), worker_id = NULL WHERE id = $1 AND worker_id = $2 AND attempt = $3`, t.ID, t.WorkerID, t.Attempt)
 	if err != nil {
 		return err
 	}

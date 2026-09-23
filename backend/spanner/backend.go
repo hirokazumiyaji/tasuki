@@ -476,10 +476,15 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 }
 
 func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
+	// Fenced to the claimed generation (worker_id + attempt): a renewal
+	// delayed past the lease (or a shutdown release racing a peer
+	// reclaim) must not clear a successor's lease. Zero rows means the
+	// lease moved on; report ErrNotFound so the worker treats it as
+	// already-released.
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
-			SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id`,
-			Params: map[string]any{"v": nowUTC(), "id": t.ID},
+			SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id AND worker_id = @w AND attempt = @a`,
+			Params: map[string]any{"v": nowUTC(), "id": t.ID, "w": t.WorkerID, "a": t.Attempt},
 		})
 		if err != nil {
 			return err

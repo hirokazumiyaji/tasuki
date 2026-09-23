@@ -369,26 +369,6 @@ func (b *Backend) updateTask(ctx context.Context, id int64, activity bool, field
 		return tx.Update(r, fields)
 	})
 }
-
-// updateTaskDoc applies fields to the wf_tasks document with the given ID.
-// Unlike updateTask it does not assume the ACT# key or check the activity
-// kind, so kind-routed callers (workflow releases) can address WF# keys.
-func (b *Backend) updateTaskDoc(ctx context.Context, docID string, fields []gcf.Update) error {
-	r := b.ref("wf_tasks", docID)
-	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
-		s, e := tx.Get(r)
-		if isNotFound(e) {
-			return backend.ErrNotFound
-		}
-		if e != nil {
-			return e
-		}
-		if !s.Exists() {
-			return backend.ErrNotFound
-		}
-		return tx.Update(r, fields)
-	})
-}
 func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
 	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
 	// kind like NackTask does. Renewing a workflow task by numeric ID would
@@ -447,8 +427,33 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 	}
 	return b.updateTask(ctx, taskID, false, fields)
 }
+// checkReleaseDoc reports whether the task document still carries the
+// claimed task generation (numeric id + claim ownership). A mismatch means
+// a peer reclaim (or an EnsureWorkflowTask replacement) moved the lease
+// on, and the stale release must not clear the successor's lease.
+func checkReleaseDoc(data map[string]any, t backend.Task) error {
+	return checkWorkflowRenewalDoc(data, t)
+}
+
 func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
-	if err := b.updateTaskDoc(ctx, releaseTaskDocID(t), []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}}); err != nil {
+	r := b.ref("wf_tasks", releaseTaskDocID(t))
+	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		s, e := tx.Get(r)
+		if isNotFound(e) {
+			return backend.ErrNotFound
+		}
+		if e != nil {
+			return e
+		}
+		if !s.Exists() {
+			return backend.ErrNotFound
+		}
+		if err := checkReleaseDoc(s.Data(), t); err != nil {
+			return err
+		}
+		return tx.Update(r, []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}})
+	})
+	if err != nil {
 		return err
 	}
 	b.notifyTasks()

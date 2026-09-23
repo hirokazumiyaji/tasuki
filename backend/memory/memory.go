@@ -260,6 +260,15 @@ func (b *Backend) ReleaseLease(_ context.Context, t backend.Task) error {
 		b.mu.Unlock()
 		return backend.ErrNotFound
 	}
+	// Fence the release to the claimed generation: a renewal delayed past
+	// the lease (or a shutdown release racing a peer reclaim) must not
+	// clear a successor's lease, or a third worker would execute
+	// concurrently with the peer. A mismatch means the lease moved on;
+	// report ErrNotFound so the worker treats it as already-released.
+	if tsk.workerID != t.WorkerID || tsk.attempt != t.Attempt {
+		b.mu.Unlock()
+		return backend.ErrNotFound
+	}
 	tsk.visibleAt = b.now
 	tsk.workerID = ""
 	b.mu.Unlock()

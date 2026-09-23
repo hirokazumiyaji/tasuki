@@ -268,6 +268,14 @@ func (w *Worker) releaseInFlight(ctx context.Context) {
 		// DynamoDB/Firestore, so the full task identity (not just the
 		// numeric ID) addresses the lease.
 		if err := w.backend.ReleaseLease(ctx, t); err != nil {
+			// A fenced release reports ErrNotFound when the lease moved
+			// on (peer reclaim or successor turn): the lease is already
+			// released, not a failure.
+			if errors.Is(err, backend.ErrNotFound) {
+				w.opts.Logger.Debug("shutdown lease already released",
+					"task_id", t.ID)
+				continue
+			}
 			w.opts.Logger.Warn("shutdown lease release failed",
 				"task_id", t.ID, "error", err)
 			w.opts.Metrics.AddStoreError(context.Background(), "release_lease")
@@ -708,6 +716,14 @@ func (w *Worker) releaseWorkflowLease(t backend.Task) {
 	relCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	if err := w.backend.ReleaseLease(relCtx, t); err != nil {
+		// A fenced release reports ErrNotFound when the lease moved on
+		// (peer reclaim or successor turn): the lease is already
+		// released, not a failure.
+		if errors.Is(err, backend.ErrNotFound) {
+			w.opts.Logger.Debug("workflow lease already released",
+				"instance_id", t.InstanceID, "task_id", t.ID)
+			return
+		}
 		w.recordStoreError(context.Background(), "release_lease", err, "task_id", t.ID)
 	}
 }
