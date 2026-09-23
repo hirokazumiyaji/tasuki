@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS wf_tasks (
     wf_singleton VARCHAR(255)
         GENERATED ALWAYS AS (CASE WHEN kind = 'workflow' THEN instance_id ELSE NULL END) STORED,
     UNIQUE KEY wf_tasks_wf_singleton (wf_singleton),
-    INDEX wf_tasks_claim_idx (kind, queue, visible_at)
+    INDEX wf_tasks_claim_idx (kind, queue, visible_at),
+    INDEX wf_tasks_instance_idx (instance_id)
 );
 
 CREATE TABLE IF NOT EXISTS wf_timers (

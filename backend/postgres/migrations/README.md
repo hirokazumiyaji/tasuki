@@ -9,7 +9,9 @@ migrations/
 ├── 000001_init.up.sql            Base tables and indexes
 ├── 000001_init.down.sql          DROP all tables
 ├── 000002_vacuum_tuning.up.sql   autovacuum / fillfactor tuning
-└── 000002_vacuum_tuning.down.sql Reset tuning settings
+├── 000002_vacuum_tuning.down.sql Reset tuning settings
+├── 000003_tasks_instance_idx.up.sql   index terminal task cleanup by instance
+└── 000003_tasks_instance_idx.down.sql Drop the instance index
 ```
 
 The naming convention is `<6-digit-version>_<name>.up.sql` / `.down.sql`. Lexicographical file name order determines application order.

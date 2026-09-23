@@ -9,7 +9,9 @@ migrations/
 ├── 000001_init.up.sql            基本テーブルとインデックス
 ├── 000001_init.down.sql          全テーブルの DROP
 ├── 000002_vacuum_tuning.up.sql   autovacuum / fillfactor 設定
-└── 000002_vacuum_tuning.down.sql 設定のリセット
+├── 000002_vacuum_tuning.down.sql 設定のリセット
+├── 000003_tasks_instance_idx.up.sql   終端タスク削除用の instance インデックス
+└── 000003_tasks_instance_idx.down.sql instance インデックスの削除
 ```
 
 命名規則は `<6桁バージョン>_<名前>.up.sql` / `.down.sql`。ファイル名は辞書順 = 適用順になる。

@@ -54,6 +54,10 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	_, _ = b.db.ExecContext(ctx, `ALTER TABLE wf_tasks ADD COLUMN heartbeat BLOB NULL`)
 	_, _ = b.db.ExecContext(ctx, `ALTER TABLE wf_instances ADD COLUMN search_attributes JSON NULL`)
 	_, _ = b.db.ExecContext(ctx, `ALTER TABLE wf_instances ADD COLUMN memo JSON NULL`)
+	// Backfill for databases created before wf_tasks_instance_idx existed:
+	// CREATE TABLE IF NOT EXISTS is a no-op there, so create the terminal-
+	// cleanup index explicitly. Duplicate-index errors are ignored.
+	_, _ = b.db.ExecContext(ctx, `CREATE INDEX wf_tasks_instance_idx ON wf_tasks (instance_id)`)
 	return nil
 }
 
