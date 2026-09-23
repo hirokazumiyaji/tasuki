@@ -24,6 +24,14 @@ type Worker struct {
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	done   chan struct{}
+	// shuttingDown gates restarts across Shutdown: it is set under mu at
+	// Shutdown entry (alongside clearing cancel/done) and cleared under mu
+	// at Shutdown return, so a StartWithError racing the shutdown window
+	// (after the mu clear but before Shutdown's actMu capture) observes it
+	// and fails with ErrWorkerShuttingDown instead of installing a new
+	// execCancel that Shutdown then captures and cancels at grace expiry
+	// (leaving the old execCtx live). Guarded by mu.
+	shuttingDown bool
 	// inFlight tracks claimed task IDs with their local lease-expiry
 	// estimate (claim time + LeaseDuration, refreshed on each successful
 	// renewal) plus the claimed task itself. The local expiry is a fast
@@ -239,6 +247,9 @@ func (w *Worker) StartWithError(parent context.Context) error {
 	if w.cancel != nil {
 		return ErrWorkerAlreadyRunning
 	}
+	if w.shuttingDown {
+		return ErrWorkerShuttingDown
+	}
 	if !w.opts.DisableSchemaValidation {
 		if err := ValidateSchema(parent, w.backend); err != nil {
 			return fmt.Errorf("tasuki: schema validation failed: %w", err)
@@ -316,14 +327,27 @@ func (w *Worker) tickSync(ctx context.Context) {
 
 func (w *Worker) Shutdown(ctx context.Context) error {
 	w.mu.Lock()
+	if w.shuttingDown {
+		// A concurrent Shutdown is already in progress; the in-flight
+		// call owns the grace, renewal join, and lease release.
+		w.mu.Unlock()
+		return nil
+	}
 	cancel := w.cancel
 	done := w.done
 	w.cancel = nil
 	w.done = nil
-	w.mu.Unlock()
 	if cancel == nil && done == nil {
+		w.mu.Unlock()
 		return nil
 	}
+	w.shuttingDown = true
+	w.mu.Unlock()
+	defer func() {
+		w.mu.Lock()
+		w.shuttingDown = false
+		w.mu.Unlock()
+	}()
 	// Stop new detached activities first so the grace period only covers
 	// work already in flight. The poll loop ctx is canceled immediately to
 	// stop new claims, but activity execution uses execCtx which stays valid
@@ -552,11 +576,20 @@ func (w *Worker) refreshLease(taskID int64, tok claimToken) {
 // entries stamped by another invocation — are ignored: the task already
 // transferred to a commit, was released, or was reclaimed and re-tracked
 // by a new generation, whose own renewal maintains its expiry.
+//
+// The update is monotonic (max-assignment): heartbeat and periodic renewal
+// overlap, both stamp their start pre-call, and out-of-order returns would
+// otherwise let the older start overwrite a newer deadline — ownsFresh
+// then stops early (or the detached guard rejects a valid result) while
+// the backend lease is still live, delaying re-execution and risking
+// duplicate side effects. Only a LATER expiry replaces the current one.
 func (w *Worker) refreshLeaseAt(taskID int64, tok claimToken, at time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if e, ok := w.inFlight[taskID]; ok && e.epoch == tok.epoch && e.seq == tok.seq {
-		w.inFlight[taskID] = inFlightEntry{expiry: at.Add(w.leaseDuration()), epoch: e.epoch, seq: e.seq, task: e.task}
+		if newExpiry := at.Add(w.leaseDuration()); newExpiry.After(e.expiry) {
+			w.inFlight[taskID] = inFlightEntry{expiry: newExpiry, epoch: e.epoch, seq: e.seq, task: e.task}
+		}
 	}
 }
 
