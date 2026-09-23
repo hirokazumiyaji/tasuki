@@ -265,3 +265,43 @@ func BadComparableNamedMixedRange[C interface {
 	}
 	return nil
 }
+
+// comparable must filter COMPOSITE non-comparable terms too: `~[1][]int`
+// (array of slices) is not comparable, so `~[1][]int | ~chan int` ∩
+// comparable is {chan int} and range/make must still flag as channel
+// operations instead of falling silent on the mixed set.
+func BadComparableCompositeMixedRange[C interface {
+	~[1][]int | ~chan int
+	comparable
+}](ctx *workflow.Context, ch C) error {
+	for v := range ch { // want `ranging over a channel is not allowed`
+		_ = v
+	}
+	return nil
+}
+
+func BadComparableCompositeMixedMake[C interface {
+	~[1][]int | ~chan int
+	comparable
+}](ctx *workflow.Context, _ struct{}) error {
+	_ = make(C) // want `make\(chan`
+	return nil
+}
+
+// A struct holding a slice is likewise not comparable and must be filtered,
+// leaving the channel term.
+func BadComparableStructMixedRange[C interface {
+	~struct{ Vs []int } | ~chan int
+	comparable
+}](ctx *workflow.Context, ch C) error {
+	for v := range ch { // want `ranging over a channel is not allowed`
+		_ = v
+	}
+	return nil
+}
+
+// A composite of comparables stays: covered at the unit level instead (see
+// analyzer_internal_test.go). A range-based Ok control cannot spell it: any
+// mixed set whose composite term survives the filter has no single core type
+// and does not compile (`[2]int and chan int have different underlying
+// types`), so analysistest cannot load it.

@@ -269,6 +269,23 @@ func OkSideEffectNestedConvertedSame(ctx *workflow.Context, _ struct{}) error {
 	return nil
 }
 
+// An unnamed func type literal as the conversion target is still a pure
+// conversion, so the inner literal stays exempt.
+func OkSideEffectUnnamedConverted(ctx *workflow.Context, _ struct{}) error {
+	_, _ = workflow.SideEffect(ctx, (func() string)(func() string {
+		return time.Now().String()
+	}))
+	return nil
+}
+
+// Unnamed and named conversions nest like named-only ones.
+func OkSideEffectNestedUnnamedConverted(ctx *workflow.Context, _ struct{}) error {
+	_, _ = workflow.SideEffect(ctx, Callback((func() string)(func() string {
+		return time.Now().String()
+	})))
+	return nil
+}
+
 // An ordinary call around a conversion executes code, so it never unwraps:
 // the inner literal must still be scanned.
 func idCallback(c Callback) Callback { return c }

@@ -181,14 +181,16 @@ func collectExcludedFuncLits(pass *analysis.Pass, body *ast.BlockStmt) map[*ast.
 // unwrapCallbackArg resolves the FuncLit passed as a workflow escape-hatch
 // callback, unwrapping parenthesized literals and verified function
 // conversions such as Callback(func() string {...}) where Callback is a named
-// func type. A pure conversion does not execute its argument (unlike the
-// factory IIFE hole, which invokes the outer func immediately), so the inner
-// literal is still the directly-passed callback and stays exempt. Only
-// single-argument CallExprs whose callee resolves to a named func type (not a
-// builtin, not a plain func call) unwrap, and the loop continues through
-// nested conversions (G(F(func() {...}))) until the literal; IIFEs (Fun is
-// itself a FuncLit) and ordinary calls never do, so BadSideEffectFactory
-// keeps flagging.
+// func type, or (func() string)(func() string {...}) where the target is an
+// unnamed func type literal. A pure conversion does not execute its argument
+// (unlike the factory IIFE hole, which invokes the outer func immediately),
+// so the inner literal is still the directly-passed callback and stays
+// exempt. Only single-argument CallExprs whose callee resolves to a named
+// func type (not a builtin, not a plain func call) — or is syntactically an
+// unnamed func type — unwrap, and the loop continues through nested
+// conversions (G(F(func() {...}))) until the literal; IIFEs (Fun is itself
+// a FuncLit) and ordinary calls never do, so BadSideEffectFactory keeps
+// flagging.
 func unwrapCallbackArg(pass *analysis.Pass, e ast.Expr) ast.Expr {
 	e = unwrapParen(e)
 	for {
@@ -210,10 +212,14 @@ func unwrapCallbackArg(pass *analysis.Pass, e ast.Expr) ast.Expr {
 	}
 }
 
-// isFuncTypeConversion reports whether call is a conversion to a named func
-// type (e.g. Callback(func() {...})) rather than a function invocation.
-// The callee must resolve to a *types.TypeName whose underlying type is a
-// signature; *types.Func (ordinary calls, methods) and builtins never match.
+// isFuncTypeConversion reports whether call is a conversion to a func type —
+// either a named func type (e.g. Callback(func() {...})) or an unnamed func
+// type literal (e.g. (func() string)(func() string {...})) — rather than a
+// function invocation. A CallExpr whose callee is syntactically a func type
+// is necessarily a conversion (a type literal is not a callable value), so
+// the FuncType case needs no type resolution. The named case must resolve to
+// a *types.TypeName whose underlying type is a signature; *types.Func
+// (ordinary calls, methods) and builtins never match.
 func isFuncTypeConversion(pass *analysis.Pass, call *ast.CallExpr) bool {
 	fun := unwrapParen(call.Fun)
 	for {
@@ -227,6 +233,9 @@ func isFuncTypeConversion(pass *analysis.Pass, call *ast.CallExpr) bool {
 		}
 	}
 done:
+	if _, ok := fun.(*ast.FuncType); ok {
+		return true
+	}
 	var obj types.Object
 	switch f := fun.(type) {
 	case *ast.Ident:
@@ -627,12 +636,12 @@ func embedCarriesComparableSeen(emb types.Type, seen map[types.Type]bool) bool {
 	return false
 }
 
-// filterComparable drops candidates that definitely violate comparability:
-// slices, maps, and funcs are never comparable. Channels are always
-// comparable and stay; arrays, structs, basic types, interfaces, and type
-// parameters stay conservatively (precise comparability of composites
-// depends on their elements/fields, and interfaces may hold comparable
-// dynamics).
+// filterComparable drops candidates that definitely violate comparability
+// under Go semantics: slices, maps, and funcs are never comparable, nor are
+// arrays or structs built (transitively) from them. Channels, pointers, and
+// basic types are always comparable and stay; interfaces and type parameters
+// stay conservatively (precise comparability of an interface depends on its
+// dynamic type, which the filter cannot see).
 func filterComparable(terms []types.Type) []types.Type {
 	var out []types.Type
 	for _, t := range terms {
@@ -645,14 +654,42 @@ func filterComparable(terms []types.Type) []types.Type {
 }
 
 // violatesComparable reports whether t's core type is definitely not
-// comparable (slice, map, or func). Everything else is kept conservatively
-// (see filterComparable).
+// comparable (see filterComparable). Everything else is kept conservatively.
 func violatesComparable(t types.Type) bool {
-	switch types.Unalias(t).Underlying().(type) {
+	return !typeComparable(types.Unalias(t), map[types.Type]bool{})
+}
+
+// typeComparable reports whether values of type t are definitely comparable.
+// Composite types recurse into their elements/fields: an array is comparable
+// iff its element is, a struct iff every field is. Named types resolve
+// through their underlying type with a cycle guard (self-reference is only
+// legal through pointers and interfaces, which resolve without recursing,
+// so revisiting a named type keeps it conservatively).
+func typeComparable(t types.Type, seen map[types.Type]bool) bool {
+	switch u := t.(type) {
 	case *types.Slice, *types.Map, *types.Signature:
+		return false
+	case *types.Array:
+		return typeComparable(types.Unalias(u.Elem()), seen)
+	case *types.Struct:
+		for i := 0; i < u.NumFields(); i++ {
+			if !typeComparable(types.Unalias(u.Field(i).Type()), seen) {
+				return false
+			}
+		}
+		return true
+	case *types.Named:
+		if seen[t] {
+			return true
+		}
+		seen[t] = true
+		defer delete(seen, t)
+		return typeComparable(types.Unalias(u.Underlying()), seen)
+	default:
+		// Basic, Chan, Pointer: always comparable. Interface, TypeParam,
+		// Union: conservative keep (see filterComparable).
 		return true
 	}
-	return false
 }
 
 // intersectTypeSets returns members of sets[0] present (types.Identical) in
