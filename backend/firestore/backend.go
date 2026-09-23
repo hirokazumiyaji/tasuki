@@ -1231,6 +1231,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		// Firestore requires all reads before writes; also skip same-batch DedupeID dups.
 		skip := make([]bool, len(items))
 		createKey := make([]bool, len(items))
+		createRawKey := make([]bool, len(items))
 		createMarker := make([]bool, len(items))
 		created := map[string]bool{}
 		for i, it := range items {
@@ -1273,7 +1274,14 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				// one is either an inert pre-upgrade marker or a legacy
 				// verbatim row no probe may mistake for this DedupeID's
 				// guard (skipping it duplicates at worst, never drops).
+				// Ownership is version-aware (Codex round 13 on #296, see
+				// matchDedupeRow): a foreign-owner row at this DedupeID's
+				// canonical key already satisfies sweep consistency (the
+				// key is occupied), so only the marker is stamped —
+				// creating over it would fail and must not suppress the
+				// insert.
 				baseExists := false
+				canonicalOccupied := false
 				for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 					if isPostTerminalMarkerKey(bk) {
 						continue
@@ -1283,12 +1291,17 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						return err
 					}
 					if err == nil && snap.Exists() {
-						baseExists = true
-						break
+						if bk == escapeDedupeID(it.DedupeID) {
+							canonicalOccupied = true
+						}
+						if matchDedupeRow(it.DedupeID, bk, snap.Data()) {
+							baseExists = true
+							break
+						}
 					}
 				}
 				created[it.DedupeID] = true
-				if baseExists {
+				if baseExists || canonicalOccupied {
 					createMarker[i] = true
 					continue
 				}
@@ -1307,15 +1320,36 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			// second escaped key, and duplicate the event. Terminal
 			// instances keep the marker-only rule (see the terminal base
 			// check above).
+			// Ownership is version-aware (Codex round 13 on #296, see
+			// matchDedupeRow): a hit counts only when the row guards THIS
+			// DedupeID — a legacy row on exact raw equality, a versioned
+			// row on canonical-form equality (v1) or raw-key equality (v2
+			// fallback). A foreign-owner row at this DedupeID's canonical
+			// key means the canonical guard cannot be created (it would
+			// collide), so the guard falls back to the raw key with an
+			// explicit version (dedupeFormatRawKeyVersion): delivery is
+			// preserved and retries keep deduping. Only when both keys are
+			// occupied (vanishingly rare: two foreign legacy rows) does
+			// the event insert unguarded.
 			baseHit := false
+			canonicalOccupied := false
+			rawOccupied := false
 			for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 				snap, err := tx.Get(b.ref("wf_signal_dedupe", instanceID+":"+bk))
 				if err != nil && !isNotFound(err) {
 					return err
 				}
 				if err == nil && snap.Exists() {
-					baseHit = true
-					break
+					if bk == escapeDedupeID(it.DedupeID) {
+						canonicalOccupied = true
+					}
+					if bk == it.DedupeID {
+						rawOccupied = true
+					}
+					if matchDedupeRow(it.DedupeID, bk, snap.Data()) {
+						baseHit = true
+						break
+					}
 				}
 			}
 			if baseHit {
@@ -1324,17 +1358,23 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				continue
 			}
 			created[it.DedupeID] = true
-			createKey[i] = true
+			createKey[i] = !canonicalOccupied
+			createRawKey[i] = canonicalOccupied && !rawOccupied
 		}
 		for i, it := range items {
 			if skip[i] {
 				continue
 			}
-			if it.DedupeID != "" && createKey[i] {
-				if err := tx.Create(b.ref("wf_signal_dedupe", signalDedupeID(instanceID, it.DedupeID)), map[string]any{
-					"instance_id": instanceID,
-					"dedupe_id":   escapeDedupeID(it.DedupeID),
-					"created_at":  now,
+			if it.DedupeID != "" && (createKey[i] || createRawKey[i]) {
+				key, ver := signalDedupeID(instanceID, it.DedupeID), int64(dedupeFormatVersion)
+				if createRawKey[i] {
+					key, ver = instanceID+":"+it.DedupeID, int64(dedupeFormatRawKeyVersion)
+				}
+				if err := tx.Create(b.ref("wf_signal_dedupe", key), map[string]any{
+					"instance_id":            instanceID,
+					"dedupe_id":              escapeDedupeID(it.DedupeID),
+					dedupeFormatVersionField: ver,
+					"created_at":             now,
 				}); err != nil {
 					return err
 				}

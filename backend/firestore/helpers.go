@@ -185,6 +185,56 @@ func isPostTerminalMarkerKey(stored string) bool {
 		strings.HasPrefix(stored, dedupeHashedMarkerPrefixV1)
 }
 
+// dedupeFormatVersion stamps new wf_signal_dedupe rows so reads can tell
+// canonical (escaped) rows from legacy verbatim rows (Codex round 13 on
+// #296). Pre-versioning code stored "__"-prefixed IDs verbatim, so a stored
+// key alone is ambiguous: the row at "____x" may be the verbatim guard for
+// user ID "____x" or the escaped guard for user ID "__x". Dual-read probes
+// over legacy candidates therefore mistake one ID's row for another's and
+// skip genuine sends (wrong owner). New writes carry format_version=1 with
+// the canonical escapeDedupeID form in both the document ID and the
+// dedupe_id field; rows without the field are legacy (v0) and match only by
+// exact raw-ID equality, never as an escaped form of another ID.
+const dedupeFormatVersion = 1
+
+const dedupeFormatVersionField = "format_version"
+
+// dedupeFormatRawKeyVersion stamps fallback guard rows written at the raw
+// (unescaped) key instead of the canonical escaped key. The fallback is used
+// when the canonical key is already occupied by a foreign legacy row (which
+// cannot be overwritten and must not be mistaken for this ID's guard): the
+// raw key with an explicit version still identifies its owner positively
+// (legacy rows never carry a version), so retries keep deduping instead of
+// duplicating. The dedupe_id field still carries the canonical escaped form.
+const dedupeFormatRawKeyVersion = 2
+
+// matchDedupeRow reports whether a stored dedupe row guards the requested
+// raw DedupeID. candidateKey is the probed stored-key form that located the
+// row; doc is the row's field map.
+//
+//   - Versioned rows (format_version >= 1) always store the canonical
+//     escapeDedupeID form, so they match iff the stored dedupe_id field
+//     equals the requested ID's canonical form — regardless of which
+//     candidate located them. A foreign-owner row (e.g. "__x"'s "____x"
+//     found via "____x"'s raw candidate) never matches.
+//   - Legacy rows (no format_version) were stored verbatim, so they belong
+//     to the requested ID iff the stored key IS the requested raw ID
+//     exactly. An escaped candidate hitting a legacy row is another ID's
+//     row and never matches (safe direction: the send inserts, possibly
+//     duplicating, but is never dropped).
+func matchDedupeRow(requestedRaw, candidateKey string, doc map[string]any) bool {
+	version := i64(doc, dedupeFormatVersionField)
+	if version >= dedupeFormatRawKeyVersion {
+		// Raw-keyed versioned row (fallback guard): the key IS the owner,
+		// positively — no other ID's probe can claim it.
+		return candidateKey == requestedRaw
+	}
+	if version >= dedupeFormatVersion {
+		return str(doc, "dedupe_id") == escapeDedupeID(requestedRaw)
+	}
+	return candidateKey == requestedRaw
+}
+
 // dedupeKeyCandidates lists the stored user-key forms to probe on
 // dedupe-check reads, legacy raw first (Codex round 8 on #327): rows written
 // before the round-6 escape stored "__"-prefixed IDs verbatim, so a lookup
@@ -232,10 +282,10 @@ func cutPrefix(s, prefix string) (string, bool) {
 }
 
 type activityPayload struct {
-	Name                    string          `json:"name"`
-	Input                   json.RawMessage `json:"input"`
-	Retry                   retryJSON       `json:"retry"`
-	StartToCloseTimeoutMs   int64           `json:"start_to_close_timeout_ms,omitempty"`
+	Name                  string          `json:"name"`
+	Input                 json.RawMessage `json:"input"`
+	Retry                 retryJSON       `json:"retry"`
+	StartToCloseTimeoutMs int64           `json:"start_to_close_timeout_ms,omitempty"`
 }
 type retryJSON struct {
 	InitialIntervalMs  int64   `json:"initial_interval_ms"`

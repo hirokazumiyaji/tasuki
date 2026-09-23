@@ -83,18 +83,18 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 		}
 		muts := []*spanner.Mutation{
 			spanner.InsertMap("wf_instances", map[string]any{
-				"id":         inst.ID,
-				"name":       inst.Name,
-				"queue":      queue,
-				"status":     "running",
-				"input":      jsonVal(inst.Input),
-				"next_seq":   int64(2),
-				"parent_id":  nullStr(inst.ParentID),
-				"parent_seq": nullInt(inst.ParentSeq),
+				"id":                inst.ID,
+				"name":              inst.Name,
+				"queue":             queue,
+				"status":            "running",
+				"input":             jsonVal(inst.Input),
+				"next_seq":          int64(2),
+				"parent_id":         nullStr(inst.ParentID),
+				"parent_seq":        nullInt(inst.ParentSeq),
 				"search_attributes": jsonVal(backend.MarshalSearchAttributes(inst.SearchAttributes)),
 				"memo":              jsonVal(backend.MarshalSearchAttributes(inst.Memo)),
-				"created_at": now,
-				"updated_at": now,
+				"created_at":        now,
+				"updated_at":        now,
 			}),
 			spanner.InsertMap("wf_journal", map[string]any{
 				"instance_id": inst.ID,
@@ -527,7 +527,7 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
-			SQL: `UPDATE wf_tasks SET visible_at = @v, heartbeat = @h WHERE id = @id`,
+			SQL:    `UPDATE wf_tasks SET visible_at = @v, heartbeat = @h WHERE id = @id`,
 			Params: map[string]any{"v": nowUTC().Add(lease), "h": details, "id": taskID},
 		})
 		if err != nil {
@@ -916,7 +916,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 				"parent_id": ch.ParentID, "parent_seq": ch.ParentSeq,
 				"search_attributes": jsonVal(backend.MarshalSearchAttributes(ch.SearchAttributes)),
 				"memo":              jsonVal(backend.MarshalSearchAttributes(ch.Memo)),
-				"created_at": now, "updated_at": now,
+				"created_at":        now, "updated_at": now,
 			}),
 			spanner.InsertMap("wf_journal", map[string]any{
 				"instance_id": ch.ID, "seq": int64(1),
@@ -1215,6 +1215,23 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
 }
 
+// readDedupeRow reads a dedupe guard row with its format version. ok=false
+// when the row is absent. Rows predating the format_version column read a
+// NULL version, i.e. legacy (v0); see matchDedupeRow.
+func readDedupeRow(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID, key string) (stored string, version spanner.NullInt64, ok bool, err error) {
+	row, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, key}, []string{"dedupe_id", dedupeFormatVersionColumn})
+	if err != nil {
+		if isNotFound(err) {
+			return "", spanner.NullInt64{}, false, nil
+		}
+		return "", spanner.NullInt64{}, false, err
+	}
+	if err := row.Columns(&stored, &version); err != nil {
+		return "", spanner.NullInt64{}, false, err
+	}
+	return stored, version, true, nil
+}
+
 func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items []backend.InboxItem) error {
 	if len(items) == 0 {
 		return nil
@@ -1296,30 +1313,41 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						"instance_id": instanceID, "marker_key": dedupeMarkerKey(it.DedupeID), "created_at": now,
 					}))
 					baseExists := false
+					canonicalOccupied := false
 					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 						if isPostTerminalMarkerKey(bk) {
 							continue
 						}
-						_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, bk}, []string{"dedupe_id"})
-						if err == nil {
+						stored, version, ok, err := readDedupeRow(ctx, txn, instanceID, bk)
+						if err != nil {
+							return err
+						}
+						if !ok {
+							continue
+						}
+						if bk == escapeDedupeID(it.DedupeID) {
+							canonicalOccupied = true
+						}
+						if matchDedupeRow(it.DedupeID, bk, stored, version) {
 							baseExists = true
 							break
 						}
-						if !isNotFound(err) {
-							return err
-						}
 					}
-					if baseExists {
+					if baseExists || canonicalOccupied {
 						created[it.DedupeID] = true
 					} else {
 						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-							"instance_id": instanceID, "dedupe_id": dedupeKey(it.DedupeID), "created_at": now,
+							"instance_id": instanceID, "dedupe_id": dedupeKey(it.DedupeID),
+							dedupeFormatVersionColumn: dedupeFormatVersion, "created_at": now,
 						}))
 						created[it.DedupeID] = true
 					}
 				} else {
 					// Probe every stored user-key form, legacy raw first (Codex
 					// round 8 on #327): pre-escape rows stored "__" IDs verbatim.
+					// Ownership is version-aware (Codex round 13 on #296, see
+					// matchDedupeRow): a hit counts only when the row guards
+					// THIS DedupeID.
 					// Marker-shaped candidates are honored here (Codex round 12
 					// on #296): live markers live in their own table, and a
 					// running instance cannot own a post-terminal marker, so a
@@ -1329,23 +1357,49 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					// and duplicate the event. Terminal instances keep the
 					// marker-only rule (see the terminal base check above).
 					baseHit := false
+					canonicalOccupied := false
+					rawOccupied := false
 					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
-						_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, bk}, []string{"dedupe_id"})
-						if err == nil {
+						stored, version, ok, err := readDedupeRow(ctx, txn, instanceID, bk)
+						if err != nil {
+							return err
+						}
+						if !ok {
+							continue
+						}
+						if bk == escapeDedupeID(it.DedupeID) {
+							canonicalOccupied = true
+						}
+						if bk == it.DedupeID {
+							rawOccupied = true
+						}
+						if matchDedupeRow(it.DedupeID, bk, stored, version) {
 							baseHit = true
 							break
-						}
-						if !isNotFound(err) {
-							return err
 						}
 					}
 					if baseHit {
 						created[it.DedupeID] = true
 						continue
 					}
-					muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-						"instance_id": instanceID, "dedupe_id": dedupeKey(it.DedupeID), "created_at": now,
-					}))
+					// A foreign-owner row at this DedupeID's canonical key
+					// means the canonical guard cannot be created (it would
+					// collide), so the guard falls back to the raw key with
+					// an explicit version (dedupeFormatRawKeyVersion):
+					// delivery is preserved and retries keep deduping. Only
+					// when both keys are occupied (vanishingly rare: two
+					// foreign legacy rows) does the event insert unguarded.
+					if !canonicalOccupied {
+						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
+							"instance_id": instanceID, "dedupe_id": dedupeKey(it.DedupeID),
+							dedupeFormatVersionColumn: dedupeFormatVersion, "created_at": now,
+						}))
+					} else if !rawOccupied {
+						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
+							"instance_id": instanceID, "dedupe_id": it.DedupeID,
+							dedupeFormatVersionColumn: dedupeFormatRawKeyVersion, "created_at": now,
+						}))
+					}
 					created[it.DedupeID] = true
 				}
 			}

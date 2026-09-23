@@ -48,7 +48,8 @@ CREATE TABLE wf_inbox_seq (
 CREATE TABLE wf_signal_dedupe (
   instance_id STRING(255) NOT NULL,
   dedupe_id STRING(255) NOT NULL,
-  created_at TIMESTAMP NOT NULL
+  created_at TIMESTAMP NOT NULL,
+  format_version INT64
 ) PRIMARY KEY (instance_id, dedupe_id);
 
 -- Post-terminal retry markers live outside the dedupe keyspace (Codex round

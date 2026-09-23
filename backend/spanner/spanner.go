@@ -192,10 +192,14 @@ func (b *Backend) Migrate(ctx context.Context) error {
 CREATE TABLE wf_signal_dedupe (
   instance_id STRING(255) NOT NULL,
   dedupe_id STRING(255) NOT NULL,
-  created_at TIMESTAMP NOT NULL
+  created_at TIMESTAMP NOT NULL,
+  format_version INT64
 ) PRIMARY KEY (instance_id, dedupe_id)`}); err != nil {
 			return err
 		}
+	}
+	if err := b.ensureDedupeFormatVersionColumn(ctx); err != nil {
+		return err
 	}
 	seqExists, err := b.tableExists(ctx, "wf_inbox_seq")
 	if err != nil {
@@ -278,6 +282,15 @@ func (b *Backend) ensureInt64Column(ctx context.Context, table, column string) e
 		return nil
 	}
 	return b.applyDDL(ctx, []string{fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s INT64`, table, column)})
+}
+
+// ensureDedupeFormatVersionColumn backfills the format_version column on
+// wf_signal_dedupe for databases created before the round-13 (#296)
+// versioning. The column is nullable: existing rows read NULL, i.e. legacy
+// (v0), which probes match only by exact raw-ID equality (see
+// matchDedupeRow). No row rewrite is needed.
+func (b *Backend) ensureDedupeFormatVersionColumn(ctx context.Context) error {
+	return b.ensureInt64Column(ctx, "wf_signal_dedupe", dedupeFormatVersionColumn)
 }
 
 func (b *Backend) columnExists(ctx context.Context, table, column string) (bool, error) {
