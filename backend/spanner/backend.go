@@ -677,7 +677,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	}
 	now := nowUTC()
 
-	taskRow, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{adv.TaskID}, []string{"kind", "instance_id"})
+	taskRow, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{adv.TaskID}, []string{"kind", "instance_id", "worker_id", "attempt"})
 	if err != nil {
 		if isNotFound(err) {
 			return backend.ErrConflict
@@ -685,11 +685,24 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		return err
 	}
 	var kind, taskInst string
-	if err := taskRow.Columns(&kind, &taskInst); err != nil {
+	var worker spanner.NullString
+	var attempt int64
+	if err := taskRow.Columns(&kind, &taskInst, &worker, &attempt); err != nil {
 		return err
 	}
 	if kind != "workflow" || taskInst != adv.InstanceID {
 		return backend.ErrConflict
+	}
+	// Fence to the claimed generation (see Advancement): stale commits
+	// after a release + peer reclaim must fail without touching the peer.
+	if adv.WorkerID != "" {
+		got := ""
+		if worker.Valid {
+			got = worker.StringVal
+		}
+		if got != adv.WorkerID || int(attempt) != adv.Attempt {
+			return backend.ErrConflict
+		}
 	}
 
 	var muts []*spanner.Mutation

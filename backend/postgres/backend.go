@@ -565,10 +565,14 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 		return backend.ErrConflict
 	}
 
-	// Verify own task exists
+	// Verify own task exists, fenced to the claimed generation when
+	// present (see Advancement): a stale commit after a release + peer
+	// reclaim must not delete the peer's active task.
 	var kind string
-	err = tx.QueryRow(ctx, `SELECT kind FROM wf_tasks WHERE id = $1 AND instance_id = $2`,
-		adv.TaskID, adv.InstanceID).Scan(&kind)
+	var workerID *string
+	var attempt int
+	err = tx.QueryRow(ctx, `SELECT kind, worker_id, attempt FROM wf_tasks WHERE id = $1 AND instance_id = $2`,
+		adv.TaskID, adv.InstanceID).Scan(&kind, &workerID, &attempt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return backend.ErrConflict
@@ -577,6 +581,15 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 	}
 	if kind != "workflow" {
 		return backend.ErrConflict
+	}
+	if adv.WorkerID != "" {
+		got := ""
+		if workerID != nil {
+			got = *workerID
+		}
+		if got != adv.WorkerID || attempt != adv.Attempt {
+			return backend.ErrConflict
+		}
 	}
 
 	for _, ev := range adv.NewEvents {
@@ -719,9 +732,17 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 			}
 		}
 	}
-	_, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE id = $1`, adv.TaskID)
+	var delTag pgx.CommandTag
+	if adv.WorkerID != "" {
+		delTag, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE id = $1 AND worker_id = $2 AND attempt = $3`, adv.TaskID, adv.WorkerID, adv.Attempt)
+	} else {
+		delTag, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE id = $1`, adv.TaskID)
+	}
 	if err != nil {
 		return err
+	}
+	if adv.WorkerID != "" && delTag.RowsAffected() == 0 {
+		return backend.ErrConflict
 	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO wf_tasks (kind, instance_id, queue)

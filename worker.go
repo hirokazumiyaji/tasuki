@@ -561,7 +561,7 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					w.recordStoreError(ctx, "commit_workflow", herr,
 						"instance_id", t.InstanceID, "task_id", t.ID)
 					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", herr)
-					if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {
+					if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) || errors.Is(herr, backend.ErrNotFound) {
 						w.dropSticky(t.InstanceID)
 					}
 					// Contention releases immediately for fast replay;
@@ -909,6 +909,12 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task, stopRenewal
 		ExpectedSeq:  state.NextSeq,
 		DrainedInbox: drained,
 		NewEvents:    append([]journal.Event{}, ingested...),
+		// Fence the commit to the claimed generation (see Advancement):
+		// a slow/non-context-aware CommitAdvancement starting after the
+		// in-memory preflight could otherwise validate ID/sequence only
+		// and delete a peer's reclaimed task after a Shutdown release.
+		WorkerID: t.WorkerID,
+		Attempt:  t.Attempt,
 	}
 
 	pending := func() *pendingWorkflowCommit {

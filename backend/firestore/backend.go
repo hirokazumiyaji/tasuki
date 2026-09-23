@@ -857,6 +857,16 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 	if !taskSnap.Exists() || i64(taskSnap.Data(), "id") != adv.TaskID {
 		return advancementPrep{}, backend.ErrConflict
 	}
+	// Fence the commit to the claimed generation (worker_id + attempt),
+	// like the release/nack fences: a stale commit after a release + peer
+	// reclaim must not delete the peer's active task. Zero WorkerID stays
+	// unfenced for legacy callers.
+	if adv.WorkerID != "" {
+		m := taskSnap.Data()
+		if str(m, "worker_id") != adv.WorkerID || int(i64(m, "attempt")) != adv.Attempt {
+			return advancementPrep{}, backend.ErrConflict
+		}
+	}
 	inst := decodeInstance(instSnap.Data())
 	if adv.ParentNotify != nil && inst.ParentID != "" {
 		if err := seedInboxSeqTx(b, tx, alloc, inst.ParentID); err != nil {

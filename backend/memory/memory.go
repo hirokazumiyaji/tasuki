@@ -517,6 +517,15 @@ func (b *Backend) preflightAdvancementLocked(adv backend.Advancement) error {
 	if !ok || own.instanceID != adv.InstanceID || own.kind != "workflow" {
 		return backend.ErrConflict
 	}
+	// Fence the commit to the claimed generation (worker + attempt), like
+	// the renewal/release fences: a stale worker whose task was reclaimed
+	// (new worker/attempt) must not delete the peer's active task. A
+	// mismatch means the lease moved on; report ErrConflict so the worker
+	// treats the turn as lost without retrying the commit. Zero WorkerID
+	// stays unfenced for legacy callers.
+	if adv.WorkerID != "" && (own.workerID != adv.WorkerID || own.attempt != adv.Attempt) {
+		return backend.ErrConflict
+	}
 	return nil
 }
 
@@ -530,6 +539,9 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 	}
 	own, ok := b.tasks[adv.TaskID]
 	if !ok || own.instanceID != adv.InstanceID || own.kind != "workflow" {
+		return backend.ErrConflict
+	}
+	if adv.WorkerID != "" && (own.workerID != adv.WorkerID || own.attempt != adv.Attempt) {
 		return backend.ErrConflict
 	}
 

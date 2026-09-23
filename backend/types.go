@@ -135,6 +135,16 @@ type Advancement struct {
 	ParentNotify  *journal.Event
 	Terminal      *TerminalUpdate
 	EnsureWorkflowTask bool // if true, enqueue workflow task after commit when inbox remains or always for M0 helpers
+	// WorkerID and Attempt fence the commit to the claimed generation
+	// (like ReleaseLease/ExtendLease/NackTask): when WorkerID is non-empty,
+	// backends commit conditionally on worker_id+attempt and report
+	// ErrConflict (or ErrNotFound) without touching the peer's fresh lease
+	// when the lease moved on (peer reclaim after a delayed/shutdown
+	// release). Workers stamp these from the claimed task (see
+	// handleWorkflow/taskForCommit); a zero WorkerID falls back to the
+	// legacy unconditional commit by ID for older callers/tests.
+	WorkerID string
+	Attempt  int
 }
 
 // InboxItem is one event for SendToInboxBatch.

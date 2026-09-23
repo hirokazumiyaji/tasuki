@@ -1037,27 +1037,42 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 		// follow-up is then part of the same atomic transaction, so no
 		// crash gap can stall the remaining replayed commands (recovery
 		// cannot detect them: they leave no inbox behind).
-		items = append(items, b.refreshWorkflowTask(adv.InstanceID, adv.TaskID, inst.Queue, now))
+		items = append(items, b.refreshWorkflowTask(adv, inst.Queue, now))
 	} else {
-		items = append(items, delWithValues(b.table("wf_tasks"), map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))}, "id = :taskid AND kind = :workflow", map[string]types.AttributeValue{":taskid": avN(adv.TaskID), ":workflow": avS("workflow")}))
+		cond := "id = :taskid AND kind = :workflow"
+		vals := map[string]types.AttributeValue{":taskid": avN(adv.TaskID), ":workflow": avS("workflow")}
+		if adv.WorkerID != "" {
+			cond += " AND worker_id = :wid AND attempt = :attempt"
+			vals[":wid"] = avS(adv.WorkerID)
+			vals[":attempt"] = avN(int64(adv.Attempt))
+		}
+		items = append(items, delWithValues(b.table("wf_tasks"), map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))}, cond, vals))
 	}
 	return items, parentID, nil
 }
 
 // refreshWorkflowTask atomically carries the singleton workflow task past a
 // truncated advancement: one Update on the same key instead of Delete +
-// post-commit Put. The fence (id/kind condition) is preserved so a zombie
-// task that lost its lease still fails the transaction.
-func (b *Backend) refreshWorkflowTask(instanceID string, taskID int64, queue string, now time.Time) types.TransactWriteItem {
+// post-commit Put. The fence (id/kind condition, plus worker_id/attempt
+// when the advancement carries the claimed generation) is preserved so a
+// zombie task that lost its lease still fails the transaction.
+func (b *Backend) refreshWorkflowTask(adv backend.Advancement, queue string, now time.Time) types.TransactWriteItem {
+	cond := "id = :taskid AND kind = :workflow"
+	vals := map[string]types.AttributeValue{
+		":newid": avN(newID()), ":v": avN(timeToN(now)), ":zero": avN(0), ":now": avN(timeToN(now)),
+		":taskid": avN(adv.TaskID), ":workflow": avS("workflow"),
+	}
+	if adv.WorkerID != "" {
+		cond += " AND worker_id = :wid AND attempt = :attempt"
+		vals[":wid"] = avS(adv.WorkerID)
+		vals[":attempt"] = avN(int64(adv.Attempt))
+	}
 	return types.TransactWriteItem{Update: &types.Update{
 		TableName:           aws.String(b.table("wf_tasks")),
-		Key:                 map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(instanceID))},
+		Key:                 map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))},
 		UpdateExpression:    aws.String("SET id = :newid, visible_at = :v, attempt = :zero, created_at = :now REMOVE worker_id"),
-		ConditionExpression: aws.String("id = :taskid AND kind = :workflow"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":newid": avN(newID()), ":v": avN(timeToN(now)), ":zero": avN(0), ":now": avN(timeToN(now)),
-			":taskid": avN(taskID), ":workflow": avS("workflow"),
-		},
+		ConditionExpression: aws.String(cond),
+		ExpressionAttributeValues: vals,
 	}}
 }
 

@@ -97,13 +97,28 @@ func TestWorkflow_PendingCommitStaysTrackedThroughFlush(t *testing.T) {
 		t.Fatal("tick did not finish")
 	}
 
-	// The commit still lands after the release: the task delete is by ID.
+	// The fenced commit must NOT land after the release: the advancement
+	// carries the w1 generation while the release cleared the lease, so the
+	// backend reports ErrConflict without deleting the task. The turn stays
+	// running and reclaimable (round-8 commit fencing closes the
+	// check-to-commit race where the preflight passed before the release).
 	info, err := c.Get(ctx, h.ID())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Status != StatusCompleted {
-		t.Fatalf("status=%s, want completed", info.Status)
+	if info.Status != StatusRunning {
+		t.Fatalf("status=%s, want running (fenced commit must not land after the release)", info.Status)
+	}
+	// The released task is immediately reclaimable by a peer.
+	peer, err := mem.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "workflow", Queues: []string{"default"}, Limit: 1,
+		Lease: time.Minute, WorkerID: "peer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(peer) != 1 {
+		t.Fatalf("peer claimed %d, want 1 (released pending task must be reclaimable)", len(peer))
 	}
 }
 

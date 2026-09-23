@@ -124,9 +124,15 @@ func (w *Worker) commitWorkflow(ctx context.Context, task backend.Task, baseJour
 	if instanceID == "" {
 		instanceID = adv.InstanceID
 	}
+	// Stamp the claim generation for legacy/test paths that built adv
+	// without it (see Advancement): production handleWorkflow already
+	// stamps, but taskForCommit callers may carry only adv. A fenced commit
+	// that lost its lease reports ErrConflict/ErrNotFound and must not be
+	// retried — the worker treats it as lost (see requeueWorkflowTask).
+	adv = w.advForCommit(task, adv)
 	err := w.backend.CommitAdvancement(ctx, adv)
 	if err != nil {
-		if errors.Is(err, backend.ErrConflict) {
+		if errors.Is(err, backend.ErrConflict) || errors.Is(err, backend.ErrNotFound) {
 			w.dropSticky(instanceID)
 		}
 		// Contention releases immediately for fast replay; other commit
@@ -197,7 +203,12 @@ func (w *Worker) wfLeaseExpired(taskID int64) bool {
 // skips the nack and expiry reclaims naturally. Nack failures share the
 // release_lease store-error op label to keep the op vocabulary bounded.
 func (w *Worker) requeueWorkflowTask(ctx context.Context, t backend.Task, herr error) {
-	if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {
+	// A fenced commit that lost its lease reports ErrConflict (generation
+	// mismatch) or ErrNotFound (task gone): the turn is lost, release
+	// immediately for fast replay (fenced, so a peer's fresh lease is
+	// untouched) and never retry the commit. Other failures back off via
+	// delayed nack.
+	if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) || errors.Is(herr, backend.ErrNotFound) {
 		if rerr := w.backend.ReleaseLease(ctx, t); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
 			w.recordStoreError(ctx, "release_lease", rerr, "task_id", t.ID)
 		}
@@ -261,7 +272,7 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 	if batcher, ok := w.backend.(backend.AdvancementBatcher); ok && len(owned) > 1 {
 		advs := make([]backend.Advancement, len(owned))
 		for i, p := range owned {
-			advs[i] = p.adv
+			advs[i] = w.advForCommit(w.taskForCommit(p), p.adv)
 		}
 		if err := batcher.CommitAdvancements(ctx, advs); err != nil {
 			w.recordStoreError(ctx, "commit_workflow", err, "n", len(owned))
@@ -316,6 +327,22 @@ func (w *Worker) taskForCommit(p pendingWorkflowCommit) backend.Task {
 		Kind:       "workflow",
 		InstanceID: p.instanceID,
 	}
+}
+
+// advForCommit resolves the fenced commit advancement for a pending commit:
+// the claim generation (worker + attempt) travels in the Advancement itself
+// so the backend can condition the transactional commit on it (see
+// Advancement). Production handleWorkflow already stamps; legacy/test
+// advancements built without generation inherit the pending task's token
+// here, keeping the worker preflight as fast path and the backend fence as
+// the atomic check-to-commit guard. A zero WorkerID stays unfenced for
+// older callers.
+func (w *Worker) advForCommit(task backend.Task, adv backend.Advancement) backend.Advancement {
+	if adv.WorkerID == "" && task.WorkerID != "" {
+		adv.WorkerID = task.WorkerID
+		adv.Attempt = task.Attempt
+	}
+	return adv
 }
 
 func (w *Worker) applyStickyAfterCommit(instanceID string, baseJournal []journal.Event, adv backend.Advancement) {
