@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -58,11 +59,17 @@ type Backend struct {
 	// for a callback that already removed its entry but has not yet
 	// finished writeWake. Each callback write carries a wakeWriteTimeout
 	// bound, so the wait is bounded even when DynamoDB stalls.
+	// wakeClosed is set at Close entry, before the flush snapshot: once
+	// set, touchWake never creates maps or schedules new timers and
+	// instead writes synchronously (best-effort, bounded), so a mutation
+	// racing Close still lands instead of being dropped with the stopped
+	// timers on fast exit.
 	wakeMu       sync.Mutex
 	wakePending  map[string]wakeEntry
 	wakeTimers   map[string]*time.Timer
 	wakeDebounce time.Duration
 	wakeWG       sync.WaitGroup
+	wakeClosed   atomic.Bool
 }
 
 type wakeEntry struct {
@@ -120,6 +127,12 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 }
 
 func (b *Backend) Close() error {
+	// Mark closed BEFORE the flush snapshot: touchWake checks this flag
+	// (fast path plus a recheck under wakeMu) and switches to synchronous
+	// best-effort writes, so no new debounce timers can be scheduled once
+	// closing begins and post-Close mutation wakes are never lost with
+	// the stopped timers on fast exit.
+	b.wakeClosed.Store(true)
 	// Flush debounced cross-process wake writes (see flushPendingWakes);
 	// otherwise a Close within the debounce window would drop them.
 	b.flushPendingWakes()

@@ -3,6 +3,7 @@ package dynamodb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -459,6 +460,74 @@ func TestClose_FlushesDistinctTerminalWakes(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&f.updateCalls); got != 2 {
 		t.Fatalf("UpdateItem calls after Close = %d, want 2 (one per instance)", got)
+	}
+}
+
+func TestClose_TouchWakeAfterCloseWritesSynchronously(t *testing.T) {
+	f := &fakeDynamo{}
+	b := newTestBackend(f)
+	// Hour-long window: no timer can fire on its own, so any write after
+	// Close must come from the synchronous post-Close path.
+	b.wakeDebounce = time.Hour
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	b.notifyTasks()
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt64(&f.updateCalls) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("post-Close wake was dropped instead of written synchronously")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := atomic.LoadInt64(&f.updateCalls); got != 1 {
+		t.Fatalf("UpdateItem calls = %d, want 1 (post-Close wake writes once)", got)
+	}
+	// No debounce state may be recreated after Close: no maps, no timers.
+	b.wakeMu.Lock()
+	pendingNil := b.wakePending == nil
+	timers := len(b.wakeTimers)
+	b.wakeMu.Unlock()
+	if !pendingNil || timers != 0 {
+		t.Fatalf("post-Close touchWake recreated debounce state: pendingNil=%v timers=%d", pendingNil, timers)
+	}
+	// A second post-Close wake also lands (no coalescing once closed).
+	b.notifyTerminal("post-close-a")
+	deadline = time.Now().Add(2 * time.Second)
+	for atomic.LoadInt64(&f.updateCalls) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("second post-Close wake was dropped")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestClose_MutationRacingCloseIsAccounted(t *testing.T) {
+	f := &fakeDynamo{}
+	b := newTestBackend(f)
+	b.wakeDebounce = time.Hour
+	// Distinct terminal keys never coalesce, so every racing mutation
+	// must produce exactly one write: either flushed by Close (pre-close
+	// snapshot) or written synchronously by touchWake (post-Close flag).
+	const n = 16
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			b.notifyTerminal(fmt.Sprintf("race-%d", i))
+		}(i)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	wg.Wait()
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt64(&f.updateCalls) != n {
+		if time.Now().After(deadline) {
+			t.Fatalf("UpdateItem calls = %d, want %d (every racing wake must land)", atomic.LoadInt64(&f.updateCalls), n)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

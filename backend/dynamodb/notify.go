@@ -92,8 +92,20 @@ func (b *Backend) wakeDebounceOrDefault() time.Duration {
 // SendToInbox/...) collapse into a single write per debounce window.
 // Terminal wakes are keyed by instance ID so distinct completions never
 // coalesce away each other's payload (the wake item holds one id).
+//
+// Once Close begins (wakeClosed set at Close entry), no new debounce state
+// is created: the wake is written synchronously and best-effort with a
+// wakeWriteTimeout-bound context instead of being dropped with the stopped
+// timers. Post-Close wakes deliberately bypass coalescing — each one writes
+// — so a mutation racing Close still lands on fast exit. The synchronous
+// path touches no shared wake state, so it never interferes with the
+// in-flight flush or its wakeWG wait.
 func (b *Backend) touchWake(ctx context.Context, pk, instanceID string) {
 	_ = ctx
+	if b.wakeClosed.Load() {
+		b.writeWakeBounded(pk, instanceID)
+		return
+	}
 	d := b.wakeDebounceOrDefault()
 	if d <= 0 {
 		b.writeWake(context.Background(), pk, instanceID)
@@ -101,6 +113,19 @@ func (b *Backend) touchWake(ctx context.Context, pk, instanceID string) {
 	}
 	key := pk + "\x00" + instanceID
 	b.wakeMu.Lock()
+	if b.wakeClosed.Load() {
+		// Lost the race with Close after the fast-path check: Close has
+		// set the flag and either already snapshotted (an entry created
+		// here would be lost) or is about to. Fall back to the
+		// synchronous path without touching shared state. The lock
+		// serializes this recheck against the flush snapshot, so every
+		// touchWake is either flushed by Close or written here: none is
+		// dropped. It also keeps wakeWG.Add clear of the flush's Wait,
+		// which must never observe an Add once its counter is zero.
+		b.wakeMu.Unlock()
+		b.writeWakeBounded(pk, instanceID)
+		return
+	}
 	if b.wakePending == nil {
 		b.wakePending = make(map[string]wakeEntry)
 		b.wakeTimers = make(map[string]*time.Timer)
@@ -149,19 +174,31 @@ func (b *Backend) writeWake(ctx context.Context, pk, instanceID string) {
 	})
 }
 
+// writeWakeBounded performs one best-effort wf_wake UpdateItem with the
+// shared wakeWriteTimeout budget. Used by the post-Close touchWake path so a
+// stalled DynamoDB cannot hang the mutating goroutine, mirroring the bound
+// on timer-callback and flush writes. Errors are ignored like everywhere
+// else on this path: wakes are hints, not commits.
+func (b *Backend) writeWakeBounded(pk, instanceID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), wakeWriteTimeout)
+	defer cancel()
+	b.writeWake(ctx, pk, instanceID)
+}
+
 // flushPendingWakes synchronously writes every debounced wake still waiting
 // in the current window. Called by Close so a short-lived process that exits
 // right after a mutation still delivers its cross-process wf_wake update
 // instead of dropping it with the stopped timer. Best-effort (write errors
 // are ignored, like the timer path) and idempotent: a second call finds no
-// pending entries. Wakes scheduled concurrently with the flush land in a
-// fresh window and fire on their own timer. A timer callback that fired at
-// the boundary (entry already removed, writeWake still in flight) is waited
-// on via wakeWG so Close never returns before its write completes. Every
-// write — the synchronous flush and each boundary callback — carries a
-// wakeWriteTimeout bound and the callbacks run concurrently, so Close
-// returns within roughly one budget even when DynamoDB stalls instead of
-// blocking indefinitely.
+// pending entries. Wakes racing the flush after wakeClosed is set bypass the
+// debounce maps entirely and write synchronously from their own goroutine,
+// so every wake is either flushed here or written there: none is dropped. A
+// timer callback that fired at the boundary (entry already removed, writeWake
+// still in flight) is waited on via wakeWG so Close never returns before its
+// write completes. Every write — the synchronous flush and each boundary
+// callback — carries a wakeWriteTimeout bound and the callbacks run
+// concurrently, so Close returns within roughly one budget even when
+// DynamoDB stalls instead of blocking indefinitely.
 func (b *Backend) flushPendingWakes() {
 	b.wakeMu.Lock()
 	pending := b.wakePending
