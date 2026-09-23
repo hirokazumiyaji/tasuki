@@ -303,62 +303,84 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		if len(out) >= req.Limit {
 			break
 		}
-		it := b.col("wf_tasks").Where("kind", "==", req.Kind).Where("queue", "==", q).Where("visible_at", "<=", now).OrderBy("visible_at", gcf.Asc).Limit(req.Limit - len(out)).Documents(ctx)
-		for {
-			d, err := it.Next()
-			if err == iterator.Done {
+		// Terminal-instance tasks are deleted on sight (best-effort) and
+		// the scan repeats while deletions free slots: without the delete
+		// a Limit:1 poll stuck behind one terminal task would return it on
+		// every call and starve the live tasks queued behind it.
+		for len(out) < req.Limit {
+			need := req.Limit - len(out)
+			it := b.col("wf_tasks").Where("kind", "==", req.Kind).Where("queue", "==", q).Where("visible_at", "<=", now).OrderBy("visible_at", gcf.Asc).Limit(need).Documents(ctx)
+			fetched, deleted := 0, 0
+			for {
+				d, err := it.Next()
+				if err == iterator.Done {
+					break
+				}
+				if err != nil {
+					it.Stop()
+					return nil, err
+				}
+				fetched++
+				old := timestamp(d.Data(), "visible_at")
+				var claimed backend.Task
+				terminal := false
+				err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+					s, e := tx.Get(d.Ref)
+					if isNotFound(e) {
+						return backend.ErrConflict
+					}
+					if e != nil {
+						return e
+					}
+					if !s.Exists() || !timestamp(s.Data(), "visible_at").Equal(old) {
+						return backend.ErrConflict
+					}
+					m := s.Data()
+					// Fence against TerminateInstance: never lease a task whose
+					// instance already left running. Reading the instance doc
+					// inside the claim transaction also conflicts with a
+					// concurrent status flip, restoring the exclusion the
+					// pre-chunk single-transaction terminate had. A stale
+					// terminal task is removed in the same transaction so
+					// later polls (and the refill pass below) reach live
+					// tasks; a commit conflict drops the delete and the next
+					// poll retries.
+					instID := str(m, "instance_id")
+					isnap, e := tx.Get(b.ref("wf_instances", instID))
+					if e != nil && !isNotFound(e) {
+						return e
+					}
+					if e == nil && isnap.Exists() && str(isnap.Data(), "status") == "running" {
+						claimed = decodeTask(m)
+						claimed.Attempt++
+						claimed.VisibleAt = now.Add(req.Lease)
+						claimed.WorkerID = req.WorkerID
+						return tx.Update(d.Ref, []gcf.Update{{Path: "visible_at", Value: claimed.VisibleAt}, {Path: "worker_id", Value: req.WorkerID}, {Path: "attempt", Value: int64(claimed.Attempt)}})
+					}
+					terminal = true
+					return tx.Delete(d.Ref)
+				})
+				if err == backend.ErrConflict {
+					continue
+				}
+				if err != nil {
+					it.Stop()
+					return nil, err
+				}
+				if terminal {
+					deleted++
+					continue
+				}
+				out = append(out, claimed)
+				if len(out) >= req.Limit {
+					break
+				}
+			}
+			it.Stop()
+			if fetched < need || deleted == 0 {
 				break
 			}
-			if err != nil {
-				it.Stop()
-				return nil, err
-			}
-			old := timestamp(d.Data(), "visible_at")
-			var claimed backend.Task
-			err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
-				s, e := tx.Get(d.Ref)
-				if isNotFound(e) {
-					return backend.ErrConflict
-				}
-				if e != nil {
-					return e
-				}
-				if !s.Exists() || !timestamp(s.Data(), "visible_at").Equal(old) {
-					return backend.ErrConflict
-				}
-				m := s.Data()
-				// Fence against TerminateInstance: never lease a task whose
-				// instance already left running. Reading the instance doc
-				// inside the claim transaction also conflicts with a
-				// concurrent status flip, restoring the exclusion the
-				// pre-chunk single-transaction terminate had.
-				instID := str(m, "instance_id")
-				isnap, e := tx.Get(b.ref("wf_instances", instID))
-				if isNotFound(e) {
-					return backend.ErrConflict
-				}
-				if e != nil {
-					return e
-				}
-				if !isnap.Exists() || str(isnap.Data(), "status") != "running" {
-					return backend.ErrConflict
-				}
-				claimed = decodeTask(m)
-				claimed.Attempt++
-				claimed.VisibleAt = now.Add(req.Lease)
-				claimed.WorkerID = req.WorkerID
-				return tx.Update(d.Ref, []gcf.Update{{Path: "visible_at", Value: claimed.VisibleAt}, {Path: "worker_id", Value: req.WorkerID}, {Path: "attempt", Value: int64(claimed.Attempt)}})
-			})
-			if err == backend.ErrConflict {
-				continue
-			}
-			if err != nil {
-				it.Stop()
-				return nil, err
-			}
-			out = append(out, claimed)
 		}
-		it.Stop()
 	}
 	return out, nil
 }
@@ -541,11 +563,15 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			// transaction: a terminal commit with hundreds of dedupe keys
 			// would otherwise exceed the 500-write transaction limit.
 			// Best-effort (DynamoDB parity); leftovers are reaped by purge.
+			// Only keys predating the terminal commit (now) are removed: a
+			// concurrent SendToInbox with a new DedupeID can land after
+			// notifyTerminal fired above, and sweeping its key while the
+			// inbox event remains would duplicate a later retry.
 			// The sweep stays synchronous so a redelivered DedupeID inserts
 			// anew once this call returns, but runs under a bounded context
 			// so a stuck store delays only this cleanup, never the caller.
 			cctx, cancel := context.WithTimeout(context.Background(), signalDedupeSweepTimeout)
-			_ = b.sweepSignalDedupe(cctx, adv.InstanceID)
+			_ = b.sweepSignalDedupe(cctx, adv.InstanceID, now)
 			cancel()
 		}
 	}

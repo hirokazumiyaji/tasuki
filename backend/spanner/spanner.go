@@ -320,7 +320,7 @@ func (b *Backend) Reset(ctx context.Context) error {
 	type keyQuery struct {
 		table string
 		sql   string
-		kind  string // "string" | "int64" | "pair"
+		kind  string // "string" | "int64" | "pair" | "strpair"
 	}
 	queries := []keyQuery{
 		{table: "wf_schedules", sql: `SELECT id FROM wf_schedules`, kind: "string"},
@@ -328,6 +328,7 @@ func (b *Backend) Reset(ctx context.Context) error {
 		{table: "wf_tasks", sql: `SELECT id FROM wf_tasks`, kind: "int64"},
 		{table: "wf_inbox", sql: `SELECT id FROM wf_inbox`, kind: "int64"},
 		{table: "wf_inbox_seq", sql: `SELECT instance_id FROM wf_inbox_seq`, kind: "string"},
+		{table: "wf_signal_dedupe", sql: `SELECT instance_id, dedupe_id FROM wf_signal_dedupe`, kind: "strpair"},
 		{table: "wf_journal", sql: `SELECT instance_id, seq FROM wf_journal`, kind: "pair"},
 		{table: "wf_instances", sql: `SELECT id FROM wf_instances`, kind: "string"},
 	}
@@ -367,6 +368,13 @@ func (b *Backend) Reset(ctx context.Context) error {
 						return err
 					}
 					muts = append(muts, spanner.Delete(q.table, spanner.Key{instanceID, seq}))
+				case "strpair":
+					var instanceID, second string
+					if err := row.Columns(&instanceID, &second); err != nil {
+						iter.Stop()
+						return err
+					}
+					muts = append(muts, spanner.Delete(q.table, spanner.Key{instanceID, second}))
 				}
 			}
 			iter.Stop()

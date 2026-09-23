@@ -77,10 +77,58 @@ func (b *Backend) sweepTerminateDocs(ctx context.Context, id string) error {
 	return nil
 }
 
-// sweepSignalDedupe removes an instance's dedupe keys in paged batches.
-// Called best-effort after terminal advancements commit.
-func (b *Backend) sweepSignalDedupe(ctx context.Context, id string) error {
-	return b.deleteDocsByInstance(ctx, "wf_signal_dedupe", id, nil)
+// sweepSignalDedupe removes an instance's dedupe keys created at or before
+// the terminal commit (cutoff), in paged batches. Called best-effort after
+// terminal advancements commit.
+//
+// Only pre-commit keys are removed: notifyTerminal fires before this sweep,
+// so a concurrent SendToInbox with a new DedupeID can land inside the sweep
+// window. Deleting that key while its inbox event remains would let a later
+// retry of the same DedupeID duplicate the signal, so keys stamped after the
+// terminal commit are left for purge. The bound is applied client-side: an
+// instance_id + created_at server-side query would need a composite index
+// (see purge.go). Docs without created_at predate the stamping and are
+// removed.
+//
+// The loop stops at the first page with nothing deletable: post-commit keys
+// never shrink the result set, so re-querying until empty could spin while
+// sends keep arriving. Residual pre-commit keys stranded behind a page of
+// newer keys stay for purge (the same best-effort model as the sweep
+// timeout above).
+func (b *Backend) sweepSignalDedupe(ctx context.Context, id string, cutoff time.Time) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		it := b.col("wf_signal_dedupe").Where("instance_id", "==", id).Limit(firestoreSweepBatchSize).Documents(ctx)
+		batch := b.client.Batch()
+		n, deletable := 0, 0
+		for {
+			dsnap, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				it.Stop()
+				return err
+			}
+			n++
+			if ts := timestamp(dsnap.Data(), "created_at"); ts.IsZero() || !ts.After(cutoff) {
+				batch.Delete(dsnap.Ref)
+				deletable++
+			}
+		}
+		it.Stop()
+		if deletable == 0 {
+			return nil
+		}
+		if _, err := batch.Commit(ctx); err != nil {
+			return err
+		}
+		if n < firestoreSweepBatchSize {
+			return nil
+		}
+	}
 }
 
 // deleteDocsByInstance deletes every document in col with instance_id == id,

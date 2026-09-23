@@ -311,81 +311,115 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 	var out []backend.Task
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		out = nil
-		iter := txn.Query(ctx, spanner.Statement{
-			SQL: `SELECT id, visible_at, instance_id FROM wf_tasks
-				WHERE kind = @kind AND visible_at <= @now AND queue IN UNNEST(@queues)
-				ORDER BY visible_at, id LIMIT @limit`,
-			Params: map[string]any{
-				"kind": req.Kind, "now": now, "queues": req.Queues, "limit": int64(req.Limit),
-			},
-		})
-		type cand struct {
-			id         int64
-			vis        time.Time
-			instanceID string
-		}
-		var cands []cand
-		for {
-			row, err := iter.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				iter.Stop()
-				return err
-			}
-			var c cand
-			if err := row.Columns(&c.id, &c.vis, &c.instanceID); err != nil {
-				iter.Stop()
-				return err
-			}
-			cands = append(cands, c)
-		}
-		iter.Stop()
-
-		for _, c := range cands {
-			// Fence against TerminateInstance: never lease a task whose
-			// instance already left running. Reading the instance row inside
-			// the claim transaction also conflicts with a concurrent status
-			// flip, restoring the exclusion the pre-chunk single-transaction
-			// terminate had (status + task deletes committed atomically).
-			irow, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{c.instanceID}, []string{"status"})
-			if err != nil {
-				if isNotFound(err) {
-					continue
-				}
-				return err
-			}
-			var st string
-			if err := irow.Columns(&st); err != nil {
-				return err
-			}
-			if st != "running" {
-				continue
-			}
-			n, err := txn.Update(ctx, spanner.Statement{
-				SQL: `UPDATE wf_tasks SET visible_at = @vis, attempt = attempt + 1, worker_id = @wid
-					WHERE id = @id AND visible_at = @old`,
+		// Terminal-instance tasks are deleted on sight (best-effort) and
+		// the select repeats while deletions free slots: without the
+		// delete a Limit:1 poll stuck behind one terminal task would
+		// return it on every call and starve the live tasks queued
+		// behind it. Each repeat deletes at least one row, so the loop
+		// terminates; lease races alone never trigger a repeat.
+		for len(out) < req.Limit {
+			need := int64(req.Limit - len(out))
+			iter := txn.Query(ctx, spanner.Statement{
+				SQL: `SELECT id, visible_at, instance_id FROM wf_tasks
+					WHERE kind = @kind AND visible_at <= @now AND queue IN UNNEST(@queues)
+					ORDER BY visible_at, id LIMIT @limit`,
 				Params: map[string]any{
-					"vis": visAt, "wid": req.WorkerID, "id": c.id, "old": c.vis,
+					"kind": req.Kind, "now": now, "queues": req.Queues, "limit": need,
 				},
 			})
-			if err != nil {
-				return err
+			type cand struct {
+				id         int64
+				vis        time.Time
+				instanceID string
 			}
-			if n == 0 {
-				continue
+			var cands []cand
+			for {
+				row, err := iter.Next()
+				if err == iterator.Done {
+					break
+				}
+				if err != nil {
+					iter.Stop()
+					return err
+				}
+				var c cand
+				if err := row.Columns(&c.id, &c.vis, &c.instanceID); err != nil {
+					iter.Stop()
+					return err
+				}
+				cands = append(cands, c)
 			}
-			row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{c.id},
-				[]string{"id", "kind", "queue", "instance_id", "ref_seq", "payload", "attempt", "visible_at", "worker_id", "heartbeat"})
-			if err != nil {
-				return err
+			iter.Stop()
+			if len(cands) == 0 {
+				break
 			}
-			t, err := scanTask(row)
-			if err != nil {
-				return err
+			deleted := 0
+			for _, c := range cands {
+				if len(out) >= req.Limit {
+					break
+				}
+				// Fence against TerminateInstance: never lease a task whose
+				// instance already left running. Reading the instance row inside
+				// the claim transaction also conflicts with a concurrent status
+				// flip, restoring the exclusion the pre-chunk single-transaction
+				// terminate had (status + task deletes committed atomically).
+				// A stale terminal task is deleted here so later polls (and
+				// the repeat select above) reach live tasks.
+				irow, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{c.instanceID}, []string{"status"})
+				if err != nil {
+					if isNotFound(err) {
+						if _, err := txn.Update(ctx, spanner.Statement{
+							SQL:    `DELETE FROM wf_tasks WHERE id = @id`,
+							Params: map[string]any{"id": c.id},
+						}); err != nil {
+							return err
+						}
+						deleted++
+						continue
+					}
+					return err
+				}
+				var st string
+				if err := irow.Columns(&st); err != nil {
+					return err
+				}
+				if st != "running" {
+					if _, err := txn.Update(ctx, spanner.Statement{
+						SQL:    `DELETE FROM wf_tasks WHERE id = @id`,
+						Params: map[string]any{"id": c.id},
+					}); err != nil {
+						return err
+					}
+					deleted++
+					continue
+				}
+				n, err := txn.Update(ctx, spanner.Statement{
+					SQL: `UPDATE wf_tasks SET visible_at = @vis, attempt = attempt + 1, worker_id = @wid
+						WHERE id = @id AND visible_at = @old`,
+					Params: map[string]any{
+						"vis": visAt, "wid": req.WorkerID, "id": c.id, "old": c.vis,
+					},
+				})
+				if err != nil {
+					return err
+				}
+				if n == 0 {
+					continue
+				}
+				row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{c.id},
+					[]string{"id", "kind", "queue", "instance_id", "ref_seq", "payload", "attempt", "visible_at", "worker_id", "heartbeat"})
+				if err != nil {
+					return err
+				}
+				t, err := scanTask(row)
+				if err != nil {
+					return err
+				}
+				out = append(out, t)
 			}
-			out = append(out, t)
+			if deleted == 0 {
+				break
+			}
 		}
 		return nil
 	})
@@ -602,11 +636,19 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			// Dedupe cleanup stays out of the advancement transaction so the
 			// mutation count never scales with accumulated dedupe keys.
 			// Best-effort (DynamoDB/Firestore parity); purge reaps leftovers.
-			// The sweep stays synchronous so a redelivered DedupeID inserts
-			// anew once this call returns, but runs under a bounded context
-			// so a stuck store delays only this cleanup, never the caller.
+			// Only keys predating the terminal commit are removed: a
+			// concurrent SendToInbox with a new DedupeID can land after
+			// notifyTerminal fired above, and sweeping its key while the
+			// inbox event remains would duplicate a later retry. The sweep
+			// stays synchronous so a redelivered DedupeID inserts anew once
+			// this call returns, but runs under a bounded context so a
+			// stuck store delays only this cleanup, never the caller.
 			cctx, cancel := context.WithTimeout(context.Background(), signalDedupeSweepTimeout)
-			_ = b.sweepSignalDedupe(cctx, adv.InstanceID, nil)
+			if cutoff := b.terminalCutoff(cctx, adv.InstanceID); !cutoff.IsZero() {
+				_ = b.sweepSignalDedupe(cctx, adv.InstanceID, nil, cutoff)
+			}
+			// A zero cutoff means the instance row is already gone
+			// (concurrent purge): purge owns the leftover rows then.
 			cancel()
 		}
 	}
@@ -616,6 +658,25 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 func (b *Backend) withRW(ctx context.Context, fn func(context.Context, *spanner.ReadWriteTransaction) error) error {
 	_, err := b.client.ReadWriteTransaction(ctx, fn)
 	return err
+}
+
+// terminalCutoff returns the terminal-transition time the advancement commit
+// recorded on the instance row. The post-commit dedupe sweep removes only
+// keys created at or before it, so a concurrent send landing after the
+// commit keeps its key (and a later retry still dedupes). Zero means the
+// instance row is already gone — a concurrent purge owns the leftovers — or
+// the read failed, in which case the best-effort sweep is skipped and purge
+// reaps everything.
+func (b *Backend) terminalCutoff(ctx context.Context, id string) time.Time {
+	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"completed_at"})
+	if err != nil {
+		return time.Time{}
+	}
+	var ts spanner.NullTime
+	if err := row.Columns(&ts); err != nil || !ts.Valid {
+		return time.Time{}
+	}
+	return ts.Time
 }
 
 func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWriteTransaction, adv backend.Advancement) error {

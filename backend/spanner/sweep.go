@@ -101,12 +101,33 @@ func (b *Backend) sweepTerminateDocs(ctx context.Context, id string) error {
 	if err := b.deleteTimersForInstance(ctx, id, nil); err != nil {
 		return err
 	}
-	return b.sweepSignalDedupe(ctx, id, nil)
+	return b.sweepSignalDedupe(ctx, id, nil, time.Time{})
 }
 
-// sweepSignalDedupe removes an instance's dedupe keys in paged transactions.
-// Called best-effort after terminal advancements commit.
-func (b *Backend) sweepSignalDedupe(ctx context.Context, id string, guard sweepGuard) error {
+// sweepSignalDedupe removes an instance's dedupe keys created at or before
+// cutoff in paged transactions. Called best-effort after terminal
+// advancements commit.
+//
+// Only pre-commit keys are removed: notifyTerminal fires before this sweep,
+// so a concurrent SendToInbox with a new DedupeID can land inside the sweep
+// window. Deleting that key while its inbox event remains would let a later
+// retry of the same DedupeID duplicate the signal, so keys stamped after the
+// terminal commit are left for purge. A zero cutoff disables the bound (the
+// terminate path, where notify fires after the sweep and the full key set
+// must go).
+func (b *Backend) sweepSignalDedupe(ctx context.Context, id string, guard sweepGuard, cutoff time.Time) error {
+	stmt := func() spanner.Statement {
+		if cutoff.IsZero() {
+			return spanner.Statement{
+				SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id LIMIT @limit`,
+				Params: map[string]any{"id": id, "limit": int64(spannerSweepBatchSize)},
+			}
+		}
+		return spanner.Statement{
+			SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id AND created_at <= @cutoff LIMIT @limit`,
+			Params: map[string]any{"id": id, "limit": int64(spannerSweepBatchSize), "cutoff": cutoff},
+		}
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -117,10 +138,7 @@ func (b *Backend) sweepSignalDedupe(ctx context.Context, id string, guard sweepG
 		var keys []string
 		err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 			keys = keys[:0]
-			iter := txn.Query(ctx, spanner.Statement{
-				SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id LIMIT @limit`,
-				Params: map[string]any{"id": id, "limit": int64(spannerSweepBatchSize)},
-			})
+			iter := txn.Query(ctx, stmt())
 			defer iter.Stop()
 			for {
 				row, err := iter.Next()
