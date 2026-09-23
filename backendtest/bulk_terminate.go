@@ -35,28 +35,32 @@ func testBulkTerminatePurge(t *testing.T, newBackend Factory) {
 	// 600 inbox rows (half with dedupe IDs), sent in capability-sized batches.
 	const total = 600
 	batchLimit := backend.InboxBatchLimit(b.Capabilities())
-	for start := 0; start < total; start += batchLimit {
-		end := start + batchLimit
-		if end > total {
-			end = total
-		}
-		items := make([]backend.InboxItem, 0, end-start)
-		for i := start; i < end; i++ {
-			item := backend.InboxItem{
-				Event: journal.Event{
-					Type: journal.TypeSignalReceived, Name: fmt.Sprintf("sig-%d", i),
-					Payload: []byte(`{}`),
-				},
+	sendBulkInbox := func() {
+		t.Helper()
+		for start := 0; start < total; start += batchLimit {
+			end := start + batchLimit
+			if end > total {
+				end = total
 			}
-			if i%2 == 0 {
-				item.DedupeID = fmt.Sprintf("bulk-pay-%d", i)
+			items := make([]backend.InboxItem, 0, end-start)
+			for i := start; i < end; i++ {
+				item := backend.InboxItem{
+					Event: journal.Event{
+						Type: journal.TypeSignalReceived, Name: fmt.Sprintf("sig-%d", i),
+						Payload: []byte(`{}`),
+					},
+				}
+				if i%2 == 0 {
+					item.DedupeID = fmt.Sprintf("bulk-pay-%d", i)
+				}
+				items = append(items, item)
 			}
-			items = append(items, item)
-		}
-		if err := b.SendToInboxBatch(ctx, id, items); err != nil {
-			t.Fatal(err)
+			if err := b.SendToInboxBatch(ctx, id, items); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
+	sendBulkInbox()
 	st, err := b.LoadWorkflow(ctx, id)
 	if err != nil {
 		t.Fatal(err)
@@ -132,6 +136,21 @@ func testBulkTerminatePurge(t *testing.T, newBackend Factory) {
 	} else {
 		older = 0 // real-time stores mark completions at wall-clock now
 	}
+	// Repopulate the bulk inbox rows AFTER termination: TerminateInstance
+	// already swept everything above, so without this PurgeInstances below
+	// would only delete the instance row and the purge half of this test
+	// would exercise nothing. Sends to a terminated instance insert without
+	// waking work, and the dedupe keys were cleared by the terminate sweep,
+	// so the same payloads land anew and the purge must sweep 600 rows in
+	// chunks over the backend write cap.
+	sendBulkInbox()
+	st, err = b.LoadWorkflow(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Inbox) != total {
+		t.Fatalf("repopulated inbox=%d want %d", len(st.Inbox), total)
+	}
 	n, err := b.PurgeInstances(ctx, older, nil, 0)
 	if err != nil {
 		t.Fatalf("PurgeInstances with %d child rows: %v", total, err)
@@ -141,5 +160,30 @@ func testBulkTerminatePurge(t *testing.T, newBackend Factory) {
 	}
 	if _, err := b.GetInstance(ctx, id); !errors.Is(err, backend.ErrNotFound) {
 		t.Fatalf("want ErrNotFound after purge, got %v", err)
+	}
+	// The repopulated bulk rows must be gone with the instance: recreating
+	// the ID must start from an empty inbox with cleared dedupe keys, not
+	// inherit leaked rows (which the replacement would then consume).
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
+		t.Fatalf("recreate after purge: %v", err)
+	}
+	st, err = b.LoadWorkflow(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Inbox) != 0 {
+		t.Fatalf("purged inbox rows leaked into recreated instance: %d", len(st.Inbox))
+	}
+	before := len(st.Inbox)
+	if err := b.SendToInbox(ctx, id,
+		journal.Event{Type: journal.TypeSignalReceived, Name: "again"}, "bulk-pay-0"); err != nil {
+		t.Fatal(err)
+	}
+	st, err = b.LoadWorkflow(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Inbox) != before+1 {
+		t.Fatalf("dedupe not cleared by purge: inbox %d -> %d, want +1", before, len(st.Inbox))
 	}
 }
