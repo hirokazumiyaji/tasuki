@@ -1445,3 +1445,163 @@ func TestNormalizePurgeStatuses(t *testing.T) {
 		t.Fatalf("%v %d %v", sts, limit, err)
 	}
 }
+
+func TestFairOverflowRequeryCarrySuccessAfterLoss(t *testing.T) {
+	// Covers the round-14 P2 (issue #294) at the refill-loop level without
+	// a live DB: a nonempty carry pass can secure all of its picks
+	// (lost==0) while overflow-dropped rows are still eligible because of
+	// an EARLIER pass's lock losses. Limit=4, MaxPerInstance=1 over FIFO
+	// A1,C1,B1,C2,B2..B2001,A2 with A1,C1 locked concurrently: pass 1
+	// secures B1 and drops A2 past FairRejectedCap; the carry pass secures
+	// C2 with no current loss. Gating the scan-exhausted requery on the
+	// current pass alone (lost==0 → break) returns [B1 C2] although A2 can
+	// fill another slot; gating on the cross-pass lostLock flag requeries
+	// from the pre-overflow snapshot and recovers A2.
+	const limit, perInstance = 4, 1
+	feed := []backend.FairTaskRef{
+		{ID: 1, InstanceID: "A"},
+		{ID: 2, InstanceID: "C"},
+		{ID: 3, InstanceID: "B"},
+		{ID: 4, InstanceID: "C"},
+	}
+	for i := 0; i < backend.FairRejectedCap; i++ {
+		feed = append(feed, backend.FairTaskRef{ID: int64(5 + i), InstanceID: "B"})
+	}
+	tail := int64(5 + backend.FairRejectedCap)
+	feed = append(feed, backend.FairTaskRef{ID: tail, InstanceID: "A"})
+	lockLost := func(id int64) bool { return id == 1 || id == 2 }
+
+	// runRefill mirrors the postgres/mysql refill loops; gateCrossPass
+	// selects the scan-exhausted gating (true = fixed round-14 gate
+	// lost==0 && !lostLock, false = pre-fix current-pass-only gate).
+	runRefill := func(gateCrossPass bool) (out []backend.FairTaskRef, arms int) {
+		cursor := 0
+		var lastID int64
+		first := true
+		var claimed, pending []backend.FairTaskRef
+		var overflowSnapValid, overflowSeen bool
+		var overflowSnapID int64
+		var requeryPasses, requeryAttempted, requeryOut int
+		attempted := map[int64]struct{}{}
+		lostLock := false
+		startOverflowRequery := func() bool {
+			if len(out) >= limit || !overflowSeen || !overflowSnapValid || requeryPasses >= backend.MaxOverflowRequeryPasses {
+				return false
+			}
+			if requeryPasses > 0 && len(attempted) <= requeryAttempted && len(out) <= requeryOut {
+				return false
+			}
+			requeryPasses++
+			arms++
+			requeryAttempted, requeryOut = len(attempted), len(out)
+			overflowSeen = false
+			first = false
+			cursor = int(overflowSnapID) // IDs are 1-based sequential
+			overflowSnapValid = false
+			pending = nil
+			return true
+		}
+		passes := 0
+		for len(out) < limit {
+			passes++
+			if passes > 4*len(feed)+20 {
+				t.Fatalf("refill loop did not terminate (gateCrossPass=%v)", gateCrossPass)
+			}
+			picker := backend.NewFairPicker(limit-len(out), perInstance).TrackRejected()
+			picker.Seed(claimed)
+			offered := 0
+			for _, r := range pending {
+				if picker.Full() {
+					break
+				}
+				picker.Offer(r)
+				offered++
+			}
+			if !picker.Full() {
+				for !picker.Full() && cursor < len(feed) {
+					r := feed[cursor]
+					cursor++
+					if !overflowSeen && !picker.RejectedCapped() {
+						overflowSnapID, overflowSnapValid = lastID, !first
+					}
+					first = false
+					lastID = r.ID
+					if _, dup := attempted[r.ID]; !(requeryPasses > 0 && dup) {
+						offerFull := picker.Offer(r)
+						if picker.RejectedCapped() {
+							overflowSeen = true
+						}
+						if offerFull {
+							break
+						}
+					}
+				}
+			}
+			scanExhausted := !picker.Full()
+			picked := picker.Picked()
+			iterRejected := picker.Rejected()
+			if overflowSeen || requeryPasses > 0 {
+				for _, r := range picked {
+					attempted[r.ID] = struct{}{}
+				}
+			}
+			if len(picked) == 0 {
+				if lostLock && startOverflowRequery() {
+					continue
+				}
+				break
+			}
+			prevOut := len(out)
+			for _, r := range picked {
+				if lockLost(r.ID) {
+					continue
+				}
+				out = append(out, r)
+				claimed = append(claimed, r)
+			}
+			if len(out)-prevOut < len(picked) {
+				lostLock = true
+			}
+			if len(out) >= limit {
+				break
+			}
+			if scanExhausted {
+				lost := len(picked) - (len(out) - prevOut)
+				if gateCrossPass {
+					if lost == 0 && !lostLock {
+						break
+					}
+				} else if lost == 0 {
+					break
+				}
+				if len(iterRejected) == 0 && startOverflowRequery() {
+					continue
+				}
+			}
+			pending = append(iterRejected, pending[offered:]...)
+			if len(pending) > backend.FairRejectedCap {
+				pending = pending[:backend.FairRejectedCap]
+			}
+		}
+		return out, arms
+	}
+
+	// Pre-fix shape: the carry pass secures C2 with lost==0 and breaks,
+	// stranding A2 past the cap.
+	got, arms := runRefill(false)
+	if len(got) != 2 || arms != 0 {
+		t.Fatalf("pre-fix refill: got %v arms=%d, want [B1 C2] with 0 arms (reproduces the underfill)", got, arms)
+	}
+	// Fixed contract: the cross-pass loss arms a requery that recovers the
+	// never-attempted A2 for a third slot.
+	got, arms = runRefill(true)
+	if len(got) != 3 || arms < 1 {
+		t.Fatalf("fixed refill: got %v arms=%d, want [B1 C2 A2] with ≥1 requery arm", got, arms)
+	}
+	want := []int64{3, 4, tail}
+	for i, id := range want {
+		if got[i].ID != id {
+			t.Fatalf("fixed refill: got IDs [%d %d %d], want %v", got[0].ID, got[1].ID, got[2].ID, want)
+		}
+	}
+}

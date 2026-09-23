@@ -546,3 +546,158 @@ func TestFairClaimPreservesUnvisitedTail(t *testing.T) {
 		t.Fatalf("claim = %v, want unvisited A3 %d and B1 %d", tasks, cands[2].id, cands[3].id)
 	}
 }
+
+// TestFairClaimRequeriesOverflowAfterCarrySuccess covers the issue #294
+// round-14 P2 at the live-DB level: Limit=4, MaxPerInstance=1 over FIFO
+// A1,C1,B1,C2,B2..B2001,A2 with A1 and C1 locked by a concurrent claimer.
+// Pass 1 secures B1 and drops A2 past FairRejectedCap; the carry pass then
+// secures C2 with no current loss (lost==0). Gating the scan-exhausted
+// requery on the current pass alone breaks there and returns [B1 C2];
+// gating on the cross-pass lostLock flag requeries from the pre-overflow
+// snapshot and recovers A2 for a third slot.
+func TestFairClaimRequeriesOverflowAfterCarrySuccess(t *testing.T) {
+	dsn := dsnOrSkip(t)
+	ctx := context.Background()
+	b, err := postgres.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	const qa, qb, qc = "ovq-a", "ovq-b", "ovq-c"
+	claimWF := func(id, queue string) backend.Task {
+		t.Helper()
+		wf, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+			Kind: "workflow", Queues: []string{queue}, Limit: 1,
+			Lease: time.Minute, WorkerID: "ov",
+		})
+		if err != nil || len(wf) != 1 || wf[0].InstanceID != id {
+			t.Fatalf("claim wf %s: %v %#v", id, err, wf)
+		}
+		return wf[0]
+	}
+	commitActs := func(id, queue string, task backend.Task, inbox []backend.InboxEvent, n int) {
+		t.Helper()
+		st, err := b.LoadWorkflow(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		adv := backend.Advancement{InstanceID: id, TaskID: task.ID, ExpectedSeq: st.NextSeq}
+		seq := st.NextSeq
+		for _, item := range inbox {
+			ev := item.Event
+			ev.Seq = seq
+			seq++
+			adv.NewEvents = append(adv.NewEvents, ev)
+			adv.DrainedInbox = append(adv.DrainedInbox, item.ID)
+		}
+		for i := 0; i < n; i++ {
+			adv.NewEvents = append(adv.NewEvents, journal.Event{
+				Seq: seq, Type: journal.TypeActivityScheduled, Name: "step",
+			})
+			adv.ActivityTasks = append(adv.ActivityTasks, backend.NewTask{
+				Kind: "activity", Queue: queue, InstanceID: id, Name: "step",
+				Seq: seq, Input: []byte(`{}`),
+			})
+			seq++
+		}
+		if err := b.CommitAdvancement(ctx, adv); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spawn := func(id, queue string, n int) {
+		t.Helper()
+		if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: queue}); err != nil {
+			t.Fatal(err)
+		}
+		commitActs(id, queue, claimWF(id, queue), nil, n)
+	}
+	appendActs := func(id, queue string, n int) {
+		t.Helper()
+		sig := journal.Event{Type: journal.TypeSignalReceived, Name: "more", Payload: []byte(`{}`)}
+		if err := b.SendToInbox(ctx, id, sig, ""); err != nil {
+			t.Fatal(err)
+		}
+		task := claimWF(id, queue)
+		st, err := b.LoadWorkflow(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(st.Inbox) != 1 {
+			t.Fatalf("%s inbox=%d want 1", id, len(st.Inbox))
+		}
+		commitActs(id, queue, task, st.Inbox, n)
+	}
+	// FIFO creation order: A1, C1, B1, C2, B2..B2001, A2.
+	spawn("ov-A", qa, 1)
+	spawn("ov-C", qc, 1)
+	spawn("ov-B", qb, 1)
+	appendActs("ov-C", qc, 1)
+	appendActs("ov-B", qb, 2000)
+	appendActs("ov-A", qa, 1)
+
+	queues := []string{qa, qb, qc}
+	rows, err := b.Pool().Query(ctx, `
+		SELECT id, instance_id FROM wf_tasks
+		WHERE kind = 'activity' AND queue = ANY($1)
+		ORDER BY visible_at, id`, queues)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type cand struct {
+		id  int64
+		ins string
+	}
+	var cands []cand
+	for rows.Next() {
+		var c cand
+		if err := rows.Scan(&c.id, &c.ins); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		cands = append(cands, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 2005 || cands[0].ins != "ov-A" || cands[1].ins != "ov-C" ||
+		cands[2].ins != "ov-B" || cands[3].ins != "ov-C" || cands[2004].ins != "ov-A" {
+		t.Fatalf("FIFO head/tail = %v..%v, want A,C,B,C,..,A over 2005 rows", cands[:4], cands[2004:])
+	}
+
+	// Blocker locks A1 and C1, like a concurrent fair claimer that scanned
+	// the same head IDs first.
+	btx, err := b.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer btx.Rollback(ctx)
+	if _, err := btx.Exec(ctx, `SELECT id FROM wf_tasks WHERE id = ANY($1) FOR UPDATE`,
+		[]int64{cands[0].id, cands[1].id}); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "activity", Queues: queues, Limit: 4,
+		Lease: time.Minute, WorkerID: "ov-w", MaxPerInstance: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 3 {
+		t.Fatalf("claim = %d tasks, want 3 [B1 C2 A2] (A2 stranded past the cap)", len(tasks))
+	}
+	want := []int64{cands[2].id, cands[3].id, cands[2004].id}
+	for i, id := range want {
+		if tasks[i].ID != id {
+			t.Fatalf("claim[%d] = %d, want %d (FIFO [B1 C2 A2])", i, tasks[i].ID, id)
+		}
+	}
+}

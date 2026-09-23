@@ -629,13 +629,18 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 		if scanExhausted {
 			// No unscanned rows remain, so the only way to make progress is
 			// to revisit rejected candidates freed by lost picks. When no
-			// pick was lost (lost==0) every pick succeeded and no quota was
+			// pick was lost on this pass (lost==0) AND no earlier pass lost
+			// one either (!lostLock), every pick succeeded and no quota was
 			// freed: the dropped overflow tail would face the same caps and
 			// reproduce the same pick, so skip the wasteful full rescan
-			// (up to 2x) and return underfilled. Only a loss frees a slot
-			// that can admit a previously rejected/dropped row.
+			// (up to 2x) and return underfilled. A current OR prior loss
+			// frees a slot that can admit a previously rejected/dropped row
+			// (e.g. Limit=4/MaxPerInstance=1 over A1,C1,B1,C2,B2..B2001,A2
+			// with A1,C1 locked: pass 1 secures B1 and drops A2 past the
+			// cap, the carry pass secures C2 with lost==0 — only the
+			// cross-pass lostLock still admits A2 via requery).
 			lost := len(picked) - (len(accepted) - prevAccepted)
-			if lost == 0 {
+			if lost == 0 && !lostLock {
 				break
 			}
 			if len(iterRejected) == 0 {

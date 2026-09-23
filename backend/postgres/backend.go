@@ -333,7 +333,9 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 	// quota. When every pick succeeded no slot was freed, so a requery would
 	// rescan the same dropped tail against the same per-instance caps and
 	// return an identical result — up to 2x the scan cost for nothing. The
-	// scan-exhausted call site therefore gates on its own pass lost>0, while
+	// scan-exhausted call site therefore gates on its own pass lost>0 OR the
+	// cross-pass lostLock flag (an earlier pass may have freed quota even
+	// when this pass secured all its picks), while
 	// the zero-pick call site gates on the cross-pass lostLock flag: a pass
 	// that picks nothing loses nothing itself, but an earlier pass may have
 	// freed quota (round-13 P2 on #294). Call sites skip the requery (break)
@@ -567,13 +569,18 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		if scanExhausted {
 			// No unscanned rows remain, so the only way to make progress is
 			// to revisit rejected candidates freed by lost picks. When no
-			// pick was lost (lost==0) every pick succeeded and no quota was
+			// pick was lost on this pass (lost==0) AND no earlier pass lost
+			// one either (!lostLock), every pick succeeded and no quota was
 			// freed: the dropped overflow tail would face the same caps and
 			// reproduce the same pick, so skip the wasteful full rescan
-			// (up to 2x) and return underfilled. Only a loss frees a slot
-			// that can admit a previously rejected/dropped row.
+			// (up to 2x) and return underfilled. A current OR prior loss
+			// frees a slot that can admit a previously rejected/dropped row
+			// (e.g. Limit=4/MaxPerInstance=1 over A1,C1,B1,C2,B2..B2001,A2
+			// with A1,C1 locked: pass 1 secures B1 and drops A2 past the
+			// cap, the carry pass secures C2 with lost==0 — only the
+			// cross-pass lostLock still admits A2 via requery).
 			lost := len(picked) - (len(out) - prevOut)
-			if lost == 0 {
+			if lost == 0 && !lostLock {
 				break
 			}
 			if len(iterRejected) == 0 {
