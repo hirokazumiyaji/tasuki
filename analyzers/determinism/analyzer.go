@@ -296,9 +296,11 @@ func checkCall(pass *analysis.Pass, call *ast.CallExpr) {
 			pass.Reportf(call.Pos(), "make(chan ...) is not allowed in workflow code; use workflow.Execute/ExecuteAsync and workflow.Await")
 			return
 		}
-		// make(chan ...) can also hide behind parentheses.
-		if tv, ok := pass.TypesInfo.Types[call.Args[0]]; ok {
-			if _, ok := tv.Type.Underlying().(*types.Chan); ok {
+		// make(chan ...) can also hide behind parentheses or a channel type
+		// parameter (make(C) with C ~chan int): resolve the argument
+		// through the type-param core type before classifying.
+		if tv, ok := pass.TypesInfo.Types[call.Args[0]]; ok && tv.Type != nil {
+			if _, ok := coreRangeType(tv.Type).(*types.Chan); ok {
 				pass.Reportf(call.Pos(), "make(chan ...) is not allowed in workflow code; use workflow.Execute/ExecuteAsync and workflow.Await")
 				return
 			}
@@ -357,6 +359,14 @@ func checkMapRange(pass *analysis.Pass, x *ast.RangeStmt) {
 // shared by its constraint's type set. It returns nil when no single core
 // type exists (e.g. a mixed union), in which case ranging would not compile
 // anyway.
+//
+// Channel unions whose members differ only in direction (e.g.
+// C chan int | <-chan int) have no single identical core type, yet every
+// instantiation ranges over a receivable channel of one element type. When
+// all constraint terms are channels permitting receive (chan T or <-chan T)
+// with identical element types, the first term is returned so the operand
+// still classifies as a channel range. Send-only members never qualify:
+// ranging over chan<- T does not compile.
 func coreRangeType(t types.Type) types.Type {
 	tp, ok := types.Unalias(t).(*types.TypeParam)
 	if !ok {
@@ -370,7 +380,7 @@ func coreRangeType(t types.Type) types.Type {
 	if !ok {
 		return nil
 	}
-	var core types.Type
+	var terms []types.Type
 	for i := 0; i < iface.NumEmbeddeds(); i++ {
 		union, ok := iface.EmbeddedType(i).(*types.Union)
 		if !ok {
@@ -378,15 +388,46 @@ func coreRangeType(t types.Type) types.Type {
 			return nil
 		}
 		for j := 0; j < union.Len(); j++ {
-			term := types.Unalias(union.Term(j).Type()).Underlying()
-			if core == nil {
-				core = term
-			} else if !types.Identical(core, term) {
-				return nil
+			terms = append(terms, types.Unalias(union.Term(j).Type()).Underlying())
+		}
+	}
+	if len(terms) == 0 {
+		return nil
+	}
+	if elem, ok := recvChanElem(terms[0]); ok {
+		recvCompatible := true
+		for _, term := range terms[1:] {
+			e, ok := recvChanElem(term)
+			if !ok || !types.Identical(elem, e) {
+				recvCompatible = false
+				break
 			}
+		}
+		if recvCompatible {
+			return terms[0]
+		}
+	}
+	core := terms[0]
+	for _, term := range terms[1:] {
+		if !types.Identical(core, term) {
+			return nil
 		}
 	}
 	return core
+}
+
+// recvChanElem returns the element type when t is a channel permitting
+// receive (bidirectional or receive-only); send-only channels and
+// non-channels report false.
+func recvChanElem(t types.Type) (types.Type, bool) {
+	ch, ok := t.(*types.Chan)
+	if !ok {
+		return nil, false
+	}
+	if ch.Dir() != types.SendRecv && ch.Dir() != types.RecvOnly {
+		return nil, false
+	}
+	return ch.Elem(), true
 }
 
 // checkPackageVar flags os.Args (and Stdin/Stdout/Stderr) selector accesses.

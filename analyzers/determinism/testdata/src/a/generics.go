@@ -55,3 +55,28 @@ func OkGenericSliceRange[S ~[]int](ctx *workflow.Context, s S) error {
 	}
 	return nil
 }
+
+// make(C) with a channel type parameter hides channel creation behind an
+// Ident (not a ChanType node); the argument must resolve through the
+// type-param core type before classifying.
+
+func BadGenericMakeChan[C ~chan int](ctx *workflow.Context, _ struct{}) error {
+	_ = make(C) // want `make\(chan`
+	return nil
+}
+
+func BadGenericMakeChanParen[C ~chan int](ctx *workflow.Context, _ struct{}) error {
+	_ = make((C)) // want `make\(chan`
+	return nil
+}
+
+// A channel union whose members differ only in direction has no single
+// identical core type, yet every instantiation ranges over a receivable
+// channel: it must still be flagged.
+
+func BadUnionChanRange[C chan int | <-chan int](ctx *workflow.Context, ch C) error {
+	for v := range ch { // want `ranging over a channel is not allowed`
+		_ = v
+	}
+	return nil
+}
