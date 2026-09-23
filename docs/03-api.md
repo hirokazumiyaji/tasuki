@@ -102,10 +102,10 @@ Functions provided by the `workflow` package:
 
 | Function | Description |
 |---|---|
-| `Execute[I, O](ctx, fn, in, opts...) (O, error)` | Runs an activity and waits for completion (`WithRetry`, `WithStartToCloseTimeout`) |
+| `Execute[I, O](ctx, name, in, opts...) (O, error)` | Runs an activity and waits for completion (`WithRetry`, `WithStartToCloseTimeout`) |
 | `ExecuteLocal[I, O](ctx, name, in) (O, error)` | Executes an activity synchronously on the same worker, recording results directly in the journal (no task queue, no retry) |
-| `ExecuteAsync[I, O](ctx, fn, in, opts...) *Future[O]` | Schedules an activity asynchronously and returns a `Future` |
-| `ExecuteChild[I, O](ctx, wf, in, opts...) (O, error)` | Runs a child workflow and waits for completion (`ExecuteChildAsync` also available) |
+| `ExecuteAsync[I, O](ctx, name, in, opts...) *Future[O]` | Schedules an activity asynchronously and returns a `Future` |
+| `ExecuteChild[I, O](ctx, name, in) (O, error)` | Runs a child workflow and waits for completion (`ExecuteChildAsync[I, O](ctx, name, in) *Future[O]` also available; neither takes options) |
 | `Sleep(ctx, d) error` / `SleepUntil(ctx, t) error` | Suspends execution using a durable timer |
 | `SleepAsync(ctx, d) *Future[struct{}]` | Starts a durable timer as a `Future` (useful for Select timeouts) |
 | `Now(ctx) time.Time` | Returns the recorded current time that remains constant across replays |
@@ -131,7 +131,7 @@ Functions provided by the `workflow` package:
 
 `UpsertMemo` is similarly recorded as a command event, but memo fields are intended for display metadata and are not indexed for `List` filtering.
 
-`ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay.
+`ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay. The workflow task turn performs no lease extension: the lease clock starts when `ClaimTasks` returns, so replay, every `ExecuteLocal` call, and the commit must together fit well within the remaining `LeaseDuration` with margin — it is not enough for each activity alone to be shorter than the lease. For example, with a 30s lease, 15s of replay followed by a 20s `ExecuteLocal` crosses expiry, letting a peer reclaim the task and repeat the local side effect before the first worker commits. Use `Execute` for anything longer than a small fraction of the lease, and keep local activities side-effect-free or idempotent where possible.
 
 The worker extends the workflow task lease (`ExtendLease` at half the `LeaseDuration`) while the turn runs, so long replays and local activities that exceed `LeaseDuration` are not reclaimed by a peer and executed twice. Renewal covers the turn through the batch commit, not just `handleWorkflow`. Local activities run with the worker turn's `context.Context`, so `Shutdown` cancels a running local activity and the canceled turn is abandoned (lease released for a peer) instead of being committed as a workflow failure. Set `WorkerOptions.LocalActivityTimeout` to bound a single `ExecuteLocal` invocation: the timeout is enforced outside the call, so even an activity that ignores cancellation returns a deadline error on time (its late result is discarded).
 
@@ -341,6 +341,15 @@ c := tasuki.NewClient(b, tasuki.WithCodec(enc))
 
 Key rotation is supported by specifying a new primary key while retaining historical keys in the keyring. Unencrypted payloads lacking envelope markers fall back to plaintext reading, allowing encryption to be enabled on existing deployments without data migration.
 
+Envelope versions and rolling upgrades: new writes default to `Enc:1` (nil AAD) so previous-release readers can still decrypt them. Readers accept both `Enc:1` and `Enc:2` (key id bound via AAD). Enable the hardened `Enc:2` writes only after every reader (workers and replay tooling) understands v2:
+
+```go
+encV2 := codec.EncryptedWithOptions(codec.JSON(), keys,
+    codec.WithWriteVersion(codec.WriteVersionV2))
+```
+
+Staged order: (1) deploy v2-capable binaries while still writing v1, (2) switch writers to v2 once all readers are upgraded. A v2 payload handed to an old reader fails authentication, and that decode error is committed as a terminal workflow failure rather than an incompatible-task Nack — which is why writes stay on v1 by default.
+
 ## Testing Support
 
 The `wftest` package enables unit testing workflows without databases and with virtual clocks:
@@ -380,8 +389,11 @@ type WorkerOptions struct {
     JournalWarnThreshold   int           // Default: 10000; negative disables
     IncompatibleRetryDelay time.Duration // Default: 5s; negative redisplays immediately
     LocalActivityTimeout   time.Duration // Default: 0 (no limit); bounds one ExecuteLocal call
+    MaxPerInstance         int           // Default: 0 (disabled); caps tasks claimed per instance per batch
 }
 ```
+
+`MaxPerInstance` is honored only by backends with fair-dispatch support (PostgreSQL, MySQL, SQLite, in-memory). DynamoDB, Firestore, and Spanner ignore it and claim in FIFO order (see [08-fair-dispatch.md](08-fair-dispatch.md)).
 
 ## Schema Validation and Migrations
 

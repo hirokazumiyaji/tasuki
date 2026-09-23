@@ -35,8 +35,20 @@ w := tasuki.NewWorker(b, tasuki.WorkerOptions{
 
 When calling backend claim APIs directly (e.g. in custom batch executors), provide `ClaimRequest.MaxPerInstance`.
 
-Supported backends: PostgreSQL, MySQL, SQLite, in-memory.  
-*(Spanner, DynamoDB, and Firestore do not currently support fair dispatch; the parameter is ignored and claims fall back to standard FIFO).*
+## Backend support
+
+| Backend | Fair dispatch | Notes |
+|---|---|---|
+| PostgreSQL | ✅ | Pages FIFO candidates through `FairPicker` |
+| MySQL | ✅ | Pages FIFO candidates through `FairPicker` |
+| SQLite | ✅ | Pages FIFO candidates through `FairPicker` |
+| In-memory | ✅ | `FairPick` over buffered candidates |
+| DynamoDB | ✅ | Pages `claim_gsi` in `FairOverfetch` windows through `FairPicker`; survivors are claimed with a `visible_at` re-check |
+| Firestore | ✅ | Pages the `(kind, queue, visible_at)` composite index with cursor windows over `(visible_at, __name__)` through a shared `FairPicker`; no extra index required |
+| Spanner | ❌ | `MaxPerInstance` is ignored, claims fall back to FIFO; `Capabilities.FairDispatch` is false and the conformance fair-dispatch test skips explicitly |
+
+Backends without support ignore the parameter and fall back to standard FIFO.
+Configure `MaxPerInstance > 0` against such a backend and the worker logs a startup warning.
 
 ## Workload Isolation Strategies
 

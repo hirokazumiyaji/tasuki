@@ -12,7 +12,11 @@ import (
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
-func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilities{} }
+func (b *Backend) Capabilities() backend.Capabilities {
+	return backend.Capabilities{FairDispatch: true}
+}
+
+var _ backend.SchemaValidator = (*Backend)(nil)
 
 func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
 	queue := inst.Queue
@@ -431,9 +435,19 @@ func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	// delayed past the lease (or a shutdown release racing a peer
 	// reclaim) must not clear a successor's lease. Zero rows means the
 	// lease moved on; report ErrNotFound so the worker treats it as
-	// already-released.
-	res, err := b.db.ExecContext(ctx, `
-		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ? AND worker_id = ? AND attempt = ?`, nowUTC(), t.ID, t.WorkerID, t.Attempt)
+	// already-released. A zero WorkerID falls back to unconditional
+	// release for legacy callers.
+	var res sql.Result
+	var err error
+	if t.WorkerID != "" {
+		// Conditional on the claim ownership token (see sqlite backend).
+		res, err = b.db.ExecContext(ctx, `
+		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ? AND worker_id = ? AND attempt = ?`,
+			nowUTC(), t.ID, t.WorkerID, t.Attempt)
+	} else {
+		res, err = b.db.ExecContext(ctx, `
+		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ?`, nowUTC(), t.ID)
+	}
 	if err != nil {
 		return err
 	}
@@ -449,8 +463,17 @@ func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 }
 
 func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {
-	res, err := b.db.ExecContext(ctx, `
+	var res sql.Result
+	var err error
+	if t.WorkerID != "" {
+		// Conditional on the claim ownership token (see ReleaseLease).
+		res, err = b.db.ExecContext(ctx, `
+		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ? AND worker_id = ? AND attempt = ?`,
+			nowUTC().Add(delay), t.ID, t.WorkerID, t.Attempt)
+	} else {
+		res, err = b.db.ExecContext(ctx, `
 		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ?`, nowUTC().Add(delay), t.ID)
+	}
 	if err != nil {
 		return err
 	}

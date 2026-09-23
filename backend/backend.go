@@ -39,19 +39,28 @@ type Backend interface {
 	// RecordHeartbeat extends the lease and stores details for GetHeartbeatDetails on later attempts.
 	RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error
 	// ReleaseLease makes a claimed task immediately reclaimable.
-	// The task carries kind/instance routing: DynamoDB/Firestore store
-	// workflow tasks under WF#<instanceID>, not ACT#<id>, so releasing by
-	// numeric ID alone misses workflow tasks (ErrNotFound) and a shutdown
-	// abandon stalls peers until lease expiry. Callers pass the claimed
-	// task, mirroring ExtendLease/NackTask.
+	// The task carries the claim ownership token (ID, Kind, InstanceID,
+	// WorkerID, Attempt): backends route workflow tasks by
+	// (Kind, InstanceID) — DynamoDB/Firestore store them under WF#<instanceID>,
+	// not ACT#<id>, so releasing by numeric ID alone misses workflow tasks
+	// (ErrNotFound) and a shutdown abandon stalls peers until lease expiry.
+	// Callers pass the claimed task, mirroring ExtendLease/NackTask.
 	//
 	// Releases are fenced to the claimed generation (worker_id + attempt):
 	// when the lease moved on (peer reclaim after a delayed renewal, or a
 	// successor turn), the release has no effect and reports ErrNotFound.
-	// Workers treat that as already-released, not an error.
+	// Workers treat that as already-released, not an error. A zero WorkerID
+	// falls back to unconditional release by ID for legacy callers.
 	ReleaseLease(ctx context.Context, t Task) error
 	// NackTask clears the lease and defers visibility by delay (store clock).
 	// Used when a Worker cannot process the task (incompatible code/registry).
+	// The task carries the claim ownership token (ID, Kind, InstanceID,
+	// WorkerID, Attempt): backends nack conditionally on the token (worker +
+	// attempt, plus numeric id on WF keys) so a stale worker never clears a
+	// newer worker's lease after a reclaim race. A mismatch (reclaimed,
+	// refreshed, or already committed task) reports ErrNotFound without
+	// touching the peer lease, which callers ignore as best-effort. A zero
+	// WorkerID falls back to unconditional nack by ID for legacy callers.
 	NackTask(ctx context.Context, t Task, delay time.Duration) error
 	LoadWorkflow(ctx context.Context, instanceID string) (*WorkflowState, error)
 	// LoadWorkflowHead returns instance metadata, inbox, next_seq, and store Now without journal.

@@ -15,7 +15,7 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{MaxAdvancementEffects: 400}
+	return backend.Capabilities{MaxAdvancementEffects: 400, FairDispatch: true}
 }
 func (b *Backend) col(name string) *gcf.CollectionRef  { return b.client.Collection(name) }
 func (b *Backend) ref(col, id string) *gcf.DocumentRef { return b.col(col).Doc(id) }
@@ -306,52 +306,256 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 	}
 	now := nowUTC()
 	var out []backend.Task
+	// Share one picker across queues so MaxPerInstance caps the whole claim
+	// batch, not each queue independently.
+	var picker *backend.FairPicker
+	if req.MaxPerInstance > 0 {
+		picker = backend.NewFairPicker(req.Limit, req.MaxPerInstance)
+	}
 	for _, q := range req.Queues {
 		if len(out) >= req.Limit {
 			break
 		}
-		it := b.col("wf_tasks").Where("kind", "==", req.Kind).Where("queue", "==", q).Where("visible_at", "<=", now).OrderBy("visible_at", gcf.Asc).Limit(req.Limit - len(out)).Documents(ctx)
+		if picker != nil && picker.Full() {
+			break
+		}
+		// skip holds IDs already attempted from this queue. A conflicted
+		// snapshot's stale index entry can resurface on a re-query before
+		// Firestore converges, so refills must exclude attempted IDs
+		// instead of reselecting the same stale entry. It stays small:
+		// only attempted (picked) IDs are recorded, never every examined
+		// row, and entries behind the committed cursor are pruned on each
+		// refill (see below), so it is bounded by the current window's
+		// attempts rather than the whole stale backlog.
+		skip := map[int64]struct{}{}
+		// cursor carries the (visible_at, __name__) scan position across
+		// conflict refills within this queue: each window is fetched once
+		// per ClaimTasks call instead of restarting from the head on
+		// every refill. exhausted marks the index end so a refill never
+		// restarts from nil and the loop terminates.
+		var cursor *gcf.DocumentSnapshot
+		exhausted := false
+		for len(out) < req.Limit && (picker == nil || !picker.Full()) && !exhausted {
+			cands, next, done, err := b.listClaimCandidates(ctx, req.Kind, q, now, req.Limit-len(out), picker, skip, cursor)
+			if err != nil {
+				return nil, err
+			}
+			cursor, exhausted = next, done
+			// Prune attempted IDs behind the committed cursor: the
+			// (visible_at, __name__) scan is forward-only, so documents
+			// before the resume point cannot recur on the next refill.
+			// Every existing entry sorts before next — picks come from
+			// documents at or before the resume document and earlier
+			// windows are further behind — so dropping them cannot
+			// reselect, and the next fetch starts after next. Only the
+			// current window's attempts are re-added below, bounding skip
+			// to O(batch) under prolonged index lag instead of O(stale
+			// backlog). Termination is unchanged: exhausted plus the
+			// empty/release breaks below.
+			clear(skip)
+			if len(cands) == 0 {
+				break
+			}
+			released := false
+			for _, d := range cands {
+				m := d.Data()
+				id := i64(m, "id")
+				skip[id] = struct{}{}
+				old := timestamp(m, "visible_at")
+				var claimed backend.Task
+				err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+					s, e := tx.Get(d.Ref)
+					if isNotFound(e) {
+						return backend.ErrConflict
+					}
+					if e != nil {
+						return e
+					}
+					if !s.Exists() || !timestamp(s.Data(), "visible_at").Equal(old) {
+						return backend.ErrConflict
+					}
+					m := s.Data()
+					claimed = decodeTask(m)
+					claimed.Attempt++
+					claimed.VisibleAt = now.Add(req.Lease)
+					claimed.WorkerID = req.WorkerID
+					return tx.Update(d.Ref, []gcf.Update{{Path: "visible_at", Value: claimed.VisibleAt}, {Path: "worker_id", Value: req.WorkerID}, {Path: "attempt", Value: int64(claimed.Attempt)}})
+				})
+				if err == backend.ErrConflict {
+					// Another worker leased this snapshot first: free its picker
+					// slot so Full below does not stop later candidates and
+					// queues from filling the batch, then re-query this queue
+					// for a replacement (the loop above) instead of moving on.
+					if picker != nil {
+						picker.Release(backend.FairTaskRef{ID: id, InstanceID: str(m, "instance_id")})
+						released = true
+					}
+					continue
+				}
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, claimed)
+				if len(out) >= req.Limit {
+					break
+				}
+			}
+			if !released {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// listClaimCandidates returns FIFO-ordered task snapshots for one queue.
+// With a nil picker it returns the first remaining snapshots; otherwise it
+// pages through the (kind, queue, visible_at, __name__) composite index in
+// FairOverfetch windows feeding the shared picker, so a victim hidden behind
+// a flooding instance is still found beyond the first page. Pages advance
+// with a document cursor over (visible_at, __name__) ordering — each query
+// fetches only its own window instead of reprocessing all preceding
+// documents, and concurrently leased rows do not shift later pages the way
+// offsets do. The DocumentID tie-breaker keeps the order deterministic when
+// tasks share the same visible_at. The picker is shared across the outer
+// queue loop in ClaimTasks so the per-instance cap applies to the whole claim
+// batch, and only snapshots picked during this call are returned (earlier
+// queues' picks are not re-attempted). Callers claim the returned snapshots
+// with a visible_at re-check inside a transaction; concurrently leased rows
+// conflict, must be released from the picker via Release (so Full does not
+// stop later queues), and are skipped; the caller then re-queries for
+// replacements, passing attempted IDs in skip so a stale index entry is never
+// reselected.
+//
+// No unbounded dedup set is kept here: the StartAfter cursor advances
+// monotonically over (visible_at, __name__), so each matching document is
+// visited exactly once per scan and repeats are impossible without concurrent
+// writes shifting page boundaries. The only cross-row state is byID, which
+// retains snapshots solely for picker-accepted candidates (bounded by the
+// batch size) and doubles as a guard against double-offering an accepted ID
+// if a concurrent update ever surfaces a duplicate within one scan.
+//
+// The caller threads cursor through conflict refills (it is both the resume
+// point and, via exhausted, the termination signal), so refills continue past
+// already-consumed windows instead of re-fetching the prefix: every window is
+// read once per ClaimTasks call and the loop ends when the index is
+// exhausted. When the batch fills mid-window the cursor points after the last
+// examined document (not the window end), so a refill re-examines the
+// unexamined window suffix instead of skipping it. Attempted IDs stay in skip
+// so a stale index entry of a released snapshot is never reselected after its
+// slot is freed; only the current window's attempts are retained, entries
+// behind the committed cursor being pruned on each refill (they cannot recur
+// past the forward-only resume point), which bounds skip to O(batch).
+// Trade-off: documents rejected by the fair cap before a
+// conflict freed a slot are picked up on a later poll rather than in the same
+// call; liveness holds because they stay claimable.
+func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker, skip map[int64]struct{}, cursor *gcf.DocumentSnapshot) ([]*gcf.DocumentSnapshot, *gcf.DocumentSnapshot, bool, error) {
+	base := b.col("wf_tasks").Where("kind", "==", kind).Where("queue", "==", queue).Where("visible_at", "<=", now).OrderBy("visible_at", gcf.Asc).OrderBy(gcf.DocumentID, gcf.Asc)
+	collect := func(it *gcf.DocumentIterator) ([]*gcf.DocumentSnapshot, error) {
+		defer it.Stop()
+		var docs []*gcf.DocumentSnapshot
 		for {
 			d, err := it.Next()
 			if err == iterator.Done {
 				break
 			}
 			if err != nil {
-				it.Stop()
 				return nil, err
 			}
-			old := timestamp(d.Data(), "visible_at")
-			var claimed backend.Task
-			err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
-				s, e := tx.Get(d.Ref)
-				if isNotFound(e) {
-					return backend.ErrConflict
-				}
-				if e != nil {
-					return e
-				}
-				if !s.Exists() || !timestamp(s.Data(), "visible_at").Equal(old) {
-					return backend.ErrConflict
-				}
-				m := s.Data()
-				claimed = decodeTask(m)
-				claimed.Attempt++
-				claimed.VisibleAt = now.Add(req.Lease)
-				claimed.WorkerID = req.WorkerID
-				return tx.Update(d.Ref, []gcf.Update{{Path: "visible_at", Value: claimed.VisibleAt}, {Path: "worker_id", Value: req.WorkerID}, {Path: "attempt", Value: int64(claimed.Attempt)}})
-			})
-			if err == backend.ErrConflict {
+			docs = append(docs, d)
+		}
+		return docs, nil
+	}
+	if picker == nil {
+		// Single-pass path: the caller never refills without a picker
+		// (refills follow a conflict Release), so cursor is always nil
+		// here; it is threaded only for signature symmetry.
+		q := base.Limit(remaining)
+		if cursor != nil {
+			q = q.StartAfter(cursor)
+		}
+		docs, err := collect(q.Documents(ctx))
+		if err != nil {
+			return nil, cursor, false, err
+		}
+		if len(skip) == 0 {
+			return docs, nil, false, nil
+		}
+		kept := docs[:0]
+		for _, d := range docs {
+			if _, ok := skip[i64(d.Data(), "id")]; !ok {
+				kept = append(kept, d)
+			}
+		}
+		return kept, nil, false, nil
+	}
+	pageSize := backend.FairOverfetch(remaining)
+	// byID retains snapshots only for picker-accepted candidates so
+	// rejected backlog scanned past an over-quota flood does not accumulate
+	// in memory.
+	// fresh counts the picks made during this call: the shared picker may
+	// already hold earlier queues' picks, which must not be re-attempted
+	// (a re-attempt would conflict with our own claim and wrongly release
+	// an already-successful pick).
+	byID := map[int64]*gcf.DocumentSnapshot{}
+	fresh := len(picker.Picked())
+	startAfter := cursor
+	exhausted := false
+	for !picker.Full() {
+		q := base.Limit(pageSize)
+		if startAfter != nil {
+			q = q.StartAfter(startAfter)
+		}
+		docs, err := collect(q.Documents(ctx))
+		if err != nil {
+			return nil, startAfter, false, err
+		}
+		if len(docs) == 0 {
+			exhausted = true
+			break
+		}
+		examined := -1
+		for i, d := range docs {
+			examined = i
+			m := d.Data()
+			id := i64(m, "id")
+			if _, ok := skip[id]; ok {
 				continue
 			}
-			if err != nil {
-				it.Stop()
-				return nil, err
+			if _, ok := byID[id]; ok {
+				continue
 			}
-			out = append(out, claimed)
+			before := len(picker.Picked())
+			full := picker.Offer(backend.FairTaskRef{ID: id, InstanceID: str(m, "instance_id")})
+			if len(picker.Picked()) > before {
+				byID[id] = d
+			}
+			if full {
+				break
+			}
 		}
-		it.Stop()
+		// Resume after the last EXAMINED document, not the last fetched
+		// one, so a refill after a claim conflict re-examines the
+		// unexamined window suffix instead of skipping it. When the whole
+		// window was consumed this is the last document, as before.
+		startAfter = docs[examined]
+		if picker.Full() {
+			// Batch filled: unscanned documents may remain behind.
+			break
+		}
+		if len(docs) < pageSize {
+			exhausted = true
+			break
+		}
 	}
-	return out, nil
+	picked := picker.Picked()[fresh:]
+	docs := make([]*gcf.DocumentSnapshot, 0, len(picked))
+	for _, r := range picked {
+		if d, ok := byID[r.ID]; ok {
+			docs = append(docs, d)
+		}
+	}
+	return docs, startAfter, exhausted, nil
 }
 func (b *Backend) updateTask(ctx context.Context, id int64, activity bool, fields []gcf.Update) error {
 	r := b.ref("wf_tasks", actTaskID(id))
@@ -428,14 +632,33 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 	return b.updateTask(ctx, taskID, false, fields)
 }
 // checkReleaseDoc reports whether the task document still carries the
-// claimed task generation (numeric id + claim ownership). A mismatch means
-// a peer reclaim (or an EnsureWorkflowTask replacement) moved the lease
-// on, and the stale release must not clear the successor's lease.
+// claimed task generation (numeric id on WF keys + claim ownership). A
+// mismatch means a peer reclaim (or an EnsureWorkflowTask replacement)
+// moved the lease on, and the stale release must not clear the successor's
+// lease. Empty token fields are skipped so legacy callers fall back to
+// routing-only release; a missing document never matches.
 func checkReleaseDoc(data map[string]any, t backend.Task) error {
-	return checkWorkflowRenewalDoc(data, t)
+	if data == nil {
+		return backend.ErrNotFound
+	}
+	if t.Kind == "workflow" && t.InstanceID != "" {
+		if t.ID != 0 && i64(data, "id") != t.ID {
+			return backend.ErrNotFound
+		}
+	}
+	if t.WorkerID != "" && (str(data, "worker_id") != t.WorkerID || int(i64(data, "attempt")) != t.Attempt) {
+		return backend.ErrNotFound
+	}
+	return nil
 }
 
 func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
+	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
+	// kind like NackTask does (see releaseTaskDocID). The release is fenced
+	// on the claim ownership token: a stale worker whose task was reclaimed
+	// or atomically refreshed sees a mismatch and reports ErrNotFound
+	// instead of clearing the fresh lease. Empty token fields fall back to
+	// routing-only so legacy callers still release.
 	r := b.ref("wf_tasks", releaseTaskDocID(t))
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		s, e := tx.Get(r)
@@ -448,7 +671,8 @@ func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 		if !s.Exists() {
 			return backend.ErrNotFound
 		}
-		if err := checkReleaseDoc(s.Data(), t); err != nil {
+		m := s.Data()
+		if err := checkReleaseDoc(m, t); err != nil {
 			return err
 		}
 		return tx.Update(r, []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}})
@@ -473,6 +697,19 @@ func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Durat
 			return e
 		}
 		if !s.Exists() {
+			return backend.ErrNotFound
+		}
+		// Fence the nack on the claim ownership token (see ReleaseLease):
+		// a stale worker whose task was reclaimed or atomically refreshed
+		// sees a mismatch and reports ErrNotFound instead of clearing the
+		// fresh lease.
+		m := s.Data()
+		if t.Kind == "workflow" && t.InstanceID != "" {
+			if t.ID != 0 && i64(m, "id") != t.ID {
+				return backend.ErrNotFound
+			}
+		}
+		if t.WorkerID != "" && (str(m, "worker_id") != t.WorkerID || int(i64(m, "attempt")) != t.Attempt) {
 			return backend.ErrNotFound
 		}
 		return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(delay)}, {Path: "worker_id", Value: gcf.Delete}})

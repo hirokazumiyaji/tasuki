@@ -13,7 +13,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilities{} }
+func (b *Backend) Capabilities() backend.Capabilities {
+	return backend.Capabilities{FairDispatch: true}
+}
 
 // Reset truncates all workflow tables (test helper).
 func (b *Backend) Reset(ctx context.Context) error {
@@ -398,9 +400,19 @@ func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	// delayed past the lease (or a shutdown release racing a peer
 	// reclaim) must not clear a successor's lease. Zero rows means the
 	// lease moved on; report ErrNotFound so the worker treats it as
-	// already-released.
-	tag, err := b.pool.Exec(ctx, `
-		UPDATE wf_tasks SET visible_at = now(), worker_id = NULL WHERE id = $1 AND worker_id = $2 AND attempt = $3`, t.ID, t.WorkerID, t.Attempt)
+	// already-released. A zero WorkerID falls back to unconditional
+	// release for legacy callers.
+	var tag pgconn.CommandTag
+	var err error
+	if t.WorkerID != "" {
+		// Conditional on the claim ownership token (see sqlite backend).
+		tag, err = b.pool.Exec(ctx, `
+		UPDATE wf_tasks SET visible_at = now(), worker_id = NULL WHERE id = $1 AND worker_id = $2 AND attempt = $3`,
+			t.ID, t.WorkerID, t.Attempt)
+	} else {
+		tag, err = b.pool.Exec(ctx, `
+		UPDATE wf_tasks SET visible_at = now(), worker_id = NULL WHERE id = $1`, t.ID)
+	}
 	if err != nil {
 		return err
 	}
@@ -412,9 +424,18 @@ func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 }
 
 func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {
-	tag, err := b.pool.Exec(ctx, `
+	var tag pgconn.CommandTag
+	var err error
+	if t.WorkerID != "" {
+		// Conditional on the claim ownership token (see ReleaseLease).
+		tag, err = b.pool.Exec(ctx, `
+		UPDATE wf_tasks SET visible_at = now() + $2::interval, worker_id = NULL WHERE id = $1 AND worker_id = $3 AND attempt = $4`,
+			t.ID, interval(delay), t.WorkerID, t.Attempt)
+	} else {
+		tag, err = b.pool.Exec(ctx, `
 		UPDATE wf_tasks SET visible_at = now() + $2::interval, worker_id = NULL WHERE id = $1`,
-		t.ID, interval(delay))
+			t.ID, interval(delay))
+	}
 	if err != nil {
 		return err
 	}

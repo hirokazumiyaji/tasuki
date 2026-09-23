@@ -8,6 +8,10 @@ import (
 
 type Capabilities struct {
 	MaxAdvancementEffects int // 0 = unlimited
+	// FairDispatch reports whether ClaimTasks honors ClaimRequest.MaxPerInstance.
+	// Backends without support ignore the cap (FIFO) and the conformance
+	// fair-dispatch test skips them explicitly.
+	FairDispatch bool
 }
 
 // InstanceFilter selects instances for ListInstances.
@@ -91,7 +95,8 @@ type ClaimRequest struct {
 	WorkerID string
 	// MaxPerInstance caps how many tasks of one instance a single claim
 	// returns, interleaving instances instead of strict FIFO (fair dispatch).
-	// 0 disables the cap. Backends without native support ignore it.
+	// 0 disables the cap. Backends that do not advertise
+	// Capabilities.FairDispatch ignore it and fall back to FIFO.
 	MaxPerInstance int
 }
 

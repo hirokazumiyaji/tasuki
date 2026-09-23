@@ -76,6 +76,7 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 // no-op.
 func (b *Backend) purgeInstanceDocs(ctx context.Context, id string) error {
 	for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox", "wf_journal"} {
+		//lint:ignore SA1019 WriteBatch still functional; migrate to BulkWriter in an emulator-verified follow-up.
 		batch := b.client.Batch()
 		n := 0
 		it := b.col(col).Where("instance_id", "==", id).Documents(ctx)
@@ -95,6 +96,7 @@ func (b *Backend) purgeInstanceDocs(ctx context.Context, id string) error {
 					it.Stop()
 					return err
 				}
+				//lint:ignore SA1019 WriteBatch still functional; migrate to BulkWriter in an emulator-verified follow-up.
 				batch = b.client.Batch()
 				n = 0
 			}

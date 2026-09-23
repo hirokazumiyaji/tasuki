@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"encoding/json"
+	"fmt"
 	"runtime"
 	"time"
 
@@ -181,6 +182,54 @@ func AsDeterminismPanic(r any) (error, bool) {
 // Sleep schedules a durable timer. If the timer has not fired in the journal, the
 // workflow goroutine suspends via runtime.Goexit.
 func Sleep(ctx *Context, d time.Duration) error {
+	return sleepAt(ctx, ctx.now.Add(d))
+}
+
+// SleepUntil schedules a durable timer that fires at the given absolute time.
+// The deadline is recorded verbatim in the journal and never passes through
+// time.Duration, so deadlines beyond the ~290-year duration range are preserved
+// instead of saturating via time.Time.Sub. A Now checkpoint is still recorded
+// first to anchor determinism and keep the journal shape
+// (now_recorded + timer_created) compatible with existing histories.
+// A deadline at or before Now is clamped to Now before persisting: zero or
+// pre-year-1000 times recorded verbatim break MySQL DATETIME(6) inserts
+// (minimum year 1000) under strict mode, turning a wake into a retry. The
+// clamped timer stays already-due and fires on the next tick.
+//
+// A deadline whose UTC-normalized instant falls outside the portable backend
+// range (MySQL DATETIME(6): years 1000-9999) is rejected with
+// ErrDeadlineOutOfRange instead of recorded: for example,
+// 9999-12-31 23:00 -02:00 passes the clamp check and marshals successfully,
+// but backends insert tm.FireAt.UTC() (year 10000), so every commit would fail
+// and retry indefinitely. Failing fast surfaces the bug to the developer.
+func SleepUntil(ctx *Context, t time.Time) error {
+	now := Now(ctx)
+	if !t.After(now) {
+		t = now
+	}
+	if err := checkPortableDeadline(t); err != nil {
+		return err
+	}
+	// Normalize to UTC before encoding: the check above accepts any instant
+	// whose UTC year is portable, but time.Time.MarshalJSON rejects a local
+	// year outside 0-9999 (e.g. year-10000 +02:00 rendering 9999-12-31T23:00Z).
+	return sleepAt(ctx, t.UTC())
+}
+
+// checkPortableDeadline rejects timer deadlines whose UTC instant cannot be
+// stored by every backend. MySQL DATETIME(6) ('1000-01-01' to '9999-12-31')
+// is the narrowest timer column; other backends accept wider ranges. The
+// check runs on the UTC-normalized time because backends insert FireAt.UTC(),
+// so a local wall clock inside years 1000-9999 can still overflow (e.g.
+// 9999-12-31 23:00 -02:00 is year 10000 in UTC).
+func checkPortableDeadline(t time.Time) error {
+	if y := t.UTC().Year(); y < 1000 || y > 9999 {
+		return fmt.Errorf("%w: %s", ErrDeadlineOutOfRange, t.UTC().Format(time.RFC3339Nano))
+	}
+	return nil
+}
+
+func sleepAt(ctx *Context, fireAt time.Time) error {
 	// Replay an already-recorded timer before applying cancel, so command matching stays aligned.
 	if rec, ok := ctx.peekCommand(); ok && rec.Type == journal.TypeTimerCreated {
 		ev := ctx.recordOrReplay(journal.Command{Type: journal.TypeTimerCreated}, rec.Payload)
@@ -196,7 +245,7 @@ func Sleep(ctx *Context, d time.Duration) error {
 	if ctx.canceled {
 		return ErrCanceled
 	}
-	payload, err := json.Marshal(timerPayload{FireAt: ctx.now.Add(d)})
+	payload, err := json.Marshal(timerPayload{FireAt: fireAt})
 	if err != nil {
 		return err
 	}

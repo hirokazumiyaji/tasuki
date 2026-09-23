@@ -31,17 +31,26 @@ import (
 type OrderInput struct{ OrderID string }
 type OrderResult struct{ InvoiceID string }
 
+type ChargeInput struct{ OrderID string }
+type ChargeResult struct {
+    InvoiceID     string
+    CustomerEmail string
+}
+type ShipInput struct{ OrderID string }
+type ShipResult struct{ TrackingID string }
+type MailInput struct{ To string }
+
 // ワークフロー: 決定的なオーケストレーションだけを書く
 func OrderWorkflow(ctx *workflow.Context, in OrderInput) (OrderResult, error) {
-    charge, err := workflow.Execute(ctx, ChargePayment, ChargeInput{OrderID: in.OrderID},
+    charge, err := workflow.Execute[ChargeInput, ChargeResult](ctx, "ChargePayment", ChargeInput{OrderID: in.OrderID},
         workflow.WithRetry(workflow.RetryPolicy{MaxAttempts: 5}))
     if err != nil {
         return OrderResult{}, err
     }
 
     // 配送手配とメール送信を並行実行する
-    ship := workflow.ExecuteAsync(ctx, ShipOrder, ShipInput{OrderID: in.OrderID})
-    mail := workflow.ExecuteAsync(ctx, SendReceiptMail, MailInput{To: charge.CustomerEmail})
+    ship := workflow.ExecuteAsync[ShipInput, ShipResult](ctx, "ShipOrder", ShipInput{OrderID: in.OrderID})
+    mail := workflow.ExecuteAsync[MailInput, struct{}](ctx, "SendReceiptMail", MailInput{To: charge.CustomerEmail})
     if _, err := ship.Get(ctx); err != nil {
         return OrderResult{}, err
     }
@@ -53,7 +62,7 @@ func OrderWorkflow(ctx *workflow.Context, in OrderInput) (OrderResult, error) {
     if err := workflow.Sleep(ctx, 7*24*time.Hour); err != nil {
         return OrderResult{}, err
     }
-    if _, err := workflow.Execute(ctx, SendFollowUpMail, MailInput{To: charge.CustomerEmail}); err != nil {
+    if _, err := workflow.Execute[MailInput, struct{}](ctx, "SendFollowUpMail", MailInput{To: charge.CustomerEmail}); err != nil {
         return OrderResult{}, err
     }
     return OrderResult{InvoiceID: charge.InvoiceID}, nil
@@ -93,10 +102,10 @@ func main() {
 
 | 関数 | 概要 |
 |---|---|
-| `Execute[I, O](ctx, fn, in, opts...) (O, error)` | アクティビティを実行し完了を待つ（`WithRetry` / `WithStartToCloseTimeout`） |
+| `Execute[I, O](ctx, name, in, opts...) (O, error)` | アクティビティを実行し完了を待つ（`WithRetry` / `WithStartToCloseTimeout`） |
 | `ExecuteLocal[I, O](ctx, name, in) (O, error)` | 同一 Worker 上で同期実行し結果をジャーナルする（タスクキューなし・リトライなし） |
-| `ExecuteAsync[I, O](ctx, fn, in, opts...) *Future[O]` | アクティビティを開始し Future を返す（同じオプション可） |
-| `ExecuteChild[I, O](ctx, wf, in, opts...) (O, error)` | 子ワークフローを実行し完了を待つ（Async 版もある） |
+| `ExecuteAsync[I, O](ctx, name, in, opts...) *Future[O]` | アクティビティを開始し Future を返す（同じオプション可） |
+| `ExecuteChild[I, O](ctx, name, in) (O, error)` | 子ワークフローを実行し完了を待つ（`ExecuteChildAsync[I, O](ctx, name, in) *Future[O]` もある。どちらもオプションなし） |
 | `Sleep(ctx, d) error` / `SleepUntil(ctx, t) error` | durable なタイマーで待つ |
 | `SleepAsync(ctx, d) *Future[struct{}]` | タイマーを Future として開始する（タイムアウトの Select 用） |
 | `Now(ctx) time.Time` | リプレイで変わらない現在時刻 |
@@ -129,6 +138,7 @@ func main() {
 
 `ExecuteLocal` は `RegisterActivity` した関数をワークフロータスク内で同期実行する。
 通常の `Execute` と違いアクティビティタスクは作らず、リトライも行わない。短い・信頼できる処理向け。結果（またはエラー）は `local_activity` コマンドとしてジャーナルに残り、リプレイではランナーを呼ばない。
+ワークフロータスクはリース延長を行わない。リース時計は `ClaimTasks` が返った時点で進み始めるため、リプレイ・すべての `ExecuteLocal` 呼び出し・コミットを合わせた全体が、残りの `LeaseDuration` に余裕を持って収まる必要がある。個々の処理がリースより短いだけでは足りない。例として、リース 30s に対してリプレイ 15s の後に 20s の `ExecuteLocal` を実行すると期限を越え、最初のワーカーがコミットする前に別ワーカーがタスクを取り直してローカルの副作用を繰り返す恐れがある。リースの一部に収まる短い処理だけに留め、長い処理には `Execute` を使うこと。ローカル処理は副作用を持たせないか、冪等にできる形が望ましい。
 
 ワーカーはタスク実行中、リース半減期ごとに `ExtendLease` でワークフロータスクのリースを延長するため、リプレイやローカル Activity の合計が `LeaseDuration` を超えても他ワーカーに奪われて二重実行にならない。リース更新はターン実行だけでなくバッチのコミット完了まで継続する。ローカル Activity にはワークフローターンの `context.Context` を渡すため、`Shutdown` でキャンセルできる（キャンセルされたターンはワークフロー失敗として確定せず、リースを解放して他ワーカーに譲る）。1 回の `ExecuteLocal` を期限で区切りたい場合は `WorkerOptions.LocalActivityTimeout` を設定する（呼び出しの外側で強制されるため、コンテキストを無視する処理でも期限切れエラーが期限どおりに返る。遅れて返った結果は破棄される）。
 
@@ -150,7 +160,7 @@ func main() {
 タイムアウト付きの外部処理は、タイマーとの Select として書ける。
 
 ```go
-f := workflow.ExecuteAsync(ctx, CallSlowAPI, in)
+f := workflow.ExecuteAsync[SlowInput, SlowOutput](ctx, "CallSlowAPI", in)
 t := workflow.SleepAsync(ctx, 10*time.Minute)
 idx, err := workflow.Await(ctx, f, t)
 if err != nil {
@@ -176,7 +186,7 @@ return したとき、エラーが `ErrCanceled`（を包むもの）ならイ�
 ```go
 v := workflow.GetVersion(ctx, "add-fraud-check", 1, 2)
 if v >= 2 {
-    if _, err := workflow.Execute(ctx, FraudCheck, in); err != nil {
+    if _, err := workflow.Execute[CheckInput, CheckResult](ctx, "FraudCheck", in); err != nil {
         return out, err
     }
 }
@@ -404,6 +414,15 @@ c := tasuki.NewClient(b, tasuki.WithCodec(enc))
 - 封筒マーカーのないペイロードは平文として読むため、既存インスタンスが残るストアでも有効化できる。
 - インスタンス ID、ワークフロー名、キュー名、時刻は暗号化されない（メタデータは平文）。
 
+封筒バージョンとローリングアップグレード: 新規書き込みは既定で `Enc:1`（nil AAD）のため、旧バイナリでも復号できる。読み取り側は `Enc:1` と `Enc:2`（鍵 ID を AAD に束縛）の両方を受け付ける。全リーダー（Worker とリプレイ用ツール）が v2 対応後にのみ、 hardened な `Enc:2` 書き込みを有効化する:
+
+```go
+encV2 := codec.EncryptedWithOptions(codec.JSON(), keys,
+    codec.WithWriteVersion(codec.WriteVersionV2))
+```
+
+手順: (1) v1 書き込みのまま v2 対応バイナリを展開、(2) 全リーダーが v2 対応後に書き込みを v2 へ切り替える。旧リーダーに v2 ペイロードを渡すと認証に失敗し、その復号エラーは incompatible-task の Nack ではなく terminal workflow failure として確定するため、既定は v1 書き込みのままにする。
+
 ## テスト支援
 
 `wftest` パッケージで、DB なし、仮想時計のユニットテストを書ける。
@@ -445,8 +464,12 @@ type WorkerOptions struct {
     JournalWarnThreshold int           // 0 → 既定 10000。負数で無効。超過時は Warn + メトリクスのみ
     IncompatibleRetryDelay time.Duration // 0 → 既定 5s。負数で即時再可視。非互換 Nack 後の hidden 時間
     LocalActivityTimeout time.Duration // 既定 0（無制限）。1 回の ExecuteLocal を期限で区切る
+    MaxPerInstance         int           // 既定 0（無効）。1 回の claim で同一インスタンスから取るタスク数の上限
 }
 ```
+
+`MaxPerInstance` が効くのは fair dispatch 対応バックエンド（PostgreSQL、MySQL、SQLite、インメモリ）のみである。
+DynamoDB、Firestore、Spanner は無視して FIFO 順に claim する（[08-fair-dispatch.md](08-fair-dispatch.md)）。
 
 決定性違反や未登録のワークフロー／アクティビティは terminal にせず Nack する（上記 Delay）。
 メトリクス `tasuki.worker.incompatible_nacks`。

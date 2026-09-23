@@ -45,6 +45,7 @@ func Run(t *testing.T, newBackend Factory) {
 	t.Run("SearchAttributesPagination", func(t *testing.T) { testSearchAttributesPagination(t, newBackend) })
 	t.Run("Memo", func(t *testing.T) { testMemo(t, newBackend) })
 	t.Run("PurgeInstances", func(t *testing.T) { testPurgeInstances(t, newBackend) })
+	t.Run("FairDispatch", func(t *testing.T) { RunFairDispatch(t, newBackend) })
 	RunConcurrent(t, newBackend)
 	RunM2(t, newBackend)
 	RunM3(t, newBackend)

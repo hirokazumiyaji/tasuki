@@ -25,6 +25,17 @@ type Worker struct {
 	done     chan struct{}
 	inFlight map[int64]backend.Task
 
+	// wfClaim records the local wall-clock claim time of each workflow
+	// task claimed by tickWorkflows. NackTask is fenced on the claim token
+	// (worker + attempt, like ReleaseLease), so a stale delayed nack in
+	// requeueWorkflowTask is rejected by the backend without touching a
+	// peer's fresh lease. The local lease-expiry estimate (claim time +
+	// LeaseDuration) stays as a fast path: once it has passed, a peer may
+	// have reclaimed the task, so the stale worker skips the nack call
+	// entirely and expiry reclaims naturally.
+	wfClaimMu sync.Mutex
+	wfClaim   map[int64]time.Time
+
 	stickyMu sync.Mutex
 	sticky   map[string]stickyEntry
 
@@ -57,6 +68,7 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		opts:     opts,
 		reg:      newRegistry(opts.Codec),
 		inFlight: map[int64]backend.Task{},
+		wfClaim:  map[int64]time.Time{},
 		sticky:   map[string]stickyEntry{},
 		instLock: map[string]*workflowActor{},
 		wfSem:    make(chan struct{}, opts.WorkflowConcurrency),
@@ -90,6 +102,10 @@ func (w *Worker) StartWithError(parent context.Context) error {
 		if err := ValidateSchema(parent, w.backend); err != nil {
 			return fmt.Errorf("tasuki: schema validation failed: %w", err)
 		}
+	}
+	if w.opts.MaxPerInstance > 0 && !w.backend.Capabilities().FairDispatch {
+		w.opts.Logger.Warn("tasuki: MaxPerInstance is set but the backend ignores it (no fair dispatch support); claims fall back to FIFO",
+			"max_per_instance", w.opts.MaxPerInstance)
 	}
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
@@ -285,11 +301,13 @@ func (w *Worker) releaseInFlight(ctx context.Context) {
 		}
 		// Kind-routed: workflow tasks live under WF#<instanceID> on
 		// DynamoDB/Firestore, so the full task identity (not just the
-		// numeric ID) addresses the lease.
+		// numeric ID) addresses the lease. Fenced by the tracked claim
+		// token: if the task was reclaimed by a peer while shutting
+		// down, the backend reports ErrNotFound and the fresh lease is
+		// left intact. A fenced release reports ErrNotFound when the
+		// lease moved on (peer reclaim or successor turn): the lease is
+		// already released, not a failure.
 		if err := w.backend.ReleaseLease(ctx, t); err != nil {
-			// A fenced release reports ErrNotFound when the lease moved
-			// on (peer reclaim or successor turn): the lease is already
-			// released, not a failure.
 			if errors.Is(err, backend.ErrNotFound) {
 				w.opts.Logger.Debug("shutdown lease already released",
 					"task_id", t.ID)
@@ -440,6 +458,13 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 	if len(wtasks) == 0 {
 		return
 	}
+	// Record local claim times so the delayed nack can be fenced against
+	// a reclaim race (see requeueWorkflowTask). Cleared after the flush
+	// below; entries are wall-clock only, never store time.
+	for _, t := range wtasks {
+		w.trackWfClaim(t.ID)
+	}
+	defer w.clearWfClaims(wtasks)
 	var wg sync.WaitGroup
 	var pendingMu sync.Mutex
 	var pending []pendingWorkflowCommit
@@ -462,7 +487,9 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		case w.wfSem <- struct{}{}:
 		default:
 			// No slot: make the task visible again promptly for peers.
-			// Kind-routed so workflow tasks address WF#<instanceID>.
+			// Kind-routed so workflow tasks address WF#<instanceID>,
+			// fenced on the just-claimed token so this only releases our
+			// own claim.
 			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
@@ -534,6 +561,14 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					w.recordStoreError(ctx, "commit_workflow", herr,
 						"instance_id", t.InstanceID, "task_id", t.ID)
 					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", herr)
+					if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {
+						w.dropSticky(t.InstanceID)
+					}
+					// Contention releases immediately for fast replay;
+					// anything else backs off via delayed nack so a
+					// persistently failing task does not spin the poll
+					// loop (see requeueWorkflowTask).
+					w.requeueWorkflowTask(ctx, t, herr)
 					return
 				}
 				if p == nil {
@@ -881,6 +916,7 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task, stopRenewal
 			instanceID:  t.InstanceID,
 			baseJournal: state.Journal,
 			adv:         adv,
+			task:        t,
 		}
 	}
 
