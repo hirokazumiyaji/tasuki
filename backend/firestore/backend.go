@@ -326,11 +326,19 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		// only attempted (picked) IDs are recorded, never every examined
 		// row, so it is bounded by the batch size plus conflicts.
 		skip := map[int64]struct{}{}
-		for len(out) < req.Limit && (picker == nil || !picker.Full()) {
-			cands, err := b.listClaimCandidates(ctx, req.Kind, q, now, req.Limit-len(out), picker, skip)
+		// cursor carries the (visible_at, __name__) scan position across
+		// conflict refills within this queue: each window is fetched once
+		// per ClaimTasks call instead of restarting from the head on
+		// every refill. exhausted marks the index end so a refill never
+		// restarts from nil and the loop terminates.
+		var cursor *gcf.DocumentSnapshot
+		exhausted := false
+		for len(out) < req.Limit && (picker == nil || !picker.Full()) && !exhausted {
+			cands, next, done, err := b.listClaimCandidates(ctx, req.Kind, q, now, req.Limit-len(out), picker, skip, cursor)
 			if err != nil {
 				return nil, err
 			}
+			cursor, exhausted = next, done
 			if len(cands) == 0 {
 				break
 			}
@@ -412,7 +420,18 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // retains snapshots solely for picker-accepted candidates (bounded by the
 // batch size) and doubles as a guard against double-offering an accepted ID
 // if a concurrent update ever surfaces a duplicate within one scan.
-func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker, skip map[int64]struct{}) ([]*gcf.DocumentSnapshot, error) {
+//
+// The caller threads cursor through conflict refills (it is both the resume
+// point and, via exhausted, the termination signal), so refills continue past
+// already-consumed windows instead of re-fetching the prefix: every window is
+// read once per ClaimTasks call and the loop ends when the index is
+// exhausted. Attempted IDs stay in skip so a stale index entry of a released
+// snapshot is never reselected after its slot is freed. Trade-off: documents
+// after the early-stop point within the window where the batch filled, and
+// documents rejected by the fair cap before a conflict freed a slot, are
+// picked up on a later poll rather than in the same call; liveness holds
+// because they stay claimable.
+func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker, skip map[int64]struct{}, cursor *gcf.DocumentSnapshot) ([]*gcf.DocumentSnapshot, *gcf.DocumentSnapshot, bool, error) {
 	base := b.col("wf_tasks").Where("kind", "==", kind).Where("queue", "==", queue).Where("visible_at", "<=", now).OrderBy("visible_at", gcf.Asc).OrderBy(gcf.DocumentID, gcf.Asc)
 	collect := func(it *gcf.DocumentIterator) ([]*gcf.DocumentSnapshot, error) {
 		defer it.Stop()
@@ -430,12 +449,19 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		return docs, nil
 	}
 	if picker == nil {
-		docs, err := collect(base.Limit(remaining).Documents(ctx))
+		// Single-pass path: the caller never refills without a picker
+		// (refills follow a conflict Release), so cursor is always nil
+		// here; it is threaded only for signature symmetry.
+		q := base.Limit(remaining)
+		if cursor != nil {
+			q = q.StartAfter(cursor)
+		}
+		docs, err := collect(q.Documents(ctx))
 		if err != nil {
-			return nil, err
+			return nil, cursor, false, err
 		}
 		if len(skip) == 0 {
-			return docs, nil
+			return docs, nil, false, nil
 		}
 		kept := docs[:0]
 		for _, d := range docs {
@@ -443,7 +469,7 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 				kept = append(kept, d)
 			}
 		}
-		return kept, nil
+		return kept, nil, false, nil
 	}
 	pageSize := backend.FairOverfetch(remaining)
 	// byID retains snapshots only for picker-accepted candidates so
@@ -455,17 +481,19 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 	// an already-successful pick).
 	byID := map[int64]*gcf.DocumentSnapshot{}
 	fresh := len(picker.Picked())
-	var cursor *gcf.DocumentSnapshot
+	startAfter := cursor
+	exhausted := false
 	for !picker.Full() {
 		q := base.Limit(pageSize)
-		if cursor != nil {
-			q = q.StartAfter(cursor)
+		if startAfter != nil {
+			q = q.StartAfter(startAfter)
 		}
 		docs, err := collect(q.Documents(ctx))
 		if err != nil {
-			return nil, err
+			return nil, startAfter, false, err
 		}
 		if len(docs) == 0 {
+			exhausted = true
 			break
 		}
 		for _, d := range docs {
@@ -486,8 +514,13 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 				break
 			}
 		}
-		cursor = docs[len(docs)-1]
-		if picker.Full() || len(docs) < pageSize {
+		startAfter = docs[len(docs)-1]
+		if picker.Full() {
+			// Batch filled: unscanned documents may remain behind.
+			break
+		}
+		if len(docs) < pageSize {
+			exhausted = true
 			break
 		}
 	}
@@ -498,7 +531,7 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 			docs = append(docs, d)
 		}
 	}
-	return docs, nil
+	return docs, startAfter, exhausted, nil
 }
 func (b *Backend) updateTask(ctx context.Context, id int64, activity bool, fields []gcf.Update) error {
 	r := b.ref("wf_tasks", actTaskID(id))

@@ -310,11 +310,20 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		// only attempted (picked) IDs are recorded, never every examined
 		// row, so it is bounded by the batch size plus conflicts.
 		skip := map[int64]struct{}{}
-		for len(result) < req.Limit && (picker == nil || !picker.Full()) {
-			cands, err := b.listClaimCandidates(ctx, req.Kind, queue, now, req.Limit-len(result), picker, skip)
+		// cursor carries the claim_gsi scan position across conflict
+		// refills within this queue: each page is read once per
+		// ClaimTasks call instead of restarting from the head on every
+		// refill (which re-reads the whole prefix per conflict and turns
+		// long stale runs quadratic). exhausted marks the partition end
+		// so a refill never restarts from nil and the loop terminates.
+		var cursor map[string]types.AttributeValue
+		exhausted := false
+		for len(result) < req.Limit && (picker == nil || !picker.Full()) && !exhausted {
+			cands, next, done, err := b.listClaimCandidates(ctx, req.Kind, queue, now, req.Limit-len(result), picker, skip, cursor)
 			if err != nil {
 				return nil, err
 			}
+			cursor, exhausted = next, done
 			if len(cands) == 0 {
 				break
 			}
@@ -374,19 +383,33 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // retains payloads solely for picker-accepted candidates (bounded by the
 // batch size) and doubles as a guard against double-offering an accepted ID
 // if a concurrent update ever surfaces a duplicate within one scan.
-func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker, skip map[int64]struct{}) ([]map[string]types.AttributeValue, error) {
+//
+// The caller threads cursor through conflict refills (it is both the resume
+// point and, via exhausted, the termination signal), so refills continue past
+// already-consumed pages instead of re-reading the prefix: every page is
+// fetched once per ClaimTasks call and the loop ends when the partition is
+// exhausted. Attempted IDs stay in skip so a stale GSI image of a released
+// candidate is never reselected after its slot is freed. Trade-off: rows
+// after the early-stop point within the page where the batch filled, and rows
+// rejected by the fair cap before a conflict freed a slot, are picked up on a
+// later poll rather than in the same call; liveness holds because they stay
+// claimable.
+func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker, skip map[int64]struct{}, cursor map[string]types.AttributeValue) ([]map[string]types.AttributeValue, map[string]types.AttributeValue, bool, error) {
 	queryPage := func(start map[string]types.AttributeValue, pageLimit int32) (*dynamodb.QueryOutput, error) {
 		return b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_tasks")), IndexName: aws.String("claim_gsi"),
 			KeyConditionExpression: aws.String("gsi_pk = :g AND visible_at <= :now"), ExpressionAttributeValues: map[string]types.AttributeValue{":g": avS(claimGSI(kind, queue)), ":now": avN(timeToN(now))},
 			Limit: aws.Int32(pageLimit), ExclusiveStartKey: start})
 	}
 	if picker == nil {
-		out, err := queryPage(nil, int32(remaining))
+		// Single-pass path: the caller never refills without a picker
+		// (refills follow a conflict Release), so cursor is always nil
+		// here; it is threaded only for signature symmetry.
+		out, err := queryPage(cursor, int32(remaining))
 		if err != nil {
-			return nil, err
+			return nil, cursor, false, err
 		}
 		if len(skip) == 0 {
-			return out.Items, nil
+			return out.Items, out.LastEvaluatedKey, false, nil
 		}
 		items := out.Items[:0]
 		for _, item := range out.Items {
@@ -394,7 +417,7 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 				items = append(items, item)
 			}
 		}
-		return items, nil
+		return items, out.LastEvaluatedKey, false, nil
 	}
 	pageSize := backend.FairOverfetch(remaining)
 	// byID retains full payloads only for picker-accepted candidates so
@@ -406,13 +429,16 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 	// release an already-successful claim).
 	byID := map[int64]map[string]types.AttributeValue{}
 	fresh := len(picker.Picked())
-	var start map[string]types.AttributeValue
+	start := cursor
+	exhausted := false
 	for !picker.Full() {
 		out, err := queryPage(start, int32(pageSize))
 		if err != nil {
-			return nil, err
+			return nil, start, false, err
 		}
 		if len(out.Items) == 0 {
+			start = out.LastEvaluatedKey
+			exhausted = start == nil
 			break
 		}
 		for _, item := range out.Items {
@@ -432,10 +458,15 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 				break
 			}
 		}
-		if picker.Full() || out.LastEvaluatedKey == nil {
+		start = out.LastEvaluatedKey
+		if picker.Full() {
+			// Batch filled: unscanned rows may remain behind.
 			break
 		}
-		start = out.LastEvaluatedKey
+		if start == nil {
+			exhausted = true
+			break
+		}
 	}
 	picked := picker.Picked()[fresh:]
 	items := make([]map[string]types.AttributeValue, 0, len(picked))
@@ -444,7 +475,7 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 			items = append(items, item)
 		}
 	}
-	return items, nil
+	return items, start, exhausted, nil
 }
 
 func decodeTask(m map[string]types.AttributeValue) backend.Task {
