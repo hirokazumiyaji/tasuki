@@ -753,6 +753,14 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	if err := row.Columns(&status, &nextSeq, &queue, &parentID, &parentSeq); err != nil {
 		return err
 	}
+	// Reject commits for instances that already left running (see firestore
+	// readAdvancementTx): a task leased before TerminateInstance still
+	// matches, and without this gate a terminal advancement would overwrite
+	// terminated → completed/failed while a suspended one appends
+	// journal/children post-termination.
+	if status != "running" {
+		return backend.ErrConflict
+	}
 	if nextSeq != adv.ExpectedSeq {
 		return backend.ErrConflict
 	}

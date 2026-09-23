@@ -79,6 +79,18 @@ CREATE TABLE wf_timers (
 
 CREATE INDEX wf_timers_fire_idx ON wf_timers(fire_at);
 
+-- wf_purge_markers is the durable incarnation fence for purge victims (see
+-- purge.go): one row per victim whose instance row is already gone but whose
+-- trailing sweep/reap may not have finished. Written in the same transaction
+-- as the victim delete, cleared when cleanup completes, resumed by later
+-- purges after a crash. Keyed by victim ID so a later purge of a replacement
+-- incarnation overwrites the row instead of colliding.
+CREATE TABLE wf_purge_markers (
+  instance_id STRING(255) NOT NULL,
+  created_at TIMESTAMP NOT NULL,
+  purged_at TIMESTAMP NOT NULL
+) PRIMARY KEY (instance_id);
+
 CREATE TABLE wf_schedules (
   id STRING(255) NOT NULL,
   cron STRING(255) NOT NULL,

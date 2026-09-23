@@ -904,6 +904,17 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 		return advancementPrep{}, backend.ErrConflict
 	}
 	inst := decodeInstance(instSnap.Data())
+	// Reject commits for instances that already left running: a task leased
+	// before TerminateInstance still carries a matching ExpectedSeq/TaskID,
+	// and the post-flip sweep no longer deletes the task inside the flip
+	// transaction, so without this gate a terminal advancement would
+	// overwrite terminated → completed/failed (and a suspended one would
+	// append journal/children post-termination). Reading the status in-txn
+	// also conflicts with a concurrent status flip, serializing the commit
+	// against termination.
+	if inst.Status != "running" {
+		return advancementPrep{}, backend.ErrConflict
+	}
 	if adv.ParentNotify != nil && inst.ParentID != "" {
 		if err := seedInboxSeqTx(b, tx, alloc, inst.ParentID); err != nil {
 			return advancementPrep{}, err

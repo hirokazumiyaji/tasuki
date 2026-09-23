@@ -26,6 +26,52 @@ type purgeVictim struct {
 	createdAt time.Time
 }
 
+// purgeMarkerTTL bounds a purge marker's life once a replacement incarnation
+// exists. Markers are only metadata: with a live replacement the child rows
+// stay ambiguous (old stragglers vs the replacement's own) and are left for
+// the replacement's own purge either way — the TTL only drops the marker row
+// itself so it never outlives its usefulness. Markers with no replacement
+// (instance row still absent) resume regardless of age: no new rows could
+// have appeared, so every remaining row is provably old.
+const purgeMarkerTTL = 7 * 24 * time.Hour
+
+// purgeMarker is the durable incarnation fence for one purge victim: the
+// victim ID plus the created_at incarnation observed at listing time and the
+// time the victim delete committed. It is written in the SAME transaction as
+// the victim delete (see deletePurgedInstanceRow) and cleared only after the
+// second sweep and residual reap complete, so a crash in between stays
+// recoverable: later purges consult stale markers (see
+// resumeStalePurgeMarkers) where the in-memory residual snapshot is lost.
+//
+// The row key is the victim ID, so a later purge of a replacement
+// incarnation overwrites the marker with its own incarnation instead of
+// colliding (collision-safe by key; InsertOrUpdate, never bare Insert).
+type purgeMarker struct {
+	id        string
+	createdAt time.Time
+	purgedAt  time.Time
+}
+
+// purgeMarkerMutation builds the marker upsert for a victim delete. Pure
+// save for the timestamp for unit tests (see purgeMarkerExpired).
+func purgeMarkerMutation(v purgeVictim, now time.Time) *spanner.Mutation {
+	return spanner.InsertOrUpdateMap("wf_purge_markers", map[string]any{
+		"instance_id": v.id,
+		"created_at":  v.createdAt,
+		"purged_at":   now,
+	})
+}
+
+// purgeMarkerExpired reports whether a marker with a live replacement may be
+// dropped (see purgeMarkerTTL). Markers without a write timestamp never
+// expire; they linger until the replacement's own purge overwrites them.
+func purgeMarkerExpired(now, purgedAt time.Time) bool {
+	if purgedAt.IsZero() {
+		return false
+	}
+	return now.Sub(purgedAt) >= purgeMarkerTTL
+}
+
 // PurgeInstances deletes terminal instances and their dependent rows in
 // per-instance paged transactions. A single transaction deleting every victim
 // (or one instance's full journal/inbox) would buffer one mutation per row and
@@ -71,6 +117,15 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 		if done {
 			purged++
 		}
+	}
+	// Crash recovery: each victim delete commits its purge marker atomically,
+	// but the trailing sweep/reap runs after — a crash in between leaves
+	// orphaned rows no victim listing can rediscover (the instance row is
+	// gone). Stale markers resume that cleanup (see
+	// resumeStalePurgeMarkers); marker resumes complete cleanups, never new
+	// victim deletes, so they are not counted in purged.
+	if err := b.resumeStalePurgeMarkers(ctx, nowUTC()); err != nil {
+		return purged, err
 	}
 	return purged, nil
 }
@@ -137,11 +192,120 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 			if rerr := b.reapResidualStragglers(ctx, v.id, residual); rerr != nil {
 				return true, rerr
 			}
+			// The residual reap is the last step owning victim rows: only
+			// now is the durable marker cleared. A crash before this point
+			// resumes via resumeStalePurgeMarkers.
+			if cerr := b.clearPurgeMarker(ctx, v.id); cerr != nil {
+				return true, cerr
+			}
 			return true, nil
 		}
 		return false, err
 	}
+	// The second sweep is the last step owning victim rows: only now is the
+	// durable marker cleared (see above for the crash window this closes).
+	if err := b.clearPurgeMarker(ctx, v.id); err != nil {
+		return true, err
+	}
 	return true, nil
+}
+
+// clearPurgeMarker removes a victim's purge marker after its trailing
+// sweep/reap completed. The victim rows are already gone, so a crash after
+// this point needs no recovery; a failure here surfaces (leaving the marker)
+// instead of reporting success while a resume stays pending. A later purge
+// then finds an empty victim (no rows, no instance row) and clears the
+// marker idempotently. Note the purge count edge: the victim was fully
+// purged but a marker-clear failure returns before it is counted, so the
+// count misses one instance across the failing call and its healing resume
+// (which never counts resumes).
+func (b *Backend) clearPurgeMarker(ctx context.Context, id string) error {
+	return b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return txn.BufferWrite([]*spanner.Mutation{
+			spanner.Delete("wf_purge_markers", spanner.Key{id}),
+		})
+	})
+}
+
+// resumeStalePurgeMarkers completes victim cleanups whose process crashed
+// between the victim-delete commit (which durably writes the purge marker)
+// and the trailing sweep/reap (which clears it). The in-memory residual
+// snapshot is lost with the crash, so the resume cannot reap by exact
+// key — instead it exploits the absent-instance invariant: while the
+// instance row stays gone no new child rows can appear (inbox writers read
+// wf_instances in-txn and abort into ErrNotFound; CreateInstance would
+// recreate the row and trip the fence), so every remaining row is provably
+// old and the fenced second sweep removes it safely. If a replacement
+// appeared, rows stay ambiguous and are left for the replacement's own
+// purge (leak-safe); only the marker itself ages out via purgeMarkerTTL.
+func (b *Backend) resumeStalePurgeMarkers(ctx context.Context, now time.Time) error {
+	iter := b.client.Single().Query(ctx, spanner.Statement{
+		SQL: `SELECT instance_id, created_at, purged_at FROM wf_purge_markers`,
+	})
+	defer iter.Stop()
+	for {
+		row, err := iter.Next()
+		if err == iterator.Done {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var marker purgeMarker
+		if err := row.Columns(&marker.id, &marker.createdAt, &marker.purgedAt); err != nil {
+			return err
+		}
+		if marker.id == "" {
+			continue
+		}
+		if err := b.resumeOnePurgeMarker(ctx, marker, now); err != nil {
+			return err
+		}
+	}
+}
+
+// resumeOnePurgeMarker resumes a single stale marker (see
+// resumeStalePurgeMarkers). A resumed cleanup that finds nothing left still
+// clears the marker; a resume racing a fresh replacement trips the absent
+// fence and keeps the marker for a later pass.
+func (b *Backend) resumeOnePurgeMarker(ctx context.Context, marker purgeMarker, now time.Time) error {
+	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{marker.id}, []string{"created_at"})
+	if err != nil && !isNotFound(err) {
+		return err
+	}
+	if err == nil {
+		var createdAt time.Time
+		if err := row.Columns(&createdAt); err != nil {
+			return err
+		}
+		if createdAt.Equal(marker.createdAt) {
+			// Same incarnation present: the delete transaction writes the
+			// marker and the delete atomically, so this is unreachable
+			// barring manual writes. Leave the marker: a later purge of
+			// this victim overwrites it in its own delete transaction.
+			return nil
+		}
+		// Replacement incarnation: rows are ambiguous, so they stay for the
+		// replacement's own purge. Drop only the marker itself once stale.
+		if purgeMarkerExpired(now, marker.purgedAt) {
+			return b.clearPurgeMarker(ctx, marker.id)
+		}
+		return nil
+	}
+	gone := func(ctx context.Context) error { return b.checkPurgeAbsent(ctx, marker.id) }
+	goneTx := func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return b.checkPurgeAbsentTx(ctx, txn, marker.id)
+	}
+	if err := b.deleteInstanceChildren(ctx, marker.id, gone, goneTx); err != nil {
+		if errors.Is(err, errPurgeSuperseded) {
+			// A replacement appeared mid-resume: rows are ambiguous now.
+			// Keep the marker; a later pass (or the replacement's own
+			// purge, which overwrites it) retries.
+			return nil
+		}
+		return err
+	}
+	return b.clearPurgeMarker(ctx, marker.id)
 }
 
 // checkPurgeVictim enforces the first-sweep fence: the victim row must still
@@ -237,6 +401,13 @@ func (b *Backend) checkPurgeAbsentTx(ctx context.Context, txn *spanner.ReadWrite
 // slip a row into that the exact-reap could then mistake for the
 // replacement's. Rows that serialize after this transaction are excluded
 // and leak safely for the replacement's own purge.
+//
+// The same transaction durably writes the purge marker (see purgeMarker):
+// the in-memory residual above is lost on a crash before the second
+// sweep/reap, but the marker lets a later purge rediscover the absent victim
+// and resume. The marker upsert overwrites any stale marker from an earlier
+// incarnation's crashed purge — keyed by victim ID, so the latest
+// incarnation always wins.
 func (b *Backend) deletePurgedInstanceRow(ctx context.Context, v purgeVictim) (bool, *residualStragglers, error) {
 	deleted := false
 	var residual residualStragglers
@@ -270,6 +441,7 @@ func (b *Backend) deletePurgedInstanceRow(ctx context.Context, v purgeVictim) (b
 		return txn.BufferWrite([]*spanner.Mutation{
 			spanner.Delete("wf_inbox_seq", spanner.Key{v.id}),
 			spanner.Delete("wf_instances", spanner.Key{v.id}),
+			purgeMarkerMutation(v, nowUTC()),
 		})
 	})
 	if errors.Is(err, errPurgeSuperseded) {

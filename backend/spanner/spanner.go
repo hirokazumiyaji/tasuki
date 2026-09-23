@@ -210,6 +210,24 @@ CREATE TABLE wf_inbox_seq (
 			return err
 		}
 	}
+	// Purge markers backfill for databases created before the crash-fence
+	// (Codex round 10 on #296): without the row the victim-delete
+	// transaction fails, so its absence must behave like the other
+	// incremental tables above, not like a fatal schema error.
+	markerExists, err := b.tableExists(ctx, "wf_purge_markers")
+	if err != nil {
+		return err
+	}
+	if !markerExists {
+		if err := b.applyDDL(ctx, []string{`
+CREATE TABLE wf_purge_markers (
+  instance_id STRING(255) NOT NULL,
+  created_at TIMESTAMP NOT NULL,
+  purged_at TIMESTAMP NOT NULL
+) PRIMARY KEY (instance_id)`}); err != nil {
+			return err
+		}
+	}
 	if err := b.ensureSearchAttributesColumn(ctx); err != nil {
 		return err
 	}
@@ -329,6 +347,7 @@ func (b *Backend) Reset(ctx context.Context) error {
 		{table: "wf_inbox", sql: `SELECT id FROM wf_inbox`, kind: "int64"},
 		{table: "wf_inbox_seq", sql: `SELECT instance_id FROM wf_inbox_seq`, kind: "string"},
 		{table: "wf_signal_dedupe", sql: `SELECT instance_id, dedupe_id FROM wf_signal_dedupe`, kind: "strpair"},
+		{table: "wf_purge_markers", sql: `SELECT instance_id FROM wf_purge_markers`, kind: "string"},
 		{table: "wf_journal", sql: `SELECT instance_id, seq FROM wf_journal`, kind: "pair"},
 		{table: "wf_instances", sql: `SELECT id FROM wf_instances`, kind: "string"},
 	}
