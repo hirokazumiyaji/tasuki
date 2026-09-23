@@ -324,7 +324,9 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		// Firestore converges, so refills must exclude attempted IDs
 		// instead of reselecting the same stale entry. It stays small:
 		// only attempted (picked) IDs are recorded, never every examined
-		// row, so it is bounded by the batch size plus conflicts.
+		// row, and entries behind the committed cursor are pruned on each
+		// refill (see below), so it is bounded by the current window's
+		// attempts rather than the whole stale backlog.
 		skip := map[int64]struct{}{}
 		// cursor carries the (visible_at, __name__) scan position across
 		// conflict refills within this queue: each window is fetched once
@@ -339,6 +341,18 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				return nil, err
 			}
 			cursor, exhausted = next, done
+			// Prune attempted IDs behind the committed cursor: the
+			// (visible_at, __name__) scan is forward-only, so documents
+			// before the resume point cannot recur on the next refill.
+			// Every existing entry sorts before next — picks come from
+			// documents at or before the resume document and earlier
+			// windows are further behind — so dropping them cannot
+			// reselect, and the next fetch starts after next. Only the
+			// current window's attempts are re-added below, bounding skip
+			// to O(batch) under prolonged index lag instead of O(stale
+			// backlog). Termination is unchanged: exhausted plus the
+			// empty/release breaks below.
+			clear(skip)
 			if len(cands) == 0 {
 				break
 			}
@@ -429,7 +443,10 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // examined document (not the window end), so a refill re-examines the
 // unexamined window suffix instead of skipping it. Attempted IDs stay in skip
 // so a stale index entry of a released snapshot is never reselected after its
-// slot is freed. Trade-off: documents rejected by the fair cap before a
+// slot is freed; only the current window's attempts are retained, entries
+// behind the committed cursor being pruned on each refill (they cannot recur
+// past the forward-only resume point), which bounds skip to O(batch).
+// Trade-off: documents rejected by the fair cap before a
 // conflict freed a slot are picked up on a later poll rather than in the same
 // call; liveness holds because they stay claimable.
 func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker, skip map[int64]struct{}, cursor *gcf.DocumentSnapshot) ([]*gcf.DocumentSnapshot, *gcf.DocumentSnapshot, bool, error) {

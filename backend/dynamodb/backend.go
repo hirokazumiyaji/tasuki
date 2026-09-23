@@ -308,7 +308,9 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		// the index catches up, so refills must exclude attempted IDs
 		// instead of reselecting the same stale entry. It stays small:
 		// only attempted (picked) IDs are recorded, never every examined
-		// row, so it is bounded by the batch size plus conflicts.
+		// row, and entries behind the committed cursor are pruned on each
+		// refill (see below), so it is bounded by the current page's
+		// attempts rather than the whole stale backlog.
 		skip := map[int64]struct{}{}
 		// cursor carries the claim_gsi scan position across conflict
 		// refills within this queue: each page is read once per
@@ -324,6 +326,18 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				return nil, err
 			}
 			cursor, exhausted = next, done
+			// Prune attempted IDs behind the committed cursor: the GSI scan
+			// is forward-only, so rows before the resume point cannot recur
+			// on the next refill. Every existing entry sorts before next —
+			// picks come from rows at or before the resume key and earlier
+			// pages are further behind (this holds for the pageStart
+			// re-fetch too: it still sits ahead of every previous page) —
+			// so dropping them cannot reselect, and the next fetch starts
+			// at/after next. Only the current page's attempts are re-added
+			// below, bounding skip to O(batch) under prolonged GSI lag
+			// instead of O(stale backlog). Termination is unchanged:
+			// exhausted plus the empty/release breaks below.
+			clear(skip)
 			if len(cands) == 0 {
 				break
 			}
@@ -392,7 +406,9 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // examined item (not the page end), so a refill re-examines the unexamined
 // page suffix instead of skipping it. Attempted IDs stay in skip so a stale
 // GSI image of a released candidate is never reselected after its slot is
-// freed. Trade-off: rows rejected by the fair cap before a conflict freed a
+// freed; only the current page's attempts are retained, entries behind the
+// committed cursor being pruned on each refill (they cannot recur past the
+// forward-only resume point), which bounds skip to O(batch). Trade-off: rows rejected by the fair cap before a conflict freed a
 // slot are picked up on a later poll rather than in the same call; liveness
 // holds because they stay claimable.
 // claimResumeKey rebuilds the ExclusiveStartKey that resumes a claim_gsi
