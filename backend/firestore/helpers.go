@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hirokazumiyaji/tasuki/backend"
@@ -35,7 +36,34 @@ func inboxID(instanceID string, id int64) string {
 	return instanceID + ":" + strconv.FormatInt(id, 10)
 }
 func signalDedupeID(instanceID, dedupeID string) string {
-	return instanceID + ":" + dedupeID
+	return instanceID + ":" + escapeDedupeID(dedupeID)
+}
+
+// signalDedupeMarkerID derives the document ID of the post-terminal send
+// marker for a DedupeID. Markers live in the same wf_signal_dedupe
+// collection as user keys, so the two namespaces must be disjoint for every
+// user-supplied DedupeID (see escapeDedupeID): the marker is derived from the
+// RAW DedupeID and never passed through the user-key escape.
+func signalDedupeMarkerID(instanceID, dedupeID string) string {
+	return instanceID + ":" + postTerminalDedupeMarker(dedupeID)
+}
+
+// escapeDedupeID encodes a user-supplied DedupeID for storage so it can never
+// collide with an internal post-terminal marker (Codex round 6 on #327). A
+// user DedupeID of "__post_terminal__:x" used to share its document with the
+// retry marker for user ID "x": a pre-terminal send of the former made the
+// marker check for the latter see a row and swallow the first post-terminal
+// send (lost signal). IDs starting with "__" gain one extra "__" prefix, so
+// every stored user key is either free of a "__" prefix (unescaped) or starts
+// with "____" (escaped, since the raw ID already started with "__"), while
+// every marker starts with "__post_terminal__:" ("__" followed by 'p'):
+// the two sets are disjoint, and the encoding is injective, so distinct user
+// IDs still map to distinct keys and normal dedupe is unaffected.
+func escapeDedupeID(dedupeID string) string {
+	if strings.HasPrefix(dedupeID, "__") {
+		return "__" + dedupeID
+	}
+	return dedupeID
 }
 
 // postTerminalDedupeMarker derives the post-terminal send marker for a
@@ -45,8 +73,9 @@ func signalDedupeID(instanceID, dedupeID string) string {
 // retries must still dedupe: the first post-terminal send creates this
 // marker alongside the event, and later retries with the same DedupeID see
 // the marker and skip. Only the marker suppresses a terminal insert; the
-// pre-terminal base key never does. The "__post_terminal__:" prefix is
-// reserved and must not be used as a user DedupeID prefix.
+// pre-terminal base key never does. User keys pass through escapeDedupeID on
+// storage, so the "__post_terminal__:" marker namespace can never collide
+// with a user DedupeID, however adversarial.
 func postTerminalDedupeMarker(dedupeID string) string {
 	return "__post_terminal__:" + dedupeID
 }

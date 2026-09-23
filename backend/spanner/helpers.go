@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -107,10 +108,36 @@ func inboxPayload(ev journal.Event) []byte {
 // fix), but retries must still dedupe: the first post-terminal send creates
 // this marker alongside the event, and later retries see the marker and
 // skip. Only the marker suppresses a terminal insert; the pre-terminal base
-// key never does. The "__post_terminal__:" prefix is reserved.
+// key never does. User keys pass through escapeDedupeID on storage, so the
+// "__post_terminal__:" marker namespace can never collide with a user
+// DedupeID, however adversarial.
 func postTerminalDedupeMarker(dedupeID string) string {
 	return "__post_terminal__:" + dedupeID
 }
+
+// escapeDedupeID encodes a user-supplied DedupeID for storage so it can never
+// collide with an internal post-terminal marker (Codex round 6 on #327). A
+// user DedupeID of "__post_terminal__:x" used to share its row with the retry
+// marker for user ID "x": a pre-terminal send of the former made the marker
+// check for the latter see a row and swallow the first post-terminal send
+// (lost signal). IDs starting with "__" gain one extra "__" prefix, so every
+// stored user key is either free of a "__" prefix (unescaped) or starts with
+// "____" (escaped), while every marker starts with "__post_terminal__:"
+// ("__" followed by 'p'): the two sets are disjoint, and the encoding is
+// injective, so distinct user IDs still map to distinct keys.
+func escapeDedupeID(dedupeID string) string {
+	if strings.HasPrefix(dedupeID, "__") {
+		return "__" + dedupeID
+	}
+	return dedupeID
+}
+
+// dedupeKey is the wf_signal_dedupe row key for a user DedupeID (escaped).
+// dedupeMarkerKey is the row key for its post-terminal send marker, derived
+// from the RAW DedupeID and never escaped, so the marker namespace stays
+// disjoint from every user key (see escapeDedupeID).
+func dedupeKey(dedupeID string) string       { return escapeDedupeID(dedupeID) }
+func dedupeMarkerKey(dedupeID string) string { return postTerminalDedupeMarker(dedupeID) }
 
 func unwrapInboxPayload(payload []byte) (string, []byte) {
 	if len(payload) == 0 {

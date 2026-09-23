@@ -106,7 +106,7 @@ func TestPurgeReapsReplacedStragglers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(residual.dedupeIDs)+len(residual.inboxIDs) == 0 {
+	if len(residual.dedupe)+len(residual.inboxIDs) == 0 {
 		t.Fatal("residual snapshot is empty; nothing to reap")
 	}
 	// Simulate the purge victim delete followed by an ID-reusing
@@ -182,4 +182,181 @@ func terminalTestInboxLen(t *testing.T, b *Backend, ctx context.Context, id stri
 		t.Fatal(err)
 	}
 	return len(st.Inbox)
+}
+
+// A user DedupeID carrying the internal marker prefix must never collide
+// with a post-terminal retry marker (Codex round 6 on #327): the marker
+// namespace is escaped on write/read, so a pre-terminal send of
+// "__post_terminal__:x" occupies a different row than the marker for user
+// ID "x". Without the escape, the terminal send of "x" below would see the
+// pre-terminal row, mistake itself for a retry, and lose the signal.
+func TestTerminalMarkerNamespaceCollision(t *testing.T) {
+	dsn := guardTestDSN(t)
+	ctx := context.Background()
+	b, err := New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	const id = "terminal-marker-collision"
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	ev := journal.Event{Type: journal.TypeSignalReceived, Name: "sig", Payload: []byte(`{}`)}
+	// Ordinary dedupe still works for the exotic ID while running.
+	if err := b.SendToInbox(ctx, id, ev, "__post_terminal__:x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SendToInbox(ctx, id, ev, "__post_terminal__:x"); err != nil {
+		t.Fatal(err)
+	}
+	if n := terminalTestInboxLen(t, b, ctx, id); n != 1 {
+		t.Fatalf("exotic-ID resend duplicated the signal: inbox=%d want 1", n)
+	}
+	// Terminal transition with the pre-terminal key still present.
+	_, err = b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return txn.BufferWrite([]*spanner.Mutation{
+			spanner.UpdateMap("wf_instances", map[string]any{
+				"id": id, "status": "terminated",
+				"updated_at": nowUTC(), "completed_at": nowUTC(),
+			}),
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first post-terminal send of "x" must insert, not dedupe against
+	// the pre-terminal "__post_terminal__:x" row.
+	if err := b.SendToInbox(ctx, id, ev, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if n := terminalTestInboxLen(t, b, ctx, id); n != 2 {
+		t.Fatalf("terminal send swallowed by marker collision: inbox=%d want 2 (signal lost)", n)
+	}
+	// Retry idempotency via the real marker still holds.
+	if err := b.SendToInbox(ctx, id, ev, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if n := terminalTestInboxLen(t, b, ctx, id); n != 2 {
+		t.Fatalf("terminal retry duplicated the signal: inbox=%d want 2 (idempotency lost)", n)
+	}
+}
+
+// When the purge second sweep stops at a replacement incarnation, the
+// version-conditioned reap must preserve a dedupe key the replacement
+// recreated after the snapshot (Codex round 6 on #327): dedupe keys are
+// deterministic ((instance_id, dedupe_id)), so an unconditional exact-key
+// delete would strip the replacement's live guard while its inbox event
+// remains, duplicating a later retry. A straggler the replacement never
+// touched is still reaped.
+func TestPurgePreservesRecreatedDedupeKey(t *testing.T) {
+	dsn := guardTestDSN(t)
+	ctx := context.Background()
+	b, err := New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	const id = "purge-recreated-key"
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	evOld := journal.Event{Type: journal.TypeSignalReceived, Name: "old-signal", Payload: []byte(`{}`)}
+	if err := b.SendToInbox(ctx, id, evOld, "old-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SendToInbox(ctx, id, evOld, "straggler-key"); err != nil {
+		t.Fatal(err)
+	}
+	residual, err := b.listResidualStragglers(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(residual.dedupe) != 2 {
+		t.Fatalf("residual dedupe snapshot holds %d keys, want 2", len(residual.dedupe))
+	}
+	// Simulate a concurrent sweep deleting the straggler row after the
+	// snapshot, then the purge victim delete and an ID-reusing
+	// CreateInstance. The replacement's send of "old-key" finds no row, so
+	// it creates a FRESH row (new created_at) with its inbox event — the
+	// reap must recognize the version change and skip it.
+	_, err = b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		_, err := txn.Update(ctx, spanner.Statement{
+			SQL:    `DELETE FROM wf_signal_dedupe WHERE instance_id = @id AND dedupe_id = @k`,
+			Params: map[string]any{"id": id, "k": "old-key"},
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		iter := txn.Query(ctx, spanner.Statement{
+			SQL:    `SELECT id FROM wf_tasks WHERE instance_id = @id`,
+			Params: map[string]any{"id": id},
+		})
+		defer iter.Stop()
+		var muts []*spanner.Mutation
+		muts = append(muts,
+			spanner.Delete("wf_instances", spanner.Key{id}),
+			spanner.Delete("wf_journal", spanner.Key{id, int64(1)}),
+		)
+		for {
+			trow, err := iter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			var taskID int64
+			if err := trow.Columns(&taskID); err != nil {
+				return err
+			}
+			muts = append(muts, spanner.Delete("wf_tasks", spanner.Key{taskID}))
+		}
+		return txn.BufferWrite(muts)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	ev := journal.Event{Type: journal.TypeSignalReceived, Name: "new-signal", Payload: []byte(`{}`)}
+	if err := b.SendToInbox(ctx, id, ev, "old-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.reapResidualStragglers(ctx, id, residual); err != nil {
+		t.Fatal(err)
+	}
+	// The replacement's recreated key survives; the untouched straggler is
+	// still reaped (the version guard skips only changed rows).
+	if !b.dedupeKeyExists(ctx, id, "old-key") {
+		t.Fatal("replacement dedupe key was reaped; a later retry would duplicate the signal")
+	}
+	if b.dedupeKeyExists(ctx, id, "straggler-key") {
+		t.Fatal("untouched straggler key survived the reap")
+	}
+	st, err := b.LoadWorkflow(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Inbox) != 1 || st.Inbox[0].Event.Name != "new-signal" {
+		t.Fatalf("inbox after reap holds %d rows, want only the replacement's new-signal", len(st.Inbox))
+	}
 }

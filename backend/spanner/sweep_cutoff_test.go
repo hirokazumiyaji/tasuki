@@ -82,7 +82,7 @@ func TestSweepSignalDedupeSnapshotPreservesPostCommitKeys(t *testing.T) {
 
 func (b *Backend) dedupeKeyExists(ctx context.Context, instanceID, dedupeID string) bool {
 	_, err := b.client.Single().ReadRow(ctx, "wf_signal_dedupe",
-		spanner.Key{instanceID, dedupeID}, []string{"dedupe_id"})
+		spanner.Key{instanceID, dedupeKey(dedupeID)}, []string{"dedupe_id"})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
 			return false

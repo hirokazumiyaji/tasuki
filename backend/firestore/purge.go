@@ -114,11 +114,12 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 	// transaction order, not by wall-clock comparison. Rows are keyed by
 	// exact document reference: a behind-clock replacement can stamp an
 	// older created_at than a straggler, but it cannot reuse the same random
-	// inbox document ID — and for dedupe keys, deleting a shared ID fixes
-	// the inheritance (the replacement's send was deduped against the
-	// straggler, so removing the key lets a retry insert anew). Stragglers
-	// committing after this listing leak safely and are reaped with the
-	// replacement's own purge.
+	// inbox document ID. Dedupe keys CAN be reused (deterministic IDs), so
+	// the snapshot also pins each dedupe row's server update time and the
+	// reap deletes only rows still carrying it (see reapResidualStragglers);
+	// deleting a shared ID unconditionally would strip a replacement's live
+	// guard. Stragglers committing after this listing leak safely and are
+	// reaped with the replacement's own purge.
 	residual, rerr := b.listResidualStragglers(ctx, v.id)
 	if rerr != nil {
 		return false, rerr
@@ -227,8 +228,26 @@ func (b *Backend) deletePurgedInstanceDoc(ctx context.Context, v purgeVictim) (b
 // by reference avoids cross-process wall-clock skew: created_at stamps from
 // different nodes cannot be compared reliably, but a document listed before
 // the delete provably predates any replacement created after it.
+//
+// Dedupe keys additionally carry the server-stamped update time observed at
+// listing: dedupe document IDs are deterministic
+// (instanceID + ":" + escaped DedupeID), so a replacement incarnation can
+// recreate the very same document between the snapshot and the reap. The
+// reap deletes a dedupe document only when its update time still matches the
+// snapshot (dedupe rows are create-once, never updated, so any difference
+// proves the row is the replacement's, not the straggler's). Inbox documents
+// use random IDs a replacement cannot reuse, so exact-reference deletes stay
+// unconditional for them.
 type residualStragglers struct {
-	refs []*gcf.DocumentRef
+	dedupe []dedupeVersion
+	inbox  []*gcf.DocumentRef
+}
+
+// dedupeVersion pins one snapshotted dedupe row: its exact reference plus
+// the server update time at snapshot time (see residualStragglers).
+type dedupeVersion struct {
+	ref        *gcf.DocumentRef
+	updateTime time.Time
 }
 
 // listResidualStragglers snapshots the dedupe and inbox rows that survived
@@ -237,43 +256,81 @@ type residualStragglers struct {
 // inserts both and wakes nothing once the instance is terminal. Task, timer
 // and journal rows are written only on behalf of the running victim.
 func (b *Backend) listResidualStragglers(ctx context.Context, id string) (*residualStragglers, error) {
-	var refs []*gcf.DocumentRef
-	for _, col := range []string{"wf_signal_dedupe", "wf_inbox"} {
-		it := b.col(col).Where("instance_id", "==", id).Documents(ctx)
-		for {
-			dsnap, err := it.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				it.Stop()
-				return nil, err
-			}
-			refs = append(refs, dsnap.Ref)
+	var out residualStragglers
+	it := b.col("wf_signal_dedupe").Where("instance_id", "==", id).Documents(ctx)
+	for {
+		dsnap, err := it.Next()
+		if err == iterator.Done {
+			break
 		}
-		it.Stop()
+		if err != nil {
+			it.Stop()
+			return nil, err
+		}
+		out.dedupe = append(out.dedupe, dedupeVersion{ref: dsnap.Ref, updateTime: dsnap.UpdateTime})
 	}
-	return &residualStragglers{refs: refs}, nil
+	it.Stop()
+	ibit := b.col("wf_inbox").Where("instance_id", "==", id).Documents(ctx)
+	for {
+		dsnap, err := ibit.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			ibit.Stop()
+			return nil, err
+		}
+		out.inbox = append(out.inbox, dsnap.Ref)
+	}
+	ibit.Stop()
+	return &out, nil
 }
 
-// reapResidualStragglers deletes the snapshotted residual rows by exact
-// reference in paged batches. Rows already gone (deleted by the second sweep
-// before it tripped) are skipped via best-effort deletes; rows never
-// snapshotted (replacement rows and post-snapshot stragglers) are preserved.
+// reapResidualStragglers deletes the snapshotted residual rows in paged
+// batches. Rows already gone (deleted by the second sweep before it tripped)
+// are skipped via best-effort deletes; rows never snapshotted (replacement
+// rows and post-snapshot stragglers) are preserved.
+//
+// Dedupe rows are deleted conditionally: the snapshotted server update time
+// must still match, otherwise the row was recreated by a replacement
+// incarnation reusing the same DedupeID after the snapshot (Codex round 6 on
+// #327) and deleting it would strip the replacement's live dedupe guard
+// while its inbox event remains, duplicating a later retry. A straggler that
+// the replacement inherited (deduped against, so no inbox event of its own)
+// still carries the snapshotted version and is reaped, letting a retry
+// insert anew.
 func (b *Backend) reapResidualStragglers(ctx context.Context, r *residualStragglers) error {
-	if r == nil || len(r.refs) == 0 {
+	if r == nil {
 		return nil
 	}
-	for start := 0; start < len(r.refs); start += firestoreSweepBatchSize {
+	for _, dv := range r.dedupe {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_ = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+			snap, err := tx.Get(dv.ref)
+			if isNotFound(err) || (err == nil && !snap.Exists()) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if !snap.UpdateTime.Equal(dv.updateTime) {
+				return nil
+			}
+			return tx.Delete(dv.ref)
+		})
+	}
+	for start := 0; start < len(r.inbox); start += firestoreSweepBatchSize {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		end := start + firestoreSweepBatchSize
-		if end > len(r.refs) {
-			end = len(r.refs)
+		if end > len(r.inbox) {
+			end = len(r.inbox)
 		}
 		batch := b.client.Batch()
-		for _, ref := range r.refs[start:end] {
+		for _, ref := range r.inbox[start:end] {
 			batch.Delete(ref)
 		}
 		if _, err := batch.Commit(ctx); err != nil {

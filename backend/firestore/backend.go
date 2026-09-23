@@ -921,7 +921,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			if terminal {
 				// Retry check first: a marker means this DedupeID already
 				// inserted post-terminal, so dedupe the retry.
-				mref := b.ref("wf_signal_dedupe", signalDedupeID(instanceID, postTerminalDedupeMarker(it.DedupeID)))
+				mref := b.ref("wf_signal_dedupe", signalDedupeMarkerID(instanceID, it.DedupeID))
 				msnap, merr := tx.Get(mref)
 				if merr != nil && !isNotFound(merr) {
 					return merr
@@ -968,14 +968,14 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			if it.DedupeID != "" && createKey[i] {
 				if err := tx.Create(b.ref("wf_signal_dedupe", signalDedupeID(instanceID, it.DedupeID)), map[string]any{
 					"instance_id": instanceID,
-					"dedupe_id":   it.DedupeID,
+					"dedupe_id":   escapeDedupeID(it.DedupeID),
 					"created_at":  now,
 				}); err != nil {
 					return err
 				}
 			}
 			if it.DedupeID != "" && createMarker[i] {
-				if err := tx.Create(b.ref("wf_signal_dedupe", signalDedupeID(instanceID, postTerminalDedupeMarker(it.DedupeID))), map[string]any{
+				if err := tx.Create(b.ref("wf_signal_dedupe", signalDedupeMarkerID(instanceID, it.DedupeID)), map[string]any{
 					"instance_id": instanceID,
 					"dedupe_id":   postTerminalDedupeMarker(it.DedupeID),
 					"created_at":  now,

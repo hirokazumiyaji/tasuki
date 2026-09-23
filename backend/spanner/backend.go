@@ -1187,7 +1187,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				if terminal {
 					// Retry check first: marker present means this DedupeID
 					// already inserted post-terminal.
-					_, merr := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, postTerminalDedupeMarker(it.DedupeID)}, []string{"dedupe_id"})
+					_, merr := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, dedupeMarkerKey(it.DedupeID)}, []string{"dedupe_id"})
 					if merr == nil {
 						created[it.DedupeID] = true
 						continue
@@ -1198,9 +1198,9 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					// First post-terminal send: stamp the marker; create
 					// the base key too when absent for sweep consistency.
 					muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-						"instance_id": instanceID, "dedupe_id": postTerminalDedupeMarker(it.DedupeID), "created_at": now,
+						"instance_id": instanceID, "dedupe_id": dedupeMarkerKey(it.DedupeID), "created_at": now,
 					}))
-					_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, it.DedupeID}, []string{"dedupe_id"})
+					_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, dedupeKey(it.DedupeID)}, []string{"dedupe_id"})
 					if err == nil {
 						created[it.DedupeID] = true
 					} else {
@@ -1208,12 +1208,12 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 							return err
 						}
 						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-							"instance_id": instanceID, "dedupe_id": it.DedupeID, "created_at": now,
+							"instance_id": instanceID, "dedupe_id": dedupeKey(it.DedupeID), "created_at": now,
 						}))
 						created[it.DedupeID] = true
 					}
 				} else {
-					_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, it.DedupeID}, []string{"dedupe_id"})
+					_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, dedupeKey(it.DedupeID)}, []string{"dedupe_id"})
 					if err == nil {
 						created[it.DedupeID] = true
 						continue
@@ -1222,7 +1222,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						return err
 					}
 					muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-						"instance_id": instanceID, "dedupe_id": it.DedupeID, "created_at": now,
+						"instance_id": instanceID, "dedupe_id": dedupeKey(it.DedupeID), "created_at": now,
 					}))
 					created[it.DedupeID] = true
 				}

@@ -108,10 +108,12 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 	// victim delete. Any key listed here predates the replacement (which can
 	// only appear after the delete below), so it is provably old by
 	// transaction order, not by wall-clock comparison. For inbox rows (random
-	// IDs) the replacement cannot reuse the same key; for dedupe keys,
-	// deleting a shared ID fixes the inheritance (the replacement's send was
-	// deduped against the straggler, so removing the key lets a retry insert
-	// anew). Stragglers committing after this listing leak safely.
+	// IDs) the replacement cannot reuse the same key. Dedupe keys CAN be
+	// reused (deterministic IDs), so the snapshot also pins each dedupe row's
+	// created_at and the reap deletes only rows still carrying it (see
+	// reapResidualStragglers); deleting a shared key unconditionally would
+	// strip a replacement's live guard. Stragglers committing after this
+	// listing leak safely.
 	residual, rerr := b.listResidualStragglers(ctx, v.id)
 	if rerr != nil {
 		return false, rerr
@@ -234,9 +236,25 @@ func (b *Backend) deleteInstanceChildren(ctx context.Context, id string, guard s
 // cross-process wall-clock skew: created_at stamps from different nodes
 // cannot be compared reliably, but a key listed before the delete provably
 // predates any replacement created after it.
+//
+// Dedupe keys additionally carry the created_at observed at listing: dedupe
+// keys are deterministic ((instance_id, dedupe_id)), so a replacement
+// incarnation can recreate the very same row between the snapshot and the
+// reap. The reap deletes a dedupe row only when its created_at still matches
+// the snapshot (dedupe rows are create-once, never updated, so any difference
+// proves the row is the replacement's, not the straggler's). Inbox rows use
+// random IDs a replacement cannot reuse, so exact-key deletes stay
+// unconditional for them.
 type residualStragglers struct {
-	dedupeIDs []string
-	inboxIDs  []int64
+	dedupe   []dedupeVersion
+	inboxIDs []int64
+}
+
+// dedupeVersion pins one snapshotted dedupe row: its key plus the created_at
+// observed at snapshot time (see residualStragglers).
+type dedupeVersion struct {
+	id        string
+	createdAt time.Time
 }
 
 // listResidualStragglers snapshots the dedupe and inbox keys that survived
@@ -245,7 +263,7 @@ type residualStragglers struct {
 func (b *Backend) listResidualStragglers(ctx context.Context, id string) (*residualStragglers, error) {
 	var out residualStragglers
 	iter := b.client.Single().Query(ctx, spanner.Statement{
-		SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id`,
+		SQL:    `SELECT dedupe_id, created_at FROM wf_signal_dedupe WHERE instance_id = @id`,
 		Params: map[string]any{"id": id},
 	})
 	for {
@@ -258,11 +276,12 @@ func (b *Backend) listResidualStragglers(ctx context.Context, id string) (*resid
 			return nil, err
 		}
 		var k string
-		if err := row.Columns(&k); err != nil {
+		var ts time.Time
+		if err := row.Columns(&k, &ts); err != nil {
 			iter.Stop()
 			return nil, err
 		}
-		out.dedupeIDs = append(out.dedupeIDs, k)
+		out.dedupe = append(out.dedupe, dedupeVersion{id: k, createdAt: ts})
 	}
 	iter.Stop()
 	iter2 := b.client.Single().Query(ctx, spanner.Statement{
@@ -289,24 +308,36 @@ func (b *Backend) listResidualStragglers(ctx context.Context, id string) (*resid
 	return &out, nil
 }
 
-// reapResidualStragglers deletes the snapshotted residual keys by exact key
-// in paged transactions. Keys already gone are skipped; keys never
-// snapshotted (replacement rows and post-snapshot stragglers) are preserved.
+// reapResidualStragglers deletes the snapshotted residual keys. Inbox keys
+// (random IDs) go by exact key in paged transactions: keys already gone are
+// skipped, keys never snapshotted (replacement rows and post-snapshot
+// stragglers) are preserved.
+//
+// Dedupe keys are deleted conditionally, one atomic DML statement per key
+// predicated on the snapshotted created_at: a replacement incarnation
+// reusing the same DedupeID after the snapshot stamps a different
+// created_at (dedupe rows are create-once, never updated), so the statement
+// matches zero rows and the replacement's live guard survives (Codex round 6
+// on #327). Deleting it unconditionally would strip the guard while the
+// replacement's inbox event remains, duplicating a later retry. A straggler
+// the replacement inherited (deduped against, so no inbox event of its own)
+// still carries the snapshotted stamp and is reaped, letting a retry insert
+// anew.
 func (b *Backend) reapResidualStragglers(ctx context.Context, id string, r *residualStragglers) error {
 	if r == nil {
 		return nil
 	}
-	for _, chunk := range chunkStrings(r.dedupeIDs, spannerSweepBatchSize) {
+	for _, dv := range r.dedupe {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		keys := chunk
+		dv := dv
 		if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-			var muts []*spanner.Mutation
-			for _, k := range keys {
-				muts = append(muts, spanner.Delete("wf_signal_dedupe", spanner.Key{id, k}))
-			}
-			return txn.BufferWrite(muts)
+			_, err := txn.Update(ctx, spanner.Statement{
+				SQL:    `DELETE FROM wf_signal_dedupe WHERE instance_id = @id AND dedupe_id = @k AND created_at = @ts`,
+				Params: map[string]any{"id": id, "k": dv.id, "ts": dv.createdAt},
+			})
+			return err
 		}); err != nil {
 			return err
 		}
