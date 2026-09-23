@@ -364,11 +364,16 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 			picker.Offer(r)
 			offered++
 		}
-		// capped stops the scan mid-queue once rejected retention hits
-		// FairRejectedCap: the keyset cursor (lastVis, lastID) stays
-		// where it is, so the unscanned tail is picked up by a refill
-		// or a later poll instead of buffered in memory.
-		capped := false
+		// The scan runs to the end of the queue (or a full batch) even when
+		// rejected retention overflows FairRejectedCap: the cap bounds the
+		// carry list, not the scan. Stopping at the cap would strand the
+		// unscanned tail: the next refill re-offers the retained rows,
+		// rejections fill the fresh carry to the cap with no picks, and the
+		// pass exits empty while later polls restart at the head, so rows
+		// past the flood (B) starve and batches underfill. Offer drops
+		// rejections beyond the cap, so scanning on stays O(cap) in memory
+		// while still reaching victims past the flood; dropped rows stay
+		// claimable for later polls.
 		if !picker.Full() {
 			for !picker.Full() {
 				query := prefix
@@ -405,25 +410,20 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 						full = true
 						break
 					}
-					if picker.RejectedCapped() {
-						capped = true
-						break
-					}
 				}
 				if err := rows.Err(); err != nil {
 					rows.Close()
 					return nil, err
 				}
 				rows.Close()
-				if full || capped || page < pageSize {
+				if full || page < pageSize {
 					break
 				}
 			}
 		}
 		// The paging loop only stops short of a full picker at the end of
-		// the queue (or at the rejected-retention cap); a full picker may
-		// still have unscanned rows behind it.
-		scanExhausted := !picker.Full() && !capped
+		// the queue; a full picker may still have unscanned rows behind it.
+		scanExhausted := !picker.Full()
 		picked := picker.Picked()
 		iterRejected := picker.Rejected()
 		if len(picked) == 0 {

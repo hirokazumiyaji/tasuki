@@ -232,6 +232,129 @@ func TestFairPickerRejectedCap(t *testing.T) {
 	}
 }
 
+func TestFairPickerScanContinuesPastRejectedCap(t *testing.T) {
+	// Covers the issue #294 P1 follow-up at the FairPicker level: a flood
+	// that overflows rejected retention must not end the scan — the cap
+	// bounds the carry list, not the scan. (Live-DB cap-overflow coverage
+	// would need FairRejectedCap+ rows; the postgres/mysql candidate loops
+	// mirror scanContinue below: page FIFO candidates, offer each, stop only
+	// on Full or end-of-candidates, never on RejectedCapped.)
+	const page = 64
+	scanContinue := func(feed []backend.FairTaskRef, limit, perInstance int) *backend.FairPicker {
+		p := backend.NewFairPicker(limit, perInstance).TrackRejected()
+		for i := 0; i < len(feed) && !p.Full(); {
+			next := i + page
+			if next > len(feed) {
+				next = len(feed)
+			}
+			for _, r := range feed[i:next] {
+				if p.Offer(r) {
+					break
+				}
+			}
+			i = next
+		}
+		return p
+	}
+	// scanWithCapBreak mirrors the pre-fix loop, which stopped paging once
+	// rejected retention hit the cap, stranding the unscanned tail.
+	scanWithCapBreak := func(feed []backend.FairTaskRef, limit, perInstance int) *backend.FairPicker {
+		p := backend.NewFairPicker(limit, perInstance).TrackRejected()
+		for i := 0; i < len(feed) && !p.Full(); {
+			next := i + page
+			if next > len(feed) {
+				next = len(feed)
+			}
+			for _, r := range feed[i:next] {
+				if p.Offer(r) {
+					break
+				}
+				if p.RejectedCapped() {
+					break
+				}
+			}
+			if p.RejectedCapped() {
+				break
+			}
+			i = next
+		}
+		return p
+	}
+
+	// FIFO: one A pick, then an A flood overflowing retention, then victim B.
+	var feed []backend.FairTaskRef
+	feed = append(feed, backend.FairTaskRef{ID: 1, InstanceID: "A"})
+	for i := 0; i < backend.FairRejectedCap+500; i++ {
+		feed = append(feed, backend.FairTaskRef{ID: int64(2 + i), InstanceID: "A"})
+	}
+	feed = append(feed, backend.FairTaskRef{ID: int64(len(feed) + 1), InstanceID: "B"})
+
+	// Pre-fix shape: the scan stops at the cap with only A1 picked; B is
+	// never reached in this pass.
+	old := scanWithCapBreak(feed, 2, 1)
+	if len(old.Picked()) != 1 || len(old.Rejected()) != backend.FairRejectedCap {
+		t.Fatalf("pre-fix loop: picked=%v rejected=%d, want 1 pick and a full carry", old.Picked(), len(old.Rejected()))
+	}
+	for _, r := range old.Picked() {
+		if r.InstanceID == "B" {
+			t.Fatal("pre-fix loop unexpectedly reached B")
+		}
+	}
+
+	// Fixed contract: the same feed fills the batch with A1,B1, retention
+	// stays bounded, and the overflow is reported but does not stop the scan.
+	got := scanContinue(feed, 2, 1)
+	if len(got.Picked()) != 2 {
+		t.Fatalf("continuing scan: picked=%v, want [A B]", got.Picked())
+	}
+	if got.Picked()[0].InstanceID != "A" || got.Picked()[1].InstanceID != "B" {
+		t.Fatalf("continuing scan: picked=%v, want victim B in the same pass", got.Picked())
+	}
+	if len(got.Rejected()) != backend.FairRejectedCap || !got.RejectedCapped() {
+		t.Fatalf("continuing scan: rejected=%d capped=%v, want %d and capped",
+			len(got.Rejected()), got.RejectedCapped(), backend.FairRejectedCap)
+	}
+
+	// Refill starvation shape from the finding: pass 1 (pre-fix) claims only
+	// A1 and carries 2000 retained As with the cursor mid-flood. The refill
+	// seeds A1, re-offers the retained As (all rejected again, carry full),
+	// then scans a tail of more flood As plus a later victim B2.
+	tail := []backend.FairTaskRef{{ID: 1e9, InstanceID: "A"}, {ID: 1e9 + 1, InstanceID: "B"}}
+	refillOld := backend.NewFairPicker(1, 1).TrackRejected()
+	refillOld.Seed(old.Picked())
+	for _, r := range old.Rejected() {
+		refillOld.Offer(r)
+	}
+	for _, r := range tail {
+		if refillOld.Offer(r) {
+			break
+		}
+		if refillOld.RejectedCapped() {
+			break
+		}
+	}
+	if len(refillOld.Picked()) != 0 {
+		t.Fatalf("pre-fix refill: picked=%v, want empty (caps with no picks)", refillOld.Picked())
+	}
+	refillFixed := backend.NewFairPicker(1, 1).TrackRejected()
+	refillFixed.Seed(old.Picked())
+	for _, r := range old.Rejected() {
+		refillFixed.Offer(r)
+	}
+	for _, r := range tail {
+		if refillFixed.Offer(r) {
+			break
+		}
+	}
+	if len(refillFixed.Picked()) != 1 || refillFixed.Picked()[0].InstanceID != "B" {
+		t.Fatalf("continuing refill: picked=%v, want the later victim B2", refillFixed.Picked())
+	}
+	if len(refillFixed.Rejected()) != backend.FairRejectedCap {
+		t.Fatalf("continuing refill: rejected=%d, want bounded carry %d",
+			len(refillFixed.Rejected()), backend.FairRejectedCap)
+	}
+}
+
 func TestNormalizePurgeStatuses(t *testing.T) {
 	got, err := backend.NormalizePurgeStatuses(nil)
 	if err != nil {
