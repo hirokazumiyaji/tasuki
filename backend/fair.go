@@ -1,12 +1,22 @@
 package backend
 
-import "sort"
+import (
+	"sort"
+	"time"
+)
 
 // FairTaskRef identifies a claimable task by id and owning instance; backends
 // feed their FIFO-ordered candidates into FairPick.
+//
+// VisibleAt is the candidate's FIFO ordering key, captured by the backend at
+// scan time from the (visible_at, id) ordered candidate query (postgres,
+// mysql). Refs that never need cross-pass reordering (single-pass backends,
+// unit feeds) leave it zero; SortFairRefs only consumes keys set by such
+// scans.
 type FairTaskRef struct {
 	ID         int64
 	InstanceID string
+	VisibleAt  time.Time
 }
 
 // FairOverfetch is the candidate page size backends should fetch when
@@ -228,46 +238,30 @@ func (p *FairPicker) Rejected() []FairTaskRef { return p.rejected }
 // later poll.
 func (p *FairPicker) RejectedCapped() bool { return p.rejectedOverflow }
 
-// FairScanOrder records the first-seen scan position of each candidate ID so
-// a multi-pass claim can restore FIFO (scan) order before returning.
+// SortFairRefs reorders refs into FIFO (scan) order by their captured
+// (VisibleAt, ID) ordering keys, stable for ties. Refill paths (postgres,
+// mysql) secure rows across passes: pass 1 may lock a later row (e.g. B1)
+// while an earlier row (e.g. A2, rejected by the per-instance cap behind
+// pick A1) is only secured on a refill pass after A1 is lost to a concurrent
+// lock. Appending secured rows in lock order would return [B1 A2], violating
+// the documented FIFO guarantee; sorting the secured batch by scan key
+// restores [A2 B1].
 //
-// Refill paths (postgres, mysql) secure rows across passes: pass 1 may lock
-// a later row (e.g. B1) while an earlier row (e.g. A2, rejected by the
-// per-instance cap behind pick A1) is only secured on a refill pass after A1
-// is lost to a concurrent lock. Appending secured rows in lock order would
-// return [B1 A2], violating the documented FIFO guarantee. Noting every
-// scanned candidate in arrival order and sorting the secured batch by that
-// position restores [A2 B1]. FIFO order is scan order: candidates come from
-// a (visible_at, id) ordered scan, and first-seen positions are stable across
-// passes — re-offered pending rows keep their earlier position, and requery
-// rescans never move an ID earlier.
-type FairScanOrder struct {
-	pos  map[int64]int64
-	next int64
-}
-
-// Note records id's scan position on first sight; later re-offers of the
-// same ID keep the earlier position.
-func (o *FairScanOrder) Note(id int64) {
-	if o.pos == nil {
-		o.pos = make(map[int64]int64)
-	}
-	if _, ok := o.pos[id]; !ok {
-		o.pos[id] = o.next
-		o.next++
-	}
-}
-
-// Rank returns id's scan position for ordering secured batches. IDs never
-// noted sort last; this is defensive only — every secured row was scanned.
-func (o *FairScanOrder) Rank(id int64) int64 {
-	if p, ok := o.pos[id]; ok {
-		return p
-	}
-	return int64(^uint64(0) >> 1)
-}
-
-// SortRefs reorders refs into FIFO (scan) order, stable for ties.
-func (o *FairScanOrder) SortRefs(refs []FairTaskRef) {
-	sort.SliceStable(refs, func(i, j int) bool { return o.Rank(refs[i].ID) < o.Rank(refs[j].ID) })
+// The key travels on the ref itself instead of a side rank map (issue #294
+// round-12 P2): noting every scanned candidate's position in a map grows
+// O(queue) and undoes the cap-bounding work, while only picked and
+// retained/rejected-carry refs (bounded by limit+cap) can ever enter the
+// returned batch. Every such ref already passed through the (visible_at, id)
+// ordered scan, so its key is directly comparable with no retention at all:
+// pending re-offers keep the key captured on their original scan pass, and a
+// requery rescan re-keys from the same ordering. Zero keys (refs that never
+// went through a keyed scan) sort before keyed ones; mixing the two never
+// happens on the paths that call this.
+func SortFairRefs(refs []FairTaskRef) {
+	sort.SliceStable(refs, func(i, j int) bool {
+		if refs[i].VisibleAt.Equal(refs[j].VisibleAt) {
+			return refs[i].ID < refs[j].ID
+		}
+		return refs[i].VisibleAt.Before(refs[j].VisibleAt)
+	})
 }

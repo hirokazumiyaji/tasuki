@@ -281,14 +281,16 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		claimed []backend.FairTaskRef
 		pending []backend.FairTaskRef
 	)
-	// scanOrder records every scanned candidate's first-seen position so the
-	// secured batch can be restored to FIFO (scan) order before returning:
-	// refill passes secure later rows first (e.g. pass 1 locks B1 while the
-	// FIFO-earlier A2 is only secured on a refill after the pick that
-	// blocked it is lost), and returning lock order would emit [B1 A2].
-	// Re-offered pending rows were noted on their original scan pass, so
-	// they keep their earlier position here.
-	var scanOrder backend.FairScanOrder
+	// Ordering for the secured batch travels on the refs themselves: each
+	// scanned candidate captures its (visible_at, id) scan key, so the
+	// batch can be restored to FIFO (scan) order before returning without
+	// retaining every scanned candidate in a rank map (issue #294 round-12
+	// P2). Refill passes secure later rows first (e.g. pass 1 locks B1
+	// while the FIFO-earlier A2 is only secured on a refill after the pick
+	// that blocked it is lost), and returning lock order would emit [B1
+	// A2]. Re-offered pending rows keep the key captured on their original
+	// scan pass. Only picked and retained/rejected-carry refs (bounded by
+	// limit+cap) ever reach the sort; the scan itself stays streaming.
 	// Overflow-requery state (issue #294 follow-up): when scan-phase rejected
 	// retention overflows FairRejectedCap, rows past the cap are dropped while
 	// the SQL cursor advances past them. If every retained candidate is then
@@ -403,11 +405,11 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 				page := 0
 				for rows.Next() {
 					var r backend.FairTaskRef
-					var vis time.Time
-					if err := rows.Scan(&r.ID, &r.InstanceID, &vis); err != nil {
+					if err := rows.Scan(&r.ID, &r.InstanceID, &r.VisibleAt); err != nil {
 						rows.Close()
 						return nil, err
 					}
+					vis := r.VisibleAt
 					page++
 					// Snapshot the pre-row cursor while retention is intact, so
 					// an overflow-triggered requery can resume from the last
@@ -424,7 +426,8 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 					}
 					first = false
 					lastVis, lastID = vis, r.ID
-					scanOrder.Note(r.ID)
+					// No rank map: r carries its (visible_at, id) scan key
+					// (see above), so ordering needs no per-candidate retention.
 					// Overflow-requery passes skip IDs already put through the
 					// lock step this claim, so never-attempted dropped rows
 					// get priority in each bounded segment.
@@ -573,9 +576,9 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 	// Restore FIFO (scan) order: refill passes secure later rows before
 	// earlier ones (e.g. B1 on pass 1, A2 on the refill), so lock order is
 	// not queue order. out[i] corresponds to claimed[i]; reorder both by
-	// first-seen scan position.
+	// the refs' captured scan keys.
 	if len(out) > 1 {
-		scanOrder.SortRefs(claimed)
+		backend.SortFairRefs(claimed)
 		byID := make(map[int64]backend.Task, len(out))
 		for _, t := range out {
 			byID[t.ID] = t
