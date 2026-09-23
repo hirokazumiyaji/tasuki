@@ -407,6 +407,32 @@ func checkCall(pass *analysis.Pass, call *ast.CallExpr) {
 	if name == "" {
 		return
 	}
+	// close/len/cap builtins on channels fall through the package switch
+	// below (empty package path). Recognize the predeclared builtins here —
+	// TypesInfo.Uses resolves to *types.Builtin only for the real builtin,
+	// so a shadowing local or package-level func never matches — and flag
+	// channel arguments through the same core-type resolution as make/range
+	// (coreMakeChanType covers named channels and channel-constraint type
+	// parameters of any direction). len/cap on non-channels (slices, maps,
+	// strings) stay clean, and close on a non-channel does not compile, so
+	// only channel arguments are ever flagged.
+	if pkgPath == "" && len(call.Args) == 1 {
+		if ident, ok := unwrapParen(call.Fun).(*ast.Ident); ok {
+			if obj, ok := pass.TypesInfo.Uses[ident]; ok {
+				if b, ok := obj.(*types.Builtin); ok {
+					switch b.Name() {
+					case "close", "len", "cap":
+						if tv, ok := pass.TypesInfo.Types[call.Args[0]]; ok && tv.Type != nil {
+							if _, ok := coreMakeChanType(tv.Type).(*types.Chan); ok {
+								pass.Reportf(call.Pos(), "%s on a channel is not allowed in workflow code; use workflow.Execute/ExecuteAsync and workflow.Await", b.Name())
+								return
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 	switch pkgPath {
 	case "time":
 		if timeNonDeterministic[name] {
