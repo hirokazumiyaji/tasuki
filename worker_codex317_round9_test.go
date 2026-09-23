@@ -83,7 +83,9 @@ func TestWorker_Round9_ShutdownJoinsInFlightRenewal(t *testing.T) {
 
 	// One ordinary renewal outstanding, as if the ticker path were
 	// blocked inside ExtendLease when the grace expires.
-	w.renewWg.Add(1)
+	if !w.renewTryEnter() {
+		t.Fatal("renewTryEnter = false, want true (no shutdown yet)")
+	}
 	shCtx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
 	shutdownDone := make(chan struct{})
@@ -93,13 +95,13 @@ func TestWorker_Round9_ShutdownJoinsInFlightRenewal(t *testing.T) {
 	// outstanding renewal slot, the old code releases immediately.
 	time.Sleep(800 * time.Millisecond)
 	if store.hasEvent("release-enter") {
-		w.renewWg.Done()
+		w.renewExit()
 		close(allowReturn)
 		<-shutdownDone
 		t.Fatal("release fired while an ordinary renewal was still in flight (Shutdown must join renewals first)")
 	}
 
-	w.renewWg.Done()
+	w.renewExit()
 	close(allowReturn)
 	select {
 	case <-shutdownDone:
@@ -142,7 +144,10 @@ func TestWorker_Round9_OrdinaryRenewalStopsAtShutdownFlag(t *testing.T) {
 	tok := w.track(71)
 	defer w.untrack(71, tok)
 
-	w.renewStop.Store(true) // Shutdown grace expiry, before the loop runs
+	// Shutdown grace expiry, before the loop runs.
+	w.renewMu.Lock()
+	w.renewStopped = true
+	w.renewMu.Unlock()
 	var committing atomic.Bool
 	done := make(chan struct{})
 	renewDone := make(chan struct{})

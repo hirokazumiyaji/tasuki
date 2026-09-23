@@ -102,9 +102,19 @@ type Worker struct {
 	execCtx    context.Context
 	execCancel context.CancelFunc
 
-	// renewWg counts in-flight ORDINARY lease-renewal store calls (the
-	// ticker path in extendLeaseLoop while no detached commit owns the
-	// task). Shutdown joins it before releasing leases (see
+	// renewMu guards the ordinary-renewal barrier below. A sync.WaitGroup
+	// cannot serve as this barrier: a ticker paused before Add while
+	// another renewal keeps the counter nonzero lets Shutdown's Wait
+	// observe a zero counter first, and the paused ticker's Add then
+	// runs concurrently with Wait → panic("sync: WaitGroup misuse"),
+	// crashing Shutdown (round-14 P1). The count + stop flag + idle
+	// channel are all guarded by this one mutex instead, so registration
+	// and the stop-check are atomic and no Add-during-Wait exists by
+	// construction.
+	renewMu sync.Mutex
+	// renewInflight counts in-flight ORDINARY lease-renewal store calls
+	// (the ticker path in extendLeaseLoop while no detached commit owns
+	// the task). Shutdown joins it before releasing leases (see
 	// shutdownRenewalJoin): a renewal already issued when the grace
 	// expires completes despite the execution-context cancel (backends
 	// may ignore cancellation), and without the join it lands after the
@@ -112,15 +122,24 @@ type Worker struct {
 	// extending a peer's fresh lease through the ID-only ExtendLease.
 	// Detached-commit renewals (see renewOnceDetached) are not counted:
 	// their entries transferred out of inFlight at commit entry, so no
-	// shutdown release can land on them.
-	renewWg sync.WaitGroup
-	// renewStop, once set at Shutdown grace expiry, stops new ordinary
-	// renewals: the ticker path claims its join slot BEFORE reading this
-	// flag, so a slot claimed after Shutdown's drain always observes the
-	// flag and issues nothing. Reset on every Start. Detached-commit
-	// cover renewals ignore it (their commit needs the cover and their
-	// entries are out of the release set).
-	renewStop atomic.Bool
+	// shutdown release can land on them. Guarded by renewMu.
+	renewInflight int
+	// renewStopped, once set at Shutdown grace expiry, stops new
+	// ordinary renewals: the ticker path registers and checks this flag
+	// under the same renewMu hold (see renewTryEnter), so a registration
+	// after Shutdown's stop always observes the flag and issues nothing.
+	// Reset on every Start. Detached-commit cover renewals ignore it
+	// (their commit needs the cover and their entries are out of the
+	// release set). Guarded by renewMu.
+	renewStopped bool
+	// renewIdle is closed when renewInflight drops to zero and replaced
+	// with a fresh open channel on the 0→1 transition (see
+	// renewTryEnter/renewExit). Shutdown snapshots it under renewMu
+	// after setting renewStopped and waits on the snapshot (see
+	// shutdownRenewalJoin). Nil only on zero-value Workers never built
+	// by NewWorker; the helpers treat nil as already drained.
+	// Guarded by renewMu.
+	renewIdle chan struct{}
 	// detMu guards detGuard. Lock order with mu is mu-then-detMu, taken
 	// together only in beginDetachedCommit; renewOnceDetached,
 	// guardedDetachedCommit, and dropDetachedGuard take detMu alone and
@@ -143,17 +162,20 @@ type Worker struct {
 
 func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 	opts = opts.withDefaults()
+	idle := make(chan struct{})
+	close(idle)
 	return &Worker{
-		backend:  b,
-		opts:     opts,
-		reg:      newRegistry(opts.Codec),
-		inFlight: map[int64]inFlightEntry{},
-		detGuard: map[int64]detachedGuard{},
-		wfClaim:  map[int64]time.Time{},
-		sticky:   map[string]stickyEntry{},
-		instLock: map[string]*workflowActor{},
-		wfSem:    make(chan struct{}, opts.WorkflowConcurrency),
-		actSem:   make(chan struct{}, opts.ActivityConcurrency),
+		backend:   b,
+		opts:      opts,
+		reg:       newRegistry(opts.Codec),
+		inFlight:  map[int64]inFlightEntry{},
+		detGuard:  map[int64]detachedGuard{},
+		wfClaim:   map[int64]time.Time{},
+		sticky:    map[string]stickyEntry{},
+		instLock:  map[string]*workflowActor{},
+		wfSem:     make(chan struct{}, opts.WorkflowConcurrency),
+		actSem:    make(chan struct{}, opts.ActivityConcurrency),
+		renewIdle: idle,
 	}
 }
 
@@ -269,7 +291,13 @@ func (w *Worker) StartWithError(parent context.Context) error {
 	w.epoch++
 	w.actMu.Lock()
 	w.stopping = false
-	w.renewStop.Store(false)
+	w.renewMu.Lock()
+	w.renewStopped = false
+	// Keep the in-flight count and idle channel as-is: a previous
+	// Shutdown that timed out on its release budget may still have
+	// renewals outstanding, and they still own the open idle channel
+	// they will close on exit.
+	w.renewMu.Unlock()
 	// Execution observes the Start parent (so parent cancel still aborts
 	// activities and lease renewal) but uses its own cancel separate from
 	// the poll loop ctx, so Shutdown's immediate loop cancellation does not
@@ -412,20 +440,67 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 // fresh lease through the ID-only ExtendLease). The join guarantees
 // every such call completed before any release is issued.
 //
-// Ordering with the ticker path: Shutdown sets renewStop BEFORE
-// draining renewWg, while the loop claims its WaitGroup slot BEFORE
-// reading renewStop. A slot claimed before the drain is waited for; a
-// slot claimed after always observes the flag and issues nothing — so
-// no renewal can slip past the join in either direction. The wait is
-// bounded by ctx (the release budget): on timeout the release below is
-// skipped and leases expire naturally, which is safe but slower.
+// Ordering with the ticker path: registration and the stop-check happen
+// atomically under renewMu (see renewTryEnter), while Shutdown sets
+// renewStopped and snapshots the idle channel under the same renewMu
+// hold. A registration before the stop is counted and its idle channel
+// waited for; a registration after always observes the flag and issues
+// nothing — so no renewal can slip past the join in either direction,
+// and no Add-during-Wait can panic by construction (round-14 P1). The
+// wait is bounded by ctx (the release budget): on timeout the release
+// below is skipped and leases expire naturally, which is safe but
+// slower.
 //
 // Only ordinary renewals participate: detached-commit cover renewals
 // belong to entries already transferred out of inFlight, so the release
 // below cannot land on them, and their commits need the cover.
 func (w *Worker) shutdownRenewalJoin(ctx context.Context) {
-	w.renewStop.Store(true)
-	waitForWaitGroup(&w.renewWg, ctx)
+	w.renewMu.Lock()
+	w.renewStopped = true
+	idle := w.renewIdle
+	if w.renewInflight == 0 || idle == nil {
+		w.renewMu.Unlock()
+		return
+	}
+	w.renewMu.Unlock()
+	select {
+	case <-idle:
+	case <-ctx.Done():
+	}
+}
+
+// renewTryEnter registers one ordinary renewal with the shutdown join.
+// Registration and the stop-check are atomic under renewMu: false means
+// Shutdown already passed grace expiry and the caller must issue
+// nothing; true means the caller holds one in-flight slot and must call
+// renewExit once its ExtendLease call returns. On the 0→1 transition a
+// fresh idle channel is installed for Shutdown to wait on.
+func (w *Worker) renewTryEnter() bool {
+	w.renewMu.Lock()
+	defer w.renewMu.Unlock()
+	if w.renewStopped {
+		return false
+	}
+	if w.renewInflight == 0 {
+		w.renewIdle = make(chan struct{})
+	}
+	w.renewInflight++
+	return true
+}
+
+// renewExit releases one slot claimed by renewTryEnter, closing the idle
+// channel when the last renewal drains so a waiting shutdownRenewalJoin
+// wakes. A nil idle (zero-value Worker) is never closed.
+func (w *Worker) renewExit() {
+	w.renewMu.Lock()
+	defer w.renewMu.Unlock()
+	if w.renewInflight <= 0 {
+		return
+	}
+	w.renewInflight--
+	if w.renewInflight == 0 && w.renewIdle != nil {
+		close(w.renewIdle)
+	}
 }
 
 // waitForWaitGroup blocks until wg drains or ctx ends.
@@ -2261,18 +2336,17 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, tok claimTok
 					return
 				}
 				// Shutdown passed grace expiry: no new ordinary
-				// renewals. Claim the join slot BEFORE reading the
-				// flag (see shutdownRenewalJoin) so no renewal slips
-				// past Shutdown's release in either direction.
-				w.renewWg.Add(1)
-				if w.renewStop.Load() {
-					w.renewWg.Done()
+				// renewals. Registration and the stop-check are atomic
+				// under renewMu (see shutdownRenewalJoin) so no renewal
+				// slips past Shutdown's release in either direction, and
+				// no Add can race the join by construction.
+				if !w.renewTryEnter() {
 					return
 				}
 				// Conservative lease base (see refreshLeaseAt).
 				renewStart := time.Now()
 				rerr := w.backend.ExtendLease(ctx, taskID, w.opts.LeaseDuration)
-				w.renewWg.Done()
+				w.renewExit()
 				if rerr != nil {
 					w.recordStoreError(ctx, "extend_lease", rerr, "task_id", taskID)
 				} else {
