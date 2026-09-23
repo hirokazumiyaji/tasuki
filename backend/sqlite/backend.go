@@ -395,9 +395,9 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 	return ids, nil
 }
 
-func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
 	res, err := b.db.ExecContext(ctx, `
-		UPDATE wf_tasks SET visible_at = ? WHERE id = ?`, formatTime(nowUTC().Add(d)), taskID)
+		UPDATE wf_tasks SET visible_at = ? WHERE id = ?`, formatTime(nowUTC().Add(d)), t.ID)
 	if err != nil {
 		return err
 	}

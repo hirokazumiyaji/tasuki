@@ -228,10 +228,10 @@ func (b *Backend) TerminateInstance(_ context.Context, id string) error {
 	return nil
 }
 
-func (b *Backend) ExtendLease(_ context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(_ context.Context, task backend.Task, d time.Duration) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	t, ok := b.tasks[taskID]
+	t, ok := b.tasks[task.ID]
 	if !ok {
 		return backend.ErrNotFound
 	}

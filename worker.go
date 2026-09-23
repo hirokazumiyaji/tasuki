@@ -445,7 +445,7 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 				// peer (which would duplicate the execution).
 				go func() {
 					defer leaseWg.Done()
-					w.extendLeaseLoop(ctx, t.ID, leaseDone)
+					w.extendLeaseLoop(ctx, t, leaseDone)
 				}()
 				p, herr := w.handleWorkflow(ctx, t, stopRenewal)
 				w.untrack(t.ID)
@@ -1067,7 +1067,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 
 	done := make(chan struct{})
 	defer close(done)
-	go w.extendLeaseLoop(ctx, t.ID, done)
+	go w.extendLeaseLoop(ctx, t, done)
 
 	attempt := t.Attempt
 	if attempt < 1 {
@@ -1277,7 +1277,7 @@ func (w *Worker) nackIncompatible(ctx context.Context, t backend.Task, reason st
 	return w.backend.NackTask(ctx, t, delay)
 }
 
-func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan struct{}) {
+func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-chan struct{}) {
 	d := w.opts.LeaseDuration / 2
 	if d <= 0 {
 		return
@@ -1291,8 +1291,8 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := w.backend.ExtendLease(ctx, taskID, w.opts.LeaseDuration); err != nil {
-				w.recordStoreError(ctx, "extend_lease", err, "task_id", taskID)
+			if err := w.backend.ExtendLease(ctx, t, w.opts.LeaseDuration); err != nil {
+				w.recordStoreError(ctx, "extend_lease", err, "task_id", t.ID)
 			}
 		}
 	}

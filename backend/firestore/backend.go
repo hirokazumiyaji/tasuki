@@ -369,8 +369,28 @@ func (b *Backend) updateTask(ctx context.Context, id int64, activity bool, field
 		return tx.Update(r, fields)
 	})
 }
-func (b *Backend) ExtendLease(ctx context.Context, id int64, d time.Duration) error {
-	return b.updateTask(ctx, id, false, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
+	// kind like NackTask does. Renewing a workflow task by numeric ID would
+	// address a missing ACT# key and return ErrNotFound, letting long
+	// replays lose their lease to a peer (duplicate execution).
+	if t.Kind == "workflow" && t.InstanceID != "" {
+		ref := b.ref("wf_tasks", wfTaskID(t.InstanceID))
+		return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+			s, e := tx.Get(ref)
+			if isNotFound(e) {
+				return backend.ErrNotFound
+			}
+			if e != nil {
+				return e
+			}
+			if !s.Exists() {
+				return backend.ErrNotFound
+			}
+			return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
+		})
+	}
+	return b.updateTask(ctx, t.ID, false, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
 }
 
 func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {

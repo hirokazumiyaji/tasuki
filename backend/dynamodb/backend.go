@@ -329,8 +329,25 @@ func decodeTask(m map[string]types.AttributeValue) backend.Task {
 	return t
 }
 
-func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
-	return b.updateTask(ctx, taskID, "SET visible_at = :v", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(d)))}, "")
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
+	// kind like NackTask does. Renewing a workflow task by numeric ID would
+	// address a missing ACT# key and return ErrNotFound, letting long
+	// replays lose their lease to a peer (duplicate execution).
+	if t.Kind == "workflow" && t.InstanceID != "" {
+		_, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:                 aws.String(b.table("wf_tasks")),
+			Key:                       map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(t.InstanceID))},
+			UpdateExpression:          aws.String("SET visible_at = :v"),
+			ConditionExpression:       aws.String("attribute_exists(task_pk)"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(d)))},
+		})
+		if conditional(err) {
+			return backend.ErrNotFound
+		}
+		return err
+	}
+	return b.updateTask(ctx, t.ID, "SET visible_at = :v", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(d)))}, "")
 }
 
 func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {

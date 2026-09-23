@@ -391,13 +391,13 @@ func (s *nackExtendSpy) NackTask(ctx context.Context, t backend.Task, delay time
 	return err
 }
 
-func (s *nackExtendSpy) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (s *nackExtendSpy) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
 	s.mu.Lock()
-	if _, ok := s.nacked[taskID]; ok {
+	if _, ok := s.nacked[t.ID]; ok {
 		s.extendsAfterNack++
 	}
 	s.mu.Unlock()
-	return s.Backend.ExtendLease(ctx, taskID, d)
+	return s.Backend.ExtendLease(ctx, t, d)
 }
 
 func (s *nackExtendSpy) countExtendsAfterNack() int {

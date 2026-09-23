@@ -362,9 +362,9 @@ func decodeActivityTask(t *backend.Task, payload []byte) {
 	t.StartToCloseTimeout = time.Duration(p.StartToCloseTimeoutMs) * time.Millisecond
 }
 
-func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
 	tag, err := b.pool.Exec(ctx, `
-		UPDATE wf_tasks SET visible_at = now() + $2::interval WHERE id = $1`, taskID, interval(d))
+		UPDATE wf_tasks SET visible_at = now() + $2::interval WHERE id = $1`, t.ID, interval(d))
 	if err != nil {
 		return err
 	}

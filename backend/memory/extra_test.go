@@ -98,7 +98,7 @@ func TestMemory_ExtendLeaseAndRetryActivity(t *testing.T) {
 	if err != nil || len(atasks) != 1 {
 		t.Fatalf("claim activity: %v %#v", err, atasks)
 	}
-	if err := b.ExtendLease(ctx, atasks[0].ID, 30*time.Second); err != nil {
+	if err := b.ExtendLease(ctx, atasks[0], 30*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	// Task not visible until lease expires

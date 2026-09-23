@@ -20,9 +20,9 @@ type slowExtendBackend struct {
 	nackOnce sync.Once
 }
 
-func (b *slowExtendBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *slowExtendBackend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
 	time.Sleep(400 * time.Millisecond)
-	return b.Backend.ExtendLease(ctx, taskID, d)
+	return b.Backend.ExtendLease(ctx, t, d)
 }
 
 func (b *slowExtendBackend) NackTask(ctx context.Context, t backend.Task, delay time.Duration) error {

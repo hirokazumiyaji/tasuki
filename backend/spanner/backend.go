@@ -441,11 +441,11 @@ func scanTask(row *spanner.Row) (backend.Task, error) {
 	return t, nil
 }
 
-func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
 			SQL:    `UPDATE wf_tasks SET visible_at = @v WHERE id = @id`,
-			Params: map[string]any{"v": nowUTC().Add(d), "id": taskID},
+			Params: map[string]any{"v": nowUTC().Add(d), "id": t.ID},
 		})
 		if err != nil {
 			return err

@@ -29,7 +29,13 @@ type Backend interface {
 	// CountClaimableTasks returns per-queue counts of tasks with visible_at <= store now
 	// for kind among queues. Queues with zero may be omitted.
 	CountClaimableTasks(ctx context.Context, kind string, queues []string) (map[string]int64, error)
-	ExtendLease(ctx context.Context, taskID int64, d time.Duration) error
+	// ExtendLease pushes a claimed task's visibility out by d (store clock).
+	// The task carries kind/instance routing: DynamoDB/Firestore store
+	// workflow tasks under WF#<instanceID>, not ACT#<id>, so renewing by
+	// numeric ID alone misses workflow tasks (ErrNotFound) and long replays
+	// lose their lease to a peer (duplicate execution). Callers pass the
+	// claimed task, mirroring NackTask.
+	ExtendLease(ctx context.Context, t Task, d time.Duration) error
 	// RecordHeartbeat extends the lease and stores details for GetHeartbeatDetails on later attempts.
 	RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error
 	ReleaseLease(ctx context.Context, taskID int64) error
