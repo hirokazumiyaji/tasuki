@@ -102,6 +102,16 @@ func inboxPayload(ev journal.Event) []byte {
 	return b
 }
 
+// postTerminalDedupeMarker derives the post-terminal send marker for a
+// DedupeID. Terminal sends always insert their event (round-4 lost-send
+// fix), but retries must still dedupe: the first post-terminal send creates
+// this marker alongside the event, and later retries see the marker and
+// skip. Only the marker suppresses a terminal insert; the pre-terminal base
+// key never does. The "__post_terminal__:" prefix is reserved.
+func postTerminalDedupeMarker(dedupeID string) string {
+	return "__post_terminal__:" + dedupeID
+}
+
 func unwrapInboxPayload(payload []byte) (string, []byte) {
 	if len(payload) == 0 {
 		return "", nil

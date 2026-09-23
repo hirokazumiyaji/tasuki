@@ -27,6 +27,16 @@ func checkGuard(ctx context.Context, guard sweepGuard) error {
 // accumulated row. Sweeps delete in small paged read-write transactions.
 const spannerSweepBatchSize = 500
 
+// spannerClaimStaleDeleteCap bounds how many terminal-instance tasks one
+// ClaimTasks call deletes inside its single read-write transaction. The
+// refill loop re-selects while deletions free slots, so an unbounded backlog
+// of stale tasks would otherwise buffer one DELETE per row in one commit and
+// breach DML/mutation limits on every claim, starving live tasks behind it.
+// Capping keeps each claim transaction small; the backlog drains across
+// successive polls (each claim deletes up to the cap and returns any live
+// tasks found within it).
+const spannerClaimStaleDeleteCap = 100
+
 // signalDedupeSweepTimeout bounds the best-effort post-commit dedupe sweep in
 // CommitAdvancements. The sweep runs synchronously so a redelivered DedupeID
 // inserts anew once the call returns, but a degraded store must not hold the

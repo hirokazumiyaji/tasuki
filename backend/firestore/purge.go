@@ -94,8 +94,9 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 // the delete commits only for that same incarnation (a concurrent purge that
 // deleted first, or a replacement created since, makes this purge stand down
 // uncounted); the second sweep proceeds only while the doc stays absent. When
-// the second sweep stops at a replacement, provably-old stragglers are still
-// reaped (see reapReplacedStragglers) instead of leaking into the
+// the second sweep stops at a replacement, residual stragglers snapshotted
+// before the delete are still reaped by exact reference (see
+// listResidualStragglers) instead of leaking into the
 // replacement. Stragglers that cannot be proven old leak, and are reaped with
 // the replacement's own purge once it is terminal — leaked rows are always
 // preferable to deleting a live incarnation's documents.
@@ -106,6 +107,21 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 			return false, nil
 		}
 		return false, err
+	}
+	// Snapshot residual rows observed after the first sweep but before the
+	// victim delete. Any row listed here predates the replacement (which can
+	// only appear after the delete below), so it is provably old by
+	// transaction order, not by wall-clock comparison. Rows are keyed by
+	// exact document reference: a behind-clock replacement can stamp an
+	// older created_at than a straggler, but it cannot reuse the same random
+	// inbox document ID — and for dedupe keys, deleting a shared ID fixes
+	// the inheritance (the replacement's send was deduped against the
+	// straggler, so removing the key lets a retry insert anew). Stragglers
+	// committing after this listing leak safely and are reaped with the
+	// replacement's own purge.
+	residual, rerr := b.listResidualStragglers(ctx, v.id)
+	if rerr != nil {
+		return false, rerr
 	}
 	// Inbox writers read wf_instances inside their transaction, so once
 	// this delete commits no new child documents can appear for the
@@ -126,10 +142,10 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 			// the victim: an inbox row (or dedupe key) that committed
 			// between the first sweep and the delete belongs to the old
 			// incarnation, but the fence above leaves it for the
-			// replacement's LoadWorkflow to consume. Reap the rows that
-			// provably predate the replacement instead of leaking them.
+			// replacement's LoadWorkflow to consume. Reap the residual rows
+			// snapshotted above by exact reference instead of leaking them.
 			// This purge still owns the victim delete, so it stays counted.
-			if rerr := b.reapReplacedStragglers(ctx, v.id); rerr != nil {
+			if rerr := b.reapResidualStragglers(ctx, residual); rerr != nil {
 				return true, rerr
 			}
 			return true, nil
@@ -206,93 +222,65 @@ func (b *Backend) deletePurgedInstanceDoc(ctx context.Context, v purgeVictim) (b
 	return deleted, nil
 }
 
-// reapReplacedStragglers deletes child rows that provably belong to the
-// purged incarnation after the second sweep stopped at a replacement (see
-// purgeOneInstance). Only wf_signal_dedupe and wf_inbox can gain rows while
-// the victim is terminal — SendToInbox inserts both and wakes nothing once
-// the instance is terminal. Task, timer and journal rows are written only on
-// behalf of the running victim, so the aborted sweep left none of those
-// behind and their collections are not reaped here.
-func (b *Backend) reapReplacedStragglers(ctx context.Context, id string) error {
+// residualStragglers holds exact document references observed after the
+// first sweep but before the victim delete (see purgeOneInstance). Deleting
+// by reference avoids cross-process wall-clock skew: created_at stamps from
+// different nodes cannot be compared reliably, but a document listed before
+// the delete provably predates any replacement created after it.
+type residualStragglers struct {
+	refs []*gcf.DocumentRef
+}
+
+// listResidualStragglers snapshots the dedupe and inbox rows that survived
+// the first sweep (stragglers committed during the sweep). Only these two
+// collections can gain rows while the victim is terminal — SendToInbox
+// inserts both and wakes nothing once the instance is terminal. Task, timer
+// and journal rows are written only on behalf of the running victim.
+func (b *Backend) listResidualStragglers(ctx context.Context, id string) (*residualStragglers, error) {
+	var refs []*gcf.DocumentRef
 	for _, col := range []string{"wf_signal_dedupe", "wf_inbox"} {
-		if err := b.reapStragglerCollection(ctx, col, id); err != nil {
+		it := b.col(col).Where("instance_id", "==", id).Documents(ctx)
+		for {
+			dsnap, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				it.Stop()
+				return nil, err
+			}
+			refs = append(refs, dsnap.Ref)
+		}
+		it.Stop()
+	}
+	return &residualStragglers{refs: refs}, nil
+}
+
+// reapResidualStragglers deletes the snapshotted residual rows by exact
+// reference in paged batches. Rows already gone (deleted by the second sweep
+// before it tripped) are skipped via best-effort deletes; rows never
+// snapshotted (replacement rows and post-snapshot stragglers) are preserved.
+func (b *Backend) reapResidualStragglers(ctx context.Context, r *residualStragglers) error {
+	if r == nil || len(r.refs) == 0 {
+		return nil
+	}
+	for start := 0; start < len(r.refs); start += firestoreSweepBatchSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := start + firestoreSweepBatchSize
+		if end > len(r.refs) {
+			end = len(r.refs)
+		}
+		batch := b.client.Batch()
+		for _, ref := range r.refs[start:end] {
+			batch.Delete(ref)
+		}
+		if _, err := batch.Commit(ctx); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// stragglerDoc is one child document buffered for the incarnation check.
-type stragglerDoc struct {
-	ref       *gcf.DocumentRef
-	createdAt time.Time
-}
-
-// reapStragglerCollection deletes one collection's rows that predate the
-// current incarnation. The incarnation is re-resolved before every batch
-// commit: absent means every buffered row is old; present means only rows
-// stamped strictly before the replacement's created_at are old. Both stamps
-// come from the same clock, and a straggler committed before the victim
-// delete strictly predates a replacement created after it. Rows without a
-// usable stamp, or tied with the replacement, are preserved: leaking is
-// always preferable to deleting a live incarnation's rows.
-func (b *Backend) reapStragglerCollection(ctx context.Context, col, id string) error {
-	flush := func(pending []stragglerDoc) error {
-		if len(pending) == 0 {
-			return nil
-		}
-		snap, err := b.ref("wf_instances", id).Get(ctx)
-		absent := isNotFound(err) || (err == nil && !snap.Exists())
-		if err != nil && !absent {
-			return err
-		}
-		var cutoff time.Time
-		if !absent {
-			cutoff = timestamp(snap.Data(), "created_at")
-		}
-		batch := b.client.Batch()
-		n := 0
-		for _, d := range pending {
-			if !absent && (d.createdAt.IsZero() || !d.createdAt.Before(cutoff)) {
-				continue
-			}
-			batch.Delete(d.ref)
-			n++
-		}
-		if n == 0 {
-			return nil
-		}
-		_, err = batch.Commit(ctx)
-		return err
-	}
-	var pending []stragglerDoc
-	flushPending := func() error {
-		if err := flush(pending); err != nil {
-			return err
-		}
-		pending = pending[:0]
-		return nil
-	}
-	it := b.col(col).Where("instance_id", "==", id).Documents(ctx)
-	for {
-		dsnap, err := it.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			it.Stop()
-			return err
-		}
-		pending = append(pending, stragglerDoc{ref: dsnap.Ref, createdAt: timestamp(dsnap.Data(), "created_at")})
-		if len(pending) == firestoreSweepBatchSize {
-			if err := flushPending(); err != nil {
-				it.Stop()
-				return err
-			}
-		}
-	}
-	it.Stop()
-	return flushPending()
 }
 
 // purgeInstanceDocs removes every child document of one instance. Batches

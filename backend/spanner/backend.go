@@ -317,7 +317,18 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		// return it on every call and starve the live tasks queued
 		// behind it. Each repeat deletes at least one row, so the loop
 		// terminates; lease races alone never trigger a repeat.
+		// The total deletes per claim are capped (see
+		// spannerClaimStaleDeleteCap): an unbounded terminal backlog must
+		// not buffer one DELETE per row in a single commit, or DML limits
+		// abort every claim and the live task stays unreachable. The cap
+		// drains across polls; Firestore needs no equivalent cap because
+		// its claim path commits one document per transaction (already
+		// bounded by the 500-write limit).
+		totalDeleted := 0
 		for len(out) < req.Limit {
+			if totalDeleted >= spannerClaimStaleDeleteCap {
+				break
+			}
 			need := int64(req.Limit - len(out))
 			iter := txn.Query(ctx, spanner.Statement{
 				SQL: `SELECT id, visible_at, instance_id FROM wf_tasks
@@ -356,6 +367,9 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 			deleted := 0
 			for _, c := range cands {
 				if len(out) >= req.Limit {
+					break
+				}
+				if totalDeleted+deleted >= spannerClaimStaleDeleteCap {
 					break
 				}
 				// Fence against TerminateInstance: never lease a task whose
@@ -420,6 +434,7 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 			if deleted == 0 {
 				break
 			}
+			totalDeleted += deleted
 		}
 		return nil
 	})
@@ -1156,9 +1171,12 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		// TerminateInstance) can observe a key snapshotted for the post-commit
 		// sweep, skip its inbox insert as a duplicate, and then lose the
 		// signal when the sweep deletes the key. Sends that commit while the
-		// instance is already terminal always insert their event; the key is
-		// created when absent, but an existing key never suppresses the
-		// insert.
+		// instance is already terminal insert on the first post-terminal
+		// send; retries dedupe via a post-terminal marker (see
+		// postTerminalDedupeMarker): the first terminal send creates the
+		// marker alongside the event, later retries see it and skip. The
+		// base key is created when absent but never suppresses a terminal
+		// insert — only the marker does.
 		terminal := status != "running"
 		created := map[string]bool{}
 		for _, it := range items {
@@ -1166,13 +1184,40 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				if created[it.DedupeID] {
 					continue
 				}
-				_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, it.DedupeID}, []string{"dedupe_id"})
-				if err == nil {
-					created[it.DedupeID] = true
-					if !terminal {
+				if terminal {
+					// Retry check first: marker present means this DedupeID
+					// already inserted post-terminal.
+					_, merr := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, postTerminalDedupeMarker(it.DedupeID)}, []string{"dedupe_id"})
+					if merr == nil {
+						created[it.DedupeID] = true
 						continue
 					}
+					if !isNotFound(merr) {
+						return merr
+					}
+					// First post-terminal send: stamp the marker; create
+					// the base key too when absent for sweep consistency.
+					muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
+						"instance_id": instanceID, "dedupe_id": postTerminalDedupeMarker(it.DedupeID), "created_at": now,
+					}))
+					_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, it.DedupeID}, []string{"dedupe_id"})
+					if err == nil {
+						created[it.DedupeID] = true
+					} else {
+						if !isNotFound(err) {
+							return err
+						}
+						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
+							"instance_id": instanceID, "dedupe_id": it.DedupeID, "created_at": now,
+						}))
+						created[it.DedupeID] = true
+					}
 				} else {
+					_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, it.DedupeID}, []string{"dedupe_id"})
+					if err == nil {
+						created[it.DedupeID] = true
+						continue
+					}
 					if !isNotFound(err) {
 						return err
 					}

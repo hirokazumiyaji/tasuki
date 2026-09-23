@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"testing"
-	"time"
 
 	gcf "cloud.google.com/go/firestore"
 	"github.com/hirokazumiyaji/tasuki/backend"
@@ -14,8 +13,9 @@ import (
 // A SendToInbox that commits while the instance is already terminal must not
 // be swallowed by a pre-terminal dedupe key (Codex round 4 on #327): the key
 // may have been snapshotted for the post-commit sweep, so treating the send
-// as a duplicate and then sweeping the key loses the signal. Terminal sends
-// always insert their event.
+// as a duplicate and then sweeping the key loses the signal. The first
+// terminal send always inserts its event, but retries still dedupe via a
+// post-terminal marker (Codex round 5 on #327).
 func TestTerminalSendBypassesStaleDedupe(t *testing.T) {
 	guardTestEmulator(t)
 	ctx := context.Background()
@@ -56,12 +56,21 @@ func TestTerminalSendBypassesStaleDedupe(t *testing.T) {
 	if n := terminalTestInboxLen(t, b, ctx, id); n != 2 {
 		t.Fatalf("terminal resend with a stale dedupe key: inbox=%d want 2 (signal lost)", n)
 	}
+	// Retry idempotency: a second identical post-terminal send must dedupe
+	// via the marker, not insert a third event.
+	if err := b.SendToInbox(ctx, id, ev, "k-race"); err != nil {
+		t.Fatal(err)
+	}
+	if n := terminalTestInboxLen(t, b, ctx, id); n != 2 {
+		t.Fatalf("terminal retry duplicated the signal: inbox=%d want 2 (idempotency lost)", n)
+	}
 }
 
-// When the purge second sweep stops at a replacement incarnation, rows that
-// provably predate the replacement must still be reaped (Codex round 4 on
-// #327): an inbox row committed between the first sweep and the victim
-// delete would otherwise be consumed by the replacement's LoadWorkflow.
+// When the purge second sweep stops at a replacement incarnation, rows
+// snapshotted before the victim delete must still be reaped by exact
+// reference (Codex round 5 on #327): comparing created_at wall clocks across
+// processes misclassifies a replacement from a behind-clock node as older.
+// Stragglers are keyed by the pre-delete listing, not by time.
 func TestPurgeReapsReplacedStragglers(t *testing.T) {
 	guardTestEmulator(t)
 	ctx := context.Background()
@@ -81,10 +90,25 @@ func TestPurgeReapsReplacedStragglers(t *testing.T) {
 	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
 		t.Fatal(err)
 	}
+	// Seed stragglers that the first sweep missed (committed during the
+	// sweep): an inbox row and dedupe key via the public API so they carry
+	// real stamps, then snapshot them by exact reference before the victim
+	// delete — the snapshot, not wall-clock comparison, proves they are old.
+	ev := journal.Event{Type: journal.TypeSignalReceived, Name: "old-signal", Payload: []byte(`{}`)}
+	if err := b.SendToInbox(ctx, id, ev, "old-key"); err != nil {
+		t.Fatal(err)
+	}
+	residual, err := b.listResidualStragglers(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(residual.refs) == 0 {
+		t.Fatal("residual snapshot is empty; nothing to reap")
+	}
 	// Simulate the purge victim delete followed by an ID-reusing
 	// CreateInstance: drop the instance doc with its first-sweep children
-	// (journal row and workflow task, as the guarded first sweep leaves
-	// them), recreate, and read back the replacement's incarnation marker.
+	// (journal row and workflow task), recreate, then add the replacement's
+	// own rows (which must survive the reap despite any clock skew).
 	if _, err := b.ref("wf_instances", id).Delete(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -97,53 +121,23 @@ func TestPurgeReapsReplacedStragglers(t *testing.T) {
 	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
 		t.Fatal(err)
 	}
-	rsnap, err := b.ref("wf_instances", id).Get(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	replCreated := timestamp(rsnap.Data(), "created_at")
-
-	seedDedupe := func(dedupeID string, createdAt time.Time) {
-		t.Helper()
-		_, err := b.ref("wf_signal_dedupe", signalDedupeID(id, dedupeID)).Create(ctx, map[string]any{
-			"instance_id": id, "dedupe_id": dedupeID, "created_at": createdAt,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	seedInbox := func(name string, createdAt time.Time) {
-		t.Helper()
-		docID := newID()
-		_, err := b.ref("wf_inbox", inboxID(id, docID)).Create(ctx,
-			inboxDoc(id, docID, 1, journal.Event{Type: journal.TypeSignalReceived, Name: name, Payload: []byte(`{}`)}, createdAt))
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	oldTs := replCreated.Add(-2 * time.Second)
-	seedDedupe("old-key", oldTs)
-	seedInbox("old-signal", oldTs)
-	// The replacement's own rows must survive: one stamped exactly at the
-	// incarnation marker (tie goes to preservation) and one sent normally.
-	seedDedupe("new-key", replCreated)
-	seedInbox("tie-signal", replCreated)
-	ev := journal.Event{Type: journal.TypeSignalReceived, Name: "new-signal", Payload: []byte(`{}`)}
-	if err := b.SendToInbox(ctx, id, ev, "api-key"); err != nil {
+	evNew := journal.Event{Type: journal.TypeSignalReceived, Name: "new-signal", Payload: []byte(`{}`)}
+	if err := b.SendToInbox(ctx, id, evNew, "api-key"); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := b.reapReplacedStragglers(ctx, id); err != nil {
+	if err := b.reapResidualStragglers(ctx, residual); err != nil {
 		t.Fatal(err)
 	}
 	if snap, err := b.ref("wf_signal_dedupe", signalDedupeID(id, "old-key")).Get(ctx); err == nil && snap.Exists() {
 		t.Fatal("old dedupe key survived the straggler reap")
 	}
-	for _, key := range []string{"new-key", "api-key"} {
-		snap, err := b.ref("wf_signal_dedupe", signalDedupeID(id, key)).Get(ctx)
-		if err != nil || !snap.Exists() {
-			t.Fatalf("replacement dedupe key %q was reaped (err=%v)", key, err)
-		}
+	// The replacement's own key (created after the snapshot) must survive.
+	// Note: the replacement is running, so its send creates the base key
+	// only, not a post-terminal marker.
+	snap, err := b.ref("wf_signal_dedupe", signalDedupeID(id, "api-key")).Get(ctx)
+	if err != nil || !snap.Exists() {
+		t.Fatalf("replacement dedupe key %q was reaped (err=%v)", "api-key", err)
 	}
 	st, err := b.LoadWorkflow(ctx, id)
 	if err != nil {
@@ -156,10 +150,8 @@ func TestPurgeReapsReplacedStragglers(t *testing.T) {
 	if names["old-signal"] {
 		t.Fatal("old inbox row survived the straggler reap; the replacement would consume it")
 	}
-	for _, want := range []string{"tie-signal", "new-signal"} {
-		if !names[want] {
-			t.Fatalf("replacement inbox row %q was reaped", want)
-		}
+	if !names["new-signal"] {
+		t.Fatal("replacement inbox row new-signal was reaped")
 	}
 }
 

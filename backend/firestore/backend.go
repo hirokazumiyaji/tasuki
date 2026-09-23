@@ -895,15 +895,20 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		// TerminateInstance) can observe a key snapshotted for the
 		// post-commit sweep, skip its inbox insert as a duplicate, and then
 		// lose the signal when the sweep deletes the key. Sends that commit
-		// while the instance is already terminal always insert their event;
-		// the key is created when absent so a later retry still dedupes
-		// within this incarnation, but an existing key never suppresses the
-		// insert. (Same-batch duplicates still collapse to one insert so a
-		// batch never issues conflicting Creates.)
+		// while the instance is already terminal always insert their event
+		// on the first post-terminal send; retries still dedupe via a
+		// post-terminal marker (see postTerminalDedupeMarker): the first
+		// terminal send with a DedupeID creates the marker alongside the
+		// event, and later retries see the marker and skip. The base key is
+		// created when absent (so sweeps/purge stay consistent) but an
+		// existing base key never suppresses a terminal insert — only the
+		// marker does. (Same-batch duplicates still collapse to one insert
+		// so a batch never issues conflicting Creates.)
 		terminal := str(isnap.Data(), "status") != "running"
 		// Firestore requires all reads before writes; also skip same-batch DedupeID dups.
 		skip := make([]bool, len(items))
 		createKey := make([]bool, len(items))
+		createMarker := make([]bool, len(items))
 		created := map[string]bool{}
 		for i, it := range items {
 			if it.DedupeID == "" {
@@ -913,6 +918,36 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				skip[i] = true
 				continue
 			}
+			if terminal {
+				// Retry check first: a marker means this DedupeID already
+				// inserted post-terminal, so dedupe the retry.
+				mref := b.ref("wf_signal_dedupe", signalDedupeID(instanceID, postTerminalDedupeMarker(it.DedupeID)))
+				msnap, merr := tx.Get(mref)
+				if merr != nil && !isNotFound(merr) {
+					return merr
+				}
+				if merr == nil && msnap.Exists() {
+					created[it.DedupeID] = true
+					skip[i] = true
+					continue
+				}
+				// First post-terminal send: insert + stamp the marker.
+				// Create the base key too when absent for sweep/purge
+				// consistency; an existing base key is kept as is.
+				dref := b.ref("wf_signal_dedupe", signalDedupeID(instanceID, it.DedupeID))
+				snap, err := tx.Get(dref)
+				if err != nil && !isNotFound(err) {
+					return err
+				}
+				created[it.DedupeID] = true
+				if err == nil && snap.Exists() {
+					createMarker[i] = true
+					continue
+				}
+				createKey[i] = true
+				createMarker[i] = true
+				continue
+			}
 			dref := b.ref("wf_signal_dedupe", signalDedupeID(instanceID, it.DedupeID))
 			snap, err := tx.Get(dref)
 			if err != nil && !isNotFound(err) {
@@ -920,9 +955,6 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			}
 			if err == nil && snap.Exists() {
 				created[it.DedupeID] = true
-				if terminal {
-					continue
-				}
 				skip[i] = true
 				continue
 			}
@@ -937,6 +969,15 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				if err := tx.Create(b.ref("wf_signal_dedupe", signalDedupeID(instanceID, it.DedupeID)), map[string]any{
 					"instance_id": instanceID,
 					"dedupe_id":   it.DedupeID,
+					"created_at":  now,
+				}); err != nil {
+					return err
+				}
+			}
+			if it.DedupeID != "" && createMarker[i] {
+				if err := tx.Create(b.ref("wf_signal_dedupe", signalDedupeID(instanceID, postTerminalDedupeMarker(it.DedupeID))), map[string]any{
+					"instance_id": instanceID,
+					"dedupe_id":   postTerminalDedupeMarker(it.DedupeID),
 					"created_at":  now,
 				}); err != nil {
 					return err

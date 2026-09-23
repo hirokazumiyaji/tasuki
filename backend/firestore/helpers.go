@@ -38,6 +38,19 @@ func signalDedupeID(instanceID, dedupeID string) string {
 	return instanceID + ":" + dedupeID
 }
 
+// postTerminalDedupeMarker derives the post-terminal send marker for a
+// DedupeID. Terminal sends always insert their event (round-4 lost-send
+// fix: a send racing the terminal transition must not be swallowed by a
+// pre-terminal dedupe key snapshotted for the post-commit sweep), but
+// retries must still dedupe: the first post-terminal send creates this
+// marker alongside the event, and later retries with the same DedupeID see
+// the marker and skip. Only the marker suppresses a terminal insert; the
+// pre-terminal base key never does. The "__post_terminal__:" prefix is
+// reserved and must not be used as a user DedupeID prefix.
+func postTerminalDedupeMarker(dedupeID string) string {
+	return "__post_terminal__:" + dedupeID
+}
+
 type activityPayload struct {
 	Name                    string          `json:"name"`
 	Input                   json.RawMessage `json:"input"`

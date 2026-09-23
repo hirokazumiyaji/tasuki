@@ -90,8 +90,9 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 // the delete commits only for that same incarnation (a concurrent purge that
 // deleted first, or a replacement created since, makes this purge stand down
 // uncounted); the second sweep proceeds only while the row stays absent. When
-// the second sweep stops at a replacement, provably-old stragglers are still
-// reaped (see reapReplacedStragglers) instead of leaking into the
+// the second sweep stops at a replacement, residual stragglers snapshotted
+// before the delete are still reaped by exact key (see
+// listResidualStragglers) instead of leaking into the
 // replacement. Stragglers that cannot be proven old leak, and are reaped with
 // the replacement's own purge once it is terminal — leaked rows are always
 // preferable to deleting a live incarnation's rows.
@@ -102,6 +103,18 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 			return false, nil
 		}
 		return false, err
+	}
+	// Snapshot residual rows observed after the first sweep but before the
+	// victim delete. Any key listed here predates the replacement (which can
+	// only appear after the delete below), so it is provably old by
+	// transaction order, not by wall-clock comparison. For inbox rows (random
+	// IDs) the replacement cannot reuse the same key; for dedupe keys,
+	// deleting a shared ID fixes the inheritance (the replacement's send was
+	// deduped against the straggler, so removing the key lets a retry insert
+	// anew). Stragglers committing after this listing leak safely.
+	residual, rerr := b.listResidualStragglers(ctx, v.id)
+	if rerr != nil {
+		return false, rerr
 	}
 	deleted, err := b.deletePurgedInstanceRow(ctx, v)
 	if err != nil {
@@ -114,13 +127,10 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 	if err := b.deleteInstanceChildren(ctx, v.id, gone); err != nil {
 		if errors.Is(err, errPurgeSuperseded) {
 			// A replacement incarnation appeared after this purge deleted
-			// the victim: an inbox row (or dedupe key) that committed
-			// between the first sweep and the delete belongs to the old
-			// incarnation, but the fence above leaves it for the
-			// replacement's LoadWorkflow to consume. Reap the rows that
-			// provably predate the replacement instead of leaking them.
-			// This purge still owns the victim delete, so it stays counted.
-			if rerr := b.reapReplacedStragglers(ctx, v.id); rerr != nil {
+			// the victim: reap the residual rows snapshotted above by exact
+			// key instead of leaking them. This purge still owns the victim
+			// delete, so it stays counted.
+			if rerr := b.reapResidualStragglers(ctx, v.id, residual); rerr != nil {
 				return true, rerr
 			}
 			return true, nil
@@ -219,150 +229,102 @@ func (b *Backend) deleteInstanceChildren(ctx context.Context, id string, guard s
 	return b.deleteJournalForInstance(ctx, id, guard)
 }
 
-// reapReplacedStragglers deletes child rows that provably belong to the
-// purged incarnation after the second sweep stopped at a replacement (see
-// purgeOneInstance). Only wf_signal_dedupe and wf_inbox can gain rows while
-// the victim is terminal — SendToInbox inserts both and wakes nothing once
-// the instance is terminal. Task, timer and journal rows are written only on
-// behalf of the running victim, so the aborted sweep left none of those
-// behind and their tables are not reaped here.
-func (b *Backend) reapReplacedStragglers(ctx context.Context, id string) error {
-	if err := b.reapStragglerDedupe(ctx, id); err != nil {
-		return err
-	}
-	return b.reapStragglerInbox(ctx, id)
+// residualStragglers holds exact keys observed after the first sweep but
+// before the victim delete (see purgeOneInstance). Deleting by key avoids
+// cross-process wall-clock skew: created_at stamps from different nodes
+// cannot be compared reliably, but a key listed before the delete provably
+// predates any replacement created after it.
+type residualStragglers struct {
+	dedupeIDs []string
+	inboxIDs  []int64
 }
 
-// stragglerCutoff resolves the current incarnation: absent reports no
-// instance row (every row with the ID is old); otherwise cutoff is the
-// replacement's created_at and only rows stamped strictly before it are old.
-// Both stamps come from the same clock, and a straggler committed before the
-// victim delete strictly predates a replacement created after it. Rows
-// without a usable stamp, or tied with the replacement, are preserved:
-// leaking is always preferable to deleting a live incarnation's rows.
-func (b *Backend) stragglerCutoff(ctx context.Context, id string) (cutoff time.Time, absent bool, err error) {
-	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"created_at"})
-	if isNotFound(err) {
-		return time.Time{}, true, nil
-	}
-	if err != nil {
-		return time.Time{}, false, err
-	}
-	var createdAt time.Time
-	if err := row.Columns(&createdAt); err != nil {
-		return time.Time{}, false, err
-	}
-	return createdAt, false, nil
-}
-
-func (b *Backend) reapStragglerDedupe(ctx context.Context, id string) error {
-	type key struct {
-		dedupeID  string
-		createdAt time.Time
-	}
-	var pending []key
-	flush := func() error {
-		if len(pending) == 0 {
-			return nil
-		}
-		cutoff, absent, err := b.stragglerCutoff(ctx, id)
-		if err != nil {
-			return err
-		}
-		var muts []*spanner.Mutation
-		for _, k := range pending {
-			if !absent && (k.createdAt.IsZero() || !k.createdAt.Before(cutoff)) {
-				continue
-			}
-			muts = append(muts, spanner.Delete("wf_signal_dedupe", spanner.Key{id, k.dedupeID}))
-		}
-		pending = pending[:0]
-		if len(muts) == 0 {
-			return nil
-		}
-		return b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-			return txn.BufferWrite(muts)
-		})
-	}
+// listResidualStragglers snapshots the dedupe and inbox keys that survived
+// the first sweep (stragglers committed during the sweep). Only these two
+// tables can gain rows while the victim is terminal.
+func (b *Backend) listResidualStragglers(ctx context.Context, id string) (*residualStragglers, error) {
+	var out residualStragglers
 	iter := b.client.Single().Query(ctx, spanner.Statement{
-		SQL:    `SELECT dedupe_id, created_at FROM wf_signal_dedupe WHERE instance_id = @id`,
+		SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id`,
 		Params: map[string]any{"id": id},
 	})
-	defer iter.Stop()
 	for {
 		row, err := iter.Next()
 		if err == iterator.Done {
 			break
 		}
 		if err != nil {
-			return err
+			iter.Stop()
+			return nil, err
 		}
-		var k key
-		if err := row.Columns(&k.dedupeID, &k.createdAt); err != nil {
-			return err
+		var k string
+		if err := row.Columns(&k); err != nil {
+			iter.Stop()
+			return nil, err
 		}
-		pending = append(pending, k)
-		if len(pending) == spannerSweepBatchSize {
-			if err := flush(); err != nil {
-				return err
-			}
-		}
+		out.dedupeIDs = append(out.dedupeIDs, k)
 	}
-	return flush()
-}
-
-func (b *Backend) reapStragglerInbox(ctx context.Context, id string) error {
-	type key struct {
-		rowID     int64
-		createdAt time.Time
-	}
-	var pending []key
-	flush := func() error {
-		if len(pending) == 0 {
-			return nil
-		}
-		cutoff, absent, err := b.stragglerCutoff(ctx, id)
-		if err != nil {
-			return err
-		}
-		var muts []*spanner.Mutation
-		for _, k := range pending {
-			if !absent && (k.createdAt.IsZero() || !k.createdAt.Before(cutoff)) {
-				continue
-			}
-			muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{k.rowID}))
-		}
-		pending = pending[:0]
-		if len(muts) == 0 {
-			return nil
-		}
-		return b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-			return txn.BufferWrite(muts)
-		})
-	}
-	iter := b.client.Single().Query(ctx, spanner.Statement{
-		SQL:    `SELECT id, created_at FROM wf_inbox WHERE instance_id = @id`,
+	iter.Stop()
+	iter2 := b.client.Single().Query(ctx, spanner.Statement{
+		SQL:    `SELECT id FROM wf_inbox WHERE instance_id = @id`,
 		Params: map[string]any{"id": id},
 	})
-	defer iter.Stop()
 	for {
-		row, err := iter.Next()
+		row, err := iter2.Next()
 		if err == iterator.Done {
 			break
 		}
 		if err != nil {
+			iter2.Stop()
+			return nil, err
+		}
+		var k int64
+		if err := row.Columns(&k); err != nil {
+			iter2.Stop()
+			return nil, err
+		}
+		out.inboxIDs = append(out.inboxIDs, k)
+	}
+	iter2.Stop()
+	return &out, nil
+}
+
+// reapResidualStragglers deletes the snapshotted residual keys by exact key
+// in paged transactions. Keys already gone are skipped; keys never
+// snapshotted (replacement rows and post-snapshot stragglers) are preserved.
+func (b *Backend) reapResidualStragglers(ctx context.Context, id string, r *residualStragglers) error {
+	if r == nil {
+		return nil
+	}
+	for _, chunk := range chunkStrings(r.dedupeIDs, spannerSweepBatchSize) {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		var k key
-		if err := row.Columns(&k.rowID, &k.createdAt); err != nil {
-			return err
-		}
-		pending = append(pending, k)
-		if len(pending) == spannerSweepBatchSize {
-			if err := flush(); err != nil {
-				return err
+		keys := chunk
+		if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			var muts []*spanner.Mutation
+			for _, k := range keys {
+				muts = append(muts, spanner.Delete("wf_signal_dedupe", spanner.Key{id, k}))
 			}
+			return txn.BufferWrite(muts)
+		}); err != nil {
+			return err
 		}
 	}
-	return flush()
+	for _, chunk := range chunkInt64s(r.inboxIDs, spannerSweepBatchSize) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		keys := chunk
+		if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			var muts []*spanner.Mutation
+			for _, k := range keys {
+				muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{k}))
+			}
+			return txn.BufferWrite(muts)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
