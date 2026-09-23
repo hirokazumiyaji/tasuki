@@ -56,8 +56,12 @@ func (b *Backend) Migrate(ctx context.Context) error {
 	_, _ = b.db.ExecContext(ctx, `ALTER TABLE wf_instances ADD COLUMN memo JSON NULL`)
 	// Backfill for databases created before wf_tasks_instance_idx existed:
 	// CREATE TABLE IF NOT EXISTS is a no-op there, so create the terminal-
-	// cleanup index explicitly. Duplicate-index errors are ignored.
-	_, _ = b.db.ExecContext(ctx, `CREATE INDEX wf_tasks_instance_idx ON wf_tasks (instance_id)`)
+	// cleanup index explicitly. Only duplicate-index errors (1061) are
+	// ignored; any other failure (bad column, privileges, engine limits)
+	// is returned so a half-migrated schema never passes silently.
+	if err := execIndexBackfill(ctx, b.db, `CREATE INDEX wf_tasks_instance_idx ON wf_tasks (instance_id)`); err != nil {
+		return err
+	}
 	return nil
 }
 

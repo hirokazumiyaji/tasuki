@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -27,6 +28,28 @@ func jsonOrNull(b []byte) any {
 func isUniqueViolation(err error) bool {
 	var mysqlErr *mysql.MySQLError
 	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1062
+}
+
+// isDuplicateIndex reports MySQL error 1061 (ER_DUP_KEYNAME): the index
+// already exists. Used by Migrate to keep the wf_tasks_instance_idx backfill
+// idempotent while surfacing every other CREATE INDEX failure (bad column,
+// insufficient privilege, storage-engine limits) instead of swallowing it.
+func isDuplicateIndex(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1061
+}
+
+// execIndexBackfill runs an idempotent CREATE INDEX backfill for databases
+// created before the index existed in schema.sql. A duplicate-index error
+// (1061, second and later Migrates) is ignored; every other failure is
+// returned so a half-migrated schema never passes silently.
+func execIndexBackfill(ctx context.Context, q queryExecer, stmt string) error {
+	if _, err := q.ExecContext(ctx, stmt); err != nil {
+		if !isDuplicateIndex(err) {
+			return fmt.Errorf("mysql migrate: %w\nstmt: %s", err, stmt)
+		}
+	}
+	return nil
 }
 
 func beginTx(ctx context.Context, db *sql.DB) (*sql.Conn, error) {
