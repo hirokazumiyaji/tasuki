@@ -527,18 +527,24 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		go func(t backend.Task, leaseDone chan struct{}, stopRenewal func()) {
 			defer wg.Done()
 			defer func() { <-w.wfSem }()
-			actor := w.actorFor(t.InstanceID)
-			actor.dispatch(func() {
+			// Track the claim and start renewal BEFORE waiting on the
+			// per-instance actor (round-11 P1): a turn queued behind
+			// a long turn on the same instance otherwise holds no
+			// renewal while queued, so its lease expires mid-queue
+			// and a peer reclaims it — concurrent execution of the
+			// same turn, including local side effects. Renewal stops
+			// via stopRenewal on every path below (early per-task
+			// stops inside dispatch plus the final stop after the
+			// flush), and the abandon path stops it when dispatch
+			// never runs.
+			w.track(t)
+			go func() {
+				defer leaseWg.Done()
+				w.extendLeaseLoop(ctx, t, leaseDone)
+			}()
+			if !w.dispatchWorkflow(ctx, t.InstanceID, func() {
 				w.opts.Metrics.AddWorkflowTask(ctx, 1)
 				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
-				w.track(t)
-				// Extend the workflow task lease while the turn runs so long
-				// replays and local activities cannot lose the lease to a
-				// peer (which would duplicate the execution).
-				go func() {
-					defer leaseWg.Done()
-					w.extendLeaseLoop(ctx, t, leaseDone)
-				}()
 				p, herr := w.handleWorkflow(ctx, t, stopRenewal)
 				if herr != nil {
 					// No commit follows: stop renewal before handling the
@@ -607,7 +613,24 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 				pendingMu.Lock()
 				pending = append(pending, *p)
 				pendingMu.Unlock()
-			})
+			}) {
+				// Dispatch abandoned (ctx canceled while queued on the
+				// actor): the turn never ran, so stop its renewal first
+				// — no ExtendLease may land after the release below —
+				// and release the lease for a prompt peer retry.
+				// Ownership-gated like every other release path:
+				// Shutdown's releaseInFlight may have released already
+				// (and a peer re-claimed), and backends match the lease
+				// by ID/key alone, so an unconditional release would
+				// clear the peer's lease.
+				stopRenewal()
+				if w.claimWorkflowRelease(t) {
+					w.releaseWorkflowLease(t)
+				} else {
+					w.opts.Logger.Debug("skipping workflow lease release; not in-flight owner",
+						"instance_id", t.InstanceID, "task_id", t.ID)
+				}
+			}
 		}(t, leaseDone, stopRenewal)
 	}
 	wg.Wait()
