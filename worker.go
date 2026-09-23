@@ -229,6 +229,24 @@ func (w *Worker) untrack(taskID int64) {
 	w.mu.Unlock()
 }
 
+// claimWorkflowRelease atomically removes taskID from the in-flight set,
+// reporting whether this caller still owns the lease and may release it.
+// Shutdown's releaseInFlight and the workflow abandon paths below both
+// funnel through in-flight ownership so only one of them releases a given
+// lease: after a shutdown-timeout release, a peer may have re-claimed the
+// task, and backends match the lease by task ID/key alone, so a second
+// (late-cancel) release by the old turn would clear the peer's fresh lease
+// and let a third worker execute concurrently with the peer.
+func (w *Worker) claimWorkflowRelease(taskID int64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, ok := w.inFlight[taskID]; !ok {
+		return false
+	}
+	delete(w.inFlight, taskID)
+	return true
+}
+
 func (w *Worker) releaseInFlight(ctx context.Context) {
 	w.mu.Lock()
 	tasks := make([]backend.Task, 0, len(w.inFlight))
@@ -453,10 +471,14 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 				}()
 				p, herr := w.handleWorkflow(ctx, t, stopRenewal)
 				if herr != nil {
-					// No commit follows: untrack, then stop renewal before
-					// handling the error so ExtendLease cannot race a lease
-					// release below or overwrite a nack's visible_at.
-					w.untrack(t.ID)
+					// No commit follows: stop renewal before handling the
+					// error so ExtendLease cannot race a lease release
+					// below or overwrite a nack's visible_at. The abandon
+					// path below funnels its release through in-flight
+					// ownership (see claimWorkflowRelease) instead of
+					// untracking here, so a Shutdown releaseInFlight that
+					// already released this turn cannot be followed by a
+					// second release.
 					stopRenewal()
 					if errors.Is(herr, errTurnAbandoned) ||
 						(ctx.Err() != nil && isCancellationError(herr)) {
@@ -464,12 +486,24 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 						// and release the lease promptly so a peer retries
 						// instead of committing shutdown as a failure.
 						// Kind-routed so workflow tasks address
-						// WF#<instanceID>, not a missing ACT# key.
+						// WF#<instanceID>, not a missing ACT# key. Only the
+						// in-flight owner releases: Shutdown's
+						// releaseInFlight may have already released (and a
+						// peer re-claimed) this lease, and backends match the
+						// lease by ID/key alone, so a second release would
+						// clear the peer's lease and enable concurrent
+						// execution by a third worker.
 						w.opts.Logger.Debug("workflow turn abandoned on shutdown",
 							"instance_id", t.InstanceID, "task_id", t.ID)
-						w.releaseWorkflowLease(t)
+						if w.claimWorkflowRelease(t.ID) {
+							w.releaseWorkflowLease(t)
+						} else {
+							w.opts.Logger.Debug("skipping workflow lease release; not in-flight owner",
+								"instance_id", t.InstanceID, "task_id", t.ID)
+						}
 						return
 					}
+					w.untrack(t.ID)
 					w.recordStoreError(ctx, "commit_workflow", herr,
 						"instance_id", t.InstanceID, "task_id", t.ID)
 					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", herr)
@@ -501,18 +535,29 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 	wg.Wait()
 	// Pending tasks stayed tracked through the flush (see above): successes
 	// are untracked inside flushWorkflowCommits. Commits that failed under
-	// a canceled tick context are still owned by this worker (a canceled
-	// flush is rejected before touching the store), so release them
-	// explicitly for a prompt peer retry instead of waiting for lease
-	// expiry. Live-context failures (conflict/transient) are untracked
-	// without release: the task may be superseded, and the lease expires
-	// naturally.
+	// a canceled tick context are released explicitly for a prompt peer
+	// retry instead of waiting for lease expiry (a canceled flush is
+	// rejected before touching the store, so the lease is still ours
+	// unless Shutdown's releaseInFlight already released it — the release
+	// below is ownership-gated for that race). Live-context failures
+	// (conflict/transient) are untracked without release: the task may be
+	// superseded, and the lease expires naturally.
 	failed := w.flushWorkflowCommits(ctx, pending)
 	if len(failed) > 0 {
 		if ctx.Err() != nil {
 			for _, p := range failed {
-				w.untrack(p.adv.TaskID)
-				w.releaseWorkflowLease(p.task)
+				// Only the in-flight owner releases (see
+				// claimWorkflowRelease): Shutdown's releaseInFlight may
+				// have released this pending task mid-flush and a peer
+				// may have re-claimed it, and backends match the lease
+				// by ID/key alone, so an unconditional release would
+				// clear the peer's lease.
+				if w.claimWorkflowRelease(p.adv.TaskID) {
+					w.releaseWorkflowLease(p.task)
+				} else {
+					w.opts.Logger.Debug("skipping workflow lease release; not in-flight owner",
+						"instance_id", p.task.InstanceID, "task_id", p.adv.TaskID)
+				}
 			}
 		} else {
 			for _, p := range failed {
