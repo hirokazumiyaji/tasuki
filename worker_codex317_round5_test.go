@@ -107,20 +107,25 @@ func (c *releaseJoinCtx) Err() error {
 }
 
 // TestWorker_CanceledActivityReleaseJoinsRenewal covers the release-path /
-// detached-renewal race: a canceled activity return sets commit-renewal mode
-// and releases concurrently with extendLeaseLoop entering renewUntilDone. A
-// renewal landing after the ReleaseLease re-hides the task for a full lease
-// (or modifies a peer's fresh lease — backend lease ops are keyed by task ID
-// alone).
+// renewal race: a periodic ExtendLease still in flight when a canceled
+// activity return takes the shutdown-release path must complete before the
+// ReleaseLease lands. A renewal landing after the release re-hides the
+// task for a full lease (or modifies a peer's fresh lease — backend lease
+// ops are keyed by task ID alone).
 //
-// The hook context freezes the handler at the cancel check with a renewal
-// already inside renewUntilDone (held in a gated ExtendLease), so the
-// interleaving is deterministic: with the fix the release path leaves
-// detached mode and joins the renewal loop before releasing — no release is
-// observable while the renewal is blocked, extend-exit precedes
-// release-exit, and the released task stays claimable. Without the join the
-// release lands while the renewal is still in flight and the renewal lands
-// last, re-hiding the task.
+// Detached-commit renewal cannot be in flight on this path: detached mode
+// is entered atomically with the commit ownership transfer (see
+// beginDetachedCommit), and the release path never transfers, so the flag
+// is still clear and the loop cannot enter detached mode after the cancel.
+// The renewal joined here is therefore an ordinary periodic tick renewal,
+// held in a gated ExtendLease. The hook context freezes the handler at the
+// post-invocation cancel check with that renewal already in flight, so the
+// interleaving is deterministic: with the fix the release path joins the
+// renewal loop before releasing — no release is observable while the
+// renewal is blocked, extend-exit precedes release-exit, and the released
+// task stays claimable. Without the join the release lands while the
+// renewal is still in flight and the renewal lands last, re-hiding the
+// task.
 func TestWorker_CanceledActivityReleaseJoinsRenewal(t *testing.T) {
 	ctx := context.Background()
 	t0 := time.Now().UTC()
@@ -132,7 +137,10 @@ func TestWorker_CanceledActivityReleaseJoinsRenewal(t *testing.T) {
 		extendGate:    make(chan struct{}),
 	}
 	w := NewWorker(store, WorkerOptions{
-		LeaseDuration:          10 * time.Second, // 5s tick: no periodic renewal during the test
+		// 500ms tick: a periodic renewal is guaranteed in flight during
+		// the test, while the 1s lease keeps the entry locally valid
+		// through the release.
+		LeaseDuration:          time.Second,
 		WorkerID:               "w1",
 		IncompatibleRetryDelay: -1,
 	})
@@ -161,14 +169,16 @@ func TestWorker_CanceledActivityReleaseJoinsRenewal(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("handler did not reach the post-invocation cancel check")
 	}
-	time.Sleep(50 * time.Millisecond) // renewal loop parked in select
+	// Gate renewals and wait for a periodic tick renewal to get in
+	// flight while the handler is still frozen at the check.
 	store.armBlock.Store(true)
-	close(hook.doneCh) // cancel lands while the handler is frozen at the check
 	select {
 	case <-store.extendEntered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("renewal loop did not enter detached mode")
+		t.Fatal("periodic renewal did not start")
 	}
+	close(hook.doneCh) // cancel lands while the handler is frozen at the check
+	time.Sleep(50 * time.Millisecond)
 	close(hook.errRelease) // the check reports cancel; the handler takes the release path
 
 	// The release path must join the in-flight renewal before releasing:
