@@ -13,7 +13,11 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{FairDispatch: true}
+	return backend.Capabilities{
+		FairDispatch:        true,
+		CleansTerminalState: true,
+		SupportsBulkCleanup: true,
+	}
 }
 
 var _ backend.SchemaValidator = (*Backend)(nil)
@@ -181,6 +185,9 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		return err
 	}
 	if _, err = conn.ExecContext(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, `DELETE FROM wf_inbox WHERE instance_id = ?`, id); err != nil {
 		return err
 	}
 	if err := commitConn(ctx, conn); err != nil {
@@ -718,8 +725,22 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = ?`, adv.InstanceID); err != nil {
 			return err
 		}
+		// Terminal transitions retire pending work: activity tasks must no
+		// longer be claimable and timers must never fire into the inbox.
+		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE instance_id = ?`, adv.InstanceID); err != nil {
+			return err
+		}
+		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_timers WHERE instance_id = ?`, adv.InstanceID); err != nil {
+			return err
+		}
+		// Purge the whole inbox, not just DrainedInbox: a signal committed
+		// after the worker loaded its state but before this terminal commit
+		// is never drained, and must not survive (like TerminateInstance).
+		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_inbox WHERE instance_id = ?`, adv.InstanceID); err != nil {
+			return err
+		}
 	}
-	if len(adv.DrainedInbox) > 0 {
+	if adv.Terminal == nil && len(adv.DrainedInbox) > 0 {
 		for _, inboxID := range adv.DrainedInbox {
 			_, err = conn.ExecContext(ctx, `DELETE FROM wf_inbox WHERE id = ?`, inboxID)
 			if err != nil {
@@ -798,7 +819,10 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 	if err != nil {
 		return err
 	}
-	if n, derr := delRes.RowsAffected(); derr == nil && n == 0 && adv.WorkerID != "" {
+	// A terminal advancement bulk-deletes every task of the instance above
+	// (including its own) after the generation preflight passed; only
+	// non-terminal commits require a deleted row here.
+	if n, derr := delRes.RowsAffected(); derr == nil && n == 0 && adv.WorkerID != "" && adv.Terminal == nil {
 		return backend.ErrConflict
 	}
 	if err := ensureWorkflowTaskIfInbox(ctx, conn, adv.InstanceID); err != nil {
@@ -1002,6 +1026,20 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			return 0, err
 		}
 		if aff == 0 {
+			continue
+		}
+		var status string
+		if err := conn.QueryRowContext(ctx, `SELECT status FROM wf_instances WHERE id = ?`, d.instanceID).
+			Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue // orphaned timer of a purged instance
+			}
+			return 0, err
+		}
+		if status != "running" {
+			// Terminal instances consume timers silently: no inbox row,
+			// no workflow task wakeup.
+			n++
 			continue
 		}
 		_, err = conn.ExecContext(ctx, `

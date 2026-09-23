@@ -7,6 +7,7 @@ import (
 	"time"
 
 	gcf "cloud.google.com/go/firestore"
+	firestorepb "cloud.google.com/go/firestore/apiv1/firestorepb"
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/journal"
 	"google.golang.org/api/iterator"
@@ -233,7 +234,10 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 			return backend.ErrNotFound
 		}
 		var refs []*gcf.DocumentRef
-		for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe"} {
+		// NOTE: instances with more than ~500 child documents exceed the
+		// Firestore transaction write cap here; chunked deletes are a
+		// follow-up to #299 (backendtest BulkTerminatePurge skips until then).
+		for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox"} {
 			it := tx.Documents(b.col(col).Where("instance_id", "==", id))
 			for {
 				d, e := it.Next()
@@ -272,24 +276,25 @@ func (b *Backend) CountClaimableTasks(ctx context.Context, kind string, queues [
 	now := nowUTC()
 	out := map[string]int64{}
 	for _, q := range queues {
-		it := b.col("wf_tasks").
+		query := b.col("wf_tasks").
 			Where("kind", "==", kind).
 			Where("queue", "==", q).
-			Where("visible_at", "<=", now).
-			Documents(ctx)
-		var n int64
-		for {
-			_, err := it.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				it.Stop()
-				return nil, err
-			}
-			n++
+			Where("visible_at", "<=", now)
+		res, err := query.NewAggregationQuery().WithCount("n").Get(ctx)
+		if err != nil {
+			return nil, err
 		}
-		it.Stop()
+		// The aggregation value arrives as a *firestorepb.Value, not an
+		// int64. A missing or unexpected result counts as zero.
+		var n int64
+		if v, ok := res["n"]; ok {
+			switch t := v.(type) {
+			case *firestorepb.Value:
+				n = t.GetIntegerValue()
+			case int64:
+				n = t
+			}
+		}
 		if n > 0 {
 			out[q] = n
 		}
@@ -785,6 +790,19 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if len(advs) == 0 {
 		return nil
 	}
+	// Reject duplicate instances up front: all reads run before any write
+	// in one transaction, so two advancements for the same instance would
+	// both pass the ExpectedSeq check and then collide creating the same
+	// journal document (AlreadyExists, not ErrConflict). Preflight keeps
+	// the batch all-or-nothing with a conflict error (see backendtest
+	// CommitAdvancementsAtomic).
+	seen := make(map[string]struct{}, len(advs))
+	for _, adv := range advs {
+		if _, dup := seen[adv.InstanceID]; dup {
+			return backend.ErrConflict
+		}
+		seen[adv.InstanceID] = struct{}{}
+	}
 	now := nowUTC()
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		// Firestore requires all reads before any writes in a transaction.
@@ -1187,15 +1205,12 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	// Even on pure dedupe hits, ensure a task when inbox remains: a prior
 	// crash between commit and ensure must not stall the instance forever.
 	if inst.Status == "running" {
-		_ = b.ensureWorkflowTask(ctx, instanceID)
-	}
-	if inserted == 0 {
-		return nil
-	}
-	if inst.Status == "running" {
 		if err := b.ensureWorkflowTask(ctx, instanceID); err != nil {
 			return err
 		}
+	}
+	if inserted == 0 {
+		return nil
 	}
 	b.notifyTasks()
 	return nil

@@ -95,7 +95,11 @@ func New() *Backend {
 func (b *Backend) Migrate(context.Context) error { return nil }
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{FairDispatch: true}
+	return backend.Capabilities{
+		FairDispatch:        true,
+		CleansTerminalState: true,
+		SupportsBulkCleanup: true,
+	}
 }
 
 func (b *Backend) SetNow(t time.Time) {
@@ -213,6 +217,7 @@ func (b *Backend) TerminateInstance(_ context.Context, id string) error {
 	inst.status = "terminated"
 	inst.completedAt = b.now
 	delete(b.signalDedupe, id)
+	delete(b.inbox, id)
 	for tid, t := range b.tasks {
 		if t.instanceID == id {
 			delete(b.tasks, tid)
@@ -432,14 +437,8 @@ func (b *Backend) ClaimTasks(_ context.Context, req backend.ClaimRequest) ([]bac
 		}
 		cands = append(cands, cand{id: id, t: t})
 	}
-	// stable-ish: pick by lowest id
-	for i := 0; i < len(cands); i++ {
-		for j := i + 1; j < len(cands); j++ {
-			if cands[j].id < cands[i].id {
-				cands[i], cands[j] = cands[j], cands[i]
-			}
-		}
-	}
+	// Lowest task id first (stable FIFO across claims).
+	sort.Slice(cands, func(i, j int) bool { return cands[i].id < cands[j].id })
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 1
@@ -481,6 +480,33 @@ func (b *Backend) CommitAdvancements(_ context.Context, advs []backend.Advanceme
 		return nil
 	}
 	b.mu.Lock()
+	// Reject duplicate instances up front: the commit loop below applies
+	// advancements sequentially, so a second advancement for the same
+	// instance would observe the first one's effects and conflict only
+	// after partial application. Preflight rejection keeps the batch
+	// all-or-nothing (see backendtest CommitAdvancementsAtomic).
+	seen := make(map[string]struct{}, len(advs))
+	for _, adv := range advs {
+		if _, dup := seen[adv.InstanceID]; dup {
+			b.mu.Unlock()
+			return backend.ErrConflict
+		}
+		seen[adv.InstanceID] = struct{}{}
+	}
+	claimedChildren := make(map[string]struct{})
+	for _, adv := range advs {
+		for _, ch := range adv.Children {
+			if _, dup := claimedChildren[ch.ID]; dup {
+				b.mu.Unlock()
+				return backend.ErrAlreadyExists
+			}
+			claimedChildren[ch.ID] = struct{}{}
+			if _, clash := seen[ch.ID]; clash {
+				b.mu.Unlock()
+				return backend.ErrConflict
+			}
+		}
+	}
 	for _, adv := range advs {
 		if err := b.preflightAdvancementLocked(adv); err != nil {
 			b.mu.Unlock()
@@ -526,6 +552,14 @@ func (b *Backend) preflightAdvancementLocked(adv backend.Advancement) error {
 	if adv.WorkerID != "" && (own.workerID != adv.WorkerID || own.attempt != adv.Attempt) {
 		return backend.ErrConflict
 	}
+	// Child IDs must be free now: createInstanceLocked is the only remaining
+	// fallible step in the commit loop, and preflighting it here keeps the
+	// batch all-or-nothing.
+	for _, ch := range adv.Children {
+		if _, exists := b.instances[ch.ID]; exists {
+			return backend.ErrAlreadyExists
+		}
+	}
 	return nil
 }
 
@@ -545,8 +579,13 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 		return backend.ErrConflict
 	}
 
-	// Apply drained inbox
-	if len(adv.DrainedInbox) > 0 {
+	// Apply drained inbox. Terminal transitions purge the entire inbox:
+	// a signal committed after the worker loaded its state but before the
+	// terminal commit is never in DrainedInbox, so deleting only drained
+	// IDs would leave it behind (like TerminateInstance, drop everything).
+	if adv.Terminal != nil {
+		delete(b.inbox, adv.InstanceID)
+	} else if len(adv.DrainedInbox) > 0 {
 		drain := map[int64]struct{}{}
 		for _, id := range adv.DrainedInbox {
 			drain[id] = struct{}{}
@@ -609,6 +648,18 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 		inst.failure = append([]byte(nil), adv.Terminal.Failure...)
 		inst.completedAt = b.now
 		delete(b.signalDedupe, adv.InstanceID)
+		// Terminal transitions retire pending work: activity tasks must no
+		// longer be claimable and timers must never fire into the inbox.
+		for tid, t := range b.tasks {
+			if t.instanceID == adv.InstanceID {
+				delete(b.tasks, tid)
+			}
+		}
+		for k := range b.timers {
+			if k.instanceID == adv.InstanceID {
+				delete(b.timers, k)
+			}
+		}
 	}
 	for _, ch := range adv.Children {
 		if err := b.createInstanceLocked(ch); err != nil {
@@ -696,6 +747,12 @@ func (b *Backend) FireDueTimers(_ context.Context, limit int) (int, error) {
 			continue
 		}
 		delete(b.timers, d.key)
+		if inst.status != "running" {
+			// Terminal instances consume timers silently: no inbox row,
+			// no workflow task wakeup.
+			n++
+			continue
+		}
 		b.nextInbox++
 		b.inbox[d.tm.instanceID] = append(b.inbox[d.tm.instanceID], &inboxItem{
 			id: b.nextInbox,
@@ -704,9 +761,7 @@ func (b *Backend) FireDueTimers(_ context.Context, limit int) (int, error) {
 				RefSeq: d.tm.seq,
 			},
 		})
-		if inst.status == "running" {
-			b.enqueueWorkflowTaskLocked(d.tm.instanceID, inst.queue)
-		}
+		b.enqueueWorkflowTaskLocked(d.tm.instanceID, inst.queue)
 		n++
 	}
 	b.mu.Unlock()
