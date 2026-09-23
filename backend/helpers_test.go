@@ -788,6 +788,146 @@ func TestFairOverflowRequerySuccessiveSegments(t *testing.T) {
 	}
 }
 
+func TestFairOverflowRequeryProgressContinuation(t *testing.T) {
+	// Covers the round-9 P2 on the postgres/mysql refill loops: a flood
+	// needing MORE segments than the old fixed pass cap (8) stranded its
+	// tail permanently — later polls restart at the head under the same caps,
+	// so the victim never surfaced. Limit=2, MaxPerInstance=1 over FIFO
+	// A1..A18010 (~9 FairRejectedCap segments) with A1..A18009 lost to
+	// concurrent locks: progress-continuation (each segment newly attempts
+	// rows) must walk all nine segments within one claim and recover the
+	// never-attempted tail, terminating via fill/exhaustion rather than the
+	// backstop. The mirror runs at full FairRejectedCap scale (no live DB);
+	// with the old bound of 8 the same loop returns empty (stranded).
+	const limit, perInstance = 2, 1
+	total := 9*backend.FairRejectedCap + 10
+	feed := make([]backend.FairTaskRef, 0, total)
+	for i := 0; i < total; i++ {
+		feed = append(feed, backend.FairTaskRef{ID: int64(i + 1), InstanceID: "A"})
+	}
+	// Only the overflow-dropped tail ever wins the lock race.
+	lockLost := func(id int64) bool { return id <= int64(total-1) }
+
+	// runRefill mirrors the postgres/mysql refill loops with looping
+	// successive-segment requeries gated on progress and backstopped by
+	// maxPasses arms.
+	runRefill := func(maxPasses int) (out []backend.FairTaskRef, arms, passes int) {
+		cursor := 0 // index of the next unscanned feed row (keyset cursor)
+		var lastID int64
+		first := true
+		var claimed, pending []backend.FairTaskRef
+		var overflowSnapValid, overflowSeen bool
+		var overflowSnapID int64
+		var requeryPasses, requeryAttempted, requeryOut int
+		attempted := map[int64]struct{}{}
+		startOverflowRequery := func() bool {
+			if len(out) >= limit || !overflowSeen || !overflowSnapValid || requeryPasses >= maxPasses {
+				return false
+			}
+			if requeryPasses > 0 && len(attempted) <= requeryAttempted && len(out) <= requeryOut {
+				return false
+			}
+			requeryPasses++
+			arms++
+			requeryAttempted, requeryOut = len(attempted), len(out)
+			overflowSeen = false
+			first = false
+			cursor = int(overflowSnapID) // IDs are 1-based sequential
+			overflowSnapValid = false
+			pending = nil
+			return true
+		}
+		for len(out) < limit {
+			passes++
+			if passes > 4*len(feed)+20 {
+				t.Fatalf("refill loop did not terminate (maxPasses=%d)", maxPasses)
+			}
+			picker := backend.NewFairPicker(limit-len(out), perInstance).TrackRejected()
+			picker.Seed(claimed)
+			offered := 0
+			for _, r := range pending {
+				if picker.Full() {
+					break
+				}
+				picker.Offer(r)
+				offered++
+			}
+			if !picker.Full() {
+				for !picker.Full() && cursor < len(feed) {
+					r := feed[cursor]
+					cursor++
+					if !overflowSeen && !picker.RejectedCapped() {
+						overflowSnapID, overflowSnapValid = lastID, !first
+					}
+					first = false
+					lastID = r.ID
+					if _, dup := attempted[r.ID]; !(requeryPasses > 0 && dup) {
+						offerFull := picker.Offer(r)
+						if picker.RejectedCapped() {
+							overflowSeen = true
+						}
+						if offerFull {
+							break
+						}
+					}
+				}
+			}
+			scanExhausted := !picker.Full()
+			picked := picker.Picked()
+			iterRejected := picker.Rejected()
+			for _, r := range picked {
+				attempted[r.ID] = struct{}{}
+			}
+			if len(picked) == 0 {
+				if startOverflowRequery() {
+					continue
+				}
+				break
+			}
+			prevOut := len(out)
+			for _, r := range picked {
+				if lockLost(r.ID) {
+					continue
+				}
+				out = append(out, r)
+				claimed = append(claimed, r)
+			}
+			if len(out) >= limit {
+				break
+			}
+			if scanExhausted {
+				if lost := len(picked) - (len(out) - prevOut); lost == 0 || len(iterRejected) == 0 {
+					if startOverflowRequery() {
+						continue
+					}
+					break
+				}
+			}
+			pending = append(iterRejected, pending[offered:]...)
+			if len(pending) > backend.FairRejectedCap {
+				pending = pending[:backend.FairRejectedCap]
+			}
+		}
+		return out, arms, passes
+	}
+
+	// Old fixed cap strands the tail: 8 arms cannot walk 9 segments.
+	if got, arms, _ := runRefill(8); len(got) != 0 || arms != 8 {
+		t.Fatalf("capped-8 requery: got %v arms=%d, want empty with 8 arms (reproduces the stranding)", got, arms)
+	}
+	// Progress-continuation with the backstop reaches the tail and stops.
+	got, arms, passes := runRefill(backend.MaxOverflowRequeryPasses)
+	if len(got) != 1 || got[0].ID != int64(total) || got[0].InstanceID != "A" {
+		t.Fatalf("progress requery: got %v arms=%d passes=%d, want [A%d]", got, arms, passes, total)
+	}
+	if arms != 9 {
+		t.Fatalf("progress requery: arms=%d, want 9 successive segments", arms)
+	}
+	if passes > 4*total+20 {
+		t.Fatalf("progress requery: passes=%d, loop must terminate", passes)
+	}
+}
+
 func TestFairOverflowRequeryNoProgressStops(t *testing.T) {
 	// The looping requery must not burn through its pass bound when a
 	// segment cannot make progress: Limit=2, MaxPerInstance=1 over FIFO

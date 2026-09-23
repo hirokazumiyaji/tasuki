@@ -292,12 +292,15 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 	// bounded requery passes from the snapshot instead of returning
 	// underfilled. A requery pass that itself overflows arms the next pass
 	// from its own fresher snapshot (successive segments), so multi-cap
-	// floods (A1..A4003, all locked) are walked through segment by segment.
-	// Passes stop at MaxOverflowRequeryPasses, when the batch fills, when a
-	// pass makes no progress (nothing newly attempted or secured), or when a
-	// pass proves no unattempted candidates remain (no overflow). Rows still
-	// dropped afterwards stay claimable for a later poll, which restarts from
-	// the head.
+	// floods (A1..A4003, all locked, or A18010 needing ~9 segments) are
+	// walked through segment by segment while each segment makes progress
+	// (newly attempts or secures a row). Passes stop when the batch fills,
+	// when a pass makes no progress, when a pass proves no unattempted
+	// candidates remain (no overflow), or — as a backstop only — at
+	// MaxOverflowRequeryPasses (64) additional segments. Worst case per claim
+	// is 64 extra bounded segment scans; each segment advances past up to
+	// FairRejectedCap dropped rows. Rows still dropped afterwards stay
+	// claimable for a later poll, which restarts from the head.
 	var (
 		overflowSnapValid bool
 		overflowSnapVis   time.Time
@@ -322,7 +325,8 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 	// the overflow flag and the snapshot, so the next pass takes a fresh
 	// snapshot further along (successive segments); passes beyond the first
 	// additionally require progress (a newly attempted or secured row) since
-	// the previous arm, and the total is bounded by MaxOverflowRequeryPasses.
+	// the previous arm — progress is the primary stop condition — and the
+	// total is backstopped by MaxOverflowRequeryPasses (64).
 	startOverflowRequery := func() bool {
 		if len(out) >= req.Limit || !overflowSeen || !overflowSnapValid ||
 			requeryPasses >= backend.MaxOverflowRequeryPasses {

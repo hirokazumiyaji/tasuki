@@ -37,14 +37,20 @@ func FairOverfetch(limit int) int {	of := limit * 4
 // enough that the carry stays cheap.
 const FairRejectedCap = 2000
 
-// MaxOverflowRequeryPasses bounds how many successive overflow-requery
-// segments one fair claim may issue (postgres, mysql). Each segment resumes
-// from the latest pre-overflow snapshot while skipping already-attempted IDs,
-// so one segment advances past up to FairRejectedCap dropped rows; 8 segments
-// cover multi-cap floods (e.g. A1..A4003) several times over while keeping
-// worst-case extra scan work bounded. Claims still underfilled afterwards
-// leave the rest to a later poll, which restarts from the head.
-const MaxOverflowRequeryPasses = 8
+// MaxOverflowRequeryPasses is the hard backstop on successive
+// overflow-requery segments one fair claim may issue (postgres, mysql). The
+// primary stop condition is progress, not this count: each segment must newly
+// attempt or secure a row (see the requery guards), so a claim over a flood
+// that keeps advancing walks segment by segment until the batch fills, a
+// segment proves exhaustion, or a segment makes no progress. The bound only
+// caps pathological no-quiescence loops. Each segment resumes from the latest
+// pre-overflow snapshot while skipping already-attempted IDs, so one segment
+// advances past up to FairRejectedCap dropped rows; 64 segments cover ~128k
+// flood rows (e.g. A18010 needs ~9 segments), far beyond any realistic single
+// flood, while keeping worst-case extra scan work bounded at 64 additional
+// bounded segment scans per claim. Claims still underfilled afterwards leave
+// the rest to a later poll, which restarts from the head.
+const MaxOverflowRequeryPasses = 64
 
 // FairPick picks up to limit candidates with at most perInstance tasks per
 // instance, preserving input (FIFO) order. perInstance <= 0 keeps plain FIFO
@@ -213,8 +219,9 @@ func (p *FairPicker) Rejected() []FairTaskRef { return p.rejected }
 // When every retained row is then lost to concurrent locks with nothing
 // secured, the postgres/mysql refill loops re-issue bounded candidate
 // requeries from the pre-overflow cursor position instead of returning
-// underfilled, continuing through successive segments (up to
-// MaxOverflowRequeryPasses) while progress is made, so overflow-dropped rows
-// get a second chance within the same claim; rows still dropped after that
-// resurface on a later poll.
+// underfilled, continuing through successive segments while each segment
+// makes progress (newly attempted or secured rows), up to the
+// MaxOverflowRequeryPasses backstop, so overflow-dropped rows get a second
+// chance within the same claim; rows still dropped after that resurface on a
+// later poll.
 func (p *FairPicker) RejectedCapped() bool { return p.rejectedOverflow }
