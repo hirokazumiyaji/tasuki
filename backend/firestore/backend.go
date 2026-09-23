@@ -1223,9 +1223,12 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		// post-terminal marker (see postTerminalDedupeMarker): the first
 		// terminal send with a DedupeID creates the marker alongside the
 		// event, and later retries see the marker and skip. The base key is
-		// created when absent (so sweeps/purge stay consistent) but an
-		// existing base key never suppresses a terminal insert — only the
-		// marker does. (Same-batch duplicates still collapse to one insert
+		// created when absent (so sweeps/purge stay consistent) but a
+		// versioned base key never suppresses a terminal insert — only the
+		// marker does. A legacy (unversioned, pre-marker-release) owned
+		// guard does suppress: it is the old release's own post-terminal
+		// retry guard, so the event was already inserted (Codex round 14 on
+		// #296). (Same-batch duplicates still collapse to one insert
 		// so a batch never issues conflicting Creates.)
 		terminal := str(isnap.Data(), "status") != "running"
 		// Firestore requires all reads before writes; also skip same-batch DedupeID dups.
@@ -1267,8 +1270,20 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				}
 				// First post-terminal send: insert + stamp the marker.
 				// Create the base key too when absent for sweep/purge
-				// consistency; an existing base key (any non-marker
-				// encoding, including legacy raw rows) is kept as is.
+				// consistency. A versioned base guard (written by current
+				// code) never suppresses a terminal insert - it is a
+				// pre-terminal key whose event the terminal sweep retired,
+				// so the reset semantics still promise a fresh post-terminal
+				// delivery (see TestTerminalSendBypassesStaleDedupe); only
+				// the marker suppresses those retries. A LEGACY (unversioned)
+				// owned guard is different: the previous release had no
+				// markers and deleted every pre-terminal key at the terminal
+				// commit, so a surviving legacy guard is the old release's
+				// own post-terminal retry guard - its event was already
+				// inserted. Suppress the retry (no new event) and stamp the
+				// marker so the next retry takes the marker fast path
+				// (Codex round 14 on #296). Without this, the first retry
+				// after upgrade duplicates a delivered signal.
 				// Marker-shaped candidates are never user keys: markers
 				// live in their own collection now, so a row shaped like
 				// one is either an inert pre-upgrade marker or a legacy
@@ -1281,6 +1296,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				// creating over it would fail and must not suppress the
 				// insert.
 				baseExists := false
+				baseLegacy := false
 				canonicalOccupied := false
 				for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 					if isPostTerminalMarkerKey(bk) {
@@ -1296,11 +1312,17 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						}
 						if matchDedupeRow(it.DedupeID, bk, snap.Data()) {
 							baseExists = true
+							baseLegacy = i64(snap.Data(), dedupeFormatVersionField) < dedupeFormatVersion
 							break
 						}
 					}
 				}
 				created[it.DedupeID] = true
+				if baseExists && baseLegacy {
+					skip[i] = true
+					createMarker[i] = true
+					continue
+				}
 				if baseExists || canonicalOccupied {
 					createMarker[i] = true
 					continue
@@ -1363,6 +1385,22 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		}
 		for i, it := range items {
 			if skip[i] {
+				// Terminal upgrade path (see the terminal read branch): a
+				// pre-upgrade legacy guard suppressed the insert, but the
+				// marker must still be stamped so the next retry takes the
+				// marker fast path. A lost Create race here (concurrent
+				// retry stamping first) surfaces as a transaction conflict
+				// and the caller retries into a marker hit — the same shape
+				// as concurrent first-send stamps today.
+				if it.DedupeID != "" && createMarker[i] {
+					if err := tx.Create(b.ref(postTerminalMarkersCollection, postTerminalMarkerDocID(instanceID, it.DedupeID)), map[string]any{
+						"instance_id": instanceID,
+						"dedupe_id":   postTerminalDedupeMarker(it.DedupeID),
+						"created_at":  now,
+					}); err != nil {
+						return err
+					}
+				}
 				continue
 			}
 			if it.DedupeID != "" && (createKey[i] || createRawKey[i]) {

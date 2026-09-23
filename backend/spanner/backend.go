@@ -1274,8 +1274,13 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		// send; retries dedupe via a post-terminal marker (see
 		// postTerminalDedupeMarker): the first terminal send creates the
 		// marker alongside the event, later retries see it and skip. The
-		// base key is created when absent but never suppresses a terminal
-		// insert — only the marker does.
+		// base key is created when absent but a versioned base key never
+		// suppresses a terminal insert — only the marker does. A legacy
+		// (NULL format_version, pre-marker-release) owned guard does
+		// suppress: the previous release had no markers and deleted every
+		// pre-terminal key at the terminal commit, so a surviving legacy
+		// guard is the old release's own post-terminal retry guard whose
+		// event was already inserted (Codex round 14 on #296).
 		terminal := status != "running"
 		created := map[string]bool{}
 		for _, it := range items {
@@ -1301,18 +1306,29 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						return merr
 					}
 					// First post-terminal send: stamp the marker; create
-					// the base key too when absent for sweep consistency
-					// (any non-marker encoding, including legacy raw rows,
-					// counts as present). Marker-shaped candidates are
-					// never user keys: markers live in their own table
-					// now, so a row shaped like one is either an inert
-					// pre-upgrade marker or a legacy verbatim row no probe
-					// may mistake for this DedupeID's guard (skipping it
-					// duplicates at worst, never drops).
+					// the base key too when absent for sweep consistency.
+					// A versioned owned guard never suppresses the insert
+					// (reset semantics: its pre-terminal event was swept,
+					// so a fresh post-terminal delivery is promised — see
+					// TestTerminalSendBypassesStaleDedupe). A legacy owned
+					// guard suppresses instead: pre-marker releases stored
+					// post-terminal retry guards only in wf_signal_dedupe
+					// and deleted every pre-terminal key at the terminal
+					// commit, so the surviving legacy row guards an already
+					// inserted post-terminal event (Codex round 14 on
+					// #296). The marker mutation above is still buffered,
+					// so the next retry takes the marker fast path.
+					// Marker-shaped candidates are never user keys:
+					// markers live in their own table now, so a row shaped
+					// like one is either an inert pre-upgrade marker or a
+					// legacy verbatim row no probe may mistake for this
+					// DedupeID's guard (skipping it duplicates at worst,
+					// never drops).
 					muts = append(muts, spanner.InsertMap(postTerminalMarkersTable, map[string]any{
 						"instance_id": instanceID, "marker_key": dedupeMarkerKey(it.DedupeID), "created_at": now,
 					}))
 					baseExists := false
+					baseLegacy := false
 					canonicalOccupied := false
 					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 						if isPostTerminalMarkerKey(bk) {
@@ -1330,8 +1346,13 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						}
 						if matchDedupeRow(it.DedupeID, bk, stored, version) {
 							baseExists = true
+							baseLegacy = !version.Valid || version.Int64 < dedupeFormatVersion
 							break
 						}
+					}
+					if baseExists && baseLegacy {
+						created[it.DedupeID] = true
+						continue
 					}
 					if baseExists || canonicalOccupied {
 						created[it.DedupeID] = true
