@@ -253,15 +253,15 @@ func (b *Backend) RecordHeartbeat(_ context.Context, taskID int64, lease time.Du
 	return nil
 }
 
-func (b *Backend) ReleaseLease(_ context.Context, taskID int64) error {
+func (b *Backend) ReleaseLease(_ context.Context, t backend.Task) error {
 	b.mu.Lock()
-	t, ok := b.tasks[taskID]
+	tsk, ok := b.tasks[t.ID]
 	if !ok {
 		b.mu.Unlock()
 		return backend.ErrNotFound
 	}
-	t.visibleAt = b.now
-	t.workerID = ""
+	tsk.visibleAt = b.now
+	tsk.workerID = ""
 	b.mu.Unlock()
 	b.notifyTasks()
 	return nil

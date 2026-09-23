@@ -369,6 +369,26 @@ func (b *Backend) updateTask(ctx context.Context, id int64, activity bool, field
 		return tx.Update(r, fields)
 	})
 }
+
+// updateTaskDoc applies fields to the wf_tasks document with the given ID.
+// Unlike updateTask it does not assume the ACT# key or check the activity
+// kind, so kind-routed callers (workflow releases) can address WF# keys.
+func (b *Backend) updateTaskDoc(ctx context.Context, docID string, fields []gcf.Update) error {
+	r := b.ref("wf_tasks", docID)
+	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		s, e := tx.Get(r)
+		if isNotFound(e) {
+			return backend.ErrNotFound
+		}
+		if e != nil {
+			return e
+		}
+		if !s.Exists() {
+			return backend.ErrNotFound
+		}
+		return tx.Update(r, fields)
+	})
+}
 func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
 	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
 	// kind like NackTask does. Renewing a workflow task by numeric ID would
@@ -387,10 +407,37 @@ func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Durati
 			if !s.Exists() {
 				return backend.ErrNotFound
 			}
+			// Fence the renewal to the claimed task generation: the
+			// singleton WF# key is reused across turns, so an
+			// EnsureWorkflowTask replacement (or a peer reclaim) must not
+			// be extended by a stale holder.
+			if err := checkWorkflowRenewalDoc(s.Data(), t); err != nil {
+				return err
+			}
 			return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
 		})
 	}
 	return b.updateTask(ctx, t.ID, false, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
+}
+
+// checkWorkflowRenewalDoc reports whether the workflow task document still
+// carries the claimed task generation (numeric id + claim ownership). A
+// mismatch means an EnsureWorkflowTask replacement or a peer reclaim moved
+// the key on, and the stale renewal must not extend it.
+func checkWorkflowRenewalDoc(data map[string]any, t backend.Task) error {
+	if data == nil || i64(data, "id") != t.ID || str(data, "worker_id") != t.WorkerID || i64(data, "attempt") != int64(t.Attempt) {
+		return backend.ErrNotFound
+	}
+	return nil
+}
+
+// releaseTaskDocID routes a lease release to the task's document: workflow
+// tasks live under WF#<instanceID>, activities under ACT#<id> (see NackTask).
+func releaseTaskDocID(t backend.Task) string {
+	if t.Kind == "workflow" && t.InstanceID != "" {
+		return wfTaskID(t.InstanceID)
+	}
+	return actTaskID(t.ID)
 }
 
 func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
@@ -400,8 +447,8 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 	}
 	return b.updateTask(ctx, taskID, false, fields)
 }
-func (b *Backend) ReleaseLease(ctx context.Context, id int64) error {
-	if err := b.updateTask(ctx, id, false, []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}}); err != nil {
+func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
+	if err := b.updateTaskDoc(ctx, releaseTaskDocID(t), []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}}); err != nil {
 		return err
 	}
 	b.notifyTasks()

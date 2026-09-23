@@ -421,9 +421,9 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 	return nil
 }
 
-func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
+func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	res, err := b.db.ExecContext(ctx, `
-		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ?`, nowUTC(), taskID)
+		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL WHERE id = ?`, nowUTC(), t.ID)
 	if err != nil {
 		return err
 	}

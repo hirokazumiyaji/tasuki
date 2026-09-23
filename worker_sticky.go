@@ -135,11 +135,23 @@ type pendingWorkflowCommit struct {
 	instanceID  string
 	baseJournal []journal.Event
 	adv         backend.Advancement
+	// task is the claimed task awaiting commit. The commit stays tracked
+	// under its ID until flush succeeds (see tickWorkflows); failures
+	// return in the failed subset so the caller can untrack or release.
+	task backend.Task
 }
 
-func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWorkflowCommit) {
+// flushWorkflowCommits commits pending advancements and returns the subset
+// whose commit did not succeed. Successful commits are untracked: the task
+// is deleted by the commit and must no longer be visible to
+// releaseInFlight. Failed commits stay tracked for the caller to dispose
+// (release when the flush context was canceled, untrack otherwise).
+func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWorkflowCommit) []pendingWorkflowCommit {
 	if len(pending) == 0 {
-		return
+		return nil
+	}
+	untrack := func(p pendingWorkflowCommit) {
+		w.untrack(p.adv.TaskID)
 	}
 	if batcher, ok := w.backend.(backend.AdvancementBatcher); ok && len(pending) > 1 {
 		advs := make([]backend.Advancement, len(pending))
@@ -151,18 +163,24 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 				w.dropSticky(p.instanceID)
 			}
 			w.recordStoreError(ctx, "commit_workflow", err, "n", len(pending))
-			return
+			return pending
 		}
 		for _, p := range pending {
 			w.applyStickyAfterCommit(p.instanceID, p.baseJournal, p.adv)
+			untrack(p)
 		}
-		return
+		return nil
 	}
+	var failed []pendingWorkflowCommit
 	for _, p := range pending {
 		if err := w.commitWorkflow(ctx, p.instanceID, p.baseJournal, p.adv); err != nil {
 			w.recordStoreError(ctx, "commit_workflow", err, "instance_id", p.instanceID)
+			failed = append(failed, p)
+			continue
 		}
+		untrack(p)
 	}
+	return failed
 }
 
 func (w *Worker) applyStickyAfterCommit(instanceID string, baseJournal []journal.Event, adv backend.Advancement) {

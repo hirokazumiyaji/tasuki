@@ -475,11 +475,11 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 	return err
 }
 
-func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
+func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
 			SQL:    `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL WHERE id = @id`,
-			Params: map[string]any{"v": nowUTC(), "id": taskID},
+			Params: map[string]any{"v": nowUTC(), "id": t.ID},
 		})
 		if err != nil {
 			return err

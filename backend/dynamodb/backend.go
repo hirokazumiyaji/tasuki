@@ -335,12 +335,13 @@ func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Durati
 	// address a missing ACT# key and return ErrNotFound, letting long
 	// replays lose their lease to a peer (duplicate execution).
 	if t.Kind == "workflow" && t.InstanceID != "" {
+		cond, values := workflowRenewalFence(t, timeToN(nowUTC().Add(d)))
 		_, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 			TableName:                 aws.String(b.table("wf_tasks")),
 			Key:                       map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(t.InstanceID))},
 			UpdateExpression:          aws.String("SET visible_at = :v"),
-			ConditionExpression:       aws.String("attribute_exists(task_pk)"),
-			ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(d)))},
+			ConditionExpression:       aws.String(cond),
+			ExpressionAttributeValues: values,
 		})
 		if conditional(err) {
 			return backend.ErrNotFound
@@ -348,6 +349,28 @@ func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Durati
 		return err
 	}
 	return b.updateTask(ctx, t.ID, "SET visible_at = :v", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(d)))}, "")
+}
+
+// workflowRenewalFence fences a workflow renewal to the claimed task
+// generation: the singleton WF#<instanceID> key is reused across turns, so
+// an EnsureWorkflowTask replacement (or a peer reclaim) must not be
+// extended by a stale holder. The update applies only when the item still
+// carries the claimed numeric id and claim ownership (worker + attempt).
+func workflowRenewalFence(t backend.Task, visible int64) (string, map[string]types.AttributeValue) {
+	return "attribute_exists(task_pk) AND id = :id AND worker_id = :w AND attempt = :a",
+		map[string]types.AttributeValue{
+			":v": avN(visible),
+			":id": avN(t.ID), ":w": avS(t.WorkerID), ":a": avN(int64(t.Attempt)),
+		}
+}
+
+// releaseTaskPK routes a lease release to the task's key: workflow tasks
+// live under WF#<instanceID>, activities under ACT#<id> (see NackTask).
+func releaseTaskPK(t backend.Task) string {
+	if t.Kind == "workflow" && t.InstanceID != "" {
+		return wfTaskPK(t.InstanceID)
+	}
+	return actTaskPK(t.ID)
 }
 
 func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
@@ -359,8 +382,8 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 	}
 	return b.updateTask(ctx, taskID, update, values, "")
 }
-func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
-	if err := b.updateTask(ctx, taskID, "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC()))}, ""); err != nil {
+func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
+	if err := b.updateTaskPK(ctx, releaseTaskPK(t), "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC()))}, ""); err != nil {
 		return err
 	}
 	b.notifyTasks()
@@ -391,10 +414,14 @@ func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Du
 	return b.updateTask(ctx, taskID, "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(delay)))}, "kind = :kind")
 }
 func (b *Backend) updateTask(ctx context.Context, id int64, update string, values map[string]types.AttributeValue, condition string) error {
+	return b.updateTaskPK(ctx, actTaskPK(id), update, values, condition)
+}
+
+func (b *Backend) updateTaskPK(ctx context.Context, pk string, update string, values map[string]types.AttributeValue, condition string) error {
 	if condition != "" {
 		values[":kind"] = avS("activity")
 	}
-	_, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": avS(actTaskPK(id))}, UpdateExpression: aws.String(update), ConditionExpression: aws.String("attribute_exists(task_pk)" + condSuffix(condition)), ExpressionAttributeValues: values})
+	_, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": avS(pk)}, UpdateExpression: aws.String(update), ConditionExpression: aws.String("attribute_exists(task_pk)" + condSuffix(condition)), ExpressionAttributeValues: values})
 	if conditional(err) {
 		return backend.ErrNotFound
 	}

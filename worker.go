@@ -23,7 +23,7 @@ type Worker struct {
 	mu       sync.Mutex
 	cancel   context.CancelFunc
 	done     chan struct{}
-	inFlight map[int64]struct{}
+	inFlight map[int64]backend.Task
 
 	stickyMu sync.Mutex
 	sticky   map[string]stickyEntry
@@ -56,7 +56,7 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 		backend:  b,
 		opts:     opts,
 		reg:      newRegistry(opts.Codec),
-		inFlight: map[int64]struct{}{},
+		inFlight: map[int64]backend.Task{},
 		sticky:   map[string]stickyEntry{},
 		instLock: map[string]*workflowActor{},
 		wfSem:    make(chan struct{}, opts.WorkflowConcurrency),
@@ -217,9 +217,9 @@ func (w *Worker) trackActivity() (done func(), ok bool) {
 	return w.actWg.Done, true
 }
 
-func (w *Worker) track(taskID int64) {
+func (w *Worker) track(t backend.Task) {
 	w.mu.Lock()
-	w.inFlight[taskID] = struct{}{}
+	w.inFlight[t.ID] = t
 	w.mu.Unlock()
 }
 
@@ -231,24 +231,27 @@ func (w *Worker) untrack(taskID int64) {
 
 func (w *Worker) releaseInFlight(ctx context.Context) {
 	w.mu.Lock()
-	ids := make([]int64, 0, len(w.inFlight))
-	for id := range w.inFlight {
-		ids = append(ids, id)
+	tasks := make([]backend.Task, 0, len(w.inFlight))
+	for _, t := range w.inFlight {
+		tasks = append(tasks, t)
 	}
-	w.inFlight = map[int64]struct{}{}
+	w.inFlight = map[int64]backend.Task{}
 	w.mu.Unlock()
-	for _, id := range ids {
+	for _, t := range tasks {
 		select {
 		case <-ctx.Done():
 			w.opts.Logger.Warn("shutdown lease release timed out",
-				"released", 0, "remaining", len(ids), "error", ctx.Err())
+				"released", 0, "remaining", len(tasks), "error", ctx.Err())
 			w.opts.Metrics.AddStoreError(context.Background(), "release_lease")
 			return
 		default:
 		}
-		if err := w.backend.ReleaseLease(ctx, id); err != nil {
+		// Kind-routed: workflow tasks live under WF#<instanceID> on
+		// DynamoDB/Firestore, so the full task identity (not just the
+		// numeric ID) addresses the lease.
+		if err := w.backend.ReleaseLease(ctx, t); err != nil {
 			w.opts.Logger.Warn("shutdown lease release failed",
-				"task_id", id, "error", err)
+				"task_id", t.ID, "error", err)
 			w.opts.Metrics.AddStoreError(context.Background(), "release_lease")
 			select {
 			case <-ctx.Done():
@@ -414,7 +417,8 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		case w.wfSem <- struct{}{}:
 		default:
 			// No slot: make the task visible again promptly for peers.
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			// Kind-routed so workflow tasks address WF#<instanceID>.
+			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
 		leaseDone := make(chan struct{})
@@ -439,7 +443,7 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 			actor.dispatch(func() {
 				w.opts.Metrics.AddWorkflowTask(ctx, 1)
 				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
-				w.track(t.ID)
+				w.track(t)
 				// Extend the workflow task lease while the turn runs so long
 				// replays and local activities cannot lose the lease to a
 				// peer (which would duplicate the execution).
@@ -448,20 +452,22 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					w.extendLeaseLoop(ctx, t, leaseDone)
 				}()
 				p, herr := w.handleWorkflow(ctx, t, stopRenewal)
-				w.untrack(t.ID)
 				if herr != nil {
-					// No commit follows: stop renewal before handling the
-					// error so ExtendLease cannot race a lease release
-					// below or overwrite a nack's visible_at.
+					// No commit follows: untrack, then stop renewal before
+					// handling the error so ExtendLease cannot race a lease
+					// release below or overwrite a nack's visible_at.
+					w.untrack(t.ID)
 					stopRenewal()
 					if errors.Is(herr, errTurnAbandoned) ||
 						(ctx.Err() != nil && isCancellationError(herr)) {
 						// Worker lifecycle ended mid-turn: abandon the turn
 						// and release the lease promptly so a peer retries
 						// instead of committing shutdown as a failure.
+						// Kind-routed so workflow tasks address
+						// WF#<instanceID>, not a missing ACT# key.
 						w.opts.Logger.Debug("workflow turn abandoned on shutdown",
 							"instance_id", t.InstanceID, "task_id", t.ID)
-						w.releaseWorkflowLease(t.ID)
+						w.releaseWorkflowLease(t)
 						return
 					}
 					w.recordStoreError(ctx, "commit_workflow", herr,
@@ -472,12 +478,20 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 				if p == nil {
 					// Nacked (renewal already stopped and joined inside
 					// handleWorkflow before the NackTask call) or no-op:
-					// nothing awaits commit, so stop renewal now instead
-					// of renewing during the wait for slower siblings.
-					// The nack-path stop above makes this a no-op there.
+					// nothing awaits commit, so untrack and stop renewal
+					// now instead of renewing during the wait for slower
+					// siblings. The nack-path stop above makes this a no-op
+					// there.
+					w.untrack(t.ID)
 					stopRenewal()
 					return
 				}
+				// A commit follows in flushWorkflowCommits: stay tracked
+				// until it succeeds. Untracking here would hide a leased,
+				// uncommitted task from releaseInFlight, so a shutdown in
+				// the window leaves peers waiting for lease expiry (and a
+				// canceled flush is rejected by context-aware backends).
+				p.task = t
 				pendingMu.Lock()
 				pending = append(pending, *p)
 				pendingMu.Unlock()
@@ -485,7 +499,27 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		}(t, leaseDone, stopRenewal)
 	}
 	wg.Wait()
-	w.flushWorkflowCommits(ctx, pending)
+	// Pending tasks stayed tracked through the flush (see above): successes
+	// are untracked inside flushWorkflowCommits. Commits that failed under
+	// a canceled tick context are still owned by this worker (a canceled
+	// flush is rejected before touching the store), so release them
+	// explicitly for a prompt peer retry instead of waiting for lease
+	// expiry. Live-context failures (conflict/transient) are untracked
+	// without release: the task may be superseded, and the lease expires
+	// naturally.
+	failed := w.flushWorkflowCommits(ctx, pending)
+	if len(failed) > 0 {
+		if ctx.Err() != nil {
+			for _, p := range failed {
+				w.untrack(p.adv.TaskID)
+				w.releaseWorkflowLease(p.task)
+			}
+		} else {
+			for _, p := range failed {
+				w.untrack(p.adv.TaskID)
+			}
+		}
+	}
 	for _, stop := range renewalStops {
 		stop()
 	}
@@ -518,7 +552,7 @@ func (w *Worker) tickActivities(ctx context.Context) {
 		select {
 		case w.actSem <- struct{}{}:
 		default:
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
 		// Lease extension starts in the handler goroutine immediately,
@@ -527,12 +561,12 @@ func (w *Worker) tickActivities(ctx context.Context) {
 		w.opts.Metrics.AddActivityTask(ctx, 1)
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
-		w.track(t.ID)
+		w.track(t)
 		done, ok := w.trackActivity()
 		if !ok {
 			w.untrack(t.ID)
 			<-w.actSem
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
 		go func(t backend.Task) {
@@ -578,14 +612,14 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 		select {
 		case w.actSem <- struct{}{}:
 		default:
-			_ = w.backend.ReleaseLease(ctx, t.ID)
+			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
 		wg.Add(1)
 		w.opts.Metrics.AddActivityTask(ctx, 1)
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
-		w.track(t.ID)
+		w.track(t)
 		done, global := w.trackActivity()
 		go func(t backend.Task) {
 			defer wg.Done()
@@ -618,15 +652,18 @@ func isCancellationError(err error) bool {
 
 // releaseWorkflowLease releases a task lease with a detached context so the
 // release survives worker shutdown (the tick context is already canceled).
-func (w *Worker) releaseWorkflowLease(taskID int64) {
+// It takes the full task identity and routes by kind: workflow tasks live
+// under WF#<instanceID> on DynamoDB/Firestore, so a numeric ID alone would
+// address a missing ACT# key (ErrNotFound) and stall peers until expiry.
+func (w *Worker) releaseWorkflowLease(t backend.Task) {
 	timeout := w.opts.ShutdownReleaseTimeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 	relCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	if err := w.backend.ReleaseLease(relCtx, taskID); err != nil {
-		w.recordStoreError(context.Background(), "release_lease", err, "task_id", taskID)
+	if err := w.backend.ReleaseLease(relCtx, t); err != nil {
+		w.recordStoreError(context.Background(), "release_lease", err, "task_id", t.ID)
 	}
 }
 
@@ -1207,36 +1244,57 @@ func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context, runCtx contex
 		// result is discarded; the underlying call keeps running until it
 		// returns, so local activities should still respect ctx to avoid
 		// wasted work after a timeout.
-		type callResult struct {
-			out []byte
-			err error
-		}
 		done := make(chan callResult, 1)
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
 					w.opts.Logger.Warn("local activity panic recovered",
 						"activity", name, "panic", fmt.Sprint(r))
-					done <- callResult{nil, fmt.Errorf("activity panic: %v", r)}
+					done <- callResult{nil, fmt.Errorf("activity panic: %v", r), ctx.Err() == nil}
 				}
 			}()
 			o, e := act.fn(ctx, input)
 			select {
-			case done <- callResult{o, e}:
+			case done <- callResult{o, e, ctx.Err() == nil}:
 			default: // turn already moved on (timeout/shutdown); drop late result
 			}
 		}()
 		select {
 		case r := <-done:
-			// The result may have arrived at/after the deadline with both
-			// branches ready (select then picks randomly). Resolve
-			// through the timeout re-check so a late success is never
-			// journaled after expiry.
-			return resolveLocalResult(name, r.out, r.err, ctx, runCtx, timeout)
+			return acceptLocalResult(name, r, ctx, runCtx, timeout)
 		case <-ctx.Done():
-			return resolveLocalResult(name, nil, nil, ctx, runCtx, timeout)
+			// The deadline may have fired while an on-time result sat
+			// buffered: drain it first so a completed-before-expiry
+			// result is preserved instead of reported as a timeout.
+			select {
+			case r := <-done:
+				return acceptLocalResult(name, r, ctx, runCtx, timeout)
+			default:
+				return resolveLocalResult(name, nil, nil, ctx, runCtx, timeout)
+			}
 		}
 	})
+}
+
+// acceptLocalResult maps a delivered local activity result to its outcome,
+// preferring production-time knowledge over consumption-time state. A
+// result that completed before the local deadline fired (onTime) is
+// returned as-is even if the deadline fired before consumption; late
+// results go through the timeout/cancel mapping in resolveLocalResult so a
+// late success is never journaled after expiry.
+func acceptLocalResult(name string, r callResult, ctx, runCtx context.Context, timeout time.Duration) ([]byte, error) {
+	if r.onTime {
+		return r.out, r.err
+	}
+	return resolveLocalResult(name, r.out, r.err, ctx, runCtx, timeout)
+}
+
+// callResult carries one local activity call outcome with its
+// production-time completion flag (see attachLocalActivityRunner).
+type callResult struct {
+	out    []byte
+	err    error
+	onTime bool
 }
 
 // localResultTimeoutError builds the deadline error for one ExecuteLocal call.

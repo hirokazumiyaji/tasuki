@@ -38,7 +38,13 @@ type Backend interface {
 	ExtendLease(ctx context.Context, t Task, d time.Duration) error
 	// RecordHeartbeat extends the lease and stores details for GetHeartbeatDetails on later attempts.
 	RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error
-	ReleaseLease(ctx context.Context, taskID int64) error
+	// ReleaseLease makes a claimed task immediately reclaimable.
+	// The task carries kind/instance routing: DynamoDB/Firestore store
+	// workflow tasks under WF#<instanceID>, not ACT#<id>, so releasing by
+	// numeric ID alone misses workflow tasks (ErrNotFound) and a shutdown
+	// abandon stalls peers until lease expiry. Callers pass the claimed
+	// task, mirroring ExtendLease/NackTask.
+	ReleaseLease(ctx context.Context, t Task) error
 	// NackTask clears the lease and defers visibility by delay (store clock).
 	// Used when a Worker cannot process the task (incompatible code/registry).
 	NackTask(ctx context.Context, t Task, delay time.Duration) error

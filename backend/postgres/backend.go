@@ -387,9 +387,9 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 	return nil
 }
 
-func (b *Backend) ReleaseLease(ctx context.Context, taskID int64) error {
+func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	tag, err := b.pool.Exec(ctx, `
-		UPDATE wf_tasks SET visible_at = now(), worker_id = NULL WHERE id = $1`, taskID)
+		UPDATE wf_tasks SET visible_at = now(), worker_id = NULL WHERE id = $1`, t.ID)
 	if err != nil {
 		return err
 	}
