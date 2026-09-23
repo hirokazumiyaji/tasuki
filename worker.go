@@ -2524,8 +2524,17 @@ func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimT
 		w.tripDetachedGuard(taskID, tok)
 		return fmt.Errorf("%w: detached renewal completed after lease continuity deadline", errLeaseLost)
 	}
-	cur.deadline = renewStart.Add(w.leaseDuration())
-	w.detGuard[taskID] = cur
+	// Monotonic deadline (same pattern as refreshLeaseAt): the sync
+	// pre-commit renewal overlaps the inherited renewal loop, both stamp
+	// their start pre-call, and out-of-order returns would otherwise let
+	// the earlier start overwrite a newer deadline — the guard then
+	// expires while the backend lease is still live, the periodic
+	// renewal cancels a valid completion, and the retry duplicates side
+	// effects. Only a LATER expiry replaces the current one.
+	if newDeadline := renewStart.Add(w.leaseDuration()); newDeadline.After(cur.deadline) {
+		cur.deadline = newDeadline
+		w.detGuard[taskID] = cur
+	}
 	w.detMu.Unlock()
 	return nil
 }
