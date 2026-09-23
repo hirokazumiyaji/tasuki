@@ -121,3 +121,43 @@ func BadExactMakeChan[C chan int](ctx *workflow.Context, _ struct{}) error {
 	_ = make(C) // want `make\(chan`
 	return nil
 }
+
+// Composed (named) constraints embed another constraint interface instead of
+// spelling the union inline; the embedded interface must be flattened
+// recursively before classifying the range/make operand.
+
+type MapBase interface{ ~map[string]int }
+
+type DerivedMap interface{ MapBase }
+
+type DerivedMap2 interface{ DerivedMap }
+
+func BadComposedMapRange[M DerivedMap](ctx *workflow.Context, m M) error {
+	for k := range m { // want `ranging over a map is not allowed`
+		_ = k
+	}
+	return nil
+}
+
+func BadComposedMapRange2[M DerivedMap2](ctx *workflow.Context, m M) error {
+	for k := range m { // want `ranging over a map is not allowed`
+		_ = k
+	}
+	return nil
+}
+
+type ChanBase interface{ ~chan int }
+
+type DerivedChan interface{ ChanBase }
+
+func BadComposedChanRange[C DerivedChan](ctx *workflow.Context, ch C) error {
+	for v := range ch { // want `ranging over a channel is not allowed`
+		_ = v
+	}
+	return nil
+}
+
+func BadComposedMakeChan[C DerivedChan](ctx *workflow.Context, _ struct{}) error {
+	_ = make(C) // want `make\(chan`
+	return nil
+}

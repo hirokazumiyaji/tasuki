@@ -364,18 +364,52 @@ func checkMapRange(pass *analysis.Pass, x *ast.RangeStmt) {
 // appendEmbeddedTerms flattens one embedded constraint term into underlying
 // core types. Union constraints expand per member; exact (non-union) terms
 // such as `C chan int` or `M map[string]int` resolve directly instead of
-// being treated as opaque. Non-channel/map terms (e.g. method signatures)
-// are kept as-is; callers classify them and yield nil when they do not form
+// being treated as opaque. Embedded constraint interfaces — named (e.g.
+// `Base` in `interface { Base }` where `Base` itself constrains
+// `~map[string]int`) or anonymous — are flattened recursively so composed
+// constraints resolve to their core types instead of contributing an opaque
+// *types.Interface that matches neither the map nor the channel checks.
+// Recursion is guarded by seen: ill-formed cyclic embeddings terminate
+// instead of looping. Non-channel/map terms (e.g. method signatures) are
+// kept as-is; callers classify them and yield nil when they do not form
 // a single range/make-compatible core type.
-func appendEmbeddedTerms(terms []types.Type, embedded types.Type) []types.Type {
+func appendEmbeddedTerms(terms []types.Type, embedded types.Type, seen map[types.Type]bool) []types.Type {
 	et := types.Unalias(embedded)
 	if union, ok := et.(*types.Union); ok {
 		for j := 0; j < union.Len(); j++ {
-			terms = append(terms, types.Unalias(union.Term(j).Type()).Underlying())
+			terms = appendEmbeddedTerm(terms, union.Term(j).Type(), seen)
 		}
 		return terms
 	}
-	return append(terms, et.Underlying())
+	return appendEmbeddedTerm(terms, et, seen)
+}
+
+// appendEmbeddedTerm appends the core-relevant type denoted by a single
+// constraint term, recursing into embedded constraint interfaces.
+func appendEmbeddedTerm(terms []types.Type, term types.Type, seen map[types.Type]bool) []types.Type {
+	u := types.Unalias(term)
+	if iface, ok := u.Underlying().(*types.Interface); ok {
+		if seen[u] {
+			return terms
+		}
+		seen[u] = true
+		for i := 0; i < iface.NumEmbeddeds(); i++ {
+			terms = appendEmbeddedTerms(terms, iface.EmbeddedType(i), seen)
+		}
+		return terms
+	}
+	return append(terms, u.Underlying())
+}
+
+// embeddedCoreTerms flattens every embedded term of a constraint interface
+// into core-relevant types, shared by the range and make checks.
+func embeddedCoreTerms(iface *types.Interface) []types.Type {
+	seen := map[types.Type]bool{}
+	var terms []types.Type
+	for i := 0; i < iface.NumEmbeddeds(); i++ {
+		terms = appendEmbeddedTerms(terms, iface.EmbeddedType(i), seen)
+	}
+	return terms
 }
 
 // coreRangeType resolves the range-relevant type of a range operand. Named
@@ -408,10 +442,7 @@ func coreRangeType(t types.Type) types.Type {
 	if !ok {
 		return nil
 	}
-	var terms []types.Type
-	for i := 0; i < iface.NumEmbeddeds(); i++ {
-		terms = appendEmbeddedTerms(terms, iface.EmbeddedType(i))
-	}
+	terms := embeddedCoreTerms(iface)
 	if len(terms) == 0 {
 		return nil
 	}
@@ -477,10 +508,7 @@ func coreMakeChanType(t types.Type) types.Type {
 	if !ok {
 		return nil
 	}
-	var terms []types.Type
-	for i := 0; i < iface.NumEmbeddeds(); i++ {
-		terms = appendEmbeddedTerms(terms, iface.EmbeddedType(i))
-	}
+	terms := embeddedCoreTerms(iface)
 	if len(terms) == 0 {
 		return nil
 	}
