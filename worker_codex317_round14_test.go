@@ -17,10 +17,17 @@ import (
 // that could panic (the pre-fix sync.WaitGroup misuse).
 func TestWorker_Round14_RenewalBarrierStopAndDrain(t *testing.T) {
 	w := NewWorker(memory.New(), WorkerOptions{WorkerID: "w1"})
+	// Barrier admissions are generation-scoped (round-15 P1): use the
+	// current barrier generation for all admissions in this test (no
+	// restart here, so the epoch never moves).
+	w.mu.Lock()
+	barrierEpoch := w.epoch
+	w.mu.Unlock()
+	barrierTok := claimToken{epoch: barrierEpoch}
 
 	// Three renewals in flight before grace expiry.
 	for i := 0; i < 3; i++ {
-		if !w.renewTryEnter() {
+		if !w.renewTryEnter(barrierTok) {
 			t.Fatalf("renewTryEnter(%d) = false, want true (no shutdown yet)", i)
 		}
 	}
@@ -36,7 +43,7 @@ func TestWorker_Round14_RenewalBarrierStopAndDrain(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 	// Grace expiry: new admissions stop, even with live-looking leases.
-	if w.renewTryEnter() {
+	if w.renewTryEnter(barrierTok) {
 		w.renewExit()
 		t.Fatal("renewTryEnter = true after stop, want false (no renewal may slip past the join)")
 	}
@@ -56,11 +63,14 @@ func TestWorker_Round14_RenewalBarrierStopAndDrain(t *testing.T) {
 	if err := ctx.Err(); err != nil {
 		t.Fatalf("drained join did not return immediately: %v", err)
 	}
-	// A fresh Start generation re-arms admissions.
+	// A fresh Start generation re-arms admissions (round-15 P1: the
+	// re-arm carries the barrier generation with the stop reset).
 	w.renewMu.Lock()
 	w.renewStopped = false
+	barrierGen := w.renewEpoch
 	w.renewMu.Unlock()
-	if !w.renewTryEnter() {
+	barrierTok = claimToken{epoch: barrierGen}
+	if !w.renewTryEnter(barrierTok) {
 		t.Fatal("renewTryEnter = false after re-arm, want true")
 	}
 	w.renewExit()
@@ -72,6 +82,10 @@ func TestWorker_Round14_RenewalBarrierStopAndDrain(t *testing.T) {
 // and the join must drain every pre-stop registration.
 func TestWorker_Round14_RenewalBarrierChurn(t *testing.T) {
 	w := NewWorker(memory.New(), WorkerOptions{WorkerID: "w1"})
+	w.mu.Lock()
+	churnEpoch := w.epoch
+	w.mu.Unlock()
+	churnTok := claimToken{epoch: churnEpoch}
 	for round := 0; round < 30; round++ {
 		// Start equivalent: re-arm admissions for the round.
 		w.renewMu.Lock()
@@ -90,7 +104,7 @@ func TestWorker_Round14_RenewalBarrierChurn(t *testing.T) {
 						return
 					default:
 					}
-					if !w.renewTryEnter() {
+					if !w.renewTryEnter(churnTok) {
 						return // stop set; done for the round
 					}
 					// Widen the in-flight window so registrations race
@@ -106,7 +120,7 @@ func TestWorker_Round14_RenewalBarrierChurn(t *testing.T) {
 		joinCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		w.shutdownRenewalJoin(joinCtx)
 		cancel()
-		if w.renewTryEnter() {
+		if w.renewTryEnter(churnTok) {
 			w.renewExit()
 			close(stop)
 			wg.Wait()
@@ -216,10 +230,15 @@ func TestWorker_Round14_ShutdownJoinsUnderRenewalChurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Held renewals, as if ticker paths were blocked inside ExtendLease
-	// when the grace expires.
+	// when the grace expires. Admissions carry the current Start
+	// generation (round-15 P1).
+	w.mu.Lock()
+	shutdownEpoch := w.epoch
+	w.mu.Unlock()
+	shutdownTok := claimToken{epoch: shutdownEpoch}
 	const held = 4
 	for i := 0; i < held; i++ {
-		if !w.renewTryEnter() {
+		if !w.renewTryEnter(shutdownTok) {
 			t.Fatalf("renewTryEnter(%d) = false, want true (no shutdown yet)", i)
 		}
 	}
@@ -231,7 +250,7 @@ func TestWorker_Round14_ShutdownJoinsUnderRenewalChurn(t *testing.T) {
 		go func() {
 			defer churn.Done()
 			for j := 0; j < 200; j++ {
-				if !w.renewTryEnter() {
+				if !w.renewTryEnter(shutdownTok) {
 					return
 				}
 				w.renewExit()

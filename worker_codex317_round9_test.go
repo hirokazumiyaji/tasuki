@@ -82,8 +82,14 @@ func TestWorker_Round9_ShutdownJoinsInFlightRenewal(t *testing.T) {
 	}
 
 	// One ordinary renewal outstanding, as if the ticker path were
-	// blocked inside ExtendLease when the grace expires.
-	if !w.renewTryEnter() {
+	// blocked inside ExtendLease when the grace expires. The barrier is
+	// generation-scoped (round-15 P1): admit with the current Start
+	// generation.
+	w.mu.Lock()
+	round9Epoch := w.epoch
+	w.mu.Unlock()
+	round9Tok := claimToken{epoch: round9Epoch}
+	if !w.renewTryEnter(round9Tok) {
 		t.Fatal("renewTryEnter = false, want true (no shutdown yet)")
 	}
 	shCtx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)

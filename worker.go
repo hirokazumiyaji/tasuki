@@ -108,10 +108,22 @@ type Worker struct {
 	// observe a zero counter first, and the paused ticker's Add then
 	// runs concurrently with Wait → panic("sync: WaitGroup misuse"),
 	// crashing Shutdown (round-14 P1). The count + stop flag + idle
-	// channel are all guarded by this one mutex instead, so registration
-	// and the stop-check are atomic and no Add-during-Wait exists by
-	// construction.
+	// channel + generation are all guarded by this one mutex instead,
+	// so registration and the stop-check are atomic and no Add-during-Wait
+	// exists by construction.
 	renewMu sync.Mutex
+	// renewEpoch is the Start generation owning the barrier. It is set
+	// to w.epoch on every Start under the same renewMu hold that resets
+	// renewStopped, and checked atomically with the stop flag on every
+	// admission (see renewTryEnter). A ticker from a previous generation
+	// paused between ownsFresh and renewTryEnter across grace expiry +
+	// restart must not observe the new generation's reset stop flag and
+	// issue an ID-only ExtendLease against the reclaimed task (memory
+	// ignores the canceled ctx and extends the new owner's lease):
+	// its token epoch no longer matches, so admission is rejected even
+	// though the flag is clear for the new generation (round-15 P1).
+	// Guarded by renewMu.
+	renewEpoch uint64
 	// renewInflight counts in-flight ORDINARY lease-renewal store calls
 	// (the ticker path in extendLeaseLoop while no detached commit owns
 	// the task). Shutdown joins it before releasing leases (see
@@ -126,11 +138,13 @@ type Worker struct {
 	renewInflight int
 	// renewStopped, once set at Shutdown grace expiry, stops new
 	// ordinary renewals: the ticker path registers and checks this flag
-	// under the same renewMu hold (see renewTryEnter), so a registration
-	// after Shutdown's stop always observes the flag and issues nothing.
-	// Reset on every Start. Detached-commit cover renewals ignore it
-	// (their commit needs the cover and their entries are out of the
-	// release set). Guarded by renewMu.
+	// atomically with its generation (see renewTryEnter), so a
+	// registration after Shutdown's stop always observes the flag and
+	// issues nothing. Reset on every Start for the new generation only;
+	// stale generations are rejected by the epoch check even though the
+	// flag is clear again (round-15 P1). Detached-commit cover renewals
+	// ignore it (their commit needs the cover and their entries are out
+	// of the release set). Guarded by renewMu.
 	renewStopped bool
 	// renewIdle is closed when renewInflight drops to zero and replaced
 	// with a fresh open channel on the 0→1 transition (see
@@ -292,6 +306,14 @@ func (w *Worker) StartWithError(parent context.Context) error {
 	w.actMu.Lock()
 	w.stopping = false
 	w.renewMu.Lock()
+	// Re-arm admissions for the NEW generation only: the epoch moves
+	// with the stop reset under the same hold, so a stale ticker paused
+	// across grace expiry + restart never observes a clear flag for its
+	// own generation — its renewTryEnter epoch check rejects it even
+	// though the flag is clear for the new generation (round-15 P1).
+	// The stop state a stale generation could observe is therefore never
+	// reset; only the new generation's barrier state is.
+	w.renewEpoch = w.epoch
 	w.renewStopped = false
 	// Keep the in-flight count and idle channel as-is: a previous
 	// Shutdown that timed out on its release budget may still have
@@ -440,16 +462,19 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 // fresh lease through the ID-only ExtendLease). The join guarantees
 // every such call completed before any release is issued.
 //
-// Ordering with the ticker path: registration and the stop-check happen
-// atomically under renewMu (see renewTryEnter), while Shutdown sets
-// renewStopped and snapshots the idle channel under the same renewMu
-// hold. A registration before the stop is counted and its idle channel
-// waited for; a registration after always observes the flag and issues
-// nothing — so no renewal can slip past the join in either direction,
-// and no Add-during-Wait can panic by construction (round-14 P1). The
-// wait is bounded by ctx (the release budget): on timeout the release
-// below is skipped and leases expire naturally, which is safe but
-// slower.
+// Ordering with the ticker path: registration, the generation check,
+// and the stop-check happen atomically under renewMu (see
+// renewTryEnter), while Shutdown sets renewStopped and snapshots the
+// idle channel under the same renewMu hold. A registration before the
+// stop is counted and its idle channel waited for; a registration after
+// always observes the flag and issues nothing — so no renewal can slip
+// past the join in either direction, and no Add-during-Wait can panic
+// by construction (round-14 P1). A registration from a previous Start
+// generation is additionally rejected by the epoch check even when the
+// flag is clear again after a restart (round-15 P1): the reset only
+// re-arms the new generation. The wait is bounded by ctx (the release
+// budget): on timeout the release below is skipped and leases expire
+// naturally, which is safe but slower.
 //
 // Only ordinary renewals participate: detached-commit cover renewals
 // belong to entries already transferred out of inFlight, so the release
@@ -470,15 +495,24 @@ func (w *Worker) shutdownRenewalJoin(ctx context.Context) {
 }
 
 // renewTryEnter registers one ordinary renewal with the shutdown join.
-// Registration and the stop-check are atomic under renewMu: false means
-// Shutdown already passed grace expiry and the caller must issue
-// nothing; true means the caller holds one in-flight slot and must call
-// renewExit once its ExtendLease call returns. On the 0→1 transition a
-// fresh idle channel is installed for Shutdown to wait on.
-func (w *Worker) renewTryEnter() bool {
+// Registration, the generation check, and the stop-check are atomic
+// under renewMu: false means Shutdown already passed grace expiry, or
+// the caller's claim belongs to a previous Start generation, and the
+// caller must issue nothing; true means the caller holds one in-flight
+// slot and must call renewExit once its ExtendLease call returns. On
+// the 0→1 transition a fresh idle channel is installed for Shutdown to
+// wait on. The token's epoch is compared against the barrier's Start
+// generation (see renewEpoch): a stale ticker paused between ownsFresh
+// and admission across grace expiry + restart is rejected even though
+// the stop flag was reset for the new generation, so its ID-only
+// ExtendLease can never land on the reclaimed task (round-15 P1).
+func (w *Worker) renewTryEnter(tok claimToken) bool {
 	w.renewMu.Lock()
 	defer w.renewMu.Unlock()
 	if w.renewStopped {
+		return false
+	}
+	if tok.epoch != w.renewEpoch {
 		return false
 	}
 	if w.renewInflight == 0 {
@@ -861,7 +895,11 @@ func (w *Worker) tripDetachedGuard(taskID int64, tok claimToken) {
 // still present — and skips the ID-only store op when the lease moved
 // on, instead of modifying a peer's task on an independent commit
 // context. A missing or superseded guard, or a stale deadline, reports
-// errLeaseLost and issues nothing.
+// errLeaseLost and issues nothing. The stale-deadline drop also cancels
+// this commit's cover context (round-15 P2): a cover ExtendLease already
+// blocked in the backend must not stay live past the rejection and land
+// by ID on the peer-reclaimed task, and the deferred joinCommitStop must
+// not hold its slot until the lease-bounded renewal timeout.
 //
 // The result write is coordinated against cover renewals for
 // row-preserving writes — RetryActivity and nack, which rewrite
@@ -897,8 +935,22 @@ func (w *Worker) guardedDetachedCommit(taskID int64, tok claimToken, commitCance
 		return fmt.Errorf("%w: detached commit gate found lease lost", errLeaseLost)
 	}
 	if !time.Now().Before(g.deadline) {
+		// Continuity lost before the store op: drop the guard AND
+		// cancel this commit's cover renewals (round-15 P2). A cover
+		// ExtendLease already blocked in the backend would otherwise
+		// stay live and land by ID on the peer-reclaimed task, and the
+		// deferred joinCommitStop would hold its slot until the
+		// lease-bounded renewal timeout even though the result is
+		// rejected here. Same cleanup as tripDetachedGuard (cover
+		// cancel fired after unlocking; detMu is never held across a
+		// cancel); no commit op is running yet so the stashed commit
+		// cancel is nil.
+		coverCancel := g.coverCancel
 		delete(w.detGuard, taskID)
 		w.detMu.Unlock()
+		if coverCancel != nil {
+			coverCancel()
+		}
 		w.opts.Logger.Debug("skipping detached commit; continuity deadline passed before the store op",
 			"task_id", taskID)
 		return fmt.Errorf("%w: detached commit gate found lease expired", errLeaseLost)
@@ -2335,12 +2387,16 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, tok claimTok
 				if !w.ownsFresh(taskID, tok) {
 					return
 				}
-				// Shutdown passed grace expiry: no new ordinary
-				// renewals. Registration and the stop-check are atomic
-				// under renewMu (see shutdownRenewalJoin) so no renewal
-				// slips past Shutdown's release in either direction, and
-				// no Add can race the join by construction.
-				if !w.renewTryEnter() {
+				// Shutdown passed grace expiry — or a restart moved the
+				// barrier to a new generation: no new ordinary
+				// renewals. Registration, the generation check, and the
+				// stop-check are atomic under renewMu (see
+				// shutdownRenewalJoin) so no renewal slips past
+				// Shutdown's release in either direction, no Add can
+				// race the join by construction, and a stale ticker
+				// paused across grace expiry + restart is rejected by
+				// its token epoch even after the re-arm (round-15 P1).
+				if !w.renewTryEnter(tok) {
 					return
 				}
 				// Conservative lease base (see refreshLeaseAt).
