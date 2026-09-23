@@ -70,6 +70,16 @@ type Backend struct {
 	wakeDebounce time.Duration
 	wakeWG       sync.WaitGroup
 	wakeClosed   atomic.Bool
+	// wakePostClose counts synchronous post-Close wake writes currently in
+	// flight (see writeWakePostClose). They bypass the debounce maps, so
+	// wakeWG cannot track them; flushPendingWakes drains this count before
+	// Close returns so a wake racing Close is observed instead of dropped
+	// on fast exit. Each write is wakeWriteTimeout-bounded, so the drain is
+	// bounded too. An atomic (not wakeWG) is used deliberately:
+	// WaitGroup.Add concurrent with Wait panics once the counter is zero,
+	// and post-Close writes may start at any moment after wakeClosed is
+	// set, including while the flush is already waiting.
+	wakePostClose atomic.Int64
 }
 
 type wakeEntry struct {

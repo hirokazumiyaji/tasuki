@@ -43,6 +43,11 @@ type fakeDynamo struct {
 	// updateGate, when non-nil, blocks UpdateItem until closed: a test
 	// hook to hold a wake write in flight across Close.
 	updateGate chan struct{}
+
+	// updateItemHook, when non-nil, runs inside UpdateItem before success
+	// is reported: a test hook to stall or record specific wake writes.
+	// It must honor ctx like the real client.
+	updateItemHook func(ctx context.Context, in *dynamodb.UpdateItemInput)
 }
 
 func (f *fakeDynamo) DescribeTable(ctx context.Context, in *dynamodb.DescribeTableInput, _ ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error) {
@@ -112,6 +117,9 @@ func (f *fakeDynamo) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInpu
 		case <-f.updateGate:
 		case <-ctx.Done():
 		}
+	}
+	if f.updateItemHook != nil {
+		f.updateItemHook(ctx, in)
 	}
 	return &dynamodb.UpdateItemOutput{}, nil
 }
@@ -577,6 +585,106 @@ func TestClose_WaitsForInflightWakeCallback(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&f.updateCalls); got != 1 {
 		t.Fatalf("UpdateItem calls = %d, want 1", got)
+	}
+}
+
+// TestClose_WaitsForPostCloseWakeWrite pins the post-Close tracking: a
+// synchronous post-Close write in flight across Close must be observed by
+// Close instead of dropped on fast exit. Without wakePostClose tracking, the
+// flush snapshots empty debounce maps and Waits on a zero wakeWG while the
+// write is still in flight, so the second Close below would return early.
+func TestClose_WaitsForPostCloseWakeWrite(t *testing.T) {
+	gate := make(chan struct{})
+	f := &fakeDynamo{updateGate: gate}
+	b := newTestBackend(f)
+	b.wakeDebounce = time.Hour
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Post-Close wake starts in the background and blocks inside UpdateItem.
+	wrote := make(chan struct{})
+	go func() {
+		defer close(wrote)
+		b.notifyTasks()
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt64(&f.updateCalls) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("post-Close wake never entered UpdateItem")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	closed := make(chan struct{})
+	go func() {
+		_ = b.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while a post-Close wake write was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(gate)
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return after the post-Close wake write completed")
+	}
+	<-wrote
+	if got := atomic.LoadInt64(&f.updateCalls); got != 1 {
+		t.Fatalf("UpdateItem calls = %d, want 1", got)
+	}
+}
+
+// TestClose_FlushDoesNotLetStalledWriteSuppressOthers pins the per-write
+// flush budgets: the flush fires every pending wake concurrently, each with
+// its own live wakeWriteTimeout context, so one stalled UpdateItem cannot
+// consume a shared context and suppress the rest. The hook models the wire
+// faithfully: a write whose context already expired never lands, and the
+// stalled write holds only until its own budget expires.
+func TestClose_FlushDoesNotLetStalledWriteSuppressOthers(t *testing.T) {
+	old := wakeWriteTimeout
+	wakeWriteTimeout = 200 * time.Millisecond
+	defer func() { wakeWriteTimeout = old }()
+
+	f := &fakeDynamo{}
+	var mu sync.Mutex
+	landed := map[string]int{}
+	f.updateItemHook = func(ctx context.Context, in *dynamodb.UpdateItemInput) {
+		if ctx.Err() != nil {
+			return // budget already expired: the write never lands
+		}
+		pk := fromS(in.Key["pk"])
+		if pk == wakePKTasks {
+			// Stalled write: hold until this write's own budget expires.
+			<-ctx.Done()
+			return
+		}
+		id := ""
+		if v, ok := in.ExpressionAttributeValues[":id"]; ok {
+			id = fromS(v)
+		}
+		mu.Lock()
+		landed[pk+"\x00"+id]++
+		mu.Unlock()
+	}
+	b := newTestBackend(f)
+	b.wakeDebounce = time.Hour
+	b.notifyTasks()            // pk=tasks (stalled)
+	b.notifyTerminal("victim") // pk=terminal (must still land)
+	start := time.Now()
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	elapsed := time.Since(start)
+	mu.Lock()
+	got := landed[wakePKTerminal+"\x00victim"]
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("stalled tasks wake suppressed the terminal wake: landed=%v", landed)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("Close blocked %v, want roughly one wakeWriteTimeout budget", elapsed)
 	}
 }
 
