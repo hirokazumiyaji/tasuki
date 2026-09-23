@@ -339,6 +339,15 @@ c := tasuki.NewClient(b, tasuki.WithCodec(enc))
 
 Key rotation is supported by specifying a new primary key while retaining historical keys in the keyring. Unencrypted payloads lacking envelope markers fall back to plaintext reading, allowing encryption to be enabled on existing deployments without data migration.
 
+Envelope versions and rolling upgrades: new writes default to `Enc:1` (nil AAD) so previous-release readers can still decrypt them. Readers accept both `Enc:1` and `Enc:2` (key id bound via AAD). Enable the hardened `Enc:2` writes only after every reader (workers and replay tooling) understands v2:
+
+```go
+encV2 := codec.EncryptedWithOptions(codec.JSON(), keys,
+    codec.WithWriteVersion(codec.WriteVersionV2))
+```
+
+Staged order: (1) deploy v2-capable binaries while still writing v1, (2) switch writers to v2 once all readers are upgraded. A v2 payload handed to an old reader fails authentication, and that decode error is committed as a terminal workflow failure rather than an incompatible-task Nack — which is why writes stay on v1 by default.
+
 ## Testing Support
 
 The `wftest` package enables unit testing workflows without databases and with virtual clocks:

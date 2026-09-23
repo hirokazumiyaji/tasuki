@@ -42,6 +42,8 @@ func TestEncrypted_RoundTrip(t *testing.T) {
 }
 
 func TestEncrypted_EnvelopeIsJSONWithMarker(t *testing.T) {
+	// Default writes stay on v1 so pre-v2 readers can still decrypt during
+	// rolling upgrades; v2 is opt-in via WithWriteVersion.
 	enc := codec.Encrypted(codec.JSON(), mustKeys(t, "k1", map[string][]byte{"k1": key32('a')}))
 	data, err := enc.Marshal(secretPayload{Msg: "top-secret"})
 	if err != nil {
@@ -52,10 +54,24 @@ func TestEncrypted_EnvelopeIsJSONWithMarker(t *testing.T) {
 		t.Fatalf("envelope is not valid JSON: %v", err)
 	}
 	if env["tasuki_enc"] != float64(1) || env["kid"] != "k1" {
-		t.Fatalf("unexpected envelope: %v", env)
+		t.Fatalf("default write must be Enc 1 for rollout safety, got envelope: %v", env)
 	}
 	if strings.Contains(string(data), "top-secret") {
 		t.Fatal("plaintext leaked into envelope")
+	}
+	// Opt-in v2 writes emit Enc 2.
+	v2 := codec.EncryptedWithOptions(codec.JSON(), mustKeys(t, "k1", map[string][]byte{"k1": key32('a')}),
+		codec.WithWriteVersion(codec.WriteVersionV2))
+	v2data, err := v2.Marshal(secretPayload{Msg: "top-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v2env map[string]any
+	if err := json.Unmarshal(v2data, &v2env); err != nil {
+		t.Fatal(err)
+	}
+	if v2env["tasuki_enc"] != float64(2) {
+		t.Fatalf("WithWriteVersion(V2) must emit Enc 2, got %v", v2env)
 	}
 }
 
