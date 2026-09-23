@@ -99,9 +99,13 @@ func TestChaos_KillWorkers(t *testing.T) {
 	startWorker := func(i int) *proc {
 		id := fmt.Sprintf("w-%d-%d", i, time.Now().UnixNano())
 		cmd := exec.Command(bin)
+		// GORACE=halt_on_error=1 makes a race report terminate the worker
+		// immediately (race exit 66) so Wait observes it before any
+		// deliberate SIGKILL, which waitKilledWorker accepts.
 		cmd.Env = append(os.Environ(),
 			"TASUKI_POSTGRES_DSN="+dsn,
 			"WORKER_ID="+id,
+			"GORACE=halt_on_error=1",
 		)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr

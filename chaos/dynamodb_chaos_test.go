@@ -65,6 +65,9 @@ func TestChaos_KillWorkers_DynamoDB(t *testing.T) {
 	startWorker := func(i int) *proc {
 		id := fmt.Sprintf("dw-%d-%d", i, time.Now().UnixNano())
 		cmd := exec.Command(bin)
+		// GORACE=halt_on_error=1 makes a race report terminate the worker
+		// immediately (race exit 66) so Wait observes it before any
+		// deliberate SIGKILL, which waitKilledWorker accepts.
 		cmd.Env = append(os.Environ(),
 			"TASUKI_BACKEND=dynamodb",
 			"TASUKI_DYNAMODB_ENDPOINT="+ep,
@@ -72,6 +75,7 @@ func TestChaos_KillWorkers_DynamoDB(t *testing.T) {
 			"AWS_SECRET_ACCESS_KEY="+envOr("AWS_SECRET_ACCESS_KEY", "local"),
 			"AWS_REGION="+envOr("AWS_REGION", "us-east-1"),
 			"WORKER_ID="+id,
+			"GORACE=halt_on_error=1",
 		)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr

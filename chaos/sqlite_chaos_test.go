@@ -62,10 +62,14 @@ func TestChaos_KillWorkers_SQLite(t *testing.T) {
 	startWorker := func(i int) *proc {
 		id := fmt.Sprintf("sw-%d-%d", i, time.Now().UnixNano())
 		cmd := exec.Command(bin)
+		// GORACE=halt_on_error=1 makes a race report terminate the worker
+		// immediately (race exit 66) so Wait observes it before any
+		// deliberate SIGKILL, which waitKilledWorker accepts.
 		cmd.Env = append(os.Environ(),
 			"TASUKI_BACKEND=sqlite",
 			"TASUKI_SQLITE_PATH="+path,
 			"WORKER_ID="+id,
+			"GORACE=halt_on_error=1",
 		)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
