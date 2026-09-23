@@ -31,7 +31,7 @@ func TestResolveLocalResultDiscardsLateResults(t *testing.T) {
 	if expired.Err() == nil {
 		t.Fatal("test setup: acceptance context should be expired")
 	}
-	out, err := resolveLocalResult("late", []byte("late-ok"), nil, expired, context.Background(), timeout)
+	out, err := resolveLocalResult("late", []byte("late-ok"), nil, time.Time{}, expired, context.Background(), timeout)
 	if err == nil {
 		t.Fatalf("expired success accepted (out=%q), want timeout error", out)
 	}
@@ -41,7 +41,7 @@ func TestResolveLocalResultDiscardsLateResults(t *testing.T) {
 
 	// Same, but the activity itself failed: still a timeout, never the
 	// late failure payload.
-	_, err = resolveLocalResult("late", nil, errors.New("boom"), expired, context.Background(), timeout)
+	_, err = resolveLocalResult("late", nil, errors.New("boom"), time.Time{}, expired, context.Background(), timeout)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err=%v, want deadline exceeded", err)
 	}
@@ -52,7 +52,7 @@ func TestResolveLocalResultDiscardsLateResults(t *testing.T) {
 	expired2, cancel2 := context.WithTimeout(runCtx, time.Nanosecond)
 	defer cancel2()
 	time.Sleep(10 * time.Millisecond)
-	_, err = resolveLocalResult("x", []byte("v"), nil, expired2, runCtx, timeout)
+	_, err = resolveLocalResult("x", []byte("v"), nil, time.Time{}, expired2, runCtx, timeout)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v, want turn cancellation", err)
 	}
@@ -60,10 +60,10 @@ func TestResolveLocalResultDiscardsLateResults(t *testing.T) {
 	// Live acceptance passes results and activity errors through.
 	live, liveCancel := context.WithCancel(context.Background())
 	defer liveCancel()
-	if out, err := resolveLocalResult("ok", []byte("v"), nil, live, context.Background(), timeout); err != nil || string(out) != "v" {
+	if out, err := resolveLocalResult("ok", []byte("v"), nil, time.Time{}, live, context.Background(), timeout); err != nil || string(out) != "v" {
 		t.Fatalf("live success: out=%q err=%v", out, err)
 	}
-	if _, err := resolveLocalResult("ok", nil, errors.New("boom"), live, context.Background(), timeout); err == nil || err.Error() != "boom" {
+	if _, err := resolveLocalResult("ok", nil, errors.New("boom"), time.Time{}, live, context.Background(), timeout); err == nil || err.Error() != "boom" {
 		t.Fatalf("live activity error: err=%v", err)
 	}
 }

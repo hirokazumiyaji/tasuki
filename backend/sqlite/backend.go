@@ -396,8 +396,13 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 }
 
 func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	// Fenced to the claimed generation (worker_id + attempt): a renewal
+	// delayed past the lease (or racing a peer reclaim after a nack)
+	// must not overwrite the successor's visible_at. Zero rows means the
+	// lease moved on; report ErrNotFound so the worker treats the renewal
+	// as stale.
 	res, err := b.db.ExecContext(ctx, `
-		UPDATE wf_tasks SET visible_at = ? WHERE id = ?`, formatTime(nowUTC().Add(d)), t.ID)
+		UPDATE wf_tasks SET visible_at = ? WHERE id = ? AND worker_id = ? AND attempt = ?`, formatTime(nowUTC().Add(d)), t.ID, t.WorkerID, t.Attempt)
 	if err != nil {
 		return err
 	}

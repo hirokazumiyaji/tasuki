@@ -247,6 +247,25 @@ func (w *Worker) claimWorkflowRelease(taskID int64) bool {
 	return true
 }
 
+// ownsWorkflowCommit reports whether the claimed task generation t is still
+// tracked in the in-flight set, i.e. whether a pending advancement commit
+// for it may proceed. A shutdown-timeout releaseInFlight may have released
+// a finished pending turn (removing it here) while a peer re-claimed the
+// task; flushing the stale advancement afterwards would commit (and delete)
+// the peer's active task after duplicate execution, since backends validate
+// the advancement by task ID alone. Generation fencing (worker + attempt)
+// additionally covers an entry re-tracked by a newer claim of the same
+// task ID, whose lease must never be disturbed by the old turn.
+func (w *Worker) ownsWorkflowCommit(t backend.Task) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	e, ok := w.inFlight[t.ID]
+	if !ok {
+		return false
+	}
+	return e.WorkerID == t.WorkerID && e.Attempt == t.Attempt
+}
+
 func (w *Worker) releaseInFlight(ctx context.Context) {
 	w.mu.Lock()
 	tasks := make([]backend.Task, 0, len(w.inFlight))
@@ -1311,12 +1330,19 @@ func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context, runCtx contex
 				if r := recover(); r != nil {
 					w.opts.Logger.Warn("local activity panic recovered",
 						"activity", name, "panic", fmt.Sprint(r))
-					done <- callResult{nil, fmt.Errorf("activity panic: %v", r), ctx.Err() == nil}
+					done <- callResult{nil, fmt.Errorf("activity panic: %v", r), time.Now()}
 				}
 			}()
 			o, e := act.fn(ctx, input)
+			// Capture the completion instant when the result is
+			// produced (see acceptLocalResult): sampling ctx.Err()
+			// here instead arbitrates completion vs expiry on
+			// consumption timing, marking a return-just-before-deadline
+			// late when the timer fires first, or accepting a
+			// return-after-deadline when the timer has not fired yet.
+			completed := time.Now()
 			select {
-			case done <- callResult{o, e, ctx.Err() == nil}:
+			case done <- callResult{o, e, completed}:
 			default: // turn already moved on (timeout/shutdown); drop late result
 			}
 		}()
@@ -1331,7 +1357,7 @@ func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context, runCtx contex
 			case r := <-done:
 				return acceptLocalResult(name, r, ctx, runCtx, timeout)
 			default:
-				return resolveLocalResult(name, nil, nil, ctx, runCtx, timeout)
+				return resolveLocalResult(name, nil, nil, time.Time{}, ctx, runCtx, timeout)
 			}
 		}
 	})
@@ -1339,23 +1365,42 @@ func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context, runCtx contex
 
 // acceptLocalResult maps a delivered local activity result to its outcome,
 // preferring production-time knowledge over consumption-time state. A
-// result that completed before the local deadline fired (onTime) is
-// returned as-is even if the deadline fired before consumption; late
-// results go through the timeout/cancel mapping in resolveLocalResult so a
-// late success is never journaled after expiry.
+// result completed before the local deadline fired is returned as-is even
+// if the deadline fired before consumption; late results go through the
+// timeout/cancel mapping in resolveLocalResult so a late success is never
+// journaled after expiry.
 func acceptLocalResult(name string, r callResult, ctx, runCtx context.Context, timeout time.Duration) ([]byte, error) {
-	if r.onTime {
+	if localCompletedOnTime(r.completed, ctx) {
 		return r.out, r.err
 	}
-	return resolveLocalResult(name, r.out, r.err, ctx, runCtx, timeout)
+	return resolveLocalResult(name, r.out, r.err, r.completed, ctx, runCtx, timeout)
+}
+
+// localCompletedOnTime arbitrates completion vs expiry on timestamps
+// rather than on ctx state sampled at consumption: completed is the
+// instant the result was produced, compared against the call's deadline.
+// A result produced at or before the deadline is on time even if the
+// timer fired before the turn consumed it; a result produced after the
+// deadline is late even if the timer has not fired yet. Without a
+// deadline (defensive; the timeout path always sets one) it falls back
+// to consumption-time state, as does a missing timestamp.
+func localCompletedOnTime(completed time.Time, ctx context.Context) bool {
+	if completed.IsZero() {
+		return ctx.Err() == nil
+	}
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return ctx.Err() == nil
+	}
+	return !completed.After(dl)
 }
 
 // callResult carries one local activity call outcome with its
-// production-time completion flag (see attachLocalActivityRunner).
+// production-time completion instant (see attachLocalActivityRunner).
 type callResult struct {
-	out    []byte
-	err    error
-	onTime bool
+	out       []byte
+	err       error
+	completed time.Time
 }
 
 // localResultTimeoutError builds the deadline error for one ExecuteLocal call.
@@ -1373,11 +1418,21 @@ func localResultTimeoutError(name string, timeout time.Duration) error {
 // of being journaled after expiry. Shutdown cancellations surface the turn
 // context error so the turn is abandoned rather than recorded as a local
 // timeout.
-func resolveLocalResult(name string, out []byte, actErr error, ctx, runCtx context.Context, timeout time.Duration) ([]byte, error) {
+//
+// completed is the production-time completion instant: when the deadline
+// has passed but the runtime timer has not fired yet (consumption won the
+// race, ctx still live), arbitration still uses the timestamp, so a
+// post-deadline result is reported as a timeout rather than wrongly
+// accepted. A zero completed disables the timestamp check and preserves
+// the pure consumption-time mapping.
+func resolveLocalResult(name string, out []byte, actErr error, completed time.Time, ctx, runCtx context.Context, timeout time.Duration) ([]byte, error) {
 	if ctx.Err() != nil {
 		if runCtx != nil && runCtx.Err() != nil {
 			return nil, runCtx.Err()
 		}
+		return nil, localResultTimeoutError(name, timeout)
+	}
+	if dl, ok := ctx.Deadline(); ok && !completed.IsZero() && completed.After(dl) {
 		return nil, localResultTimeoutError(name, timeout)
 	}
 	return out, actErr
@@ -1411,6 +1466,17 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 			return
 		case <-ticker.C:
 			if err := w.backend.ExtendLease(ctx, t, w.opts.LeaseDuration); err != nil {
+				// A fenced renewal reports ErrNotFound when the lease
+				// moved on (task completed/deleted, or a peer reclaim
+				// after a nack or an expired lease advanced the
+				// generation): the lease is no longer ours, so stop
+				// renewing quietly instead of warning and retrying a
+				// renewal the backend will keep rejecting.
+				if errors.Is(err, backend.ErrNotFound) {
+					w.opts.Logger.Debug("lease moved on; stopping renewal",
+						"task_id", t.ID)
+					return
+				}
 				w.recordStoreError(ctx, "extend_lease", err, "task_id", t.ID)
 			}
 		}

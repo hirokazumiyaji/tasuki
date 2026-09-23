@@ -146,33 +146,52 @@ type pendingWorkflowCommit struct {
 // is deleted by the commit and must no longer be visible to
 // releaseInFlight. Failed commits stay tracked for the caller to dispose
 // (release when the flush context was canceled, untrack otherwise).
+//
+// Entries that lost in-flight ownership before the flush (see
+// ownsWorkflowCommit) are skipped without touching the store and returned
+// in the failed subset: Shutdown's releaseInFlight may have released a
+// finished pending turn mid-flush and a peer may have re-claimed it, and
+// backends validate the advancement by task ID alone, so committing it
+// would delete the peer's active task after duplicate execution. The
+// caller's disposal is ownership-gated (see claimWorkflowRelease), so a
+// skipped entry is never released twice.
 func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWorkflowCommit) []pendingWorkflowCommit {
 	if len(pending) == 0 {
 		return nil
 	}
+	owned, skipped := pending[:0:0], pending[:0:0]
+	for _, p := range pending {
+		if w.ownsWorkflowCommit(p.task) {
+			owned = append(owned, p)
+		} else {
+			w.opts.Logger.Debug("skipping stale workflow commit; lease already released",
+				"instance_id", p.instanceID, "task_id", p.adv.TaskID)
+			skipped = append(skipped, p)
+		}
+	}
+	failed := append([]pendingWorkflowCommit(nil), skipped...)
 	untrack := func(p pendingWorkflowCommit) {
 		w.untrack(p.adv.TaskID)
 	}
-	if batcher, ok := w.backend.(backend.AdvancementBatcher); ok && len(pending) > 1 {
-		advs := make([]backend.Advancement, len(pending))
-		for i, p := range pending {
+	if batcher, ok := w.backend.(backend.AdvancementBatcher); ok && len(owned) > 1 {
+		advs := make([]backend.Advancement, len(owned))
+		for i, p := range owned {
 			advs[i] = p.adv
 		}
 		if err := batcher.CommitAdvancements(ctx, advs); err != nil {
-			for _, p := range pending {
+			for _, p := range owned {
 				w.dropSticky(p.instanceID)
 			}
-			w.recordStoreError(ctx, "commit_workflow", err, "n", len(pending))
-			return pending
+			w.recordStoreError(ctx, "commit_workflow", err, "n", len(owned))
+			return append(failed, owned...)
 		}
-		for _, p := range pending {
+		for _, p := range owned {
 			w.applyStickyAfterCommit(p.instanceID, p.baseJournal, p.adv)
 			untrack(p)
 		}
-		return nil
+		return failed
 	}
-	var failed []pendingWorkflowCommit
-	for _, p := range pending {
+	for _, p := range owned {
 		if err := w.commitWorkflow(ctx, p.instanceID, p.baseJournal, p.adv); err != nil {
 			w.recordStoreError(ctx, "commit_workflow", err, "instance_id", p.instanceID)
 			failed = append(failed, p)

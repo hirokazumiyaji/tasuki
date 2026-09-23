@@ -235,6 +235,15 @@ func (b *Backend) ExtendLease(_ context.Context, task backend.Task, d time.Durat
 	if !ok {
 		return backend.ErrNotFound
 	}
+	// Fence the renewal to the claimed generation (worker + attempt): a
+	// renewal delayed past the lease (or racing a peer reclaim after a
+	// nack) must not overwrite the successor's visible_at, or the peer's
+	// retry stays hidden and a third worker executes concurrently with
+	// it. A mismatch means the lease moved on; report ErrNotFound so the
+	// worker treats the renewal as stale.
+	if t.workerID != task.WorkerID || t.attempt != task.Attempt {
+		return backend.ErrNotFound
+	}
 	t.visibleAt = b.now.Add(d)
 	return nil
 }

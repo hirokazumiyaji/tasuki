@@ -442,10 +442,15 @@ func scanTask(row *spanner.Row) (backend.Task, error) {
 }
 
 func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	// Fenced to the claimed generation (worker_id + attempt): a renewal
+	// delayed past the lease (or racing a peer reclaim after a nack)
+	// must not overwrite the successor's visible_at. Zero rows means the
+	// lease moved on; report ErrNotFound so the worker treats the renewal
+	// as stale.
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
-			SQL:    `UPDATE wf_tasks SET visible_at = @v WHERE id = @id`,
-			Params: map[string]any{"v": nowUTC().Add(d), "id": t.ID},
+			SQL:    `UPDATE wf_tasks SET visible_at = @v WHERE id = @id AND worker_id = @w AND attempt = @a`,
+			Params: map[string]any{"v": nowUTC().Add(d), "id": t.ID, "w": t.WorkerID, "a": t.Attempt},
 		})
 		if err != nil {
 			return err

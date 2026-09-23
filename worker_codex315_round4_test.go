@@ -167,37 +167,39 @@ func TestReleaseInFlightKeepsFullTaskIdentity(t *testing.T) {
 // local-deadline finding: a result sent to the buffered channel before the
 // deadline but consumed after had ctx.Err() != nil at consumption and was
 // discarded as a timeout. Completion-before-expiry is now recorded at
-// production time (onTime) and preserved.
+// production time (completed) and preserved.
 func TestAcceptLocalResultPreservesOnTimeResult(t *testing.T) {
 	const timeout = 50 * time.Millisecond
 
-	// On-time success consumed after expiry: production-time flag wins.
+	// produced predates the acceptance deadline: the on-time instant.
+	produced := time.Now()
+	// On-time success consumed after expiry: production-time stamp wins.
 	expired, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
 	defer cancel()
 	time.Sleep(10 * time.Millisecond) // let the deadline pass deterministically
 	if expired.Err() == nil {
 		t.Fatal("test setup: acceptance context should be expired")
 	}
-	out, err := acceptLocalResult("fast", callResult{out: []byte("ok"), onTime: true}, expired, context.Background(), timeout)
+	out, err := acceptLocalResult("fast", callResult{out: []byte("ok"), completed: produced}, expired, context.Background(), timeout)
 	if err != nil || string(out) != "ok" {
 		t.Fatalf("on-time success discarded (out=%q err=%v), want preserved", out, err)
 	}
 
 	// On-time activity error is preserved too, not mapped to a timeout.
 	actErr := errors.New("boom")
-	_, err = acceptLocalResult("fast", callResult{err: actErr, onTime: true}, expired, context.Background(), timeout)
+	_, err = acceptLocalResult("fast", callResult{err: actErr, completed: produced}, expired, context.Background(), timeout)
 	if err == nil || err.Error() != "boom" {
 		t.Fatalf("on-time activity error mapped (err=%v), want the activity error", err)
 	}
 
 	// Late success is still discarded as a timeout, never journaled.
-	_, err = acceptLocalResult("late", callResult{out: []byte("late-ok")}, expired, context.Background(), timeout)
+	_, err = acceptLocalResult("late", callResult{out: []byte("late-ok"), completed: time.Now()}, expired, context.Background(), timeout)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("late success accepted (err=%v), want deadline exceeded", err)
 	}
 
 	// Late failure is still a timeout, never the late payload.
-	_, err = acceptLocalResult("late", callResult{err: errors.New("late-boom")}, expired, context.Background(), timeout)
+	_, err = acceptLocalResult("late", callResult{err: errors.New("late-boom"), completed: time.Now()}, expired, context.Background(), timeout)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("late failure accepted (err=%v), want deadline exceeded", err)
 	}
@@ -208,7 +210,7 @@ func TestAcceptLocalResultPreservesOnTimeResult(t *testing.T) {
 	expired2, cancel2 := context.WithTimeout(runCtx, time.Nanosecond)
 	defer cancel2()
 	time.Sleep(10 * time.Millisecond)
-	_, err = acceptLocalResult("x", callResult{out: []byte("v")}, expired2, runCtx, timeout)
+	_, err = acceptLocalResult("x", callResult{out: []byte("v"), completed: time.Now()}, expired2, runCtx, timeout)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v, want turn cancellation", err)
 	}
@@ -216,7 +218,7 @@ func TestAcceptLocalResultPreservesOnTimeResult(t *testing.T) {
 	// Live acceptance passes results and activity errors through.
 	live, liveCancel := context.WithCancel(context.Background())
 	defer liveCancel()
-	if out, err := acceptLocalResult("ok", callResult{out: []byte("v"), onTime: true}, live, context.Background(), timeout); err != nil || string(out) != "v" {
+	if out, err := acceptLocalResult("ok", callResult{out: []byte("v"), completed: time.Now()}, live, context.Background(), timeout); err != nil || string(out) != "v" {
 		t.Fatalf("live success: out=%q err=%v", out, err)
 	}
 }

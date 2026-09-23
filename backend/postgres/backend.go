@@ -363,8 +363,14 @@ func decodeActivityTask(t *backend.Task, payload []byte) {
 }
 
 func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	// Fenced to the claimed generation (worker_id + attempt): a renewal
+	// delayed past the lease (or racing a peer reclaim after a nack)
+	// must not overwrite the successor's visible_at, or the peer's retry
+	// stays hidden and a third worker executes concurrently with it.
+	// Zero rows means the lease moved on; report ErrNotFound so the
+	// worker treats the renewal as stale.
 	tag, err := b.pool.Exec(ctx, `
-		UPDATE wf_tasks SET visible_at = now() + $2::interval WHERE id = $1`, t.ID, interval(d))
+		UPDATE wf_tasks SET visible_at = now() + $2::interval WHERE id = $1 AND worker_id = $3 AND attempt = $4`, t.ID, interval(d), t.WorkerID, t.Attempt)
 	if err != nil {
 		return err
 	}

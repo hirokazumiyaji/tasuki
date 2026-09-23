@@ -165,9 +165,13 @@ func TestFlushWorkflowCommits_Batch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Tracked, as tickWorkflows does: the flush fences commits to
+		// in-flight ownership, so untracked entries would be skipped.
+		w.track(tsk)
 		pending = append(pending, pendingWorkflowCommit{
 			instanceID:  tsk.InstanceID,
 			baseJournal: st.Journal,
+			task:        tsk,
 			adv: backend.Advancement{
 				InstanceID:  tsk.InstanceID,
 				TaskID:      tsk.ID,
@@ -266,9 +270,13 @@ func TestFlushWorkflowCommits_BatchConflictDropsSticky(t *testing.T) {
 		if i == 1 {
 			exp = 999 // force batch conflict
 		}
+		// Tracked, as tickWorkflows does (see above): the flush fences
+		// commits to in-flight ownership.
+		w.track(tsk)
 		pending = append(pending, pendingWorkflowCommit{
 			instanceID:  tsk.InstanceID,
 			baseJournal: st.Journal,
+			task:        tsk,
 			adv: backend.Advancement{
 				InstanceID:  tsk.InstanceID,
 				TaskID:      tsk.ID,
