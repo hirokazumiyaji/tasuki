@@ -185,8 +185,10 @@ func collectExcludedFuncLits(pass *analysis.Pass, body *ast.BlockStmt) map[*ast.
 // factory IIFE hole, which invokes the outer func immediately), so the inner
 // literal is still the directly-passed callback and stays exempt. Only
 // single-argument CallExprs whose callee resolves to a named func type (not a
-// builtin, not a plain func call) unwrap; IIFEs (Fun is itself a FuncLit) and
-// ordinary calls never do, so BadSideEffectFactory keeps flagging.
+// builtin, not a plain func call) unwrap, and the loop continues through
+// nested conversions (G(F(func() {...}))) until the literal; IIFEs (Fun is
+// itself a FuncLit) and ordinary calls never do, so BadSideEffectFactory
+// keeps flagging.
 func unwrapCallbackArg(pass *analysis.Pass, e ast.Expr) ast.Expr {
 	e = unwrapParen(e)
 	for {
@@ -197,9 +199,10 @@ func unwrapCallbackArg(pass *analysis.Pass, e ast.Expr) ast.Expr {
 		if _, ok := unwrapParen(call.Fun).(*ast.FuncLit); ok {
 			return e
 		}
-		if _, ok := unwrapParen(call.Args[0]).(*ast.FuncLit); !ok {
-			return e
-		}
+		// Unwrap T(x) only when T resolves to a named func type; x may be
+		// the FuncLit itself or another such conversion (handled by looping).
+		// Anything else — ordinary calls, builtins, IIFE-shaped results —
+		// stops the unwrap so the argument keeps being scanned.
 		if !isFuncTypeConversion(pass, call) {
 			return e
 		}
@@ -450,7 +453,7 @@ func checkMapRange(pass *analysis.Pass, x *ast.RangeStmt) {
 // constraint interfaces (named like `Base` or anonymous) resolve to their
 // effective (intersected) set. Recursion is guarded by seen with mark/unmark
 // so sibling embeds sharing a base do not suppress each other; cycles yield
-// an empty set. Non-channel/map terms are kept as-is for the caller to reject.
+// no terms (the caller treats term-less embeds as neutral). Non-channel/map terms are kept as-is for the caller to reject.
 func embeddedAlternatives(embedded types.Type, seen map[types.Type]bool) []types.Type {
 	et := types.Unalias(embedded)
 	if union, ok := et.(*types.Union); ok {
@@ -492,12 +495,21 @@ func embeddedAlternatives(embedded types.Type, seen map[types.Type]bool) []types
 // {chan int}. Likewise `interface { chan int | []int; chan int }` flattens to
 // a mixed list although only chan int satisfies both embeds. A single embed
 // intersects to itself, preserving all prior single-union behavior.
+//
+// Embeds contributing zero type terms (comparable, method-only interfaces)
+// are neutral and skipped: they constrain by method set, not by type terms,
+// so they must filter nothing at the core-type level. Treating them as empty
+// would erase the intersection (e.g. `interface { ~chan int; comparable }`
+// must keep {chan int}). Genuinely empty intersections (e.g. `int` ∩
+// `string`) still yield empty via intersectTypeSets below — no value can
+// inhabit them, so returning nil (no diagnostic) stays correct there. When no
+// embed contributes terms at all, nil is returned as before (unconstrained).
 func effectiveConstraintSet(iface *types.Interface, seen map[types.Type]bool) []types.Type {
 	var sets [][]types.Type
 	for i := 0; i < iface.NumEmbeddeds(); i++ {
 		alt := embeddedAlternatives(iface.EmbeddedType(i), seen)
 		if len(alt) == 0 {
-			return nil
+			continue
 		}
 		sets = append(sets, alt)
 	}

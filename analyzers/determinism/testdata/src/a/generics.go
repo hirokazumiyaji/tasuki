@@ -185,3 +185,44 @@ func BadIntersectMakeChan[C interface {
 	_ = make(C) // want `make\(chan`
 	return nil
 }
+
+// Comparable and method-only embeds contribute no type terms, so they are
+// neutral in the intersection: `~chan int` ∩ comparable is still {chan int}
+// and must keep flagging range and make.
+func BadComparableChanRange[C interface {
+	~chan int
+	comparable
+}](ctx *workflow.Context, ch C) error {
+	for v := range ch { // want `ranging over a channel is not allowed`
+		_ = v
+	}
+	return nil
+}
+
+func BadComparableMakeChan[C interface {
+	~chan int
+	comparable
+}](ctx *workflow.Context, _ struct{}) error {
+	_ = make(C) // want `make\(chan`
+	return nil
+}
+
+type MethodOnly interface{ M() }
+
+func BadMethodOnlyMapRange[M interface {
+	~map[string]int
+	MethodOnly
+}](ctx *workflow.Context, m M) error {
+	for k := range m { // want `ranging over a map is not allowed`
+		_ = k
+	}
+	return nil
+}
+
+func BadMethodOnlyMakeChan[C interface {
+	~chan int
+	MethodOnly
+}](ctx *workflow.Context, _ struct{}) error {
+	_ = make(C) // want `make\(chan`
+	return nil
+}

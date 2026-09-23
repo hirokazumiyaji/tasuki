@@ -251,6 +251,35 @@ func OkSideEffectConvertedParen(ctx *workflow.Context, _ struct{}) error {
 	return nil
 }
 
+// Nested conversions around the callback are still pure conversions, so the
+// loop unwraps through each layer until the literal stays exempt.
+type Callback2 func() string
+
+func OkSideEffectNestedConverted(ctx *workflow.Context, _ struct{}) error {
+	_, _ = workflow.SideEffect(ctx, Callback(Callback2(func() string {
+		return time.Now().String()
+	})))
+	return nil
+}
+
+func OkSideEffectNestedConvertedSame(ctx *workflow.Context, _ struct{}) error {
+	_, _ = workflow.SideEffect(ctx, Callback(Callback(func() string {
+		return time.Now().String()
+	})))
+	return nil
+}
+
+// An ordinary call around a conversion executes code, so it never unwraps:
+// the inner literal must still be scanned.
+func idCallback(c Callback) Callback { return c }
+
+func BadSideEffectCallWrapped(ctx *workflow.Context, _ struct{}) error {
+	_, _ = workflow.SideEffect(ctx, idCallback(Callback(func() string {
+		return time.Now().String() // want `time.Now is not allowed`
+	})))
+	return nil
+}
+
 // Non-workflow functions must not be flagged (covers isWorkflowFunc false paths).
 func NotWorkflow() {
 	_ = time.Now()
