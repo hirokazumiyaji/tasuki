@@ -245,6 +245,44 @@ func (w *Worker) untrack(taskID int64) {
 	w.mu.Unlock()
 }
 
+// untrackWorkflow removes t from the in-flight set only when the entry
+// still carries t's claim generation (worker + attempt, as
+// ownsWorkflowCommit and claimWorkflowRelease check). A shutdown-timeout
+// restart lets the new generation track() a new attempt under the same
+// task ID while the old turn is still blocked (e.g. on the instance
+// actor); when the old backend call returns a domain/store error (not a
+// cancellation) the failed-turn branch must not delete the NEW entry by
+// ID — that would make ownsWorkflowCommit fail for the live turn, skip
+// its commit, and risk repeating side effects post-expiry. On a
+// generation mismatch the new entry is left intact and no local cleanup
+// runs for the stale turn. Untracked IDs are ignored.
+func (w *Worker) untrackWorkflow(t backend.Task) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	e, ok := w.inFlight[t.ID]
+	if !ok {
+		return
+	}
+	if e.WorkerID != t.WorkerID || e.Attempt != t.Attempt {
+		w.opts.Logger.Debug("skipping workflow untrack; entry re-tracked by a newer attempt",
+			"instance_id", t.InstanceID, "task_id", t.ID)
+		return
+	}
+	delete(w.inFlight, t.ID)
+}
+
+// untrackPending drops a pending commit's in-flight entry after disposal,
+// generation-gated on the pending task when present (see untrackWorkflow)
+// so a stale turn never deletes its successor's entry. Legacy/test
+// pendings without a task fall back to the adv-derived ID.
+func (w *Worker) untrackPending(p pendingWorkflowCommit) {
+	if p.task.ID != 0 || p.task.InstanceID != "" {
+		w.untrackWorkflow(p.task)
+		return
+	}
+	w.untrack(p.adv.TaskID)
+}
+
 // claimWorkflowRelease atomically removes t from the in-flight set,
 // reporting whether this caller still owns the lease and may release it.
 // Shutdown's releaseInFlight and the workflow abandon paths below both
@@ -579,7 +617,7 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 						}
 						return
 					}
-					w.untrack(t.ID)
+					w.untrackWorkflow(t)
 					w.recordStoreError(ctx, "commit_workflow", herr,
 						"instance_id", t.InstanceID, "task_id", t.ID)
 					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", herr)
@@ -599,8 +637,9 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					// nothing awaits commit, so untrack and stop renewal
 					// now instead of renewing during the wait for slower
 					// siblings. The nack-path stop above makes this a no-op
-					// there.
-					w.untrack(t.ID)
+					// there. Generation-gated like the failed-turn path:
+					// a stale turn must not delete its successor's entry.
+					w.untrackWorkflow(t)
 					stopRenewal()
 					return
 				}
@@ -662,7 +701,7 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 			}
 		} else {
 			for _, p := range failed {
-				w.untrack(p.adv.TaskID)
+				w.untrackPending(p)
 			}
 		}
 	}

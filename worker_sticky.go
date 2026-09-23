@@ -284,7 +284,7 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 	}
 	failed := append([]pendingWorkflowCommit(nil), skipped...)
 	untrack := func(p pendingWorkflowCommit) {
-		w.untrack(p.adv.TaskID)
+		w.untrackPending(p)
 	}
 	if batcher, ok := w.backend.(backend.AdvancementBatcher); ok && len(owned) > 1 {
 		advs := make([]backend.Advancement, len(owned))
