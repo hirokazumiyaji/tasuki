@@ -1214,10 +1214,22 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		return ctx.Err()
 	}
 
+	// committing marks a detached result commit as in flight so lease
+	// renewal stays alive until the commit finishes (see
+	// beginDetachedCommit and extendLeaseLoop). done still closes at
+	// handler return, which is after every commit path below. Renewal
+	// starts before the registry lookup so the unregistered-activity
+	// early result paths below are covered too: their detached nack
+	// would otherwise run without renewal.
+	var committing atomic.Bool
+	done := make(chan struct{})
+	defer close(done)
+	go w.extendLeaseLoop(ctx, t.ID, done, &committing)
+
 	act, err := w.reg.activity(t.Name)
 	if err != nil {
 		if errors.Is(err, ErrActivityNotRegistered) {
-			if !w.beginResultCommit(t.ID) {
+			if !w.beginDetachedCommit(t.ID, &committing) {
 				return ctx.Err()
 			}
 			commitCtx, commitCancel := w.commitContext(ctx)
@@ -1225,7 +1237,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 			commitCancel()
 			return rerr
 		}
-		if !w.beginResultCommit(t.ID) {
+		if !w.beginDetachedCommit(t.ID, &committing) {
 			return ctx.Err()
 		}
 		commitCtx, commitCancel := w.commitContext(ctx)
@@ -1234,15 +1246,8 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 		return rerr
 	}
 
-	// committing marks a detached result commit as in flight so lease
-	// renewal stays alive until the commit finishes (see
-	// beginDetachedCommit and extendLeaseLoop). done still closes at
-	// handler return, which is after every commit path below.
-	var committing atomic.Bool
-	done := make(chan struct{})
-	defer close(done)
-	go w.extendLeaseLoop(ctx, t.ID, done, &committing)
-
+	// Execution setup: renewal already runs (see above), so every commit
+	// path below stays covered.
 	attempt := t.Attempt
 	if attempt < 1 {
 		attempt = 1
@@ -1273,6 +1278,16 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	})
 
 	out, err := w.invokeActivity(actCtx, act.fn, t.Input)
+	// Enter detached-commit renewal mode BEFORE checking for
+	// parent-cancel/shutdown-expiry: a cancel landing between the check
+	// and committing.Store(true) would let extendLeaseLoop exit while a
+	// detached commit below starts without renewal (peer reclaim, then
+	// the task-ID-only store op clobbers the peer's task). With the flag
+	// set first, either renewal stays alive through the commit or the
+	// shutdown check below routes to release — never a commit without
+	// renewal. A set flag on the release path only keeps renewal alive
+	// until done closes at return.
+	committing.Store(true)
 	// Shutdown (grace expired) aborted the execution: never consume an
 	// attempt or record a timeout failure for a Shutdown-caused cancel.
 	// Release with a fresh detached commit ctx so a peer retries promptly.
