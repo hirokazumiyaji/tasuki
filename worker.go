@@ -1234,7 +1234,16 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	var committing atomic.Bool
 	done := make(chan struct{})
 	defer close(done)
-	go w.extendLeaseLoop(ctx, t.ID, done, &committing)
+	// renewDone closes when the renewal loop exits so the shutdown-release
+	// path below can JOIN it before releasing (see below): joining
+	// guarantees no ExtendLease is in flight that could land after the
+	// ReleaseLease and re-hide the task for a full lease (or modify a
+	// peer's fresh lease — backend lease ops are keyed by task ID alone).
+	renewDone := make(chan struct{})
+	go func() {
+		defer close(renewDone)
+		w.extendLeaseLoop(ctx, t.ID, done, &committing)
+	}()
 
 	act, err := w.reg.activity(t.Name)
 	if err != nil {
@@ -1302,9 +1311,22 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 	// attempt or record a timeout failure for a Shutdown-caused cancel.
 	// Release with a fresh detached commit ctx so a peer retries promptly.
 	if ctx.Err() != nil {
-		// Only the in-flight owner releases (see claimReleaseOwnership):
-		// releasing a lease Shutdown already handed to a peer would clear
-		// the peer's lease and enable duplicate execution.
+		// Leave detached-commit renewal mode and JOIN the renewal loop
+		// before releasing. The flag was set first so a cancel racing the
+		// commit entry keeps renewal alive through the commit (see above);
+		// on this release path no commit follows, so renewal must stop
+		// first: otherwise the loop — already inside renewUntilDone or
+		// about to enter it on ctx.Done — issues a detached ExtendLease
+		// that lands after the ReleaseLease below, re-hiding the task for
+		// a full lease or modifying a peer's fresh lease. The join waits
+		// for the loop goroutine to return, and every ExtendLease it
+		// issued completes before that return, so none can land after the
+		// joined release. Only the in-flight owner releases (see
+		// claimReleaseOwnership): releasing a lease Shutdown already
+		// handed to a peer would clear the peer's lease and enable
+		// duplicate execution.
+		committing.Store(false)
+		<-renewDone
 		if w.claimReleaseOwnership(t.ID) {
 			commitCtx, commitCancel := w.commitContext(ctx)
 			_ = w.backend.ReleaseLease(commitCtx, t.ID)
@@ -1463,7 +1485,7 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan 
 			// Exiting here would let a commit longer than the remaining
 			// lease race a peer reclaim, and the task-ID-only commit
 			// would then clobber the peer's task.
-			w.renewUntilDone(ctx, taskID, done, ticker)
+			w.renewUntilDone(ctx, taskID, done, ticker, committing)
 			return
 		case <-ticker.C:
 			if err := w.backend.ExtendLease(ctx, taskID, w.opts.LeaseDuration); err != nil {
@@ -1480,7 +1502,14 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, done <-chan 
 // context (parent cancel or shutdown-grace expiry mid-commit). Each renewal
 // is bounded by the lease duration and the commit itself is bounded by its
 // commit context, so this loop always terminates when the commit returns.
-func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, done <-chan struct{}, ticker *time.Ticker) {
+//
+// committing gates detached mode: the shutdown-release path in
+// handleActivity unsets it and joins the renewal loop before releasing, so
+// every iteration re-checks it and exits promptly once the release path
+// leaves detached mode. Without these checks the loop would only exit on
+// done (closed at handler return, i.e. after the release) and a detached
+// renewal could land after the ReleaseLease.
+func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, done <-chan struct{}, ticker *time.Ticker, committing *atomic.Bool) {
 	// Renew immediately on entering detached mode instead of waiting for
 	// the next tick: the transition can coincide with a renewal tick that
 	// used the now-canceled ctx and failed, and the next tick is a
@@ -1493,8 +1522,14 @@ func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, done <-chan s
 		return
 	default:
 	}
+	if committing == nil || !committing.Load() {
+		return
+	}
 	w.renewOnceDetached(ctx, taskID)
 	for {
+		if committing == nil || !committing.Load() {
+			return
+		}
 		select {
 		case <-done:
 			return
@@ -1503,6 +1538,9 @@ func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, done <-chan s
 			case <-done:
 				return
 			default:
+			}
+			if committing == nil || !committing.Load() {
+				return
 			}
 			w.renewOnceDetached(ctx, taskID)
 		}
