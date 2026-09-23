@@ -169,13 +169,96 @@ func collectExcludedFuncLits(pass *analysis.Pass, body *ast.BlockStmt) map[*ast.
 			return true
 		}
 		for _, arg := range call.Args {
-			if lit, ok := unwrapParen(arg).(*ast.FuncLit); ok {
+			if lit, ok := unwrapCallbackArg(pass, arg).(*ast.FuncLit); ok {
 				excluded[lit] = true
 			}
 		}
 		return true
 	})
 	return excluded
+}
+
+// unwrapCallbackArg resolves the FuncLit passed as a workflow escape-hatch
+// callback, unwrapping parenthesized literals and verified function
+// conversions such as Callback(func() string {...}) where Callback is a named
+// func type. A pure conversion does not execute its argument (unlike the
+// factory IIFE hole, which invokes the outer func immediately), so the inner
+// literal is still the directly-passed callback and stays exempt. Only
+// single-argument CallExprs whose callee resolves to a named func type (not a
+// builtin, not a plain func call) unwrap; IIFEs (Fun is itself a FuncLit) and
+// ordinary calls never do, so BadSideEffectFactory keeps flagging.
+func unwrapCallbackArg(pass *analysis.Pass, e ast.Expr) ast.Expr {
+	e = unwrapParen(e)
+	for {
+		call, ok := e.(*ast.CallExpr)
+		if !ok || len(call.Args) != 1 {
+			return e
+		}
+		if _, ok := unwrapParen(call.Fun).(*ast.FuncLit); ok {
+			return e
+		}
+		if _, ok := unwrapParen(call.Args[0]).(*ast.FuncLit); !ok {
+			return e
+		}
+		if !isFuncTypeConversion(pass, call) {
+			return e
+		}
+		e = unwrapParen(call.Args[0])
+	}
+}
+
+// isFuncTypeConversion reports whether call is a conversion to a named func
+// type (e.g. Callback(func() {...})) rather than a function invocation.
+// The callee must resolve to a *types.TypeName whose underlying type is a
+// signature; *types.Func (ordinary calls, methods) and builtins never match.
+func isFuncTypeConversion(pass *analysis.Pass, call *ast.CallExpr) bool {
+	fun := unwrapParen(call.Fun)
+	for {
+		switch f := fun.(type) {
+		case *ast.IndexExpr:
+			fun = unwrapParen(f.X)
+		case *ast.IndexListExpr:
+			fun = unwrapParen(f.X)
+		default:
+			goto done
+		}
+	}
+done:
+	var obj types.Object
+	switch f := fun.(type) {
+	case *ast.Ident:
+		o, ok := pass.TypesInfo.Uses[f]
+		if !ok {
+			return false
+		}
+		if _, ok := o.(*types.Builtin); ok {
+			return false
+		}
+		if _, ok := o.(*types.Func); ok {
+			return false
+		}
+		obj = o
+	case *ast.SelectorExpr:
+		o, ok := pass.TypesInfo.Uses[f.Sel]
+		if !ok {
+			return false
+		}
+		if _, ok := o.(*types.Builtin); ok {
+			return false
+		}
+		if _, ok := o.(*types.Func); ok {
+			return false
+		}
+		obj = o
+	default:
+		return false
+	}
+	tn, ok := obj.(*types.TypeName)
+	if !ok {
+		return false
+	}
+	_, ok = tn.Type().Underlying().(*types.Signature)
+	return ok
 }
 
 // unwrapParen strips parenthesized expressions so ((func() {...}))
@@ -361,55 +444,103 @@ func checkMapRange(pass *analysis.Pass, x *ast.RangeStmt) {
 	}
 }
 
-// appendEmbeddedTerms flattens one embedded constraint term into underlying
-// core types. Union constraints expand per member; exact (non-union) terms
-// such as `C chan int` or `M map[string]int` resolve directly instead of
-// being treated as opaque. Embedded constraint interfaces — named (e.g.
-// `Base` in `interface { Base }` where `Base` itself constrains
-// `~map[string]int`) or anonymous — are flattened recursively so composed
-// constraints resolve to their core types instead of contributing an opaque
-// *types.Interface that matches neither the map nor the channel checks.
-// Recursion is guarded by seen: ill-formed cyclic embeddings terminate
-// instead of looping. Non-channel/map terms (e.g. method signatures) are
-// kept as-is; callers classify them and yield nil when they do not form
-// a single range/make-compatible core type.
-func appendEmbeddedTerms(terms []types.Type, embedded types.Type, seen map[types.Type]bool) []types.Type {
+// embeddedAlternatives returns the alternative type set denoted by one
+// embedded constraint term: union members expand per member, exact terms
+// (e.g. `C chan int`) resolve to their underlying type, and embedded
+// constraint interfaces (named like `Base` or anonymous) resolve to their
+// effective (intersected) set. Recursion is guarded by seen with mark/unmark
+// so sibling embeds sharing a base do not suppress each other; cycles yield
+// an empty set. Non-channel/map terms are kept as-is for the caller to reject.
+func embeddedAlternatives(embedded types.Type, seen map[types.Type]bool) []types.Type {
 	et := types.Unalias(embedded)
 	if union, ok := et.(*types.Union); ok {
+		var out []types.Type
 		for j := 0; j < union.Len(); j++ {
-			terms = appendEmbeddedTerm(terms, union.Term(j).Type(), seen)
+			mem := types.Unalias(union.Term(j).Type())
+			if inner, ok := mem.Underlying().(*types.Interface); ok {
+				if seen[mem] {
+					continue
+				}
+				seen[mem] = true
+				eff := effectiveConstraintSet(inner, seen)
+				delete(seen, mem)
+				out = append(out, eff...)
+				continue
+			}
+			out = append(out, mem.Underlying())
 		}
-		return terms
+		return out
 	}
-	return appendEmbeddedTerm(terms, et, seen)
+	if inner, ok := et.Underlying().(*types.Interface); ok {
+		if seen[et] {
+			return nil
+		}
+		seen[et] = true
+		eff := effectiveConstraintSet(inner, seen)
+		delete(seen, et)
+		return eff
+	}
+	return []types.Type{et.Underlying()}
 }
 
-// appendEmbeddedTerm appends the core-relevant type denoted by a single
-// constraint term, recursing into embedded constraint interfaces.
-func appendEmbeddedTerm(terms []types.Type, term types.Type, seen map[types.Type]bool) []types.Type {
-	u := types.Unalias(term)
-	if iface, ok := u.Underlying().(*types.Interface); ok {
-		if seen[u] {
-			return terms
+// effectiveConstraintSet computes the type set denoted by a constraint
+// interface as the INTERSECTION across its embedded terms: a candidate type
+// survives iff it appears (Identical) in every embedded's alternative set.
+// Flattening (union across embeds) is wrong here: e.g.
+// `interface { chan int | chan<- int; chan int | <-chan int }` flattens to
+// [chan, send, chan, recv] containing a send-only term, while the true set is
+// {chan int}. Likewise `interface { chan int | []int; chan int }` flattens to
+// a mixed list although only chan int satisfies both embeds. A single embed
+// intersects to itself, preserving all prior single-union behavior.
+func effectiveConstraintSet(iface *types.Interface, seen map[types.Type]bool) []types.Type {
+	var sets [][]types.Type
+	for i := 0; i < iface.NumEmbeddeds(); i++ {
+		alt := embeddedAlternatives(iface.EmbeddedType(i), seen)
+		if len(alt) == 0 {
+			return nil
 		}
-		seen[u] = true
-		for i := 0; i < iface.NumEmbeddeds(); i++ {
-			terms = appendEmbeddedTerms(terms, iface.EmbeddedType(i), seen)
-		}
-		return terms
+		sets = append(sets, alt)
 	}
-	return append(terms, u.Underlying())
+	if len(sets) == 0 {
+		return nil
+	}
+	return intersectTypeSets(sets)
+}
+
+// intersectTypeSets returns members of sets[0] present (types.Identical) in
+// every other set, deduplicated. Channel direction and element type both
+// participate via Identical: `chan int` matches only `chan int`, not
+// `<-chan int` or `chan string`.
+func intersectTypeSets(sets [][]types.Type) []types.Type {
+	var out []types.Type
+outer:
+	for _, cand := range sets[0] {
+		for _, s := range sets[1:] {
+			if !containsIdentical(s, cand) {
+				continue outer
+			}
+		}
+		if !containsIdentical(out, cand) {
+			out = append(out, cand)
+		}
+	}
+	return out
+}
+
+func containsIdentical(set []types.Type, t types.Type) bool {
+	for _, m := range set {
+		if types.Identical(m, t) {
+			return true
+		}
+	}
+	return false
 }
 
 // embeddedCoreTerms flattens every embedded term of a constraint interface
-// into core-relevant types, shared by the range and make checks.
+// into core-relevant types, shared by the range and make checks. It now
+// computes the effective INTERSECTED set (see effectiveConstraintSet).
 func embeddedCoreTerms(iface *types.Interface) []types.Type {
-	seen := map[types.Type]bool{}
-	var terms []types.Type
-	for i := 0; i < iface.NumEmbeddeds(); i++ {
-		terms = appendEmbeddedTerms(terms, iface.EmbeddedType(i), seen)
-	}
-	return terms
+	return effectiveConstraintSet(iface, map[types.Type]bool{})
 }
 
 // coreRangeType resolves the range-relevant type of a range operand. Named

@@ -161,3 +161,27 @@ func BadComposedMakeChan[C DerivedChan](ctx *workflow.Context, _ struct{}) error
 	_ = make(C) // want `make\(chan`
 	return nil
 }
+
+// Intersected embedded constraints denote the INTERSECTION across embeds, not
+// the flattened union: `chan int | chan<- int` intersected with
+// `chan int | <-chan int` is {chan int}, so ranging must still flag.
+func BadIntersectChanRange[C interface {
+	chan int | chan<- int
+	chan int | <-chan int
+}](ctx *workflow.Context, ch C) error {
+	for v := range ch { // want `ranging over a channel is not allowed`
+		_ = v
+	}
+	return nil
+}
+
+// Likewise `chan int | []int` intersected with `chan int` is {chan int}, so
+// make must still flag even though the flattened union mixes channel and
+// non-channel terms.
+func BadIntersectMakeChan[C interface {
+	chan int | []int
+	chan int
+}](ctx *workflow.Context, _ struct{}) error {
+	_ = make(C) // want `make\(chan`
+	return nil
+}

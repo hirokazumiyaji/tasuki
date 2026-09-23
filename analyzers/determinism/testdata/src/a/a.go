@@ -232,6 +232,25 @@ func BadQueryHandlerFactory(ctx *workflow.Context, _ struct{}) error {
 	return nil
 }
 
+// A pure function conversion around the callback does not execute it, so the
+// inner literal stays exempt (unlike the factory IIFE above, whose outer func
+// runs immediately).
+type Callback func() string
+
+func OkSideEffectConverted(ctx *workflow.Context, _ struct{}) error {
+	_, _ = workflow.SideEffect(ctx, Callback(func() string {
+		return time.Now().String()
+	}))
+	return nil
+}
+
+func OkSideEffectConvertedParen(ctx *workflow.Context, _ struct{}) error {
+	_, _ = workflow.SideEffect(ctx, Callback((func() string {
+		return time.Now().String()
+	})))
+	return nil
+}
+
 // Non-workflow functions must not be flagged (covers isWorkflowFunc false paths).
 func NotWorkflow() {
 	_ = time.Now()
