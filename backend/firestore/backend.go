@@ -425,12 +425,13 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // point and, via exhausted, the termination signal), so refills continue past
 // already-consumed windows instead of re-fetching the prefix: every window is
 // read once per ClaimTasks call and the loop ends when the index is
-// exhausted. Attempted IDs stay in skip so a stale index entry of a released
-// snapshot is never reselected after its slot is freed. Trade-off: documents
-// after the early-stop point within the window where the batch filled, and
-// documents rejected by the fair cap before a conflict freed a slot, are
-// picked up on a later poll rather than in the same call; liveness holds
-// because they stay claimable.
+// exhausted. When the batch fills mid-window the cursor points after the last
+// examined document (not the window end), so a refill re-examines the
+// unexamined window suffix instead of skipping it. Attempted IDs stay in skip
+// so a stale index entry of a released snapshot is never reselected after its
+// slot is freed. Trade-off: documents rejected by the fair cap before a
+// conflict freed a slot are picked up on a later poll rather than in the same
+// call; liveness holds because they stay claimable.
 func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker, skip map[int64]struct{}, cursor *gcf.DocumentSnapshot) ([]*gcf.DocumentSnapshot, *gcf.DocumentSnapshot, bool, error) {
 	base := b.col("wf_tasks").Where("kind", "==", kind).Where("queue", "==", queue).Where("visible_at", "<=", now).OrderBy("visible_at", gcf.Asc).OrderBy(gcf.DocumentID, gcf.Asc)
 	collect := func(it *gcf.DocumentIterator) ([]*gcf.DocumentSnapshot, error) {
@@ -496,7 +497,9 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 			exhausted = true
 			break
 		}
-		for _, d := range docs {
+		examined := -1
+		for i, d := range docs {
+			examined = i
 			m := d.Data()
 			id := i64(m, "id")
 			if _, ok := skip[id]; ok {
@@ -514,7 +517,11 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 				break
 			}
 		}
-		startAfter = docs[len(docs)-1]
+		// Resume after the last EXAMINED document, not the last fetched
+		// one, so a refill after a claim conflict re-examines the
+		// unexamined window suffix instead of skipping it. When the whole
+		// window was consumed this is the last document, as before.
+		startAfter = docs[examined]
 		if picker.Full() {
 			// Batch filled: unscanned documents may remain behind.
 			break

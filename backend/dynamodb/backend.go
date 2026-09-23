@@ -388,12 +388,30 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // point and, via exhausted, the termination signal), so refills continue past
 // already-consumed pages instead of re-reading the prefix: every page is
 // fetched once per ClaimTasks call and the loop ends when the partition is
-// exhausted. Attempted IDs stay in skip so a stale GSI image of a released
-// candidate is never reselected after its slot is freed. Trade-off: rows
-// after the early-stop point within the page where the batch filled, and rows
-// rejected by the fair cap before a conflict freed a slot, are picked up on a
-// later poll rather than in the same call; liveness holds because they stay
-// claimable.
+// exhausted. When the batch fills mid-page the cursor points after the last
+// examined item (not the page end), so a refill re-examines the unexamined
+// page suffix instead of skipping it. Attempted IDs stay in skip so a stale
+// GSI image of a released candidate is never reselected after its slot is
+// freed. Trade-off: rows rejected by the fair cap before a conflict freed a
+// slot are picked up on a later poll rather than in the same call; liveness
+// holds because they stay claimable.
+// claimResumeKey rebuilds the ExclusiveStartKey that resumes a claim_gsi
+// Query after item: the table HASH key (task_pk) plus the index HASH+RANGE
+// keys (gsi_pk, visible_at). It lets a refill continue after the last
+// examined item of a partially consumed page instead of skipping the
+// unexamined page suffix. Nil when the item lacks those attributes (never
+// for claim candidates, which always carry them); callers then re-fetch the
+// page rather than skip rows.
+func claimResumeKey(item map[string]types.AttributeValue) map[string]types.AttributeValue {
+	tpk, ok1 := item["task_pk"]
+	gpk, ok2 := item["gsi_pk"]
+	vis, ok3 := item["visible_at"]
+	if !ok1 || !ok2 || !ok3 || tpk == nil || gpk == nil || vis == nil {
+		return nil
+	}
+	return map[string]types.AttributeValue{"task_pk": tpk, "gsi_pk": gpk, "visible_at": vis}
+}
+
 func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, now time.Time, remaining int, picker *backend.FairPicker, skip map[int64]struct{}, cursor map[string]types.AttributeValue) ([]map[string]types.AttributeValue, map[string]types.AttributeValue, bool, error) {
 	queryPage := func(start map[string]types.AttributeValue, pageLimit int32) (*dynamodb.QueryOutput, error) {
 		return b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_tasks")), IndexName: aws.String("claim_gsi"),
@@ -432,6 +450,7 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 	start := cursor
 	exhausted := false
 	for !picker.Full() {
+		pageStart := start
 		out, err := queryPage(start, int32(pageSize))
 		if err != nil {
 			return nil, start, false, err
@@ -441,7 +460,9 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 			exhausted = start == nil
 			break
 		}
-		for _, item := range out.Items {
+		examined := -1
+		for i, item := range out.Items {
+			examined = i
 			id := fromN(item["id"])
 			if _, ok := skip[id]; ok {
 				continue
@@ -458,11 +479,31 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 				break
 			}
 		}
-		start = out.LastEvaluatedKey
 		if picker.Full() {
-			// Batch filled: unscanned rows may remain behind.
+			// Batch filled: the refill after a claim conflict resumes
+			// after the last EXAMINED item, not after the whole fetched
+			// page, so the unexamined page suffix is re-examined instead
+			// of skipped. The resume key carries the table HASH key plus
+			// the claim_gsi HASH+RANGE keys of that item.
+			if examined >= 0 && examined < len(out.Items)-1 {
+				if key := claimResumeKey(out.Items[examined]); key != nil {
+					start = key
+				} else {
+					// Unreachable: claim items always carry these
+					// attributes. Re-fetch the page rather than skip the
+					// suffix; the skip set dedups the re-examined prefix
+					// and attempted IDs keep growing, so the loop still
+					// terminates.
+					start = pageStart
+				}
+				break
+			}
+			start = out.LastEvaluatedKey
+			// Batch filled exactly at the page end, or the page is the
+			// partition tail: unscanned rows may remain behind.
 			break
 		}
+		start = out.LastEvaluatedKey
 		if start == nil {
 			exhausted = true
 			break
