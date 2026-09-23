@@ -4,7 +4,6 @@ package chaos_test
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -12,23 +11,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/hirokazumiyaji/tasuki"
-	"github.com/hirokazumiyaji/tasuki/backend/mysql"
+	"github.com/hirokazumiyaji/tasuki/backend/sqlite"
 )
 
-func TestChaos_KillWorkers_TiDB(t *testing.T) {
-	dsn := os.Getenv("TASUKI_TIDB_DSN")
-	if dsn == "" {
-		t.Skip("TASUKI_TIDB_DSN not set")
-	}
-	ensureTiDBDatabase(t, dsn)
+func TestChaos_KillWorkers_SQLite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chaos-sqlite.db")
 	ctx := context.Background()
-	b, err := mysql.New(ctx, dsn)
+	b, err := sqlite.New(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +37,7 @@ func TestChaos_KillWorkers_TiDB(t *testing.T) {
 	const nInst = 20
 	c := tasuki.NewClient(b)
 	for i := 0; i < nInst; i++ {
-		id := fmt.Sprintf("chaos-tidb-%d", i)
+		id := fmt.Sprintf("chaos-sqlite-%d", i)
 		if _, err := tasuki.Start(ctx, c, "chaos", 0, tasuki.WithID(id)); err != nil {
 			t.Fatal(err)
 		}
@@ -51,7 +45,7 @@ func TestChaos_KillWorkers_TiDB(t *testing.T) {
 
 	_, thisFile, _, _ := runtime.Caller(0)
 	workerDir := filepath.Join(filepath.Dir(thisFile), "cmd", "worker")
-	bin := filepath.Join(t.TempDir(), "chaos-worker-tidb")
+	bin := filepath.Join(t.TempDir(), "chaos-worker-sqlite")
 	build := exec.Command("go", "build", "-race", "-tags", "tasuki_all", "-o", bin, ".")
 	build.Dir = workerDir
 	// Race-instrument the spawned workers too: -race on the test binary
@@ -66,14 +60,14 @@ func TestChaos_KillWorkers_TiDB(t *testing.T) {
 	}
 	workers := make([]*proc, 0, 3)
 	startWorker := func(i int) *proc {
-		id := fmt.Sprintf("tw-%d-%d", i, time.Now().UnixNano())
+		id := fmt.Sprintf("sw-%d-%d", i, time.Now().UnixNano())
 		cmd := exec.Command(bin)
 		// GORACE=halt_on_error=1 makes a race report terminate the worker
 		// immediately (race exit 66) so Wait observes it before any
 		// deliberate SIGKILL, which waitKilledWorker accepts.
 		cmd.Env = append(os.Environ(),
-			"TASUKI_BACKEND=mysql",
-			"TASUKI_MYSQL_DSN="+dsn,
+			"TASUKI_BACKEND=sqlite",
+			"TASUKI_SQLITE_PATH="+path,
 			"WORKER_ID="+id,
 			"GORACE=halt_on_error=1",
 		)
@@ -97,11 +91,11 @@ func TestChaos_KillWorkers_TiDB(t *testing.T) {
 	}()
 
 	deadline := time.Now().Add(30 * time.Second)
-	rng := rand.New(rand.NewSource(3))
+	rng := rand.New(rand.NewSource(6))
 	for time.Now().Before(deadline) {
 		done := 0
 		for i := 0; i < nInst; i++ {
-			info, err := c.Get(ctx, fmt.Sprintf("chaos-tidb-%d", i))
+			info, err := c.Get(ctx, fmt.Sprintf("chaos-sqlite-%d", i))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -125,7 +119,7 @@ func TestChaos_KillWorkers_TiDB(t *testing.T) {
 	}
 
 	for i := 0; i < nInst; i++ {
-		id := fmt.Sprintf("chaos-tidb-%d", i)
+		id := fmt.Sprintf("chaos-sqlite-%d", i)
 		info, err := c.Get(ctx, id)
 		if err != nil {
 			t.Fatal(err)
@@ -150,41 +144,4 @@ func TestChaos_KillWorkers_TiDB(t *testing.T) {
 		}
 		assertJournalContiguous(t, events)
 	}
-}
-
-func ensureTiDBDatabase(t *testing.T, dsn string) {
-	t.Helper()
-	dbName, adminDSN, ok := splitMySQLDSN(dsn)
-	if !ok || dbName == "" {
-		t.Fatalf("cannot parse database from TASUKI_TIDB_DSN")
-	}
-	db, err := sql.Open("mysql", adminDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	ctx := context.Background()
-	if err := db.PingContext(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+dbName+"`"); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func splitMySQLDSN(dsn string) (string, string, bool) {
-	slash := strings.Index(dsn, ")/")
-	if slash < 0 {
-		return "", "", false
-	}
-	rest := dsn[slash+2:]
-	q := strings.IndexByte(rest, '?')
-	var dbName, params string
-	if q < 0 {
-		dbName = rest
-	} else {
-		dbName = rest[:q]
-		params = rest[q:]
-	}
-	return dbName, dsn[:slash+2] + params, true
 }

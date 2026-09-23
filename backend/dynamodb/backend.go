@@ -1406,15 +1406,6 @@ func (b *Backend) deleteSignalDedupeForInstance(ctx context.Context, id string) 
 	}
 }
 
-func isDedupeConflict(err error) bool {
-	var t *types.TransactionCanceledException
-	if !errors.As(err, &t) || len(t.CancellationReasons) == 0 {
-		return false
-	}
-	r := t.CancellationReasons[0]
-	return r.Code != nil && *r.Code == "ConditionalCheckFailed"
-}
-
 func put(table string, item map[string]types.AttributeValue, condition string) types.TransactWriteItem {
 	p := &types.Put{TableName: aws.String(table), Item: item}
 	if condition != "" {

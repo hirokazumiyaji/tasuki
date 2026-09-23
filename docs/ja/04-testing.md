@@ -39,6 +39,23 @@
 - 残された別ワーカーが失効したリースを引き継ぎ、最新のジャーナル状態から安全にワークフローをリプレイ・再開する。
 - 全体の終了後、ジャーナルイベントの欠落や重複がなく、全インスタンスが期待される計算結果で終端していることを検証する。
 
+### 継続的インテグレーション
+
+CI（`.github/workflows/ci.yml`）はプルリクエストと `main` への push ごとに実行し、さらに nightly スケジュール（UTC `0 3 * * *`、`workflow_dispatch` による手動実行も可）でも実行する：
+
+| ジョブ | ゲート内容 |
+|---|---|
+| `lint` | root と backend に `staticcheck` が clean であること |
+| `vuln` | root と backend への `govulncheck`（参考表示。stdlib の指摘は toolchain に追従するため非ブロッキング） |
+| `root` | `go test ./... -race`。fuzz の seed は通常の単体テストとしてここで実行 |
+| `backend-*` | backend ごとのスイートを `-race` 付きで実行 |
+| `chaos-*` | `kill -9` カオスを `-race` 付きで実行（インフラ不要の `chaos-sqlite` を含む） |
+| `cover` | root のカバレッジサマリと成果物 |
+| `gowork-check` | `GOWORK=off` の独立性、workspace の `tasuki_all` ビルド、`go test -tags tasuki_all ./contrib/... ./examples/...` |
+| `fuzz-nightly` | nightly のみ。各 codec/engine ファズ対象に `-fuzz -fuzztime` 60 秒 |
+
+CI の Go は全ジョブで `1.24.x` を使用する（`docs/ja/10-modules.md` 参照）。
+
 ## リスクと対策
 
 分散・耐久ワークフロー実行において想定される技術的リスクと、tasuki のアーキテクチャによる対策は以下の通りである：

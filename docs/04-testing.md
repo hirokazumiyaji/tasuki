@@ -39,6 +39,23 @@ Chaos tests simulate hostile real-world failures by executing distributed workfl
 - Replacement workers pick up unrenewed leases and resume workflows from the latest recorded journal state.
 - Post-run invariants verify that no journal entries are duplicated, skipped, or corrupted, and final workflow results match expected golden values.
 
+### Continuous Integration
+
+CI (`.github/workflows/ci.yml`) runs on every pull request and push to `main`, plus a nightly schedule (`0 3 * * *` UTC, also triggerable via `workflow_dispatch`):
+
+| Job | What it gates |
+|---|---|
+| `lint` | `staticcheck` is clean on the root and backend modules |
+| `vuln` | Advisory `govulncheck` over root and backend modules (non-blocking: stdlib findings track the toolchain) |
+| `root` | `go test ./... -race`; fuzz seed corpora run here as ordinary unit tests |
+| `backend-*` | Per-backend suites with `-race` |
+| `chaos-*` | `kill -9` chaos suites with `-race`, including the zero-infrastructure `chaos-sqlite` job |
+| `cover` | Root coverage summary and artifact |
+| `gowork-check` | `GOWORK=off` independence, the workspace `tasuki_all` build, and `go test -tags tasuki_all ./contrib/... ./examples/...` |
+| `fuzz-nightly` | Nightly only: 60s of `-fuzz -fuzztime` per codec/engine fuzz target |
+
+CI uses Go `1.24.x` across all jobs (see `docs/10-modules.md`).
+
 ## Risks and Mitigations
 
 The table below outlines technical risks identified in durable workflow execution and the architectural defenses built into tasuki:
