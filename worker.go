@@ -1802,8 +1802,6 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 	if d <= 0 {
 		return
 	}
-	ticker := time.NewTicker(d)
-	defer ticker.Stop()
 	// lastSuccess is the wall-clock instant of the last renewal that moved
 	// the store lease forward. It bounds the retry window below (round-21
 	// P2b). It approximates the store clock, which production backends
@@ -1817,14 +1815,53 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 	// lease by that latency. lastSuccess bounds conservatively from the
 	// earlier of the pre-claim wall instant and the claim's own
 	// VisibleAt-derived start (see leaseBaseFromClaim).
+	//
+	// Every success stamps the pre-call instant (round-24 P2b), not the
+	// response time: a successful ExtendLease delayed in flight was
+	// already aging the store lease while blocked, so measuring from the
+	// response stretches the following retry window past the actual
+	// store expiry by the response latency — a later failure then keeps
+	// the turn alive while a peer reclaims mid-side-effects. Stamping
+	// before the call can only bound the window early, never late (same
+	// conservatism as refreshLeaseAt/trackAt).
 	lastSuccess := leaseBaseFromClaim(t, claimBase, lease)
+	// The first renewal is scheduled from the claim timestamp (round-24
+	// P2a), not from loop entry: a plain half-lease ticker started AFTER
+	// ClaimTasks returns waits a full half-lease more, so a claim that
+	// consumed more than half the lease lets the original lease expire —
+	// and a peer reclaim — while the turn still waits for its first
+	// renewal. When the claim was slow, the first attempt fires almost
+	// immediately (the remaining lease minus the abandon margin, floored
+	// at zero); when it was fast this equals the regular half-lease tick.
+	// Later ticks keep the half-lease period.
+	margin := renewAbandonMargin(lease)
+	firstDelay := d
+	if remaining := time.Until(lastSuccess.Add(lease - margin)); remaining < firstDelay {
+		firstDelay = remaining
+		if firstDelay < 0 {
+			firstDelay = 0
+		}
+	}
+	firstTimer := time.NewTimer(firstDelay)
+	defer firstTimer.Stop()
+	ticker := time.NewTicker(d)
+	defer ticker.Stop()
+	first := true
 	for {
+		tick := ticker.C
+		if first {
+			tick = firstTimer.C
+		}
 		select {
 		case <-done:
 			return
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
+			if first {
+				first = false
+			}
+			renewStart := time.Now()
 			if err := w.backend.ExtendLease(ctx, t, lease); err != nil {
 				// A fenced renewal reports ErrNotFound when the lease
 				// moved on (task completed/deleted, or a peer reclaim
@@ -1862,7 +1899,7 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 				}
 				return
 			}
-			lastSuccess = time.Now()
+			lastSuccess = renewStart
 			// The store lease moved forward: the local
 			// claim-time estimate used by the delayed nack
 			// (see requeueWorkflowTask) must move with it
@@ -1982,8 +2019,13 @@ func (w *Worker) retryRenewal(ctx context.Context, t backend.Task, done <-chan s
 			return lastSuccess, false
 		case <-timer.C:
 		}
+		// Conservative renewal instant (round-24 P2b, mirroring the
+		// claimBase pattern from round-23): the store lease was already
+		// aging while this call was in flight, so the retry window
+		// bounds from the pre-call instant, never the delayed response.
+		renewStart := time.Now()
 		if err := w.backend.ExtendLease(ctx, t, lease); err == nil {
-			return time.Now(), true
+			return renewStart, true
 		} else if errors.Is(err, backend.ErrNotFound) {
 			w.opts.Logger.Debug("lease moved on; stopping renewal",
 				"task_id", t.ID)
