@@ -701,3 +701,130 @@ func TestFairClaimRequeriesOverflowAfterCarrySuccess(t *testing.T) {
 		}
 	}
 }
+
+// TestFairClaimProbesLockedCarry covers the issue #294 round-15 P2: a
+// retained carry over one locked instance must be batch-probed with a single
+// SELECT ... FOR UPDATE SKIP LOCKED instead of retried one pick per pass
+// (~2001 lock queries plus quadratic re-offers for A1..A2002 with A1..A2001
+// locked, all inside one long txn). One instance holds 60 activity tasks
+// with the first 59 locked by a concurrent claimer; the claim must return
+// the unlocked FIFO tail — not a locked row, not an empty batch — and keep
+// FIFO + cap semantics.
+func TestFairClaimProbesLockedCarry(t *testing.T) {
+	dsn := dsnOrSkip(t)
+	ctx := context.Background()
+	b, err := postgres.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	const queue = "probecarry"
+	const total = 60
+	const perAdv = 20
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: "probe-1", Name: "WF", Queue: queue}); err != nil {
+		t.Fatal(err)
+	}
+	for adv := 0; adv < total/perAdv; adv++ {
+		wf, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+			Kind: "workflow", Queues: []string{queue}, Limit: 1,
+			Lease: time.Minute, WorkerID: "probe-spawn",
+		})
+		if err != nil || len(wf) != 1 {
+			t.Fatalf("claim wf round %d: %v %#v", adv, err, wf)
+		}
+		st, err := b.LoadWorkflow(ctx, "probe-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		commit := backend.Advancement{
+			InstanceID:         "probe-1",
+			TaskID:             wf[0].ID,
+			ExpectedSeq:        st.NextSeq,
+			EnsureWorkflowTask: true,
+		}
+		for i := 0; i < perAdv; i++ {
+			seq := st.NextSeq + int64(i)
+			commit.NewEvents = append(commit.NewEvents, journal.Event{
+				Seq: seq, Type: journal.TypeActivityScheduled, Name: "step",
+			})
+			commit.ActivityTasks = append(commit.ActivityTasks, backend.NewTask{
+				Kind: "activity", Queue: queue, InstanceID: "probe-1",
+				Name: "step", Seq: seq, Input: []byte(`{}`),
+			})
+		}
+		if err := b.CommitAdvancement(ctx, commit); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows, err := b.Pool().Query(ctx, `
+		SELECT id FROM wf_tasks
+		WHERE kind = 'activity' AND queue = $1
+		ORDER BY visible_at, id`, queue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != total {
+		t.Fatalf("spawned %d activity tasks, want %d", len(ids), total)
+	}
+
+	// Blocker locks every head row, like a concurrent fair claimer that
+	// scanned the same IDs and locked them first; only the FIFO tail stays
+	// claimable.
+	btx, err := b.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer btx.Rollback(ctx)
+	if _, err := btx.Exec(ctx, `SELECT id FROM wf_tasks WHERE id = ANY($1) FOR UPDATE`, ids[:len(ids)-1]); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "activity", Queues: []string{queue}, Limit: 2,
+		Lease: time.Minute, WorkerID: "probe-w", MaxPerInstance: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != ids[len(ids)-1] {
+		got := make([]int64, 0, len(tasks))
+		for _, task := range tasks {
+			got = append(got, task.ID)
+		}
+		t.Fatalf("claim = %v, want unlocked FIFO tail [%d]", got, ids[len(ids)-1])
+	}
+
+	// Everything left is locked: a follow-up claim must come back empty
+	// rather than hand out a row the blocker owns.
+	again, err := b.ClaimTasks(ctx, backend.ClaimRequest{
+		Kind: "activity", Queues: []string{queue}, Limit: 2,
+		Lease: time.Minute, WorkerID: "probe-w2", MaxPerInstance: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("claim over fully locked carry = %d tasks, want 0", len(again))
+	}
+}

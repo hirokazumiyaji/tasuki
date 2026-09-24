@@ -375,6 +375,28 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 	for len(out) < req.Limit {
 		picker := backend.NewFairPicker(req.Limit-len(out), req.MaxPerInstance).TrackRejected()
 		picker.Seed(claimed)
+		// Batch-probe the retained carry in one SKIP LOCKED query before
+		// re-offering it (issue #294 round-15 P2): re-offering a large
+		// carry one pick per pass costs a lock query per pass plus
+		// quadratic re-offers when every pick is lost to concurrent locks
+		// (a retained run over one locked instance drains a single row per
+		// pass, so A1..A2002 with A1..A2001 locked needs ~2001 lock queries
+		// in one long txn). The DB skips locked rows at once; only unlocked
+		// survivors are re-offered, in FIFO order, so fair-cap semantics are
+		// unchanged. Probe-dropped rows are locked by a concurrent claimant
+		// — like lock-skipped picks they stay claimable for later polls —
+		// and count as lost for the overflow-requery gate below (a later
+		// pass may reuse the freed position, same as a lost pick).
+		if len(pending) > 0 {
+			kept, dropped, err := b.probeRetainedCarry(ctx, tx, req, pending)
+			if err != nil {
+				return nil, err
+			}
+			pending = kept
+			if dropped {
+				lostLock = true
+			}
+		}
 		// Reconsider candidates rejected by an earlier pass first: they are
 		// FIFO-earlier than the scan cursor and may now fit under the cap
 		// once the picks that blocked them were lost to concurrent locks.
@@ -633,6 +655,41 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		b.notifyTasks(ctx)
 	}
 	return out, nil
+}
+
+// probeRetainedCarry batch-filters a retained carry to its unlocked rows
+// with a single SELECT ... FOR UPDATE SKIP LOCKED over the carry IDs (see
+// the call site in claimTasksFair). The probe locks the survivors in FIFO
+// (visible_at, id) order, so re-offering them preserves fair-cap semantics
+// while locked rows are dropped in one query instead of one pass each.
+// A visibility re-check mirrors the lock step: rows leased since the scan
+// are invisible here (and again at UPDATE time).
+func (b *Backend) probeRetainedCarry(ctx context.Context, tx pgx.Tx, req backend.ClaimRequest, pending []backend.FairTaskRef) ([]backend.FairTaskRef, bool, error) {
+	ids := make([]int64, 0, len(pending))
+	for _, r := range pending {
+		ids = append(ids, r.ID)
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT id, instance_id, visible_at FROM wf_tasks
+		WHERE id = ANY($1) AND kind = $2 AND visible_at <= now()
+		ORDER BY visible_at, id
+		FOR UPDATE SKIP LOCKED`, ids, req.Kind)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	kept := make([]backend.FairTaskRef, 0, len(pending))
+	for rows.Next() {
+		var r backend.FairTaskRef
+		if err := rows.Scan(&r.ID, &r.InstanceID, &r.VisibleAt); err != nil {
+			return nil, false, err
+		}
+		kept = append(kept, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	return kept, len(kept) < len(pending), nil
 }
 
 // scanClaimedTask scans the shared claim RETURNING column list and returns

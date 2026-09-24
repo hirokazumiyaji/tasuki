@@ -1605,3 +1605,167 @@ func TestFairOverflowRequeryCarrySuccessAfterLoss(t *testing.T) {
 		}
 	}
 }
+
+
+func TestFairCarryProbeConvergesSameSet(t *testing.T) {
+	// Covers the issue #294 round-15 P2 at the refill-loop level without a
+	// live DB: a retained carry over one locked instance must be
+	// batch-probed (one SKIP LOCKED step over the whole carry) instead of
+	// retried one pick per pass. runClaim mirrors the postgres/mysql refill
+	// loops (per-pass picker with TrackRejected, FIFO carry, keyset cursor,
+	// lock step, lost-pick carry); the probe variant filters the carry to
+	// unlocked rows in one lock operation before re-offering. Both variants
+	// must converge to the same secured set in FIFO order, while the probe
+	// variant needs O(1) lock operations instead of one per retained row.
+	scenarios := []struct {
+		name        string
+		feed        []backend.FairTaskRef
+		locked      map[int64]bool
+		limit       int
+		perInstance int
+		minSerial   int
+	}{
+		{
+			name:        "single instance tail unlocked",
+			feed:        refs("A", 1, 200),
+			locked:      lockSet(1, 199),
+			limit:       2,
+			perInstance: 1,
+			minSerial:   150,
+		},
+		{
+			name:        "multi instance caps preserved",
+			feed:        append(refs("A", 1, 50), refs("B", 101, 1)...),
+			locked:      lockSet(1, 49),
+			limit:       2,
+			perInstance: 1,
+			minSerial:   40,
+		},
+	}
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			runClaim := func(probe bool) ([]backend.FairTaskRef, int, int) {
+				cursor := 0
+				var out, claimed, pending []backend.FairTaskRef
+				lockOps, passes := 0, 0
+				for len(out) < sc.limit {
+					passes++
+					if passes > 2*len(sc.feed)+10 {
+						t.Fatalf("probe=%v: claim loop did not terminate", probe)
+					}
+					picker := backend.NewFairPicker(sc.limit-len(out), sc.perInstance).TrackRejected()
+					picker.Seed(claimed)
+					if probe && len(pending) > 0 {
+						// The batch probe: one SKIP LOCKED step over the
+						// whole carry, survivors stay in FIFO order.
+						lockOps++
+						kept := pending[:0]
+						for _, r := range pending {
+							if !sc.locked[r.ID] {
+								kept = append(kept, r)
+							}
+						}
+						pending = kept
+					}
+					offered := 0
+					for _, r := range pending {
+						if picker.Full() {
+							break
+						}
+						picker.Offer(r)
+						offered++
+					}
+					if !picker.Full() {
+						for !picker.Full() && cursor < len(sc.feed) {
+							r := sc.feed[cursor]
+							cursor++
+							if picker.Offer(r) {
+								break
+							}
+						}
+					}
+					scanExhausted := !picker.Full()
+					picked := picker.Picked()
+					iterRejected := picker.Rejected()
+					if len(picked) == 0 {
+						break
+					}
+					// The per-pass lock step.
+					lockOps++
+					prevOut := len(out)
+					for _, r := range picked {
+						if sc.locked[r.ID] {
+							continue
+						}
+						out = append(out, r)
+						claimed = append(claimed, r)
+					}
+					if len(out) >= sc.limit {
+						break
+					}
+					if scanExhausted && len(picked)-(len(out)-prevOut) == 0 {
+						break
+					}
+					pending = append(iterRejected, pending[offered:]...)
+				}
+				backend.SortFairRefs(claimed)
+				byID := make(map[int64]backend.FairTaskRef, len(out))
+				for _, r := range out {
+					byID[r.ID] = r
+				}
+				ordered := make([]backend.FairTaskRef, 0, len(claimed))
+				for _, r := range claimed {
+					ordered = append(ordered, byID[r.ID])
+				}
+				return ordered, lockOps, passes
+			}
+			oldOut, oldOps, oldPasses := runClaim(false)
+			newOut, newOps, newPasses := runClaim(true)
+			if len(oldOut) != len(newOut) {
+				t.Fatalf("secured sets differ: serial=%v probe=%v", idsOf(oldOut), idsOf(newOut))
+			}
+			for i := range oldOut {
+				if oldOut[i].ID != newOut[i].ID {
+					t.Fatalf("secured sets differ: serial=%v probe=%v", idsOf(oldOut), idsOf(newOut))
+				}
+			}
+			if len(newOut) == 0 {
+				t.Fatalf("probe variant secured nothing (serial=%v)", idsOf(oldOut))
+			}
+			// The serial retry drains one retained row per pass; the probe
+			// must collapse that to a handful of lock operations.
+			if oldPasses < sc.minSerial {
+				t.Fatalf("serial variant took %d passes, want >= %d (mirror must exhibit the bug shape)", oldPasses, sc.minSerial)
+			}
+			if newOps > 8 || newPasses > 8 {
+				t.Fatalf("probe variant took %d lock ops over %d passes, want <= 8", newOps, newPasses)
+			}
+			t.Logf("serial: %d lock ops over %d passes; probe: %d lock ops over %d passes; secured=%v",
+				oldOps, oldPasses, newOps, newPasses, idsOf(newOut))
+		})
+	}
+}
+
+func idsOf(refs []backend.FairTaskRef) []int64 {
+	out := make([]int64, 0, len(refs))
+	for _, r := range refs {
+		out = append(out, r.ID)
+	}
+	return out
+}
+
+func refs(inst string, first, n int) []backend.FairTaskRef {
+	out := make([]backend.FairTaskRef, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, backend.FairTaskRef{ID: int64(first + i), InstanceID: inst})
+	}
+	return out
+}
+
+func lockSet(first, n int) map[int64]bool {
+	out := make(map[int64]bool, n)
+	for i := 0; i < n; i++ {
+		out[int64(first+i)] = true
+	}
+	return out
+}
