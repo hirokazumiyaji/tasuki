@@ -268,6 +268,23 @@ type pendingWorkflowCommit struct {
 // would delete the peer's active task after duplicate execution. The
 // caller's disposal is ownership-gated (see claimWorkflowRelease), so a
 // skipped entry is never released twice.
+//
+// Cancellation is re-checked immediately before EACH store call
+// (round-18 P1): tickWorkflows checks ctx.Err() before the flush, but
+// Shutdown can cancel in the check-to-flush window — or while the flush
+// is blocked between two commits — and context-insensitive backends
+// (memory and similar) would then persist the advancement instead of
+// abandoning it. The per-call check narrows that window to the backend
+// call itself: a cancel observed before a store call skips it (returned
+// as failed so the caller releases the lease for a peer retry), and
+// ownership is re-verified at the same point so a Shutdown release that
+// landed between the preflight and this commit is never followed by a
+// stale write. Residual: a cancel landing after the final pre-call
+// check — inside the backend call — can still persist on a
+// context-insensitive backend. That commit carries the claim generation
+// (see advForCommit), so a backend enforcing the fence rejects it when
+// the lease moved on, and the caller still releases failures observed
+// under a canceled tick for a prompt peer retry.
 func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWorkflowCommit) []pendingWorkflowCommit {
 	if len(pending) == 0 {
 		return nil
@@ -285,6 +302,13 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 	failed := append([]pendingWorkflowCommit(nil), skipped...)
 	untrack := func(p pendingWorkflowCommit) {
 		w.untrackPending(p)
+	}
+	// Canceled before any store call: skip the flush outright (see
+	// above). The caller disposes the failed subset.
+	if ctx.Err() != nil {
+		w.opts.Logger.Debug("skipping workflow flush; tick canceled",
+			"n", len(owned))
+		return append(failed, owned...)
 	}
 	if batcher, ok := w.backend.(backend.AdvancementBatcher); ok && len(owned) > 1 {
 		advs := make([]backend.Advancement, len(owned))
@@ -305,6 +329,10 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 			// context and been rejected before touching the store).
 			// Skipped (stale) entries never reach the store (see above).
 			for _, p := range owned {
+				if fp, skip := w.skipCanceledCommit(ctx, p); skip {
+					failed = append(failed, fp)
+					continue
+				}
 				if cerr := w.commitWorkflow(ctx, w.taskForCommit(p), p.baseJournal, p.adv); cerr != nil {
 					w.recordStoreError(ctx, "commit_workflow", cerr, "instance_id", p.instanceID)
 					failed = append(failed, p)
@@ -321,6 +349,10 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 		return failed
 	}
 	for _, p := range owned {
+		if fp, skip := w.skipCanceledCommit(ctx, p); skip {
+			failed = append(failed, fp)
+			continue
+		}
 		if err := w.commitWorkflow(ctx, w.taskForCommit(p), p.baseJournal, p.adv); err != nil {
 			w.recordStoreError(ctx, "commit_workflow", err, "instance_id", p.instanceID)
 			failed = append(failed, p)
@@ -329,6 +361,29 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 		untrack(p)
 	}
 	return failed
+}
+
+// skipCanceledCommit enforces the round-18 P1 per-store-call gate: when
+// the tick context was canceled after the flush preflight (or while an
+// earlier commit in the same flush was blocked), the pending commit must
+// not reach the store — a context-insensitive backend would persist the
+// advancement instead of abandoning it. Ownership is re-verified for the
+// same reason: Shutdown's releaseInFlight may have released this entry
+// since the preflight. A skipped entry reports true so the caller routes
+// it to its canceled-tick disposal (ownership-gated release for a prompt
+// peer retry) instead of committing it.
+func (w *Worker) skipCanceledCommit(ctx context.Context, p pendingWorkflowCommit) (pendingWorkflowCommit, bool) {
+	if ctx.Err() != nil {
+		w.opts.Logger.Debug("skipping workflow commit; tick canceled before the store call",
+			"instance_id", p.instanceID, "task_id", p.adv.TaskID)
+		return p, true
+	}
+	if !w.ownsWorkflowCommit(p.task) {
+		w.opts.Logger.Debug("skipping stale workflow commit; lease released during the flush",
+			"instance_id", p.instanceID, "task_id", p.adv.TaskID)
+		return p, true
+	}
+	return p, false
 }
 
 // taskForCommit resolves the fenced release token for a pending commit.

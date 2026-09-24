@@ -682,6 +682,13 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 	// Dispose instead: ownership-gated, kind-routed releases (see
 	// claimWorkflowRelease) so a Shutdown releaseInFlight that already
 	// released (and a peer re-claimed) lease is never cleared twice.
+	// The check below races a cancel landing between it and the first
+	// store call; flushWorkflowCommits re-checks cancellation (and
+	// ownership) immediately before EACH store call (round-18 P1), so
+	// the remaining window is only the backend call itself — plus the
+	// documented residual of a cancel landing mid-call on a
+	// context-insensitive backend, whose fenced commit still cannot
+	// disturb a peer's reclaimed lease (see flushWorkflowCommits).
 	if ctx.Err() != nil {
 		// Dispose under one shared release budget (see
 		// releaseWorkflowLeases): N pendings released serially with a
@@ -705,10 +712,11 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		// flush (see above): successes are untracked inside
 		// flushWorkflowCommits. Commits that failed under a tick
 		// canceled mid-flush are released explicitly for a prompt peer
-		// retry instead of waiting for lease expiry (a canceled flush
-		// is rejected before touching the store, so the lease is still
-		// ours unless Shutdown's releaseInFlight already released it —
-		// the release below is ownership-gated for that race).
+		// retry instead of waiting for lease expiry (a flush whose
+		// per-call cancellation gate fires before a store call never
+		// touches the store, so the lease is still ours unless
+		// Shutdown's releaseInFlight already released it — the release
+		// below is ownership-gated for that race).
 		// Live-context failures (conflict/transient) are untracked
 		// without release: the task may be superseded, and the lease
 		// expires naturally.
