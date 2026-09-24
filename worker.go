@@ -1847,16 +1847,32 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 // renewAbandonMargin bounds how close to lease expiry retryRenewal may keep
 // trying: once the remaining lease drops below the margin, the turn is
 // abandoned (its context canceled via onLeaseLost) instead of racing a peer
-// reclaim at expiry. A quarter of the lease, clamped so short test leases
-// still retry a couple of times while long production leases abandon with
-// seconds to spare.
+// reclaim at expiry. A quarter of the lease, clamped to [25ms, 2s] so short
+// test leases still retry while long production leases abandon with seconds
+// to spare.
+//
+// The margin must stay strictly below half the lease: the first
+// post-failure check runs about half a lease after the last success (the
+// half-lease tick), so a margin at or above half the lease abandons
+// immediately on one transient failure instead of retrying in-window —
+// with the old 200ms floor, any lease at or below 400ms abandoned without
+// a single retry, causing needless replay and repeated side effects. The
+// cap below keeps at least one retry attempt possible for every positive
+// lease (the loop attempts once before re-checking the deadline); for
+// degenerate non-positive leases the margin bottoms out at zero.
 func renewAbandonMargin(lease time.Duration) time.Duration {
 	m := lease / 4
-	if m < 200*time.Millisecond {
-		m = 200 * time.Millisecond
+	if m < 25*time.Millisecond {
+		m = 25 * time.Millisecond
 	}
 	if m > 2*time.Second {
 		m = 2 * time.Second
+	}
+	if ceiling := lease/2 - time.Millisecond; m > ceiling {
+		m = ceiling
+	}
+	if m < 0 {
+		m = 0
 	}
 	return m
 }
