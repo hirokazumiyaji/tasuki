@@ -54,6 +54,16 @@ type fakeDynamo struct {
 	// is reported: a test hook to stall or record specific wake writes.
 	// It must honor ctx like the real client.
 	updateItemHook func(ctx context.Context, in *dynamodb.UpdateItemInput)
+
+	// Scripted-operation hooks for fault-injection tests (nil = legacy
+	// canned behavior above). Each runs instead of the canned response
+	// when set, so one test can route per-table/per-instance traffic
+	// (e.g. fail only one victim's cleanup deletes).
+	getItemFn    func(ctx context.Context, in *dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error)
+	queryFn      func(ctx context.Context, in *dynamodb.QueryInput) (*dynamodb.QueryOutput, error)
+	deleteItemFn func(ctx context.Context, in *dynamodb.DeleteItemInput) (*dynamodb.DeleteItemOutput, error)
+	updateItemFn func(ctx context.Context, in *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error)
+	transactFn   func(ctx context.Context, in *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error)
 }
 
 func (f *fakeDynamo) DescribeTable(ctx context.Context, in *dynamodb.DescribeTableInput, _ ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error) {
@@ -105,9 +115,15 @@ func (f *fakeDynamo) Query(ctx context.Context, in *dynamodb.QueryInput, _ ...fu
 	if f.queryErr != nil {
 		return nil, f.queryErr
 	}
+	if f.queryFn != nil {
+		return f.queryFn(ctx, in)
+	}
 	return &dynamodb.QueryOutput{Items: f.queryItems}, nil
 }
 func (f *fakeDynamo) GetItem(ctx context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	if f.getItemFn != nil {
+		return f.getItemFn(ctx, in)
+	}
 	return &dynamodb.GetItemOutput{}, nil
 }
 func (f *fakeDynamo) PutItem(ctx context.Context, in *dynamodb.PutItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
@@ -115,6 +131,9 @@ func (f *fakeDynamo) PutItem(ctx context.Context, in *dynamodb.PutItemInput, _ .
 }
 func (f *fakeDynamo) DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error) {
 	atomic.AddInt64(&f.deleteCalls, 1)
+	if f.deleteItemFn != nil {
+		return f.deleteItemFn(ctx, in)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if pk, ok := in.Key["task_pk"]; ok {
@@ -124,6 +143,9 @@ func (f *fakeDynamo) DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInpu
 }
 func (f *fakeDynamo) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
 	atomic.AddInt64(&f.updateCalls, 1)
+	if f.updateItemFn != nil {
+		return f.updateItemFn(ctx, in)
+	}
 	if f.updateGate != nil {
 		// Honor ctx like the real client: a stalled write unblocks when
 		// the caller's context times out instead of hanging forever.
@@ -138,6 +160,9 @@ func (f *fakeDynamo) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInpu
 	return &dynamodb.UpdateItemOutput{}, nil
 }
 func (f *fakeDynamo) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, _ ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
+	if f.transactFn != nil {
+		return f.transactFn(ctx, in)
+	}
 	return &dynamodb.TransactWriteItemsOutput{}, nil
 }
 

@@ -1323,9 +1323,14 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	// excluded from the ensure loop below: ensureWorkflowTask would be a
 	// no-op status-gated read for them, and a transient failure must not
 	// fail terminal success after the rows are already gone.
-	if err := b.cleanupTerminalAdvancements(context.Background(), advs); err != nil {
-		return err
-	}
+	// A per-instance cleanup failure no longer aborts the batch (Codex
+	// round-19 P2 on #291): cleanup-retries-exhausted used to return
+	// immediately, skipping later instances' sweeps (residue with no
+	// recovery: the advancement already committed) and every parent ensure
+	// (dormant parents till the orphan scan). The first error is retained
+	// while every committed instance is still swept and ensured; it is
+	// returned at the end, after notifications.
+	cleanupErr := b.cleanupTerminalAdvancements(context.Background(), advs)
 	terminal := make(map[string]bool, len(advs))
 	for _, adv := range advs {
 		if adv.Terminal != nil {
@@ -1333,8 +1338,8 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		}
 	}
 	for _, id := range parentEnsures {
-		if err := b.ensureWorkflowTask(ctx, id); err != nil {
-			return err
+		if err := b.ensureWorkflowTask(ctx, id); err != nil && cleanupErr == nil {
+			cleanupErr = err
 		}
 	}
 	for _, id := range ensures {
@@ -1346,9 +1351,12 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		if terminal[id] {
 			continue
 		}
-		if err := b.ensureWorkflowTask(ctx, id); err != nil {
-			return err
+		if err := b.ensureWorkflowTask(ctx, id); err != nil && cleanupErr == nil {
+			cleanupErr = err
 		}
+	}
+	if cleanupErr != nil {
+		return cleanupErr
 	}
 	return b.notifyAfterAdvancements(advs)
 }
@@ -1369,16 +1377,21 @@ func (b *Backend) notifyAfterAdvancements(advs []backend.Advancement) error {
 // cleanupTerminalAdvancements sweeps residual rows for every terminal
 // advancement. Callers run it immediately after the commit and before any
 // fallible post-commit work, so a throttled ensure cannot strand claimable
-// rows behind.
+// rows behind. Per-instance failures do not abort the sweep (Codex round-19
+// P2 on #291): every committed instance is still swept and the first error
+// is returned, so one victim's exhausted cleanup retries never strand later
+// instances' residue (unrecoverable once the advancement committed) while
+// the caller still continues parent/self ensures before surfacing it.
 func (b *Backend) cleanupTerminalAdvancements(ctx context.Context, advs []backend.Advancement) error {
+	var first error
 	for _, adv := range advs {
 		if adv.Terminal != nil {
-			if err := b.cleanupTerminalInstance(ctx, adv.InstanceID); err != nil {
-				return err
+			if err := b.cleanupTerminalInstance(ctx, adv.InstanceID); err != nil && first == nil {
+				first = err
 			}
 		}
 	}
-	return nil
+	return first
 }
 
 // cleanupTerminalInstance removes residual tasks, timers, inbox entries and
@@ -1436,16 +1449,21 @@ func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advance
 	// terminal status already committed, so a throttled GetItem here would
 	// otherwise skip cleanup with no recovery (retrying the advancement
 	// conflicts on the consumed sequence and no later pass removes the
-	// rows).
+	// rows). A cleanup failure is retained — not returned immediately — so
+	// the parent ensure below still runs (Codex round-19 P2 on #291, same
+	// shape as the batch path: an early return would leave a dormant
+	// parent till the orphan scan).
+	var cleanupErr error
 	if adv.Terminal != nil {
-		if err := b.cleanupTerminalInstance(context.Background(), adv.InstanceID); err != nil {
-			return err
-		}
+		cleanupErr = b.cleanupTerminalInstance(context.Background(), adv.InstanceID)
 	}
 	if parentID != "" {
-		if err := b.ensureWorkflowTask(ctx, parentID); err != nil {
-			return err
+		if err := b.ensureWorkflowTask(ctx, parentID); err != nil && cleanupErr == nil {
+			cleanupErr = err
 		}
+	}
+	if cleanupErr != nil {
+		return cleanupErr
 	}
 	if adv.Terminal != nil {
 		// The owned workflow task was deleted atomically in the

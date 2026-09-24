@@ -399,8 +399,16 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 			// so a poll can observe a task whose instance already
 			// completed. Handing it out would execute user code after
 			// completion, so verify the owning instance is still running
-			// in the same transaction. A residual task of a terminal
-			// instance is deleted here; the sweep removes the rest.
+			// in the same transaction. The status read serializes
+			// against a concurrent terminal commit (read-write conflict
+			// on the instance row aborts one side): a terminal landing
+			// BEFORE this claim is observed here and the residue
+			// deleted; a terminal landing AFTER the claim commit leaves
+			// a live lease the sweep cannot recall, fenced post-commit
+			// below (see fenceClaimedTasks) and at dispatch by the
+			// worker's pre-invoke re-check (issue-296 branch). A
+			// residual task of a terminal instance is deleted here; the
+			// sweep removes the rest.
 			instRow, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{t.InstanceID}, []string{"status"})
 			if isNotFound(err) {
 				if _, err := txn.Update(ctx, spanner.Statement{
@@ -445,9 +453,25 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // invoke user code post-completion — the terminal sweep deletes the row
 // but cannot recall the in-memory task. Each claimed task whose instance
 // is no longer running is dropped and its residue deleted best-effort here
-// (the sweep owns whatever remains). A status-read failure releases every
-// claimed lease best-effort — fenced by the claim token, detached from
-// cancellation — instead of abandoning the batch hidden for a full lease.
+// (the sweep owns whatever remains).
+//
+// RESIDUAL (Codex round-19 P1 on #291): this fence is itself a separate
+// status read, so a terminal commit landing between this read and the
+// worker's dispatch still dispatches post-completion. No backend-side read
+// can close that gap — fencing THROUGH the handoff requires the worker's
+// pre-invoke re-check immediately before invokeActivity, which lives on the
+// issue-296 branch (checkActivityFence, fail-closed) and is absent here.
+// Defense in depth across the two branches, narrowest window last:
+//  1. In-claim gate in the claim transaction (this backend: status read in
+//     the claim RW txn; DynamoDB: atomic ConditionCheck in
+//     claimTransactItems; Firestore: instance read in the claim txn) —
+//     covers terminals landing before the claim.
+//  2. This post-claim fence — narrows the window to fence-read→dispatch.
+//  3. Worker pre-invoke re-check (issue-296) — narrows it to ~0.
+//
+// A status-read failure releases every claimed lease best-effort — fenced
+// by the claim token, detached from cancellation — instead of abandoning
+// the batch hidden for a full lease.
 func (b *Backend) fenceClaimedTasks(ctx context.Context, tasks []backend.Task) ([]backend.Task, error) {
 	kept := make([]backend.Task, 0, len(tasks))
 	for _, t := range tasks {
