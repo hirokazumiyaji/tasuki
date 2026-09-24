@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hirokazumiyaji/tasuki/activity"
@@ -1520,9 +1521,6 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, claimBase t
 
 	done := make(chan struct{})
 	defer close(done)
-	// claimBase bounds the retry window below (see extendLeaseLoop): the
-	// renewal deadline derives from the actual claim, not handler start.
-	go w.extendLeaseLoop(ctx, t, done, nil, claimBase)
 
 	attempt := t.Attempt
 	if attempt < 1 {
@@ -1534,7 +1532,33 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, claimBase t
 		runCtx, cancel = context.WithTimeout(ctx, t.StartToCloseTimeout)
 		defer cancel()
 	}
-	actCtx := activity.WithEnv(runCtx, &activity.Env{
+	// Per-activity execution context (round-28 P1a): proven lease loss
+	// (ExtendLease ErrNotFound — the lease moved on, so a peer owns the
+	// activity now — or an unrestorable renewal) cancels the running
+	// activity, so it abandons instead of executing side effects
+	// concurrently with the peer. Previously the renewal loop was
+	// started with a nil loss callback: it stopped quietly while the
+	// activity kept running, and the stale worker then issued ID-only
+	// Complete/Retry, deleting or rescheduling the peer's task with
+	// duplicate side effects. Workflow turns already cancel per turn
+	// on lease loss (round-21 P2a); activities now mirror that.
+	// The parent is runCtx (itself a child of the tick ctx, with the
+	// StartToCloseTimeout bound when set), so Shutdown and the
+	// start-to-close timeout still cancel the activity; the deferred
+	// cancel avoids leaking the context chain. The loop keeps the tick
+	// ctx (not actCtx): binding it to actCtx would stop renewal at the
+	// loss signal it just sent.
+	// claimBase bounds the retry window below (see extendLeaseLoop): the
+	// renewal deadline derives from the actual claim, not handler start.
+	var leaseLost atomic.Bool
+	actRunCtx, cancelAct := context.WithCancel(runCtx)
+	defer cancelAct()
+	go w.extendLeaseLoop(ctx, t, done, func() {
+		leaseLost.Store(true)
+		cancelAct()
+	}, claimBase)
+
+	actCtx := activity.WithEnv(actRunCtx, &activity.Env{
 		Info: activity.Info{
 			InstanceID:     t.InstanceID,
 			ActivityName:   t.Name,
@@ -1550,6 +1574,24 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, claimBase t
 	})
 
 	out, err := w.invokeActivity(actCtx, act.fn, t.Input)
+	// Lease loss wins over the activity result (round-28 P1a): the
+	// renewal loop proved the lease moved on (peer reclaimed and may
+	// be executing the same activity), so the result — value or error
+	// — must not reach the ID-only Complete/Retry below, which would
+	// delete or reschedule the peer's task. This also covers a
+	// cancel-ignoring activity that returns after the loss: the flag
+	// is checked after return, not just via ctx cancellation. The
+	// task is left for the peer; natural expiry reclaims anything
+	// the peer leaves. Complete/Retry remain ID-only on all backends
+	// (see backend.Backend): the pre-commit flag check narrows the
+	// stale-write window to a post-return race, which backend
+	// worker/attempt fencing closes where the store supports it
+	// (release/nack/renewal are fenced; see below).
+	if leaseLost.Load() {
+		w.opts.Logger.Debug("activity lease lost; abandoning result without commit",
+			"task_id", t.ID, "instance_id", t.InstanceID, "activity", t.Name)
+		return actRunCtx.Err()
+	}
 	if runCtx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
 		err = fmt.Errorf("activity start-to-close timeout")
 	}

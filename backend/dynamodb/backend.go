@@ -666,7 +666,42 @@ func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Durati
 		}
 		return err
 	}
-	return b.updateTask(ctx, t.ID, "SET visible_at = :v", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(d)))}, "")
+	// Fence the activity renewal to the claimed generation (worker +
+	// attempt, round-28 P2b): a delayed renewal from a stale holder that
+	// lands after a peer reclaimed and retried the activity must not
+	// replace the peer's retry delay with a full lease, hiding the task.
+	// The update applies only while the item still carries the claimed
+	// ownership; otherwise the lease moved on and the renewal reports
+	// ErrNotFound so the worker treats it as stale. An empty WorkerID
+	// falls back to the legacy routing-only update so older/test call
+	// sites that pass only an ID still renew.
+	return b.updateActivityLease(ctx, t, d)
+}
+
+// activityRenewalFence fences an activity renewal to the claimed task
+// generation (worker + attempt), mirroring the relational/memory fencing
+// from round-20. A delayed renewal that lands after a peer reclaim+retry
+// must not overwrite the successor's visible_at. An empty WorkerID yields
+// an empty condition so legacy callers fall back to routing-only update.
+func activityRenewalFence(t backend.Task, visible int64) (string, map[string]types.AttributeValue) {
+	values := map[string]types.AttributeValue{":v": avN(visible)}
+	if t.WorkerID == "" {
+		return "", values
+	}
+	return "kind = :kind AND worker_id = :w AND attempt = :a",
+		map[string]types.AttributeValue{
+			":v": avN(visible),
+			":w": avS(t.WorkerID), ":a": avN(int64(t.Attempt)),
+		}
+}
+
+// updateActivityLease renews one activity task's visibility fenced on the
+// claimed generation (see ExtendLease). It mirrors the relational/memory
+// fencing from round-20: worker_id + attempt predicate, ErrNotFound on
+// mismatch.
+func (b *Backend) updateActivityLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	cond, values := activityRenewalFence(t, timeToN(nowUTC().Add(d)))
+	return b.updateTask(ctx, t.ID, "SET visible_at = :v", values, cond)
 }
 
 // workflowRenewalFence fences a workflow renewal to the claimed task

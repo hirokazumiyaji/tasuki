@@ -68,6 +68,14 @@ type Backend interface {
 	CommitAdvancement(ctx context.Context, adv Advancement) error
 	CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error
 	// RetryActivity clears the lease and defers activity visibility by delay (store clock).
+	// It addresses the task by ID alone (no worker/attempt fencing):
+	// the worker-side lease-loss abandon (see handleActivity) is the
+	// primary defense — a stale worker whose lease moved on skips the
+	// call instead of touching a peer's task. A post-return race (loss
+	// after the result but before the store op) can still reach the
+	// store; release/nack/renewal are fenced on the claim token, while
+	// Complete/Retry stay ID-only on every backend (changing them would
+	// break the store contract) and rely on that abandon check.
 	RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error
 	FireDueTimers(ctx context.Context, limit int) (int, error)
 

@@ -606,7 +606,43 @@ func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Durati
 			return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
 		})
 	}
-	return b.updateTask(ctx, t.ID, false, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
+	// Fence the activity renewal to the claimed generation (worker +
+	// attempt, round-28 P2b): a delayed renewal from a stale holder that
+	// lands after a peer reclaimed and retried the activity must not
+	// replace the peer's retry delay with a full lease. Mirrors the
+	// relational/memory fencing from round-20; ErrNotFound on mismatch.
+	r := b.ref("wf_tasks", actTaskID(t.ID))
+	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		s, e := tx.Get(r)
+		if isNotFound(e) {
+			return backend.ErrNotFound
+		}
+		if e != nil {
+			return e
+		}
+		if !s.Exists() {
+			return backend.ErrNotFound
+		}
+		if err := checkActivityRenewalDoc(s.Data(), t); err != nil {
+			return err
+		}
+		return tx.Update(r, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
+	})
+}
+
+// checkActivityRenewalDoc reports whether the activity task document still
+// carries the claimed generation (claim ownership). A mismatch means a
+// peer reclaim moved the lease on, and the stale renewal must not extend
+// it. An empty WorkerID skips the ownership check so legacy callers that
+// pass only an ID still renew (mirroring checkReleaseDoc).
+func checkActivityRenewalDoc(data map[string]any, t backend.Task) error {
+	if data == nil {
+		return backend.ErrNotFound
+	}
+	if t.WorkerID != "" && (str(data, "worker_id") != t.WorkerID || i64(data, "attempt") != int64(t.Attempt)) {
+		return backend.ErrNotFound
+	}
+	return nil
 }
 
 // checkWorkflowRenewalDoc reports whether the workflow task document still
