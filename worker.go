@@ -594,8 +594,21 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					// already released this turn cannot be followed by a
 					// second release.
 					stopRenewal()
+					// A canceled tick abandons the turn regardless of
+					// herr (round-19 P2b): Shutdown racing an early
+					// non-cancel error (loadWorkflowState, registry
+					// lookup) used to miss the abandon path (herr is
+					// not a context error) and fall through to
+					// untrack + nack/release with the canceled tick
+					// ctx — which a context-aware backend rejects —
+					// leaving the task untracked so neither this
+					// path nor Shutdown's releaseInFlight can release
+					// it, and failover waits for lease expiry. Check
+					// ctx.Err() first: any canceled tick abandons
+					// with an ownership-gated detached release
+					// (see claimWorkflowRelease) instead.
 					if errors.Is(herr, errTurnAbandoned) ||
-						(ctx.Err() != nil && isCancellationError(herr)) {
+						ctx.Err() != nil {
 						// Worker lifecycle ended mid-turn: abandon the turn
 						// and release the lease promptly so a peer retries
 						// instead of committing shutdown as a failure.
@@ -871,13 +884,6 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 // abandoned — lease released, nothing committed — instead of persisting the
 // shutdown as a terminal workflow failure.
 var errTurnAbandoned = errors.New("tasuki: workflow turn abandoned on shutdown")
-
-// isCancellationError reports context lifecycle errors. workflow.ErrCanceled
-// (user-requested cancellation) is deliberately excluded: it is a legitimate
-// terminal outcome, unlike Shutdown-induced context.Canceled.
-func isCancellationError(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
 
 // releaseWorkflowLease releases a task lease with a detached context so the
 // release survives worker shutdown (the tick context is already canceled).
@@ -1525,6 +1531,17 @@ func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context, runCtx contex
 		act, err := w.reg.activity(name)
 		if err != nil {
 			return nil, err
+		}
+		// Reject an already-canceled runCtx BEFORE invoking in both
+		// branches below (round-19 P2a): a workflow that catches
+		// cancellation from one local activity and calls ExecuteLocal
+		// again passes the same canceled runCtx, and invoking act.fn
+		// (or launching the timeout goroutine that invokes it) would
+		// run side effects post-shutdown. The post-call checks alone
+		// cannot prevent the invocation. Return the cancellation
+		// without invoking fn or launching a goroutine.
+		if runCtx != nil && runCtx.Err() != nil {
+			return nil, runCtx.Err()
 		}
 		// Run with the worker turn's context so Shutdown cancels a running
 		// local activity.
