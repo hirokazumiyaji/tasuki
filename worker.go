@@ -1175,6 +1175,34 @@ func (w *Worker) guardedDetachedCommit(taskID int64, tok claimToken, commitCtx c
 	return err
 }
 
+// waitRenewDoneBounded joins a renewal loop's renewDone channel with the
+// same commitJoinCap bound as the teardown path (round-19 P1). A renewal
+// stuck in a context-ignoring backend holds renewDone open past grace
+// expiry (the ordinary ExtendLease runs on the execution context, which
+// such a backend ignores), so an unconditional wait would hold the
+// activity slot forever: the handler would never actWg.Done nor release
+// its semaphore slot, and with ActivityConcurrency==1 a restarted worker
+// could not execute activities. Giving up releases the slot; the stuck
+// renewal landing later is harmless: ordinary renewals refresh only
+// token-matching in-flight entries (transferred out or released, so the
+// refresh is a no-op) and admission stays generation- and expiry-gated,
+// while cover renewals observe the dropped guard and exit without
+// issuing. Reports true when the loop exited, false on give-up (the
+// caller drops the guard and proceeds).
+func waitRenewDoneBounded(renewDone <-chan struct{}) bool {
+	if renewDone == nil {
+		return true
+	}
+	timer := time.NewTimer(commitJoinCap)
+	defer timer.Stop()
+	select {
+	case <-renewDone:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
 // joinCommitStop builds the commit-scoped teardown for a stop func from
 // ensureCommitRenewal so the deferred stop also terminates AND joins
 // the inherited renewal loop before the handler drops its guard
@@ -2262,8 +2290,19 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		// releases (see claimReleaseOwnership): releasing a lease
 		// Shutdown already handed to a peer would clear the peer's lease
 		// and enable duplicate execution.
+		//
+		// The join is bounded by commitJoinCap (round-19 P1, see
+		// waitRenewDoneBounded): grace expiry with an ordinary ExtendLease
+		// blocked in a context-ignoring backend would otherwise hold
+		// renewDone open forever while the context-aware activity already
+		// returned — bypassing the bounded joinCommitStop teardown (not
+		// yet installed on this path) and holding the activity slot
+		// forever. On give-up the guard is dropped and the release
+		// proceeds; the late renewal is harmless per above.
 		committing.Store(false)
-		<-renewDone
+		if !waitRenewDoneBounded(renewDone) {
+			w.dropDetachedGuard(t.ID, tok)
+		}
 		if w.claimReleaseOwnership(t.ID, tok) {
 			commitCtx, commitCancel := w.commitContext(ctx)
 			_ = w.backend.ReleaseLease(commitCtx, t)
@@ -2381,10 +2420,18 @@ var errLeaseLost = errors.New("tasuki: lease lost; skipping detached commit")
 // is done: with a live ctx the loop cannot be in detached mode (entry
 // requires ctx.Done) and the cleared flag prevents any future entry, so
 // the loop exits on done at handler return.
+//
+// The canceled-ctx join is bounded by commitJoinCap (round-19 P1, see
+// waitRenewDoneBounded): like the cancellation-path release above, this
+// runs before the bounded joinCommitStop teardown is installed, so an
+// ordinary ExtendLease blocked in a context-ignoring backend would
+// otherwise hold the activity slot forever. On give-up the handler's
+// deferred guard drop still runs at return, and the late renewal is
+// harmless per above.
 func (w *Worker) exitDetachedCommit(ctx context.Context, renewDone <-chan struct{}, committing *atomic.Bool) {
 	committing.Store(false)
 	if ctx.Err() != nil {
-		<-renewDone
+		waitRenewDoneBounded(renewDone)
 	}
 }
 
@@ -2432,11 +2479,21 @@ func (w *Worker) ensureCommitRenewal(ctx context.Context, taskID int64, tok clai
 	// ambiguous. Both channels are closed exactly once by the loop (ack on
 	// detached entry, renewDone on return); done stays open until handler
 	// return, so a detached ack cannot be followed by an exit before the
-	// commit below.
+	// commit below. Bounded by commitJoinCap (round-19 P1): a renewal
+	// stuck in a context-ignoring backend holds both channels open past
+	// grace expiry, and an unconditional wait here would hold the slot
+	// before the bounded teardown is installed. On give-up the handoff
+	// proceeds to the synchronous pre-commit renewal below; the late
+	// ordinary renewal is harmless (see waitRenewDoneBounded) and the
+	// post-commit join stays bounded.
 	if ctx.Err() != nil && renewDone != nil && detachedAck != nil {
+		timer := time.NewTimer(commitJoinCap)
 		select {
 		case <-renewDone:
+			timer.Stop()
 		case <-detachedAck:
+			timer.Stop()
+		case <-timer.C:
 		}
 	}
 	// Synchronous pre-commit renewal: proves the lease is still ours and
