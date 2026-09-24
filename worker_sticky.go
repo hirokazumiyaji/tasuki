@@ -343,9 +343,24 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 			// commit would otherwise land after it and overwrite
 			// what it wrote. Stop new cover from issuing and join
 			// the admitted calls (bounded like the exclusive-commit
-			// path) before requeueing.
+			// path) before requeueing. When the join gives up
+			// (round-28 P2b) a cover renewal ignoring cancellation
+			// is still live: suppress the requeue and leave the
+			// task to natural expiry reclaim — an immediate
+			// release/nack would land before the late renewal,
+			// which then replaces visible_at and hides the retry
+			// for a full lease. Requeueing only after a confirmed
+			// drain keeps the release/nack ordered after every
+			// cover call that could overwrite it.
 			g.committing.Store(false)
-			w.joinStaleCoverForRequeue(g.task.ID, cctx)
+			if !w.joinStaleCoverForRequeue(g.task.ID, cctx) {
+				w.opts.Logger.Debug("skipping workflow requeue; cover renewal still in flight, leaving to natural expiry",
+					"instance_id", g.p.instanceID, "task_id", g.task.ID)
+				if errors.Is(err, backend.ErrConflict) || errors.Is(err, backend.ErrSuperseded) {
+					w.dropSticky(g.p.instanceID)
+				}
+				return
+			}
 			_ = w.finishWorkflowCommit(ctx, g.task, g.p.baseJournal, g.p.adv, err)
 			return
 		}
@@ -597,6 +612,15 @@ func (w *Worker) guardedDetachedBatchCommit(gated []flushGuardedCommit, commitCa
 	return live, nil, nil
 }
 
+// round28CoverStoreHook pauses Phase 1 success goroutines between the
+// renewal return and the fenceMu publish (round-28 P2a regression test
+// only; nil in production). It lets the test force the
+// success-vs-timeout interleaving deterministically: the renewal has
+// returned nil (guard present) but the covered store has not run, so the
+// timeout fence trips first and the resuming goroutine must compensate
+// instead of marking covered.
+var round28CoverStoreHook func()
+
 // startFlushCover keeps every gated flush entry's lease live until the
 // flush returns (round-23 P2). Workflow turns run no renewal loop —
 // unlike activities, whose extendLeaseLoop hands off to detached cover
@@ -661,6 +685,21 @@ func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit
 	// backstop trip below covers errors that bypass the internal one)
 	// and starts no ticker loop; the commit gate then skips the entry.
 	covered := make([]atomic.Bool, len(gated))
+	// fenceMu makes the success publish and the timeout fencing atomic
+	// (round-28 P2a): without it a renewal that returns success
+	// concurrently with the flush context expiring is descheduled
+	// before its covered store, the timeout branch observes
+	// covered==false and trips the guard, and the goroutine then marks
+	// covered without compensation — the commit gates reject the
+	// missing guard, but the successful backend-side renewal already
+	// hid the unowned task for a full lease. Holding fenceMu across
+	// the timedOut check + covered store on the success path and
+	// across the timedOut set + covered check + trip collection on the
+	// timeout path publishes exactly once: either the success wins
+	// (covered, no trip, commit admitted) or the timeout wins
+	// (tripped, uncovered, success compensates below).
+	var fenceMu sync.Mutex
+	timedOut := false
 	var initWg sync.WaitGroup
 	for i, g := range gated {
 		initWg.Add(1)
@@ -697,7 +736,27 @@ func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit
 				w.compensateStaleCoverRenewal(ctx, g.task, leaseExpiry)
 				return
 			}
+			if round28CoverStoreHook != nil {
+				round28CoverStoreHook()
+			}
+			fenceMu.Lock()
+			if timedOut {
+				fenceMu.Unlock()
+				// Lost the race to the timeout fence (round-28
+				// P2a): the guard is already tripped and no
+				// commit will ever be admitted for this entry,
+				// but this successful backend-side renewal
+				// already extended the lease. Compensate with
+				// the same fenced release as the failure path
+				// so the task becomes reclaimable promptly
+				// instead of sitting unowned and hidden for a
+				// full lease. covered stays false so Phase 2
+				// starts no loop for the tripped entry.
+				w.compensateStaleCoverRenewal(ctx, g.task, leaseExpiry)
+				return
+			}
 			covered[i].Store(true)
+			fenceMu.Unlock()
 		}(i, g, w.detGuardDeadline(g.task.ID, g.p.tok))
 	}
 	// Bounded join (round-25 P1): the pre-fix initWg.Wait held the flush
@@ -723,10 +782,22 @@ func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit
 	select {
 	case <-initDone:
 	case <-ctx.Done():
+		// Round-28 P2a: collect the still-unproven entries under
+		// fenceMu so a concurrent success publish cannot slip
+		// between the covered check and the trip (see fenceMu
+		// above). Trips fire after unlocking; detMu is never held
+		// across fenceMu and vice versa, so the order cannot invert.
+		fenceMu.Lock()
+		timedOut = true
+		var toTrip []flushGuardedCommit
 		for i, g := range gated {
 			if !covered[i].Load() {
-				w.tripDetachedGuard(g.task.ID, g.p.tok)
+				toTrip = append(toTrip, g)
 			}
+		}
+		fenceMu.Unlock()
+		for _, g := range toTrip {
+			w.tripDetachedGuard(g.task.ID, g.p.tok)
 		}
 	}
 	// Phase 2: periodic cover for the entries proven live above.

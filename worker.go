@@ -780,10 +780,15 @@ func (w *Worker) coverRenewExit(taskID int64) {
 // window (every already-blocked renewal) and bounded the same way.
 //
 // The wait is bounded by ctx and commitJoinCap like the exclusive-commit
-// path. On give-up the requeue still proceeds — the task must become
-// visible, and unlike the pre-write join there is nothing to abort —
-// leaving the same bounded-overwrite residual as other give-ups.
-func (w *Worker) joinStaleCoverForRequeue(taskID int64, ctx context.Context) {
+// path. It reports whether the barrier drained: on give-up (false) the
+// caller must NOT requeue (round-28 P2b) — a periodic cover renewal
+// ignoring cancellation is still live past the bound, and an immediate
+// release/nack would land before it, letting the late ExtendLease
+// overwrite visible_at and hide the retry for a full lease. The task is
+// left to natural expiry reclaim instead, which already accounts for the
+// extension; requeueing promptly is worse than requeueing late. A drained
+// (true) barrier means no cover call can overlap the requeue store op.
+func (w *Worker) joinStaleCoverForRequeue(taskID int64, ctx context.Context) bool {
 	w.detMu.Lock()
 	e := w.coverInflight[taskID]
 	var idle chan struct{}
@@ -792,7 +797,7 @@ func (w *Worker) joinStaleCoverForRequeue(taskID int64, ctx context.Context) {
 	}
 	w.detMu.Unlock()
 	if idle == nil {
-		return
+		return true
 	}
 	timer := time.NewTimer(commitJoinCap)
 	defer timer.Stop()
@@ -801,8 +806,11 @@ func (w *Worker) joinStaleCoverForRequeue(taskID int64, ctx context.Context) {
 	}
 	select {
 	case <-idle:
+		return true
 	case <-ctx.Done():
+		return false
 	case <-timer.C:
+		return false
 	}
 }
 
@@ -2549,13 +2557,17 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 				w.exitDetachedCommit(ctx, renewDone, &committing)
 				return ctx.Err()
 			}
-			stopCommitRenewal, herr := w.ensureCommitRenewal(ctx, t.ID, tok, renewDone, detachedEntered)
+			// Round-28 P1a: create the bounded commit context FIRST so
+			// the handoff renewal is bounded by min(commit bound,
+			// lease logic) instead of blocking past CommitTimeout.
+			commitCtx, commitCancel := w.commitContext(ctx)
+			stopCommitRenewal, herr := w.ensureCommitRenewalWithCommitCtx(ctx, commitCtx, t.ID, tok, renewDone, detachedEntered)
 			if herr != nil {
+				commitCancel()
 				w.exitDetachedCommit(ctx, renewDone, &committing)
 				return herr
 			}
 			defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)()
-			commitCtx, commitCancel := w.commitContext(ctx)
 			// Nack rewrites visible_at in place: serialize against
 			// cover renewals (round-11 P1b).
 			rerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, true, func() error {
@@ -2568,13 +2580,15 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			w.exitDetachedCommit(ctx, renewDone, &committing)
 			return ctx.Err()
 		}
-		stopCommitRenewal, herr := w.ensureCommitRenewal(ctx, t.ID, tok, renewDone, detachedEntered)
+		// Round-28 P1a: bound the handoff by the pre-created commit ctx.
+		commitCtx, commitCancel := w.commitContext(ctx)
+		stopCommitRenewal, herr := w.ensureCommitRenewalWithCommitCtx(ctx, commitCtx, t.ID, tok, renewDone, detachedEntered)
 		if herr != nil {
+			commitCancel()
 			w.exitDetachedCommit(ctx, renewDone, &committing)
 			return herr
 		}
 		defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)()
-		commitCtx, commitCancel := w.commitContext(ctx)
 		// failActivity deletes the task row: shared commit, so a
 		// renewal running during a blocked Complete can still cancel
 		// it mid-call on observed loss (round-10 P1b).
@@ -2694,13 +2708,15 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 				w.exitDetachedCommit(ctx, renewDone, &committing)
 				return ctx.Err()
 			}
-			stopCommitRenewal, herr := w.ensureCommitRenewal(ctx, t.ID, tok, renewDone, detachedEntered)
+			// Round-28 P1a: bound the handoff by the pre-created commit ctx.
+			commitCtx, commitCancel := w.commitContext(ctx)
+			stopCommitRenewal, herr := w.ensureCommitRenewalWithCommitCtx(ctx, commitCtx, t.ID, tok, renewDone, detachedEntered)
 			if herr != nil {
+				commitCancel()
 				w.exitDetachedCommit(ctx, renewDone, &committing)
 				return herr
 			}
 			defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)()
-			commitCtx, commitCancel := w.commitContext(ctx)
 			// failActivity deletes the task row: shared commit (see above).
 			rerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, false, func() error {
 				return w.failActivity(commitCtx, t, err)
@@ -2722,13 +2738,15 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			w.exitDetachedCommit(ctx, renewDone, &committing)
 			return ctx.Err()
 		}
-		stopCommitRenewal, herr := w.ensureCommitRenewal(ctx, t.ID, tok, renewDone, detachedEntered)
+		// Round-28 P1a: bound the handoff by the pre-created commit ctx.
+		commitCtx, commitCancel := w.commitContext(ctx)
+		stopCommitRenewal, herr := w.ensureCommitRenewalWithCommitCtx(ctx, commitCtx, t.ID, tok, renewDone, detachedEntered)
 		if herr != nil {
+			commitCancel()
 			w.exitDetachedCommit(ctx, renewDone, &committing)
 			return herr
 		}
 		defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)()
-		commitCtx, commitCancel := w.commitContext(ctx)
 		// RetryActivity rewrites visible_at in place: serialize against
 		// cover renewals (round-11 P1b).
 		if rerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, true, func() error {
@@ -2764,13 +2782,15 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		w.exitDetachedCommit(ctx, renewDone, &committing)
 		return ctx.Err()
 	}
-	stopCommitRenewal, herr := w.ensureCommitRenewal(ctx, t.ID, tok, renewDone, detachedEntered)
+	// Round-28 P1a: bound the handoff by the pre-created commit ctx.
+	commitCtx, commitCancel := w.commitContext(ctx)
+	stopCommitRenewal, herr := w.ensureCommitRenewalWithCommitCtx(ctx, commitCtx, t.ID, tok, renewDone, detachedEntered)
 	if herr != nil {
+		commitCancel()
 		w.exitDetachedCommit(ctx, renewDone, &committing)
 		return herr
 	}
 	defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)()
-	commitCtx, commitCancel := w.commitContext(ctx)
 	// CompleteActivity deletes the task row: shared commit (see above).
 	if cerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, false, func() error {
 		return w.backend.CompleteActivity(commitCtx, t.ID, journal.Event{
@@ -2831,6 +2851,145 @@ func (w *Worker) exitDetachedCommit(ctx context.Context, renewDone <-chan struct
 	if ctx.Err() != nil {
 		waitRenewDoneBounded(renewDone)
 	}
+}
+
+// rebaseDetachedCover re-parents taskID's detached-cover context onto parent
+// (round-28 P1a). beginDetachedCommit seeds coverCtx from
+// context.Background so cover outlives execution cancellation, but the
+// activity result commit runs under a bounded commit context (see
+// commitContext: CommitTimeout normally, ShutdownReleaseTimeout after
+// Shutdown begins) and its documented bound must hold for the whole
+// commit — including the pre-commit renewal. renewOnceDetached derives
+// its store-call context via WithTimeout(coverCtx, leaseDuration), so a
+// coverCtx that is a child of the commit context yields
+// min(commit deadline, lease-based timeout) for every renewal: a
+// context-aware backend aborts promptly on commit expiry, while a
+// context-ignoring one is cut off by the bounded handoff wait below
+// (see renewOnceDetachedBounded) instead of pinning the activity slot
+// past CommitTimeout. The old background-derived cancel fires on
+// replacement; no renewal is in flight yet at the call sites (the
+// handoff has not run), so nothing is disturbed. A missing or
+// superseded guard is a no-op.
+func (w *Worker) rebaseDetachedCover(taskID int64, tok claimToken, parent context.Context) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	w.detMu.Lock()
+	defer w.detMu.Unlock()
+	gd, ok := w.detGuard[taskID]
+	if !ok || gd.epoch != tok.epoch || gd.seq != tok.seq {
+		return
+	}
+	oldCancel := gd.coverCancel
+	nctx, ncancel := context.WithCancel(parent)
+	gd.coverCtx = nctx
+	gd.coverCancel = ncancel
+	w.detGuard[taskID] = gd
+	if oldCancel != nil {
+		oldCancel()
+	}
+}
+
+// renewOnceDetachedBounded runs one detached pre-commit renewal bounded by
+// both the commit context and the lease duration (round-28 P1a): the
+// activity-result paths must not block past the advertised commit bound
+// on a stalled ExtendLease. The renewal itself derives
+// min(commit deadline, lease timeout) once the cover is rebased (see
+// rebaseDetachedCover), which bounds a context-aware backend; a
+// context-ignoring backend ignores that deadline and would still block
+// the synchronous call indefinitely — holding the activity slot (and,
+// across Shutdown, the restart) with no bound. Running the call in a
+// goroutine and waiting on the commit context plus a lease-duration timer
+// bounds that case too: on give-up the guard is tripped so the commit
+// aborts, the late call finds the missing guard and reports loss without
+// refreshing (see renewOnceDetached), and the handler releases its slot
+// instead of parking it. The late backend-side ID-only write may still
+// land, extending the lease once; the aborted commit leaves the task
+// untracked for natural expiry reclaim, which already accounts for such
+// an extension. Reports errLeaseLost on give-up.
+func (w *Worker) renewOnceDetachedBounded(commitCtx context.Context, taskID int64, tok claimToken) error {
+	if commitCtx == nil {
+		commitCtx = context.Background()
+	}
+	type res struct{ err error }
+	ch := make(chan res, 1)
+	go func() {
+		ch <- res{err: w.renewOnceDetached(commitCtx, taskID, tok)}
+	}()
+	lease := w.leaseDuration()
+	if lease <= 0 {
+		lease = 30 * time.Second
+	}
+	timer := time.NewTimer(lease)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.err
+	case <-commitCtx.Done():
+		w.tripDetachedGuard(taskID, tok)
+		return fmt.Errorf("%w: pre-commit renewal bounded by commit context", errLeaseLost)
+	case <-timer.C:
+		w.tripDetachedGuard(taskID, tok)
+		return fmt.Errorf("%w: pre-commit renewal bounded by lease", errLeaseLost)
+	}
+}
+
+// ensureCommitRenewalWithCommitCtx is ensureCommitRenewal bounded by a
+// pre-created commit context (round-28 P1a). Callers create the bounded
+// commit context FIRST via commitContext, rebase the detached cover onto
+// it, then hand off: the synchronous pre-commit renewal runs bounded by
+// min(commit bound, lease logic) instead of blocking on the execution
+// context past CommitTimeout. execCtx drives the handoff-join liveness
+// check (canceled execution needs the fate join); commitCtx bounds the
+// renewal and — via the rebased cover — every renewal the scoped
+// replacement issues. See ensureCommitRenewal for the handoff itself.
+func (w *Worker) ensureCommitRenewalWithCommitCtx(execCtx, commitCtx context.Context, taskID int64, tok claimToken, renewDone <-chan struct{}, detachedEntered ...<-chan struct{}) (func(), error) {
+	w.rebaseDetachedCover(taskID, tok, commitCtx)
+	var detachedAck <-chan struct{}
+	if len(detachedEntered) > 0 {
+		detachedAck = detachedEntered[0]
+	}
+	if execCtx.Err() != nil && renewDone != nil && detachedAck != nil {
+		timer := time.NewTimer(commitJoinCap)
+		select {
+		case <-renewDone:
+			timer.Stop()
+		case <-detachedAck:
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
+	if err := w.renewOnceDetachedBounded(commitCtx, taskID, tok); err != nil {
+		return nil, fmt.Errorf("%w: pre-commit renewal failed: %v", errLeaseLost, err)
+	}
+	if renewDone != nil {
+		select {
+		case <-renewDone:
+		default:
+			return func() {}, nil
+		}
+	} else {
+		return func() {}, nil
+	}
+	d := w.leaseDuration() / 2
+	if d <= 0 {
+		return func() {}, nil
+	}
+	done := make(chan struct{})
+	ticker := time.NewTicker(d)
+	var detached atomic.Bool
+	detached.Store(true)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		w.renewUntilDone(execCtx, taskID, tok, done, ticker, &detached)
+	}()
+	return func() {
+		close(done)
+		wg.Wait()
+		ticker.Stop()
+	}, nil
 }
 
 // ensureCommitRenewal performs the true renewal-loop handoff for a result
