@@ -1293,6 +1293,13 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	if len(items) > backend.InboxBatchLimit(b.Capabilities()) {
 		return backend.ErrBatchTooLarge
 	}
+	// No terminal-specific cap here (cf. Firestore's
+	// firestoreTerminalInboxBatchLimit, Codex round-25 P2 on #296): a Spanner
+	// terminal first-send costs at most one marker row plus one base-guard
+	// row plus one inbox row (3 mutations) plus one inbox-seq mutation —
+	// 100*3+1=301 mutations, far below the 20,000-mutation commit limit, and
+	// composite (instance_id, dedupe_id) keys never alias across IDs, so no
+	// dual-write compat docs are needed.
 	var inserted int
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		// Stamp inside the transaction (per attempt): a transaction that

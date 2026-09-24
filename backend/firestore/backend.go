@@ -1237,6 +1237,17 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
 }
 
+// firestoreTerminalInboxBatchLimit caps terminal-instance signal batches
+// below the generic InboxBatchLimit (Codex round-25 P2 on #296): a terminal
+// first-send with a fresh DedupeID writes up to two marker docs (framed plus
+// rolling-upgrade dual), two base-guard docs (framed plus dual), and one
+// inbox doc — 5 writes per item — plus one flushInboxSeqs write. A 100-item
+// terminal batch therefore needs 100*5+1=501 writes, exceeding Firestore's
+// 500-write transaction limit even though InboxBatchLimit permits 100 items.
+// Running batches stay at the generic limit (worst case two guard docs plus
+// one inbox per item: 100*3+1=301 writes). 99*5+1=496 fits with headroom.
+const firestoreTerminalInboxBatchLimit = 99
+
 func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items []backend.InboxItem) error {
 	if len(items) == 0 {
 		return nil
@@ -1247,6 +1258,12 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil {
 		return err
+	}
+	// Fast path for the terminal write budget (see above): the in-transaction
+	// check below covers a running→terminal race between this read and the
+	// commit, but rejecting here avoids opening a doomed transaction.
+	if inst.Status != "running" && len(items) > firestoreTerminalInboxBatchLimit {
+		return backend.ErrBatchTooLarge
 	}
 	var inserted int
 	err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
@@ -1296,6 +1313,14 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		// does. (Same-batch duplicates still collapse to one insert
 		// so a batch never issues conflicting Creates.)
 		terminal := str(isnap.Data(), "status") != "running"
+		// Enforce the terminal write budget inside the transaction as well:
+		// the instance may have flipped to terminal after the pre-read above
+		// (running→terminal race), turning a 100-item running batch into a
+		// 501-write terminal commit. Fail fast with ErrBatchTooLarge instead
+		// of a deterministic Firestore limit error.
+		if terminal && len(items) > firestoreTerminalInboxBatchLimit {
+			return backend.ErrBatchTooLarge
+		}
 		// Firestore requires all reads before writes; also skip same-batch DedupeID dups.
 		skip := make([]bool, len(items))
 		createDoc := make([]string, len(items))
@@ -1478,18 +1503,18 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			baseHit := false
 			canonicalKey := escapeDedupeID(it.DedupeID)
 			fallbackKey := rawFallbackDedupeKey(it.DedupeID)
-			canonFramedFree, canonLegacyFree := true, true
-			fbFramedFree, fbLegacyFree := true, true
+			canonProbe := dedupeKeyProbe{framedFree: true, legacyFree: true}
+			fbProbe := dedupeKeyProbe{framedFree: true, legacyFree: true}
 			for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 				pr, err := b.probeDedupeKey(tx, "wf_signal_dedupe", instanceID, bk)
 				if err != nil {
 					return err
 				}
 				if bk == canonicalKey {
-					canonFramedFree, canonLegacyFree = pr.framedFree, pr.legacyFree
+					canonProbe = pr
 				}
 				if bk == fallbackKey {
-					fbFramedFree, fbLegacyFree = pr.framedFree, pr.legacyFree
+					fbProbe = pr
 				}
 				if matchOwnedDedupeRow(it.DedupeID, bk, pr, instanceID) {
 					baseHit = true
@@ -1502,7 +1527,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				continue
 			}
 			created[it.DedupeID] = true
-			if target, ok := pickDedupeGuardTarget(instanceID, canonicalKey, fallbackKey, canonFramedFree, canonLegacyFree, fbFramedFree, fbLegacyFree, reserved); ok {
+			if target, ok := pickDedupeGuardTarget(instanceID, it.DedupeID, canonicalKey, fallbackKey, canonProbe, fbProbe, reserved); ok {
 				reserved[target.docID] = true
 				createDoc[i] = target.docID
 				createVer[i] = target.ver
@@ -1510,7 +1535,10 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				// a framed guard also lands under its legacy-format doc
 				// ID so pre-framing nodes see the guard. Legacy targets
 				// need no counterpart (old readers see them directly).
-				if dual, ok := dualDedupeGuardDoc(instanceID, target, canonicalKey, fallbackKey, canonLegacyFree, fbLegacyFree, reserved); ok {
+				// Dual-write needs the PHYSICAL legacy availability (a
+				// foreign-occupied legacy leg still collides), not the
+				// effective availability pick used above.
+				if dual, ok := dualDedupeGuardDoc(instanceID, target, canonicalKey, fallbackKey, canonProbe.legacyFree, fbProbe.legacyFree, reserved); ok {
 					reserved[dual.docID] = true
 					createDocDual[i] = dual.docID
 				}

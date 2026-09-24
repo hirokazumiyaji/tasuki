@@ -505,23 +505,44 @@ type dedupeGuardTarget struct {
 	ver   int64
 }
 
+// legacyLegBlocks reports whether an occupied legacy leg could be this
+// instance's guard for the requested DedupeID (Codex round-25 P2 on #296):
+// only then does it veto a free framed slot. A foreign row — a different
+// instance (docInstanceMatches false) or a different key whose legacy doc
+// aliases this one (matchDedupeRow false, e.g. instance "3:3" key "x" whose
+// framed doc "3:3:3:x" is instance "3:3" key "3:x"'s legacy doc) — must not
+// veto: the framed doc is a different document, probes match the framed
+// guard first (see matchOwnedDedupeRow), and retries keep deduping. Requiring
+// both legs free for every key left such signals permanently unguarded, with
+// every retry appending another inbox event.
+func legacyLegBlocks(requestedRaw, candidateKey string, legacyDoc map[string]any, instanceID string) bool {
+	if legacyDoc == nil {
+		return false
+	}
+	if !docInstanceMatches(legacyDoc, instanceID) {
+		return false
+	}
+	return matchDedupeRow(requestedRaw, candidateKey, legacyDoc)
+}
+
 // pickDedupeGuardTarget chooses where to create the guard for a DedupeID
-// with no owned guard found (Codex round-18 on #296). Each availability flag
-// reports whether that candidate doc is free (unoccupied). Preference is
-// existing behavior first — framed canonical when the whole canonical key is
-// free, then framed fallback when the whole fallback key is free (a row at
-// either framing occupies the key: creating over the other framing would
-// fork the guard) — with the legacy framings as overflow for framed docs
-// occupied by other rows: the legacy leg is consulted by probes (see
-// matchOwnedDedupeRow), so the guard still dedupes retries. Docs already
-// reserved by earlier items of the same batch count as unavailable:
-// transaction reads don't see buffered Creates, so two items choosing one
-// doc fail the whole batch deterministically on every retry (round-18 P2).
-// ok=false when nothing is free: the caller inserts unguarded
+// with no owned guard found (Codex round-18 on #296, refined round-25 P2).
+// Probes carry both framings' rows plus per-framing availability (see
+// probeDedupeKey): a framed doc occupied by any row still collides, but a
+// legacy leg occupied by a foreign row no longer vetoes the free framed slot
+// (see legacyLegBlocks) — the framed guard still dedupes retries via
+// matchOwnedDedupeRow. Preference is existing behavior first — framed
+// canonical when usable, then framed fallback — with the legacy framings as
+// overflow for framed docs occupied by other rows: the legacy leg is
+// consulted by probes (see matchOwnedDedupeRow), so the guard still dedupes
+// retries. Docs already reserved by earlier items of the same batch count as
+// unavailable: transaction reads don't see buffered Creates, so two items
+// choosing one doc fail the whole batch deterministically on every retry
+// (round-18 P2). ok=false when nothing is free: the caller inserts unguarded
 // (duplicate-never-drop) instead of failing the batch.
-func pickDedupeGuardTarget(instanceID, canonicalKey, fallbackKey string, canonFramedFree, canonLegacyFree, fbFramedFree, fbLegacyFree bool, reserved map[string]bool) (dedupeGuardTarget, bool) {
-	canonFree := canonFramedFree && canonLegacyFree
-	fbFree := fbFramedFree && fbLegacyFree
+func pickDedupeGuardTarget(instanceID, requestedRaw, canonicalKey, fallbackKey string, canonProbe, fbProbe dedupeKeyProbe, reserved map[string]bool) (dedupeGuardTarget, bool) {
+	canonFree := canonProbe.framedFree && (canonProbe.legacyFree || !legacyLegBlocks(requestedRaw, canonicalKey, canonProbe.legacyDoc, instanceID))
+	fbFree := fbProbe.framedFree && (fbProbe.legacyFree || !legacyLegBlocks(requestedRaw, fallbackKey, fbProbe.legacyDoc, instanceID))
 	cands := []dedupeGuardTarget{
 		{frameDedupeDocID(instanceID, canonicalKey), dedupeFormatVersion},
 		{frameDedupeDocID(instanceID, fallbackKey), dedupeFormatRawKeyVersion},
@@ -531,8 +552,8 @@ func pickDedupeGuardTarget(instanceID, canonicalKey, fallbackKey string, canonFr
 	free := []bool{
 		canonFree,
 		fbFree,
-		!canonFramedFree && canonLegacyFree,
-		!fbFramedFree && fbLegacyFree,
+		!canonProbe.framedFree && canonProbe.legacyFree,
+		!fbProbe.framedFree && fbProbe.legacyFree,
 	}
 	for i, c := range cands {
 		if !free[i] || reserved[c.docID] {

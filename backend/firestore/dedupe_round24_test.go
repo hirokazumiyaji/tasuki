@@ -14,7 +14,7 @@ func TestDualDedupeGuardDocCoversOldReader(t *testing.T) {
 	const inst = "roll-upg"
 	for _, dedupe := range []string{"k", "ordinary-id", "a:b:c", "__x", "____x"} {
 		canon, fallback := escapeDedupeID(dedupe), rawFallbackDedupeKey(dedupe)
-		target, ok := pickDedupeGuardTarget(inst, canon, fallback, true, true, true, true, map[string]bool{})
+		target, ok := pickDedupeGuardTarget(inst, dedupe, canon, fallback, freeProbe(), freeProbe(), map[string]bool{})
 		if !ok {
 			t.Fatalf("%q: no guard target on empty store", dedupe)
 		}
