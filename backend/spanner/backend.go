@@ -1205,6 +1205,30 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			if delN == 0 {
 				continue
 			}
+			n++
+			// Fence event creation on the instance still running (Codex
+			// round-23 P1 on #296, Firestore parity): a timer due after a
+			// status-only terminal commit but before the sweep deletes it
+			// must be discarded without recording. enqueueWorkflowTask
+			// below already gates task creation on running, but without
+			// this check the TimerFired inbox insert stands
+			// unconditionally, leaving a post-terminal event behind.
+			row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{d.instanceID}, []string{"status"})
+			if err != nil {
+				if isNotFound(err) {
+					// Instance purged: the timer is already deleted
+					// above; nothing to record.
+					continue
+				}
+				return err
+			}
+			var status string
+			if err := row.Columns(&status); err != nil {
+				return err
+			}
+			if status != "running" {
+				continue
+			}
 			seq, existed, err := readInboxSeq(ctx, txn, d.instanceID)
 			if err != nil {
 				return err
@@ -1221,7 +1245,6 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			if err := enqueueWorkflowTask(ctx, txn, d.instanceID, "", now); err != nil {
 				return err
 			}
-			n++
 		}
 		return nil
 	})
