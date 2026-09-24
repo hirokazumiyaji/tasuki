@@ -543,6 +543,79 @@ func pickDedupeGuardTarget(instanceID, canonicalKey, fallbackKey string, canonFr
 	return dedupeGuardTarget{}, false
 }
 
+// dualDedupeGuardDoc returns the legacy-format counterpart of a framed guard
+// target for rolling-upgrade dual-write (Codex round-24 on #296). New guards
+// are created at the framed doc by pickDedupeGuardTarget, but nodes predating
+// the length framing probe only instanceID + ":" + key: a retry routed to an
+// old node misses the framed-only guard and duplicates the inbox event,
+// breaking at-most-once during a mixed rollout — even for ordinary IDs with
+// no colons. Writing the same guard under both framings keeps old-format
+// readers correct: they see the legacy duplicate, new readers probe framed
+// first and match either. The counterpart carries the same stored key and
+// version stamp (the stamp travels with the KEY, not the framing), so both
+// rows match identically via matchDedupeRow; purge and the terminate sweep
+// list by the instance_id field and reap both, and the legacy rows drain
+// once the fleet is upgraded. ok=false when there is no counterpart to
+// write: the target is already legacy-framed (old readers see it directly),
+// its legacy leg is occupied, it aliases the primary, or it is reserved by
+// an earlier batch item (transaction reads don't see buffered Creates).
+func dualDedupeGuardDoc(instanceID string, target dedupeGuardTarget, canonicalKey, fallbackKey string, canonLegacyFree, fbLegacyFree bool, reserved map[string]bool) (dedupeGuardTarget, bool) {
+	var key string
+	var legacyFree bool
+	switch {
+	case target.docID == frameDedupeDocID(instanceID, canonicalKey) && target.ver == int64(dedupeFormatVersion):
+		key, legacyFree = canonicalKey, canonLegacyFree
+	case target.docID == frameDedupeDocID(instanceID, fallbackKey) && target.ver == int64(dedupeFormatRawKeyVersion):
+		key, legacyFree = fallbackKey, fbLegacyFree
+	default:
+		return dedupeGuardTarget{}, false
+	}
+	if !legacyFree {
+		return dedupeGuardTarget{}, false
+	}
+	leg := legacyDedupeDocID(instanceID, key)
+	if leg == target.docID || reserved[leg] {
+		return dedupeGuardTarget{}, false
+	}
+	return dedupeGuardTarget{docID: leg, ver: target.ver}, true
+}
+
+// dualMarkerDoc returns the legacy-format counterpart of a framed
+// post-terminal marker for rolling-upgrade dual-write (same round-24 P1 as
+// above, in postTerminalMarkersCollection): pre-framing nodes probe only the
+// legacy concatenation there and would otherwise miss a framed-only marker
+// and duplicate one retry. ok=false when the legacy leg is occupied,
+// aliases the primary, or is reserved by an earlier batch item.
+func dualMarkerDoc(instanceID, dedupeID string, legacyFree bool, reserved map[string]bool) (string, bool) {
+	framed := postTerminalMarkerDocID(instanceID, dedupeID)
+	leg := legacyDedupeDocID(instanceID, postTerminalDedupeMarker(dedupeID))
+	if !legacyFree || leg == framed || reserved[leg] {
+		return "", false
+	}
+	return leg, true
+}
+
+// markerGuardTarget chooses where to stamp a post-terminal marker when no
+// owned marker exists yet (Codex round-24 on #296): the framed doc when free
+// (existing behavior), else the legacy doc when free (a foreign-occupied
+// framed doc must not fail the send deterministically on every retry — the
+// legacy leg is probed by new readers, so the marker still dedupes; old
+// readers see it directly). ok=false when both legs are occupied by foreign
+// rows: the caller stamps no marker and still inserts the event
+// (duplicate-never-drop; the retry may duplicate once rather than the send
+// failing). Docs reserved by earlier batch items count as unavailable.
+func markerGuardTarget(instanceID, dedupeID string, framedFree, legacyFree bool, reserved map[string]bool) (string, bool) {
+	framed := postTerminalMarkerDocID(instanceID, dedupeID)
+	if framedFree && !reserved[framed] {
+		return framed, true
+	}
+	leg := legacyDedupeDocID(instanceID, postTerminalDedupeMarker(dedupeID))
+	if leg != framed && legacyFree && !reserved[leg] {
+		return leg, true
+	}
+	return "", false
+}
+
 func cutPrefix(s, prefix string) (string, bool) {
 	if len(s) < len(prefix) || s[:len(prefix)] != prefix {
 		return s, false

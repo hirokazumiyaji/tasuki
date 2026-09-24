@@ -1299,8 +1299,10 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		// Firestore requires all reads before writes; also skip same-batch DedupeID dups.
 		skip := make([]bool, len(items))
 		createDoc := make([]string, len(items))
+		createDocDual := make([]string, len(items))
 		createVer := make([]int64, len(items))
-		createMarker := make([]bool, len(items))
+		markerDoc := make([]string, len(items))
+		markerDocDual := make([]string, len(items))
 		created := map[string]bool{}
 		// reserved tracks guard document IDs chosen earlier in this batch
 		// (round-18 P2): transaction reads don't see buffered Creates.
@@ -1371,6 +1373,8 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				// insert.
 				baseExists := false
 				canonicalOccupied := false
+				canonFramedFree, canonLegacyFree := true, true
+				canonicalKey := escapeDedupeID(it.DedupeID)
 				for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 					if isPostTerminalMarkerKey(bk) {
 						continue
@@ -1378,6 +1382,9 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					pr, err := b.probeDedupeKey(tx, "wf_signal_dedupe", instanceID, bk)
 					if err != nil {
 						return err
+					}
+					if bk == canonicalKey {
+						canonFramedFree, canonLegacyFree = pr.framedFree, pr.legacyFree
 					}
 					if bk == escapeDedupeID(it.DedupeID) && (!pr.framedFree || !pr.legacyFree) {
 						// Either framing occupied — even by a foreign row
@@ -1394,13 +1401,43 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					}
 				}
 				created[it.DedupeID] = true
+				// Stamp the marker under rolling-upgrade dual-write (Codex
+				// round-24 P1 on #296): the framed doc plus its legacy
+				// counterpart when free, else the legacy doc alone when the
+				// framed leg is foreign-occupied, else no marker (the event
+				// still inserts; a retry may duplicate once rather than the
+				// send failing deterministically).
+				if md, ok := markerGuardTarget(instanceID, it.DedupeID, mpr.framedFree, mpr.legacyFree, reserved); ok {
+					reserved[md] = true
+					markerDoc[i] = md
+					if dual, ok := dualMarkerDoc(instanceID, it.DedupeID, mpr.legacyFree, reserved); ok && dual != md {
+						reserved[dual] = true
+						markerDocDual[i] = dual
+					}
+				}
 				if baseExists || canonicalOccupied {
-					createMarker[i] = true
 					continue
 				}
-				createDoc[i] = signalDedupeID(instanceID, it.DedupeID)
-				createVer[i] = int64(dedupeFormatVersion)
-				createMarker[i] = true
+				// New base guards dual-write both framings (same round-24
+				// P1): pre-framing nodes probe only the legacy
+				// concatenation and would otherwise miss the framed-only
+				// guard. canonicalOccupied is false here, so both legs of
+				// the canonical key are free.
+				target := dedupeGuardTarget{docID: signalDedupeID(instanceID, it.DedupeID), ver: int64(dedupeFormatVersion)}
+				if !canonFramedFree || reserved[target.docID] {
+					// Framed leg lost a same-batch race (reserved) or a
+					// concurrent commit: fall back to marker-only like the
+					// occupied case above (duplicate-never-drop) instead of
+					// failing the batch deterministically.
+					continue
+				}
+				reserved[target.docID] = true
+				createDoc[i] = target.docID
+				createVer[i] = target.ver
+				if dual, ok := dualDedupeGuardDoc(instanceID, target, canonicalKey, rawFallbackDedupeKey(it.DedupeID), canonLegacyFree, true, reserved); ok {
+					reserved[dual.docID] = true
+					createDocDual[i] = dual.docID
+				}
 				continue
 			}
 			// Probe every stored user-key form, legacy raw first (Codex round 8
@@ -1469,26 +1506,23 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				reserved[target.docID] = true
 				createDoc[i] = target.docID
 				createVer[i] = target.ver
+				// Rolling-upgrade dual-write (Codex round-24 P1 on #296):
+				// a framed guard also lands under its legacy-format doc
+				// ID so pre-framing nodes see the guard. Legacy targets
+				// need no counterpart (old readers see them directly).
+				if dual, ok := dualDedupeGuardDoc(instanceID, target, canonicalKey, fallbackKey, canonLegacyFree, fbLegacyFree, reserved); ok {
+					reserved[dual.docID] = true
+					createDocDual[i] = dual.docID
+				}
 			}
 		}
 		for i, it := range items {
 			if skip[i] {
 				// Suppressed same-batch duplicate (or a running-state
-				// dedupe hit): no inbox insert. The marker is still
-				// stamped when requested so the next retry takes the
-				// marker fast path. A lost Create race here (concurrent
-				// retry stamping first) surfaces as a transaction conflict
-				// and the caller retries into a marker hit — the same shape
-				// as concurrent first-send stamps today.
-				if it.DedupeID != "" && createMarker[i] {
-					if err := tx.Create(b.ref(postTerminalMarkersCollection, postTerminalMarkerDocID(instanceID, it.DedupeID)), map[string]any{
-						"instance_id": instanceID,
-						"dedupe_id":   postTerminalDedupeMarker(it.DedupeID),
-						"created_at":  now,
-					}); err != nil {
-						return err
-					}
-				}
+				// dedupe hit): no inbox insert and no marker (markers are
+				// terminal-only; terminal marker hits return above without
+				// stamping). Kept as an explicit no-op branch so a future
+				// marker-on-skip never silently inserts an inbox row.
 				continue
 			}
 			if it.DedupeID != "" && createDoc[i] != "" {
@@ -1500,14 +1534,33 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				}); err != nil {
 					return err
 				}
+				if createDocDual[i] != "" {
+					if err := tx.Create(b.ref("wf_signal_dedupe", createDocDual[i]), map[string]any{
+						"instance_id":            instanceID,
+						"dedupe_id":              escapeDedupeID(it.DedupeID),
+						dedupeFormatVersionField: createVer[i],
+						"created_at":             now,
+					}); err != nil {
+						return err
+					}
+				}
 			}
-			if it.DedupeID != "" && createMarker[i] {
-				if err := tx.Create(b.ref(postTerminalMarkersCollection, postTerminalMarkerDocID(instanceID, it.DedupeID)), map[string]any{
+			if it.DedupeID != "" && markerDoc[i] != "" {
+				if err := tx.Create(b.ref(postTerminalMarkersCollection, markerDoc[i]), map[string]any{
 					"instance_id": instanceID,
 					"dedupe_id":   postTerminalDedupeMarker(it.DedupeID),
 					"created_at":  now,
 				}); err != nil {
 					return err
+				}
+				if markerDocDual[i] != "" {
+					if err := tx.Create(b.ref(postTerminalMarkersCollection, markerDocDual[i]), map[string]any{
+						"instance_id": instanceID,
+						"dedupe_id":   postTerminalDedupeMarker(it.DedupeID),
+						"created_at":  now,
+					}); err != nil {
+						return err
+					}
 				}
 			}
 			id := newID()
