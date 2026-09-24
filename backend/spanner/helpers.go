@@ -409,6 +409,29 @@ func dedupeKeyCandidates(dedupeID string) []string {
 func dedupeKey(dedupeID string) string       { return escapeDedupeID(dedupeID) }
 func dedupeMarkerKey(dedupeID string) string { return postTerminalDedupeMarker(dedupeID) }
 
+// rawCompatGuardKey decides the rolling-upgrade compat leg for a new dedupe
+// guard (Codex round-26 P1 on #296): nodes predating the escape probe the
+// RAW verbatim key, so the primary (escaped) row alone is invisible to them.
+// It returns the raw DedupeID when a second legacy-shaped row must be
+// written alongside the primary guard at chosenKey: the raw key differs from
+// the primary, fits the STRING(255) budget, is unoccupied, and was not
+// reserved by an earlier batch item. Otherwise ("", false): the primary
+// already covers old readers (identity encoding), the raw form is
+// unwritable, or writing it would collide — duplicate-never-drop, the
+// primary still guards current readers. Pure for unit tests.
+func rawCompatGuardKey(dedupeID, chosenKey string, rawOccupied bool, reserved map[string]bool) (string, bool) {
+	if dedupeID == chosenKey {
+		return "", false
+	}
+	if len(dedupeID) > dedupeKeyLimit {
+		return "", false
+	}
+	if rawOccupied || reserved[dedupeID] {
+		return "", false
+	}
+	return dedupeID, true
+}
+
 // pickSpannerDedupeInsert chooses the guard key for a DedupeID with no owned
 // guard found (Codex round-18 on #296 P2): the canonical key when free, else
 // the fallback key when free — the same preference the inline code had, with

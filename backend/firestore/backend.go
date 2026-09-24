@@ -1398,7 +1398,8 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				// insert.
 				baseExists := false
 				canonicalOccupied := false
-				canonFramedFree, canonLegacyFree := true, true
+				canonFramedFree := true
+				rawLegacyFree := true
 				canonicalKey := escapeDedupeID(it.DedupeID)
 				for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 					if isPostTerminalMarkerKey(bk) {
@@ -1409,7 +1410,10 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						return err
 					}
 					if bk == canonicalKey {
-						canonFramedFree, canonLegacyFree = pr.framedFree, pr.legacyFree
+						canonFramedFree = pr.framedFree
+					}
+					if bk == it.DedupeID {
+						rawLegacyFree = pr.legacyFree
 					}
 					if bk == escapeDedupeID(it.DedupeID) && (!pr.framedFree || !pr.legacyFree) {
 						// Either framing occupied — even by a foreign row
@@ -1444,10 +1448,11 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					continue
 				}
 				// New base guards dual-write both framings (same round-24
-				// P1): pre-framing nodes probe only the legacy
-				// concatenation and would otherwise miss the framed-only
-				// guard. canonicalOccupied is false here, so both legs of
-				// the canonical key are free.
+				// P1, corrected round-26 P1 on #296): pre-framing nodes probe
+				// only the raw legacy concatenation and would otherwise miss
+				// the framed-only guard. canonicalOccupied is false here, so
+				// the framed leg is free; the raw legacy leg rides along when
+				// free (see dualDedupeGuardDoc).
 				target := dedupeGuardTarget{docID: signalDedupeID(instanceID, it.DedupeID), ver: int64(dedupeFormatVersion)}
 				if !canonFramedFree || reserved[target.docID] {
 					// Framed leg lost a same-batch race (reserved) or a
@@ -1459,7 +1464,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				reserved[target.docID] = true
 				createDoc[i] = target.docID
 				createVer[i] = target.ver
-				if dual, ok := dualDedupeGuardDoc(instanceID, target, canonicalKey, rawFallbackDedupeKey(it.DedupeID), canonLegacyFree, true, reserved); ok {
+				if dual, ok := dualDedupeGuardDoc(instanceID, target, it.DedupeID, canonicalKey, rawFallbackDedupeKey(it.DedupeID), rawLegacyFree, reserved); ok {
 					reserved[dual.docID] = true
 					createDocDual[i] = dual.docID
 				}
@@ -1505,6 +1510,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			fallbackKey := rawFallbackDedupeKey(it.DedupeID)
 			canonProbe := dedupeKeyProbe{framedFree: true, legacyFree: true}
 			fbProbe := dedupeKeyProbe{framedFree: true, legacyFree: true}
+			rawProbe := dedupeKeyProbe{framedFree: true, legacyFree: true}
 			for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 				pr, err := b.probeDedupeKey(tx, "wf_signal_dedupe", instanceID, bk)
 				if err != nil {
@@ -1515,6 +1521,9 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				}
 				if bk == fallbackKey {
 					fbProbe = pr
+				}
+				if bk == it.DedupeID {
+					rawProbe = pr
 				}
 				if matchOwnedDedupeRow(it.DedupeID, bk, pr, instanceID) {
 					baseHit = true
@@ -1531,14 +1540,15 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				reserved[target.docID] = true
 				createDoc[i] = target.docID
 				createVer[i] = target.ver
-				// Rolling-upgrade dual-write (Codex round-24 P1 on #296):
-				// a framed guard also lands under its legacy-format doc
-				// ID so pre-framing nodes see the guard. Legacy targets
-				// need no counterpart (old readers see them directly).
-				// Dual-write needs the PHYSICAL legacy availability (a
-				// foreign-occupied legacy leg still collides), not the
-				// effective availability pick used above.
-				if dual, ok := dualDedupeGuardDoc(instanceID, target, canonicalKey, fallbackKey, canonProbe.legacyFree, fbProbe.legacyFree, reserved); ok {
+				// Rolling-upgrade dual-write (Codex round-24 P1 on #296,
+				// corrected round-26 P1): a framed guard also lands under
+				// the RAW legacy-format doc ID so pre-framing nodes (which
+				// probe instanceID + ":" + raw DedupeID) see the guard.
+				// Legacy targets need no counterpart (old readers see them
+				// directly). Dual-write needs the PHYSICAL raw-legacy
+				// availability (a foreign-occupied raw leg still collides),
+				// not the effective availability pick used above.
+				if dual, ok := dualDedupeGuardDoc(instanceID, target, it.DedupeID, canonicalKey, fallbackKey, rawProbe.legacyFree, reserved); ok {
 					reserved[dual.docID] = true
 					createDocDual[i] = dual.docID
 				}

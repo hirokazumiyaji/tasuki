@@ -565,36 +565,42 @@ func pickDedupeGuardTarget(instanceID, requestedRaw, canonicalKey, fallbackKey s
 }
 
 // dualDedupeGuardDoc returns the legacy-format counterpart of a framed guard
-// target for rolling-upgrade dual-write (Codex round-24 on #296). New guards
-// are created at the framed doc by pickDedupeGuardTarget, but nodes predating
-// the length framing probe only instanceID + ":" + key: a retry routed to an
-// old node misses the framed-only guard and duplicates the inbox event,
-// breaking at-most-once during a mixed rollout — even for ordinary IDs with
-// no colons. Writing the same guard under both framings keeps old-format
+// target for rolling-upgrade dual-write (Codex round-24 on #296, corrected
+// round-26 P1). New guards are created at the framed doc by
+// pickDedupeGuardTarget, but nodes predating the length framing probe only
+// instanceID + ":" + key with the RAW DedupeID: a retry routed to an old node
+// misses the framed-only guard and duplicates the inbox event, breaking
+// at-most-once during a mixed rollout — even for ordinary IDs with no
+// colons. Writing the same guard under both framings keeps old-format
 // readers correct: they see the legacy duplicate, new readers probe framed
 // first and match either. The counterpart carries the same stored key and
 // version stamp (the stamp travels with the KEY, not the framing), so both
 // rows match identically via matchDedupeRow; purge and the terminate sweep
 // list by the instance_id field and reap both, and the legacy rows drain
-// once the fleet is upgraded. ok=false when there is no counterpart to
-// write: the target is already legacy-framed (old readers see it directly),
-// its legacy leg is occupied, it aliases the primary, or it is reserved by
-// an earlier batch item (transaction reads don't see buffered Creates).
-func dualDedupeGuardDoc(instanceID string, target dedupeGuardTarget, canonicalKey, fallbackKey string, canonLegacyFree, fbLegacyFree bool, reserved map[string]bool) (dedupeGuardTarget, bool) {
-	var key string
-	var legacyFree bool
+// once the fleet is upgraded.
+//
+// The legacy leg MUST be the raw DedupeID verbatim
+// (legacyDedupeDocID(instanceID, requestedRaw)), NOT the encoded canonical
+// key: the pre-fix code copied the ENCODED canonicalKey into the legacy
+// framing, so a send of "__x" via a new node created "<instance>:____x"
+// while old nodes retry probing "<instance>:__x" — a miss followed by a
+// duplicate. ok=false when there is no counterpart to write: the target is
+// already legacy-framed (old readers see it directly), the raw legacy leg is
+// occupied, it aliases the primary, or it is reserved by an earlier batch
+// item (transaction reads don't see buffered Creates).
+func dualDedupeGuardDoc(instanceID string, target dedupeGuardTarget, requestedRaw, canonicalKey, fallbackKey string, rawLegacyFree bool, reserved map[string]bool) (dedupeGuardTarget, bool) {
 	switch {
 	case target.docID == frameDedupeDocID(instanceID, canonicalKey) && target.ver == int64(dedupeFormatVersion):
-		key, legacyFree = canonicalKey, canonLegacyFree
+		// Framed canonical guard: counterpart at the raw legacy doc.
 	case target.docID == frameDedupeDocID(instanceID, fallbackKey) && target.ver == int64(dedupeFormatRawKeyVersion):
-		key, legacyFree = fallbackKey, fbLegacyFree
+		// Framed fallback guard: counterpart at the raw legacy doc.
 	default:
 		return dedupeGuardTarget{}, false
 	}
-	if !legacyFree {
+	if !rawLegacyFree {
 		return dedupeGuardTarget{}, false
 	}
-	leg := legacyDedupeDocID(instanceID, key)
+	leg := legacyDedupeDocID(instanceID, requestedRaw)
 	if leg == target.docID || reserved[leg] {
 		return dedupeGuardTarget{}, false
 	}

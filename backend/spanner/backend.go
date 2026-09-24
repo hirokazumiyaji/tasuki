@@ -1455,6 +1455,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					canonicalOccupied := false
 					fallbackKey := rawFallbackDedupeKey(it.DedupeID)
 					fallbackOccupied := false
+					rawOccupied := false
 					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 						stored, owner, version, owned, ok, err := readDedupeRow(ctx, txn, instanceID, bk)
 						if err != nil {
@@ -1468,6 +1469,9 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						}
 						if bk == fallbackKey {
 							fallbackOccupied = true
+						}
+						if bk == it.DedupeID {
+							rawOccupied = true
 						}
 						if !owned {
 							continue
@@ -1508,6 +1512,23 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 							m[dedupeFallbackOwnerColumn] = escapeDedupeID(it.DedupeID)
 						}
 						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", m))
+						// Rolling-upgrade compat (Codex round-26 P1 on #296):
+						// nodes predating the escape probe the RAW verbatim
+						// key, so a new-node send of "__x" (stored as
+						// "____x") is invisible to an old-node retry probing
+						// "__x" — a miss followed by a duplicate. Write the
+						// raw legacy form as a second guard leg (see
+						// rawCompatGuardKey): legacy-shaped (no version,
+						// stored raw) so both verbatim-era readers
+						// (stored == raw) and current readers (legacy rule)
+						// match it, while no other ID's probe can claim it
+						// (the key itself differs).
+						if raw, ok := rawCompatGuardKey(it.DedupeID, key, rawOccupied, reservedGuardKeys); ok {
+							reservedGuardKeys[raw] = true
+							muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
+								"instance_id": instanceID, "dedupe_id": raw, "created_at": now,
+							}))
+						}
 					}
 					created[it.DedupeID] = true
 				}
