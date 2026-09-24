@@ -37,12 +37,12 @@ func TestPurgeCompletedAtIndex(t *testing.T) {
 
 	// Retrofit path: databases provisioned before the index existed must gain
 	// it from Migrate. Under versioned migrations a plain re-Migrate skips
-	// already-applied versions, so simulate an unapplied 000003 by dropping
+	// already-applied versions, so simulate an unapplied 000005 by dropping
 	// the index and deleting its version row.
 	if _, err := b.DB().ExecContext(ctx, `DROP INDEX wf_instances_completed_at_idx`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.DB().ExecContext(ctx, `DELETE FROM tasuki_schema_migrations WHERE version = 3`); err != nil {
+	if _, err := b.DB().ExecContext(ctx, `DELETE FROM tasuki_schema_migrations WHERE version = 5`); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.Migrate(ctx); err != nil {
@@ -54,10 +54,14 @@ func TestPurgeCompletedAtIndex(t *testing.T) {
 }
 
 // TestPurgeIndexLeadsWithOrderingColumns guards the round-19 P2 index
-// shape: the victim index must lead with (completed_at, id) so the ordered
-// scan serves ORDER BY without a TEMP B-TREE sort, and the 000004 migration
-// must retrofit databases still carrying the pre-fix (status, completed_at)
-// shape (databases at version >= 3 never re-run 000003).
+// shape, restricted round-23 to the default purge statuses: the victim
+// index must lead with (completed_at, id) so the ordered scan serves ORDER
+// BY without a TEMP B-TREE sort, and its partial predicate must admit
+// exactly backend.DefaultPurgeStatuses so the forced default scan never
+// walks old continued rows. The 000004 migration must retrofit databases
+// still carrying the pre-fix (status, completed_at) shape, and 000005 the
+// pre-restriction (completed_at-only predicate) shape (databases at version
+// >= 5 never re-run the earlier versions).
 func TestPurgeIndexLeadsWithOrderingColumns(t *testing.T) {
 	ctx := context.Background()
 	b, err := sqlite.New(filepath.Join(t.TempDir(), "purge_shape.db"))
@@ -80,8 +84,23 @@ func TestPurgeIndexLeadsWithOrderingColumns(t *testing.T) {
 	if sql := indexSQL(); !strings.Contains(sql, "(completed_at, id)") {
 		t.Fatalf("victim index DDL = %q, want leading (completed_at, id)", sql)
 	}
+	// The partial predicate must admit exactly the default purge statuses:
+	// continued rows (never deleted by a default purge) must not be in the
+	// index, or the forced ordered scan walks them on every batch.
+	if sql := indexSQL(); !strings.Contains(sql, "completed_at IS NOT NULL") {
+		t.Fatalf("victim index DDL = %q, want completed_at IS NOT NULL predicate", sql)
+	}
+	for _, s := range []string{"'completed'", "'failed'", "'terminated'", "'canceled'"} {
+		if sql := indexSQL(); !strings.Contains(sql, s) {
+			t.Fatalf("victim index DDL = %q, want default status %s in the predicate", sql, s)
+		}
+	}
+	if sql := indexSQL(); strings.Contains(sql, "'continued'") {
+		t.Fatalf("victim index DDL = %q, must not admit continued rows", sql)
+	}
 	// Simulate a pre-fix database: stale status-leading index with 000004
-	// unapplied, then re-Migrate must rebuild the ordering-leading shape.
+	// and 000005 unapplied, then re-Migrate must rebuild the
+	// ordering-leading, default-status shape through both migrations.
 	if _, err := b.DB().ExecContext(ctx, `DROP INDEX wf_instances_completed_at_idx`); err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +108,7 @@ func TestPurgeIndexLeadsWithOrderingColumns(t *testing.T) {
 		`CREATE INDEX wf_instances_completed_at_idx ON wf_instances (status, completed_at) WHERE completed_at IS NOT NULL`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.DB().ExecContext(ctx, `DELETE FROM tasuki_schema_migrations WHERE version = 4`); err != nil {
+	if _, err := b.DB().ExecContext(ctx, `DELETE FROM tasuki_schema_migrations WHERE version IN (4, 5)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.Migrate(ctx); err != nil {
@@ -98,16 +117,44 @@ func TestPurgeIndexLeadsWithOrderingColumns(t *testing.T) {
 	if sql := indexSQL(); !strings.Contains(sql, "(completed_at, id)") {
 		t.Fatalf("retrofitted victim index DDL = %q, want leading (completed_at, id)", sql)
 	}
+	if sql := indexSQL(); strings.Contains(sql, "'continued'") || !strings.Contains(sql, "'completed'") {
+		t.Fatalf("retrofitted victim index DDL = %q, want exactly the default-status predicate", sql)
+	}
+	// Simulate a pre-restriction database: stale completed_at-only
+	// predicate with 000005 unapplied, then re-Migrate must rebuild the
+	// default-status shape.
+	if _, err := b.DB().ExecContext(ctx, `DROP INDEX wf_instances_completed_at_idx`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.DB().ExecContext(ctx,
+		`CREATE INDEX wf_instances_completed_at_idx ON wf_instances (completed_at, id) WHERE completed_at IS NOT NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.DB().ExecContext(ctx, `DELETE FROM tasuki_schema_migrations WHERE version = 5`); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if sql := indexSQL(); !strings.Contains(sql, "(completed_at, id)") {
+		t.Fatalf("retrofitted victim index DDL = %q, want leading (completed_at, id)", sql)
+	}
+	if sql := indexSQL(); strings.Contains(sql, "'continued'") || !strings.Contains(sql, "'completed'") {
+		t.Fatalf("retrofitted victim index DDL = %q, want exactly the default-status predicate", sql)
+	}
 }
 // through EXPLAIN QUERY PLAN and requires an index-backed search (issue #294).
 // Round-19 P2 additionally requires NO temp b-tree: the victim index leads
 // with (completed_at, id) and the query forces it, so the ordered scan
 // serves the ORDER BY directly instead of sorting.
-// TestPurgeVictimScanUsesIndex runs the exact PurgeInstances victim SELECT
-// through EXPLAIN QUERY PLAN and requires an index-backed search (issue #294).
-// Round-19 P2 additionally requires NO temp b-tree: the victim index leads
-// with (completed_at, id) and the query forces it, so the ordered scan
-// serves the ORDER BY directly instead of sorting.
+// TestPurgeVictimScanUsesIndex runs the exact default PurgeInstances victim
+// SELECT through EXPLAIN QUERY PLAN and requires an index-backed search
+// (issue #294). Round-19 P2 additionally requires NO temp b-tree: the
+// victim index leads with (completed_at, id) and the query forces it, so
+// the ordered scan serves the ORDER BY directly instead of sorting.
+// Round-23 uses the full default 4-status filter: the partial index admits
+// exactly those statuses, so the forced scan is applicable and walks
+// victims only (no continued rows are in the index).
 func TestPurgeVictimScanUsesIndex(t *testing.T) {
 	ctx := context.Background()
 	b, err := sqlite.New(filepath.Join(t.TempDir(), "purge_plan.db"))
@@ -122,7 +169,7 @@ func TestPurgeVictimScanUsesIndex(t *testing.T) {
 	rows, err := b.DB().QueryContext(ctx, `
 		EXPLAIN QUERY PLAN
 		SELECT id FROM wf_instances INDEXED BY wf_instances_completed_at_idx
-		WHERE status IN ('completed', 'failed', 'terminated')
+		WHERE status IN ('completed', 'failed', 'terminated', 'canceled')
 		  AND completed_at IS NOT NULL AND completed_at <= '2026-01-01T00:00:00.000000000Z'
 		ORDER BY completed_at, id
 		LIMIT 100`)

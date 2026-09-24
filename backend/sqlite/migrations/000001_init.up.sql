@@ -28,9 +28,16 @@ CREATE INDEX IF NOT EXISTS wf_instances_visibility_idx ON wf_instances (status, 
 -- the range + ordering lets SQLite walk victims in order and stop at LIMIT;
 -- the status IN (...) filter applies per row off the ordered scan, which
 -- stays bounded because completed rows are overwhelmingly purge-eligible.
+-- The partial predicate covers exactly the default purge status set
+-- (backend.DefaultPurgeStatuses): `continued` instances are never deleted by
+-- a default purge, so admitting them (round-23 P2 on #294) would make the
+-- forced ordered scan walk old continued rows on every batch. Purges whose
+-- filter is not exactly the default set run unhinted (see
+-- purgeUsesOrderingHint) and never need this index.
 -- Kept here for fresh databases; pre-existing databases gain it through
--- migration 000003 (legacy-stamped version-1 databases skip the baseline).
-CREATE INDEX IF NOT EXISTS wf_instances_completed_at_idx ON wf_instances (completed_at, id) WHERE completed_at IS NOT NULL;
+-- migrations 000003 (legacy-stamped version-1 databases skip the baseline),
+-- 000004 (ordering shape) and 000005 (default-status predicate).
+CREATE INDEX IF NOT EXISTS wf_instances_completed_at_idx ON wf_instances (completed_at, id) WHERE completed_at IS NOT NULL AND status IN ('completed', 'failed', 'terminated', 'canceled');
 
 CREATE TABLE IF NOT EXISTS wf_journal (
     instance_id TEXT    NOT NULL,
