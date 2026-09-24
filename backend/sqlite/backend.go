@@ -856,11 +856,21 @@ func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Du
 	return nil
 }
 
+// defaultPurgeIndexStatuses is the FIXED status set covered by the
+// wf_instances_completed_at_idx partial index predicate (see
+// 000005_purge_index_default_statuses.up.sql). The hint may only fire when
+// the requested filter equals this set exactly: backend.DefaultPurgeStatuses
+// is a customizable var, so comparing against it (the pre-fix rule) hints a
+// customized ["completed"] default into the four-literal inlined filter and
+// deletes failed/terminated/canceled too. The index predicate never changes,
+// so the comparison is against this fixed set.
+var defaultPurgeIndexStatuses = []string{"completed", "failed", "terminated", "canceled"}
+
 // purgeUsesOrderingHint reports whether the PurgeInstances victim SELECT
 // should force the (completed_at, id) partial ordering index (issue #294
 // round-22 P2, reshaped round-23). The forced ordered scan pays off only for
 // the default purge: the index predicate covers exactly
-// backend.DefaultPurgeStatuses, so the default filter matches the index
+// defaultPurgeIndexStatuses, so the default filter matches the index
 // contents row for row and the scan stops at LIMIT without walking unrelated
 // history. Continued-only purges force their own partial index instead (see
 // purgeContinuedOrderingHint, round-24 P2); every other filter runs unhinted,
@@ -873,21 +883,24 @@ func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Du
 //     index and sorts only the few matches instead of walking every
 //     default-status row.
 // sts is the normalized status set; empty normalizes to the default status
-// set upstream (ValidatePurgeArgs), which hints by definition.
+// set upstream (ValidatePurgeArgs). The hint fires only when that set equals
+// the FIXED index predicate above — a customized backend.DefaultPurgeStatuses
+// takes the unhinted path with its own statuses (Codex round-26 P1 on #294).
 func purgeUsesOrderingHint(sts []string) bool {
 	// Empty normalizes to the default status set upstream
-	// (ValidatePurgeArgs), which hints by definition.
+	// (ValidatePurgeArgs): hint iff those defaults equal the fixed index
+	// set.
 	if len(sts) == 0 {
-		return true
+		sts = backend.DefaultPurgeStatuses
 	}
-	if len(sts) != len(backend.DefaultPurgeStatuses) {
+	if len(sts) != len(defaultPurgeIndexStatuses) {
 		return false
 	}
 	have := make(map[string]struct{}, len(sts))
 	for _, s := range sts {
 		have[s] = struct{}{}
 	}
-	for _, s := range backend.DefaultPurgeStatuses {
+	for _, s := range defaultPurgeIndexStatuses {
 		if _, ok := have[s]; !ok {
 			return false
 		}
@@ -919,8 +932,9 @@ func purgeContinuedOrderingHint(sts []string) bool {
 // parameters: INDEXED BY a partial index is a prepare-time "no query
 // solution" error unless the WHERE clause provably implies the index
 // predicate, which placeholders cannot satisfy. The default hint applies
-// exactly when sts equals the default set (nil included — it normalizes to
-// the defaults upstream) and the continued hint exactly when sts is
+// exactly when sts equals the FIXED index set above (nil included only when
+// the configured defaults equal it — a customized default takes the unhinted
+// path with its own statuses) and the continued hint exactly when sts is
 // ["continued"], so the literal lists are semantically identical.
 func purgeVictimQuery(sts []string) string {
 	hint := ""
