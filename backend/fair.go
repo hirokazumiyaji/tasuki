@@ -265,3 +265,79 @@ func SortFairRefs(refs []FairTaskRef) {
 		return refs[i].VisibleAt.Before(refs[j].VisibleAt)
 	})
 }
+
+// FairSecuredCounts tallies secured refs per instance.
+func FairSecuredCounts(secured []FairTaskRef) map[string]int {
+	counts := make(map[string]int, len(secured))
+	for _, r := range secured {
+		counts[r.InstanceID]++
+	}
+	return counts
+}
+
+// TrimFairCarry bounds a retained refill carry to the rows that can actually
+// be picked on the next pass (issue #294 round-17 P2): a plain visibility
+// probe cannot see row locks, so probing the full carry retains every locked
+// row and the picker then admits one retained row per pass (~2000 lock
+// queries plus quadratic re-offers for a 2000-row locked carry). Only
+// MaxPerInstance-minus-secured rows per instance can be picked — the picker
+// rejects anything beyond that — and only Limit-minus-secured rows in total,
+// so earlier rows beyond either quota can never contribute to this claim.
+// Keep the FIFO-earliest rows within both quotas (by original scan order);
+// locked extras stay dropped for later polls, which restart from the head.
+// The result is O(limit), not O(carry).
+func TrimFairCarry(pending, secured []FairTaskRef, limit, perInstance int) []FairTaskRef {
+	if len(pending) == 0 || limit <= 0 || perInstance <= 0 {
+		return pending
+	}
+	securedCounts := FairSecuredCounts(secured)
+	remaining := limit - len(secured)
+	if remaining <= 0 {
+		return nil
+	}
+	sorted := append([]FairTaskRef(nil), pending...)
+	SortFairRefs(sorted)
+	kept := make([]FairTaskRef, 0, remaining)
+	keptCounts := make(map[string]int)
+	for _, r := range sorted {
+		if len(kept) >= remaining {
+			break
+		}
+		quota := perInstance - securedCounts[r.InstanceID]
+		if quota <= 0 {
+			continue
+		}
+		if keptCounts[r.InstanceID] >= quota {
+			continue
+		}
+		keptCounts[r.InstanceID]++
+		kept = append(kept, r)
+	}
+	return kept
+}
+
+// NoteFairLoss records per-instance outstanding lock/lease losses from one
+// pass (issue #294 round-17 P2): picked refs that were not secured free quota
+// a later pass can reuse. Instances whose secured count is back at the cap
+// hold no outstanding quota — a refill already consumed the freed slot — so
+// they resolve immediately (and previously recorded instances resolve once a
+// later pass refills them to the cap).
+func NoteFairLoss(outstanding map[string]struct{}, picked []FairTaskRef, securedIDs map[int64]bool, secured []FairTaskRef, perInstance int) {
+	if outstanding == nil {
+		return
+	}
+	for _, r := range picked {
+		if !securedIDs[r.ID] {
+			outstanding[r.InstanceID] = struct{}{}
+		}
+	}
+	if perInstance <= 0 {
+		return
+	}
+	counts := FairSecuredCounts(secured)
+	for inst := range outstanding {
+		if counts[inst] >= perInstance {
+			delete(outstanding, inst)
+		}
+	}
+}

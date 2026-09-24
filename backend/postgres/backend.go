@@ -320,12 +320,17 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		requeryAttempted  int
 		requeryOut        int
 		attempted         map[int64]struct{}
-		// lostLock remembers whether ANY earlier pass in this claim lost
-		// picks to concurrent locks, freeing quota a later pass can reuse
-		// (round-13 P2 on #294). A pass that picks nothing loses nothing
-		// itself, so without this cross-pass flag it cannot tell whether a
-		// requery could admit a previously dropped row.
-		lostLock bool
+		// outstanding tracks per-instance OUTSTANDING lock/lease losses:
+		// picks lost to concurrent locks that no later pass has refilled
+		// back to the per-instance cap (round-17 P2 on #294, via
+		// backend.NoteFairLoss). A historical bool stays true after a
+		// refill replaces every lost pick (e.g. A1..A100000 with A1
+		// locked: the refill secures A2 and the next zero-pick carry pass
+		// rescans the suffix though no A row is admissible), causing a
+		// wasteful rescan. Outstanding quota clears once the securing pass
+		// restores the instance to the cap, so requery gates fire only
+		// while freed quota actually remains.
+		outstanding map[string]struct{}
 	)
 	// startOverflowRequery arms the next bounded requery pass from the
 	// pre-overflow snapshot when the batch would otherwise return
@@ -334,9 +339,9 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 	// rescan the same dropped tail against the same per-instance caps and
 	// return an identical result — up to 2x the scan cost for nothing. The
 	// scan-exhausted call site therefore gates on its own pass lost>0 OR the
-	// cross-pass lostLock flag (an earlier pass may have freed quota even
+	// cross-pass outstanding map (an earlier pass may have freed quota even
 	// when this pass secured all its picks), while
-	// the zero-pick call site gates on the cross-pass lostLock flag: a pass
+	// the zero-pick call site gates on the cross-pass outstanding map: a pass
 	// that picks nothing loses nothing itself, but an earlier pass may have
 	// freed quota (round-13 P2 on #294). Call sites skip the requery (break)
 	// when no loss freed quota; the dropped rows stay claimable for a later
@@ -388,17 +393,29 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		// unchanged. Rows locked between the probe and the pick are skipped
 		// by the picker's lock step below (which locks only accepted rows)
 		// and refilled as lost picks, exactly as before the batch probe
-		// existed. Probe-dropped rows count as lost for the
-		// overflow-requery gate below (a later pass may reuse the freed
-		// position, same as a lost pick).
+		// existed. Probe-dropped rows do NOT create outstanding quota (they
+		// were rejected carry that turned invisible — no picker slot was
+		// freed, so a requery would face identical caps). Only lock/lease
+		// losses below free quota (see backend.NoteFairLoss).
+		// Trim the carry to the rows that can actually be picked (round-17
+		// P2 on #294) BEFORE probing: the plain visibility probe cannot see
+		// locks, so it would retain the entire locked carry and the picker
+		// would admit one retained row per pass (~2000 lock queries plus
+		// quadratic re-offers). Trimming to the unfilled per-instance quota
+		// bounds the probe set to O(limit); locked extras stay dropped for
+		// later polls.
 		if len(pending) > 0 {
-			kept, dropped, err := b.probeRetainedCarry(ctx, tx, req, pending)
-			if err != nil {
-				return nil, err
-			}
-			pending = kept
-			if dropped {
-				lostLock = true
+			pending = backend.TrimFairCarry(pending, claimed, req.Limit, req.MaxPerInstance)
+			if len(pending) == 0 {
+				// Everything retained is already over quota: nothing to
+				// probe or re-offer this pass; the scan below (or the
+				// requery gates) decides what happens next.
+			} else {
+				kept, _, err := b.probeRetainedCarry(ctx, tx, req, pending)
+				if err != nil {
+					return nil, err
+				}
+				pending = kept
 			}
 		}
 		// Reconsider candidates rejected by an earlier pass first: they are
@@ -511,17 +528,19 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		}
 		if len(picked) == 0 {
 			// No picks means this pass lost nothing (lost==0 by
-			// definition): without a prior loss an overflow requery would
-			// re-offer the dropped tail against identical caps and return
-			// the same empty pick, so skip it and break. But when an
-			// earlier pass lost picks to locks (lostLock), quota was freed
-			// that can admit a previously dropped row (e.g. Limit=3/
+			// definition): without prior OUTSTANDING loss an overflow
+			// requery would re-offer the dropped tail against identical
+			// caps and return the same empty pick, so skip it and break.
+			// But when an earlier pass lost picks to locks and no later
+			// pass refilled those instances back to the cap
+			// (len(outstanding) > 0), quota was freed that can admit a
+			// previously dropped row (e.g. Limit=3/
 			// MaxPerInstance=1 over A1,B1,B2..B2001,A2 with A1 locked:
 			// pass 1 secures B1 and drops A2 past the cap, pass 2
 			// re-rejects the carry and picks nothing — only a requery from
 			// the pre-overflow snapshot revisits A2). Dropped rows stay
 			// claimable for later polls.
-			if lostLock && startOverflowRequery() {
+			if len(outstanding) > 0 && startOverflowRequery() {
 				continue
 			}
 			break
@@ -559,6 +578,7 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		}
 
 		prevOut := len(out)
+		prevClaimed := len(claimed)
 		for _, r := range picked {
 			if !locked[r.ID] {
 				continue // locked or leased concurrently; refilled above
@@ -582,12 +602,22 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 			out = append(out, t)
 			claimed = append(claimed, r)
 		}
-		if len(out)-prevOut < len(picked) {
-			// Picks lost to concurrent locks (or to a concurrent claim
-			// between select and update) free quota a later pass can
-			// reuse; remember across passes for the zero-pick requery gate
-			// above (round-13 P2 on #294).
-			lostLock = true
+		// Picks lost to concurrent locks (or to a concurrent claim between
+		// select and update) free quota a later pass can reuse; record
+		// OUTSTANDING losses for the requery gates (round-13 P2, refined to
+		// outstanding-only in round-17 P2 on #294). Instances refilled back
+		// to the cap resolve (see backend.NoteFairLoss), so a refill that
+		// replaces every lost pick clears the flag instead of triggering a
+		// wasteful rescan.
+		{
+			securedIDs := make(map[int64]bool, len(claimed)-prevClaimed)
+			for _, r := range claimed[prevClaimed:] {
+				securedIDs[r.ID] = true
+			}
+			if outstanding == nil {
+				outstanding = make(map[string]struct{})
+			}
+			backend.NoteFairLoss(outstanding, picked, securedIDs, claimed, req.MaxPerInstance)
 		}
 		if len(out) >= req.Limit {
 			break
@@ -595,18 +625,19 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		if scanExhausted {
 			// No unscanned rows remain, so the only way to make progress is
 			// to revisit rejected candidates freed by lost picks. When no
-			// pick was lost on this pass (lost==0) AND no earlier pass lost
-			// one either (!lostLock), every pick succeeded and no quota was
-			// freed: the dropped overflow tail would face the same caps and
-			// reproduce the same pick, so skip the wasteful full rescan
-			// (up to 2x) and return underfilled. A current OR prior loss
-			// frees a slot that can admit a previously rejected/dropped row
-			// (e.g. Limit=4/MaxPerInstance=1 over A1,C1,B1,C2,B2..B2001,A2
-			// with A1,C1 locked: pass 1 secures B1 and drops A2 past the
-			// cap, the carry pass secures C2 with lost==0 — only the
-			// cross-pass lostLock still admits A2 via requery).
+			// pick was lost on this pass (lost==0) AND no earlier pass holds
+			// OUTSTANDING freed quota (len(outstanding)==0), every pick
+			// succeeded and no quota was freed: the dropped overflow tail
+			// would face the same caps and reproduce the same pick, so skip
+			// the wasteful full rescan (up to 2x) and return underfilled. A
+			// current OR outstanding prior loss frees a slot that can admit
+			// a previously rejected/dropped row (e.g.
+			// Limit=4/MaxPerInstance=1 over A1,C1,B1,C2,B2..B2001,A2 with
+			// A1,C1 locked: pass 1 secures B1 and drops A2 past the cap,
+			// the carry pass secures C2 with lost==0 — only the outstanding
+			// prior loss still admits A2 via requery).
 			lost := len(picked) - (len(out) - prevOut)
-			if lost == 0 && !lostLock {
+			if lost == 0 && len(outstanding) == 0 {
 				break
 			}
 			if len(iterRejected) == 0 {
