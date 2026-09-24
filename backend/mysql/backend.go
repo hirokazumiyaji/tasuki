@@ -450,18 +450,22 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 	for len(accepted) < req.Limit {
 		picker := backend.NewFairPicker(req.Limit-len(accepted), req.MaxPerInstance).TrackRejected()
 		picker.Seed(accepted)
-		// Batch-probe the retained carry in one SKIP LOCKED query before
-		// re-offering it (issue #294 round-15 P2): re-offering a large
-		// carry one pick per pass costs a lock query per pass plus
-		// quadratic re-offers when every pick is lost to concurrent locks
-		// (a retained run over one locked instance drains a single row per
-		// pass, so A1..A2002 with A1..A2001 locked needs ~2001 lock queries
-		// in one long txn). The DB skips locked rows at once; only unlocked
-		// survivors are re-offered, in FIFO order, so fair-cap semantics are
-		// unchanged. Probe-dropped rows are locked by a concurrent claimant
-		// — like lock-skipped picks they stay claimable for later polls —
-		// and count as lost for the overflow-requery gate below (a later
-		// pass may reuse the freed position, same as a lost pick).
+		// Batch-probe the retained carry in one lock-free query before
+		// re-offering it (issue #294 round-15 P2, round-16 fix): re-offering
+		// a large carry one pick per pass costs a lock query per pass plus
+		// quadratic re-offers when every pick is lost (a retained run over
+		// one invisible instance drains a single row per pass, so
+		// A1..A2002 with A1..A2001 leased needs ~2001 lock queries in one
+		// long txn). The probe drops rows leased since the scan in one
+		// plain SELECT — taking no locks, so concurrent claimers never skip
+		// claimable work held by this claim — and only visible survivors
+		// are re-offered, in FIFO order, so fair-cap semantics are
+		// unchanged. Rows locked between the probe and the pick are skipped
+		// by the picker's lock step below (which locks only accepted rows)
+		// and refilled as lost picks, exactly as before the batch probe
+		// existed. Probe-dropped rows count as lost for the
+		// overflow-requery gate below (a later pass may reuse the freed
+		// position, same as a lost pick).
 		if len(pending) > 0 {
 			kept, dropped, err := probeRetainedCarry(ctx, conn, req, now, pending)
 			if err != nil {
@@ -707,13 +711,20 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 	return out, nil
 }
 
-// probeRetainedCarry batch-filters a retained carry to its unlocked rows
-// with a single SELECT ... FOR UPDATE SKIP LOCKED over the carry IDs (see
-// the call site in selectClaimCandidates). The probe locks the survivors in
-// FIFO (visible_at, id) order, so re-offering them preserves fair-cap
-// semantics while locked rows are dropped in one query instead of one pass
-// each. A visibility re-check mirrors the lock step: rows leased since the
-// scan are invisible here (and again at UPDATE time).
+// probeRetainedCarry batch-filters a retained carry to its visible rows
+// with a single plain SELECT over the carry IDs (see the call site in
+// selectClaimCandidates). The probe takes NO row locks: probing with SELECT
+// ... FOR UPDATE SKIP LOCKED over every unlocked carry row held up to ~2000
+// locks until commit though the picker accepts only a few, so concurrent
+// claimers skipped claimable work (Codex round-16 on #294). Only the
+// picker's lock step below takes locks, and only on accepted rows. Rows
+// locked between the probe and the pick are skipped there (counted as lost,
+// same as before the batch probe existed), and rows leased since the scan
+// fail the visibility re-check here and again at UPDATE time — so probe
+// staleness in either direction is covered without retaining locks.
+// Re-offered survivors stay in FIFO (visible_at, id) order, preserving
+// fair-cap semantics while invisible rows are dropped in one query instead
+// of one lost pick each.
 func probeRetainedCarry(ctx context.Context, conn *sql.Conn, req backend.ClaimRequest, now time.Time, pending []backend.FairTaskRef) ([]backend.FairTaskRef, bool, error) {
 	queryArgs := make([]any, 0, len(pending)+2)
 	for _, r := range pending {
@@ -723,8 +734,7 @@ func probeRetainedCarry(ctx context.Context, conn *sql.Conn, req backend.ClaimRe
 	rows, err := conn.QueryContext(ctx, fmt.Sprintf(`
 		SELECT id, instance_id, visible_at FROM wf_tasks
 		WHERE id IN (%s) AND kind = ? AND visible_at <= ?
-		ORDER BY visible_at, id
-		FOR UPDATE SKIP LOCKED`, inClause(len(pending))), queryArgs...)
+		ORDER BY visible_at, id`, inClause(len(pending))), queryArgs...)
 	if err != nil {
 		return nil, false, err
 	}

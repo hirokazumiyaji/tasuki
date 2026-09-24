@@ -613,14 +613,14 @@ func TestFairClaimRequeriesOverflowAfterCarrySuccess(t *testing.T) {
 	}
 }
 
-// TestFairClaimProbesLockedCarry covers the issue #294 round-15 P2: a
-// retained carry over one locked instance must be batch-probed with a single
-// SELECT ... FOR UPDATE SKIP LOCKED instead of retried one pick per pass
-// (~2001 lock queries plus quadratic re-offers for A1..A2002 with A1..A2001
-// locked, all inside one long txn). One instance holds 60 activity tasks
-// with the first 59 locked by a concurrent claimer; the claim must return
-// the unlocked FIFO tail — not a locked row, not an empty batch — and keep
-// FIFO + cap semantics.
+// TestFairClaimProbesLockedCarry covers the issue #294 round-16 fix: a
+// retained carry over one locked instance is batch-probed with a single
+// lock-free visibility SELECT (no FOR UPDATE), so locked rows flow through
+// to the picker's lock step — which locks only accepted rows and skips rows
+// locked in the meantime — instead of the claim retaining ~2000 locks until
+// commit. One instance holds 60 activity tasks with the first 59 locked by
+// a concurrent claimer; the claim must return the unlocked FIFO tail — not
+// a locked row, not an empty batch — and keep FIFO + cap semantics.
 func TestFairClaimProbesLockedCarry(t *testing.T) {
 	dsn := dsnOrSkip(t)
 	ctx := context.Background()

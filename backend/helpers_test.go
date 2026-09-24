@@ -1608,38 +1608,56 @@ func TestFairOverflowRequeryCarrySuccessAfterLoss(t *testing.T) {
 
 
 func TestFairCarryProbeConvergesSameSet(t *testing.T) {
-	// Covers the issue #294 round-15 P2 at the refill-loop level without a
-	// live DB: a retained carry over one locked instance must be
-	// batch-probed (one SKIP LOCKED step over the whole carry) instead of
-	// retried one pick per pass. runClaim mirrors the postgres/mysql refill
-	// loops (per-pass picker with TrackRejected, FIFO carry, keyset cursor,
-	// lock step, lost-pick carry); the probe variant filters the carry to
-	// unlocked rows in one lock operation before re-offering. Both variants
-	// must converge to the same secured set in FIFO order, while the probe
-	// variant needs O(1) lock operations instead of one per retained row.
+	// Covers the issue #294 round-16 fix at the refill-loop level without a
+	// live DB: the retained-carry probe is a lock-free visibility filter
+	// (plain SELECT, no FOR UPDATE), so it must drop rows leased since the
+	// scan in one step without retaining locks, while rows locked between
+	// the probe and the pick are skipped by the picker's lock step — which
+	// locks only accepted rows — exactly as before the batch probe existed.
+	// runClaim mirrors the postgres/mysql refill loops (per-pass picker with
+	// TrackRejected, FIFO carry, keyset cursor, lock step, lost-pick
+	// carry); the probe variant filters the carry to visible rows in one
+	// lock-free operation before re-offering. Both variants must converge to
+	// the same secured set in FIFO order, while the probe variant collapses
+	// invisible-row drains to a handful of passes and takes no probe locks.
 	scenarios := []struct {
 		name        string
 		feed        []backend.FairTaskRef
 		locked      map[int64]bool
+		invisible   map[int64]bool
 		limit       int
 		perInstance int
 		minSerial   int
+		// maxProbePasses bounds the probe variant's passes; 0 skips the
+		// bound (lock-heavy scenarios converge pass-for-pass with serial,
+		// since locked rows flow through to the lock step in both).
+		maxProbePasses int
 	}{
 		{
-			name:        "single instance tail unlocked",
-			feed:        refs("A", 1, 200),
-			locked:      lockSet(1, 199),
-			limit:       2,
-			perInstance: 1,
-			minSerial:   150,
+			name:           "single instance tail visible",
+			feed:           refs("A", 1, 200),
+			invisible:      lockSet(1, 199),
+			limit:          2,
+			perInstance:    1,
+			minSerial:      150,
+			maxProbePasses: 8,
 		},
 		{
-			name:        "multi instance caps preserved",
-			feed:        append(refs("A", 1, 50), refs("B", 101, 1)...),
-			locked:      lockSet(1, 49),
+			name:           "multi instance caps preserved",
+			feed:           append(refs("A", 1, 50), refs("B", 101, 1)...),
+			invisible:      lockSet(1, 49),
+			limit:          2,
+			perInstance:    1,
+			minSerial:      40,
+			maxProbePasses: 8,
+		},
+		{
+			name:        "locked rows pass through to the lock step",
+			feed:        refs("A", 1, 10),
+			locked:      lockSet(1, 9),
 			limit:       2,
 			perInstance: 1,
-			minSerial:   40,
+			minSerial:   0,
 		},
 	}
 	for _, sc := range scenarios {
@@ -1656,12 +1674,14 @@ func TestFairCarryProbeConvergesSameSet(t *testing.T) {
 					picker := backend.NewFairPicker(sc.limit-len(out), sc.perInstance).TrackRejected()
 					picker.Seed(claimed)
 					if probe && len(pending) > 0 {
-						// The batch probe: one SKIP LOCKED step over the
-						// whole carry, survivors stay in FIFO order.
-						lockOps++
+						// The batch probe: one lock-free visibility filter
+						// over the whole carry — invisible rows drop here,
+						// locked rows pass through to the lock step below.
+						// It takes no locks (plain SELECT), so it costs no
+						// lock operation.
 						kept := pending[:0]
 						for _, r := range pending {
-							if !sc.locked[r.ID] {
+							if !sc.invisible[r.ID] {
 								kept = append(kept, r)
 							}
 						}
@@ -1690,11 +1710,13 @@ func TestFairCarryProbeConvergesSameSet(t *testing.T) {
 					if len(picked) == 0 {
 						break
 					}
-					// The per-pass lock step.
+					// The per-pass lock step locks only accepted rows;
+					// rows locked or leased in the meantime are skipped
+					// (the visibility re-check mirrors the probe).
 					lockOps++
 					prevOut := len(out)
 					for _, r := range picked {
-						if sc.locked[r.ID] {
+						if sc.locked[r.ID] || sc.invisible[r.ID] {
 							continue
 						}
 						out = append(out, r)
@@ -1732,13 +1754,13 @@ func TestFairCarryProbeConvergesSameSet(t *testing.T) {
 			if len(newOut) == 0 {
 				t.Fatalf("probe variant secured nothing (serial=%v)", idsOf(oldOut))
 			}
-			// The serial retry drains one retained row per pass; the probe
-			// must collapse that to a handful of lock operations.
+			// The serial retry drains one invisible row per pass; the probe
+			// must collapse that to a handful of passes.
 			if oldPasses < sc.minSerial {
 				t.Fatalf("serial variant took %d passes, want >= %d (mirror must exhibit the bug shape)", oldPasses, sc.minSerial)
 			}
-			if newOps > 8 || newPasses > 8 {
-				t.Fatalf("probe variant took %d lock ops over %d passes, want <= 8", newOps, newPasses)
+			if sc.maxProbePasses > 0 && (newOps > sc.maxProbePasses || newPasses > sc.maxProbePasses) {
+				t.Fatalf("probe variant took %d lock ops over %d passes, want <= %d", newOps, newPasses, sc.maxProbePasses)
 			}
 			t.Logf("serial: %d lock ops over %d passes; probe: %d lock ops over %d passes; secured=%v",
 				oldOps, oldPasses, newOps, newPasses, idsOf(newOut))
