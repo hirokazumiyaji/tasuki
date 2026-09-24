@@ -275,6 +275,27 @@ func FairSecuredCounts(secured []FairTaskRef) map[string]int {
 	return counts
 }
 
+// FairCarryMargin bounds the fallback rows TrimFairCarry retains past the
+// quota-kept prefix (issue #294 round-18 P1): the plain visibility probe
+// cannot see row locks, so a quota-only trim discards the very rows a
+// lock-skip round needs as replacements (e.g. Limit=2/MaxPerInstance=1 over
+// A1,A2,A3,B1 with A1+A2 locked: pass 1 secures B1 and carries A2,A3; a
+// quota-only trim keeps A2, SKIP LOCKED loses it, and the already-discarded
+// A3 leaves the batch underfilled — and worse, when the quota fill never
+// completes, every pass keeps one row, loses it, and stalls with the scan
+// cursor exhausted). The margin retains the FIFO-next window after the quota
+// fill so one lock-skip round still has replacements; lock-lost rows
+// themselves are dropped from the carry (offered but not secured), and the
+// unoffered margin tail survives via pending[offered:] for the next pass.
+// The bound is O(limit+margin), not O(carry): rows of an instance already at
+// its secured cap stay dropped everywhere (the picker is seeded with the
+// same secured set, so it rejects them for the rest of the claim), and only
+// one bounded post-fill window is scanned. Residual corner: a flood wider
+// than quota+margin still drains one window per pass, and rows past the
+// window wait for a later poll, which restarts from the head — liveness, not
+// fulfillment.
+const FairCarryMargin = 64
+
 // TrimFairCarry bounds a retained refill carry to the rows that can actually
 // be picked on the next pass (issue #294 round-17 P2): a plain visibility
 // probe cannot see row locks, so probing the full carry retains every locked
@@ -285,7 +306,11 @@ func FairSecuredCounts(secured []FairTaskRef) map[string]int {
 // so earlier rows beyond either quota can never contribute to this claim.
 // Keep the FIFO-earliest rows within both quotas (by original scan order);
 // locked extras stay dropped for later polls, which restart from the head.
-// The result is O(limit), not O(carry).
+// Plus the round-18 P1 fallback margin (see FairCarryMargin): one bounded
+// FIFO-next window past the quota-kept prefix is retained (skipping rows of
+// instances already at their secured cap, which the picker cannot admit) so
+// a lock-skip round that loses its quota picks still has replacements in the
+// same trimmed set. The result is O(limit+margin), not O(carry).
 func TrimFairCarry(pending, secured []FairTaskRef, limit, perInstance int) []FairTaskRef {
 	if len(pending) == 0 || limit <= 0 || perInstance <= 0 {
 		return pending
@@ -297,10 +322,21 @@ func TrimFairCarry(pending, secured []FairTaskRef, limit, perInstance int) []Fai
 	}
 	sorted := append([]FairTaskRef(nil), pending...)
 	SortFairRefs(sorted)
-	kept := make([]FairTaskRef, 0, remaining)
+	kept := make([]FairTaskRef, 0, remaining+FairCarryMargin)
 	keptCounts := make(map[string]int)
-	for _, r := range sorted {
+	// stop marks the start of the fallback window: when the quota fill
+	// completes it is the first unexamined row; when the fill never
+	// completes (single-instance carry wider than its quota) it is the row
+	// after the last kept one, so the margin still covers the FIFO-next
+	// replacements a lock-skip round needs. Rows skipped before stop as
+	// over-quota stay dropped for quota accounting, but the margin below
+	// re-admits the FIFO-next ones as fallbacks: a lock loss frees the very
+	// quota they exceed, so they are the replacements.
+	stop := len(sorted)
+	lastKept := -1
+	for i, r := range sorted {
 		if len(kept) >= remaining {
+			stop = i
 			break
 		}
 		quota := perInstance - securedCounts[r.InstanceID]
@@ -311,6 +347,29 @@ func TrimFairCarry(pending, secured []FairTaskRef, limit, perInstance int) []Fai
 			continue
 		}
 		keptCounts[r.InstanceID]++
+		kept = append(kept, r)
+		lastKept = i
+	}
+	if len(kept) == 0 {
+		return kept
+	}
+	if stop == len(sorted) {
+		stop = lastKept + 1
+	}
+	// One bounded window past stop: keep rows the picker can still admit
+	// (instances below their secured cap). Rows of capped instances are
+	// inadmissible for the rest of the claim — the picker is seeded with
+	// the same secured set — so they stay dropped instead of consuming the
+	// window. Retention stays O(margin); the window scan itself is CPU-only
+	// over refs, like the quota loop above, while the probe and lock steps
+	// below only ever see the retained set.
+	for _, r := range sorted[stop:] {
+		if len(kept) >= remaining+FairCarryMargin {
+			break
+		}
+		if securedCounts[r.InstanceID] >= perInstance {
+			continue
+		}
 		kept = append(kept, r)
 	}
 	return kept

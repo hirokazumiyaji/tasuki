@@ -471,11 +471,13 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 		// freed, so a requery would face identical caps). Only lock/lease
 		// losses below free quota (see backend.NoteFairLoss).
 		// Trim the carry to the rows that can actually be picked (round-17
-		// P2 on #294) BEFORE probing: the plain visibility probe cannot see
-		// locks, so it would retain the entire locked carry and the picker
-		// would admit one retained row per pass. Trimming to the unfilled
-		// per-instance quota bounds the probe set to O(limit); locked
-		// extras stay dropped for later polls.
+		// P2 on #294, round-18 fallback margin) BEFORE probing: the plain
+		// visibility probe cannot see locks, so it would retain the entire
+		// locked carry and the picker would admit one retained row per pass.
+		// Trimming to the unfilled per-instance quota plus a bounded
+		// fallback margin (see backend.FairCarryMargin) bounds the probe
+		// set to O(limit+margin); locked extras past the margin stay
+		// dropped for later polls.
 		if len(pending) > 0 {
 			pending = backend.TrimFairCarry(pending, accepted, req.Limit, req.MaxPerInstance)
 			if len(pending) == 0 {

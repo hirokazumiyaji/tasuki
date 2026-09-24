@@ -11,7 +11,7 @@ import (
 // plain visibility probe cannot see locks, so probing the full retained carry
 // retains every locked row and the picker admits one per pass (~2000 lock
 // queries + quadratic re-offers). Trimming to the unfilled per-instance quota
-// bounds the probe set to O(limit).
+// plus the round-18 fallback margin bounds the probe set to O(limit+margin).
 func TestTrimFairCarryBoundsLockedFlood(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	var carry []backend.FairTaskRef
@@ -19,8 +19,12 @@ func TestTrimFairCarryBoundsLockedFlood(t *testing.T) {
 		carry = append(carry, backend.FairTaskRef{ID: int64(i + 1), InstanceID: "A", VisibleAt: base.Add(time.Duration(i) * time.Millisecond)})
 	}
 	trimmed := backend.TrimFairCarry(carry, nil, 2, 1)
-	if len(trimmed) != 1 {
-		t.Fatalf("trimmed locked flood = %d rows, want 1 (MaxPerInstance quota)", len(trimmed))
+	// Quota (1 row: per-instance cap) plus one bounded fallback window —
+	// never the full 2000-row carry. The window is what lets a later pass
+	// replace lock-skipped quota rows (round-18 P1) instead of stalling.
+	// The cap is remaining+margin (O(limit+margin)).
+	if len(trimmed) != 2+backend.FairCarryMargin {
+		t.Fatalf("trimmed locked flood = %d rows, want remaining(2) + %d margin", len(trimmed), backend.FairCarryMargin)
 	}
 	if trimmed[0].ID != 1 {
 		t.Fatalf("trimmed[0] = %d, want FIFO-earliest 1", trimmed[0].ID)
@@ -34,10 +38,15 @@ func TestTrimFairCarryBoundsLockedFlood(t *testing.T) {
 		t.Fatalf("trimmed mixed = %d rows, want 2 (one quota per instance)", len(trimmed))
 	}
 
-	// Total bounded by the remaining limit, not by the sum of quotas.
+	// Total bounded by the remaining limit plus the fallback margin, not by
+	// the sum of quotas (round-18 P1 keeps the next margin rows past the
+	// quota fill as lock-skip replacements).
 	trimmed = backend.TrimFairCarry(mixed, nil, 1, 1)
-	if len(trimmed) != 1 {
-		t.Fatalf("trimmed to limit 1 = %d rows, want 1", len(trimmed))
+	if len(trimmed) != 1+backend.FairCarryMargin {
+		t.Fatalf("trimmed to limit 1 = %d rows, want 1 quota + %d margin", len(trimmed), backend.FairCarryMargin)
+	}
+	if trimmed[0].ID != 1 || trimmed[len(trimmed)-1].ID != backend.FairCarryMargin+1 {
+		t.Fatalf("trimmed to limit 1 = [%d..%d], want FIFO A1..A%d", trimmed[0].ID, trimmed[len(trimmed)-1].ID, backend.FairCarryMargin+1)
 	}
 
 	// Already-full instances contribute nothing.
