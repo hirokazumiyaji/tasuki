@@ -537,6 +537,38 @@ func (w *Worker) renewExit() {
 	}
 }
 
+// joinOrdinaryRenewalsForCommit waits for admitted ordinary renewals to
+// settle before a row-preserving result write (round-16 P1). An ordinary
+// ticker renewal admitted via renewTryEnter just before beginDetachedCommit
+// flips committing uses the execution context — not the commit's cover
+// context — so the post-commit cover cancel cannot stop it: it stays
+// blocked while the sync pre-commit renewal succeeds and RetryActivity (or
+// a nack) completes, then lands after the result write and overwrites what
+// it wrote (the retry delay, the nack's visible_at). The deferred
+// joinCommitStop only joins after the write, which is too late.
+//
+// Waiting here orders the write after the admitted renewal: the renewal
+// lands first and the result overwrites it. New ordinary renewals for this
+// task cannot start during the wait — the ticker takes the detached branch
+// once committing is set — so the snapshot covers the raced call; renewals
+// for other task IDs may drain or start around it without affecting this
+// task's ID-only write. Unlike shutdownRenewalJoin this sets no stop flag:
+// ordinary renewal stays armed for every task that never commits. Callers
+// re-gate the detached guard after the wait (the guard may have tripped
+// and the continuity deadline may have passed while waiting) and run the
+// store op only when the gate still holds. detMu is never held across the
+// wait, so cover renewals keep the commit covered meanwhile.
+func (w *Worker) joinOrdinaryRenewalsForCommit() {
+	w.renewMu.Lock()
+	idle := w.renewIdle
+	n := w.renewInflight
+	w.renewMu.Unlock()
+	if n == 0 || idle == nil {
+		return
+	}
+	<-idle
+}
+
 // waitForWaitGroup blocks until wg drains or ctx ends.
 func waitForWaitGroup(wg *sync.WaitGroup, ctx context.Context) {
 	done := make(chan struct{})
@@ -918,6 +950,15 @@ func (w *Worker) tripDetachedGuard(taskID int64, tok claimToken) {
 // while one running during a blocked Complete must still observe loss
 // and cancel it mid-call (round-10 P1b).
 //
+// An ordinary (non-cover) renewal admitted just before the commit
+// transfer needs the same ordering on the other side of the write
+// (round-16 P1): it runs on the execution context, so the cover cancel
+// above cannot stop it, and the post-commit joinCommitStop waits only
+// after the write. Row-preserving commits therefore join admitted
+// ordinary renewals BEFORE the store op (see
+// joinOrdinaryRenewalsForCommit) and re-gate the guard after the wait;
+// row-deleting writes skip the join (a late renewal finds no row).
+//
 // While the op runs, its commit-context cancel is stashed in the guard
 // (see tripDetachedGuard) so a loss observed mid-call still aborts a
 // context-aware backend op; it is cleared before returning, so a later
@@ -955,9 +996,44 @@ func (w *Worker) guardedDetachedCommit(taskID int64, tok claimToken, commitCance
 			"task_id", taskID)
 		return fmt.Errorf("%w: detached commit gate found lease expired", errLeaseLost)
 	}
-	g.cancel = commitCancel
-	w.detGuard[taskID] = g
-	w.detMu.Unlock()
+	if !exclusive {
+		g.cancel = commitCancel
+		w.detGuard[taskID] = g
+		w.detMu.Unlock()
+	} else {
+		// Row-preserving write: join admitted ordinary renewals
+		// BEFORE the store op (round-16 P1, see
+		// joinOrdinaryRenewalsForCommit), then re-gate. detMu is
+		// released across the wait so cover keeps the commit
+		// covered; the wait took time, so the guard may have
+		// tripped and the continuity deadline may have passed —
+		// the op runs only when the gate still holds, with the
+		// same rejection cleanup as the initial gate.
+		w.detMu.Unlock()
+		w.joinOrdinaryRenewalsForCommit()
+		w.detMu.Lock()
+		g, ok = w.detGuard[taskID]
+		if !ok || g.epoch != tok.epoch || g.seq != tok.seq {
+			w.detMu.Unlock()
+			w.opts.Logger.Debug("skipping detached commit; lease lost while joining ordinary renewals",
+				"task_id", taskID)
+			return fmt.Errorf("%w: detached commit gate found lease lost", errLeaseLost)
+		}
+		if !time.Now().Before(g.deadline) {
+			coverCancel := g.coverCancel
+			delete(w.detGuard, taskID)
+			w.detMu.Unlock()
+			if coverCancel != nil {
+				coverCancel()
+			}
+			w.opts.Logger.Debug("skipping detached commit; continuity deadline passed while joining ordinary renewals",
+				"task_id", taskID)
+			return fmt.Errorf("%w: detached commit gate found lease expired", errLeaseLost)
+		}
+		g.cancel = commitCancel
+		w.detGuard[taskID] = g
+		w.detMu.Unlock()
+	}
 	err := op()
 	// Clear the stashed cancel and drop the guard: with the store op
 	// done, further cover would only overwrite what the commit just
