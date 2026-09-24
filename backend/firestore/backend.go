@@ -1062,14 +1062,48 @@ func (b *Backend) cleanupTerminalDocsWithRetry(ctx context.Context, id string) e
 // sweeping it is required, preserving it fails the suite). Server update
 // times order the two commits exactly, with no entry-time skew and no
 // cross-process clock skew. A missing instance doc falls back to the
-// unbounded sweep (status quo, e.g. a concurrent purge owns the leftovers).
-// A second TerminateInstance on an already-terminal instance advances the
-// instance update time and sweeps rows predating THAT call — matching the
-// conformance expectation that re-terminating stays clean.
+// unbounded sweep (status quo, e.g. a concurrent purge owns the leftovers);
+// any other instance-doc read error propagates (retried by
+// cleanupTerminalDocsWithRetry) instead of silently zeroing the cutoff and
+// sweeping unbounded (Codex round-22 P2 on #291). A second TerminateInstance
+// on an already-terminal instance advances the instance update time and
+// sweeps rows predating THAT call — matching the conformance expectation
+// that re-terminating stays clean.
+
+// snapTime returns a document snapshot's server update time (zero when the
+// snapshot is nil, e.g. a failed Get).
+func snapTime(snap *gcf.DocumentSnapshot) time.Time {
+	if snap == nil {
+		return time.Time{}
+	}
+	return snap.UpdateTime
+}
+
+// resolveSweepCutoff maps an instance-doc read onto the terminal-sweep
+// cutoff (Codex round-22 P2 on #291). NotFound (or a missing doc) means the
+// instance is gone — a concurrent purge owns the leftovers — so the sweep
+// falls back to unbounded with no error. Any other read error propagates so
+// the caller retries instead of sweeping unbounded: a transient Get failure
+// that silently zeroed the cutoff would delete an accepted post-commit send
+// and report success. Pure for unit tests.
+func resolveSweepCutoff(exists bool, err error, updateTime time.Time) (time.Time, error) {
+	if err != nil {
+		if isNotFound(err) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+	if !exists {
+		return time.Time{}, nil
+	}
+	return updateTime, nil
+}
+
 func (b *Backend) cleanupTerminalDocs(ctx context.Context, id string) error {
-	var cutoff time.Time
-	if snap, err := b.ref("wf_instances", id).Get(ctx); err == nil && snap.Exists() {
-		cutoff = snap.UpdateTime
+	snap, err := b.ref("wf_instances", id).Get(ctx)
+	cutoff, err := resolveSweepCutoff(snap != nil && snap.Exists(), err, snapTime(snap))
+	if err != nil {
+		return err
 	}
 	for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox"} {
 		if err := b.deleteTerminalColDocs(ctx, col, id, cutoff); err != nil {
@@ -1092,14 +1126,32 @@ func sweepKeepsRow(rowUpdate, flipUpdate time.Time) bool {
 }
 
 func (b *Backend) deleteTerminalColDocs(ctx context.Context, col, id string, cutoff time.Time) error {
+	// Paginate with a document-ID cursor and stop only when a page yields
+	// zero ROWS — not zero deletions (Codex round-22 P2 on #291). Retained
+	// post-transition rows survive the client-side cutoff below, so a page
+	// can fill entirely with survivors (400+ of them) while older deletable
+	// rows wait behind it: returning on an empty deletion set would declare
+	// completion and shield those rows permanently. The cursor advances
+	// past every row seen (deleted or retained), so each page makes
+	// progress and the loop always terminates.
+	//
+	// The OrderBy(__name__) + StartAfter cursor needs a composite index on
+	// (instance_id, __name__) per swept collection in production; the
+	// emulator serves it without one.
+	var cursor string
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		it := b.col(col).Where("instance_id", "==", id).Limit(terminalCleanupBatchSize).Documents(ctx)
+		q := b.col(col).Where("instance_id", "==", id).OrderBy(gcf.DocumentID, gcf.Asc).Limit(terminalCleanupBatchSize)
+		if cursor != "" {
+			q = q.StartAfter(cursor)
+		}
+		it := q.Documents(ctx)
 		var refs []*gcf.DocumentRef
+		rows := 0
 		for {
 			d, err := it.Next()
 			if err == iterator.Done {
@@ -1109,24 +1161,29 @@ func (b *Backend) deleteTerminalColDocs(ctx context.Context, col, id string, cut
 				it.Stop()
 				return err
 			}
-			// Client-side cutoff (no composite index required): only
-			// rows committed at or before the terminal flip are deleted,
-			// so a racing post-commit send's rows survive the sweep.
+			rows++
+			cursor = d.Ref.ID
+			// Client-side cutoff (no composite index on update time
+			// required): only rows committed at or before the terminal
+			// flip are deleted, so a racing post-commit send's rows
+			// survive the sweep.
 			if sweepKeepsRow(d.UpdateTime, cutoff) {
 				continue
 			}
 			refs = append(refs, d.Ref)
 		}
 		it.Stop()
-		if len(refs) == 0 {
+		if len(refs) > 0 {
+			batch := b.client.Batch()
+			for _, r := range refs {
+				batch.Delete(r)
+			}
+			if _, err := batch.Commit(ctx); err != nil {
+				return err
+			}
+		}
+		if rows < terminalCleanupBatchSize {
 			return nil
-		}
-		batch := b.client.Batch()
-		for _, r := range refs {
-			batch.Delete(r)
-		}
-		if _, err := batch.Commit(ctx); err != nil {
-			return err
 		}
 	}
 }

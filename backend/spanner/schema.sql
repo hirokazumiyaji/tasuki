@@ -13,7 +13,8 @@ CREATE TABLE wf_instances (
   memo JSON,
   created_at TIMESTAMP NOT NULL,
   updated_at TIMESTAMP NOT NULL,
-  completed_at TIMESTAMP
+  completed_at TIMESTAMP,
+  sweep_commit_ts TIMESTAMP OPTIONS (allow_commit_timestamp=true)
 ) PRIMARY KEY (id);
 
 CREATE INDEX wf_instances_visibility_idx ON wf_instances(status, name, created_at);
@@ -35,7 +36,7 @@ CREATE TABLE wf_inbox (
   type STRING(64) NOT NULL,
   ref_seq INT64,
   payload JSON,
-  created_at TIMESTAMP NOT NULL
+  created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true)
 ) PRIMARY KEY (id);
 
 CREATE INDEX wf_inbox_instance_idx ON wf_inbox(instance_id, id);
@@ -48,7 +49,7 @@ CREATE TABLE wf_inbox_seq (
 CREATE TABLE wf_signal_dedupe (
   instance_id STRING(255) NOT NULL,
   dedupe_id STRING(255) NOT NULL,
-  created_at TIMESTAMP NOT NULL
+  created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true)
 ) PRIMARY KEY (instance_id, dedupe_id);
 
 CREATE TABLE wf_tasks (
@@ -63,7 +64,7 @@ CREATE TABLE wf_tasks (
   visible_at TIMESTAMP NOT NULL,
   worker_id STRING(255),
   heartbeat BYTES(MAX),
-  created_at TIMESTAMP NOT NULL,
+  created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
   wf_singleton STRING(255) AS (IF(kind = 'workflow', instance_id, NULL)) STORED
 ) PRIMARY KEY (id);
 

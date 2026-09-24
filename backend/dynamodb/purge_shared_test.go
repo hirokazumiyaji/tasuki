@@ -66,7 +66,7 @@ func TestDeleteTasksForInstancesByScan_SharesOneScan(t *testing.T) {
 		},
 	}
 	b := newTestBackend(f)
-	if err := b.deleteTasksForInstancesByScan(context.Background(), []string{"A", "B"}); err != nil {
+	if err := b.deleteTasksForInstancesByScan(context.Background(), []string{"A", "B"}, terminalSweepCutoff{}); err != nil {
 		t.Fatalf("shared scan: %v", err)
 	}
 	if got := atomic.LoadInt64(&f.scanCalls); got != 1 {
@@ -87,7 +87,7 @@ func TestDeleteTasksForInstancesByScan_SharesOneScan(t *testing.T) {
 func TestDeleteTasksForInstancesFull_EmptyIsNoop(t *testing.T) {
 	f := &fakeDynamo{}
 	b := newTestBackend(f)
-	if err := b.deleteTasksForInstancesFull(context.Background(), nil); err != nil {
+	if err := b.deleteTasksForInstancesFull(context.Background(), nil, terminalSweepCutoff{}); err != nil {
 		t.Fatalf("empty: %v", err)
 	}
 	if got := atomic.LoadInt64(&f.scanCalls); got != 0 {
@@ -111,7 +111,7 @@ func TestDeleteTasksForInstancesFull_GSISweepPerInstanceSharedScan(t *testing.T)
 		},
 	}
 	b := newTestBackend(f)
-	if err := b.deleteTasksForInstancesFull(context.Background(), []string{"A", "B"}); err != nil {
+	if err := b.deleteTasksForInstancesFull(context.Background(), []string{"A", "B"}, terminalSweepCutoff{}); err != nil {
 		t.Fatalf("full: %v", err)
 	}
 	if got := atomic.LoadInt64(&f.queryCalls); got != 2 {
@@ -134,7 +134,7 @@ func TestDeleteTasksForInstancesFull_GSIMissingStopsProbing(t *testing.T) {
 		},
 	}
 	b := newTestBackend(f)
-	if err := b.deleteTasksForInstancesFull(context.Background(), []string{"A", "B"}); err != nil {
+	if err := b.deleteTasksForInstancesFull(context.Background(), []string{"A", "B"}, terminalSweepCutoff{}); err != nil {
 		t.Fatalf("full without index: %v", err)
 	}
 	if got := atomic.LoadInt64(&f.queryCalls); got != 1 {

@@ -185,7 +185,7 @@ func TestDeleteTasksForInstance_UsesQueryNotScan(t *testing.T) {
 		},
 	}
 	b := newTestBackend(f)
-	if err := b.deleteTasksForInstance(context.Background(), "inst-1"); err != nil {
+	if err := b.deleteTasksForInstance(context.Background(), "inst-1", terminalSweepCutoff{}); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if got := atomic.LoadInt64(&f.queryCalls); got != 1 {
@@ -262,7 +262,7 @@ func TestDeleteTasksForInstance_FallsBackToScanWhenGSIMissing(t *testing.T) {
 		},
 	}
 	b := newTestBackend(f)
-	if err := b.deleteTasksForInstance(context.Background(), "inst-9"); err != nil {
+	if err := b.deleteTasksForInstance(context.Background(), "inst-9", terminalSweepCutoff{}); err != nil {
 		t.Fatalf("delete with fallback: %v", err)
 	}
 	if got := atomic.LoadInt64(&f.queryCalls); got != 1 {
@@ -294,7 +294,7 @@ func TestDeleteTasksForInstance_AccessDeniedDoesNotFallBack(t *testing.T) {
 		},
 	}
 	b := newTestBackend(f)
-	if err := b.deleteTasksForInstance(context.Background(), "inst-9"); err == nil {
+	if err := b.deleteTasksForInstance(context.Background(), "inst-9", terminalSweepCutoff{}); err == nil {
 		t.Fatal("delete with IAM denial = nil, want the access error (no Scan fallback)")
 	}
 	if got := atomic.LoadInt64(&f.queryCalls); got != 1 {
@@ -333,7 +333,7 @@ func TestDeleteTasksForInstance_TypedMissingIndexFallsBack(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &fakeDynamo{queryErr: tc.queryErr, scanItems: scanItems}
 			b := newTestBackend(f)
-			err := b.deleteTasksForInstance(context.Background(), "inst-9")
+			err := b.deleteTasksForInstance(context.Background(), "inst-9", terminalSweepCutoff{})
 			if tc.fallback {
 				if err != nil {
 					t.Fatalf("delete = %v, want nil (Scan fallback)", err)

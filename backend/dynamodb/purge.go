@@ -65,17 +65,17 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 	// before any instance row is removed, so purged counts only
 	// fully-purged instances (zero here) and a retry resumes idempotently —
 	// deletes never partially report an instance as purged.
-	if err := b.deleteTasksForInstancesFull(ctx, ids); err != nil {
+	if err := b.deleteTasksForInstancesFull(ctx, ids, terminalSweepCutoff{}); err != nil {
 		return purged, err
 	}
 	for _, id := range ids {
-		if err := b.deleteTimersForInstance(ctx, id); err != nil {
+		if err := b.deleteTimersForInstance(ctx, id, terminalSweepCutoff{}); err != nil {
 			return purged, err
 		}
-		if err := b.deleteSignalDedupeForInstance(ctx, id); err != nil {
+		if err := b.deleteSignalDedupeForInstance(ctx, id, terminalSweepCutoff{}); err != nil {
 			return purged, err
 		}
-		if err := b.deleteInboxForInstance(ctx, id); err != nil {
+		if err := b.deleteInboxForInstance(ctx, id, terminalSweepCutoff{}); err != nil {
 			return purged, err
 		}
 		if err := b.deleteJournalForInstance(ctx, id); err != nil {
@@ -103,16 +103,20 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 }
 
 // deleteInboxForInstance / deleteJournalForInstance page over the instance_id
-// hash key and remove every item.
-func (b *Backend) deleteInboxForInstance(ctx context.Context, id string) error {
-	return b.deleteByInstance(ctx, "wf_inbox", id)
+// hash key and remove every item. Inbox rows created after the terminal
+// transition survive when cutoff carries one (see terminalSweepCutoff);
+// journal rows are never re-added post-terminal (only advancements write
+// them, and the terminal commit is last), so the journal sweep stays
+// unbounded.
+func (b *Backend) deleteInboxForInstance(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
+	return b.deleteByInstance(ctx, "wf_inbox", id, cutoff)
 }
 
 func (b *Backend) deleteJournalForInstance(ctx context.Context, id string) error {
-	return b.deleteByInstance(ctx, "wf_journal", id)
+	return b.deleteByInstance(ctx, "wf_journal", id, terminalSweepCutoff{})
 }
 
-func (b *Backend) deleteByInstance(ctx context.Context, name, id string) error {
+func (b *Backend) deleteByInstance(ctx context.Context, name, id string, cutoff terminalSweepCutoff) error {
 	table := b.table(name)
 	var startKey map[string]types.AttributeValue
 	for {
@@ -131,6 +135,13 @@ func (b *Backend) deleteByInstance(ctx context.Context, name, id string) error {
 			return err
 		}
 		for _, m := range out.Items {
+			// Preserve rows a racing post-commit send created after the
+			// terminal transition (see terminalSweepCutoff). Journal rows
+			// carry recorded_at instead of created_at and always sweep
+			// with a zero cutoff (unbounded).
+			if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
+				continue
+			}
 			key := keyFromItem(name, m)
 			if key == nil {
 				continue

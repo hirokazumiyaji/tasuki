@@ -98,7 +98,7 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 				"instance_id": inst.ID,
 				"attempt":     int64(0),
 				"visible_at":  now,
-				"created_at":  now,
+				"created_at":  commitTimestamp(),
 			}),
 		}
 		return txn.BufferWrite(muts)
@@ -251,10 +251,11 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		// below (cleanupTerminalInstance).
 		var muts []*spanner.Mutation
 		muts = append(muts, spanner.UpdateMap("wf_instances", map[string]any{
-			"id":           id,
-			"status":       "terminated",
-			"updated_at":   now,
-			"completed_at": now,
+			"id":              id,
+			"status":          "terminated",
+			"updated_at":      now,
+			"completed_at":    now,
+			"sweep_commit_ts": commitTimestamp(),
 		}))
 		budget := terminalCleanupMutationBudget
 		dMuts, err := deleteSignalDedupe(ctx, txn, id, budget, time.Time{}, false)
@@ -881,12 +882,20 @@ func (b *Backend) cleanupTerminalInstanceOnce(ctx context.Context, id string, in
 // mid-sweep, and an unrestricted sweep deletes the inbox row while the
 // dedupe phase already passed — the marker survives, the event is lost, and
 // every later send under the same DedupeID is discarded. The cutoff is the
-// instance's completed_at read in this same transaction (the terminal
-// commit's own timestamp): rows created after it are the racing sends and
-// must survive. A missing instance row or a NULL completed_at (legacy rows)
-// falls back to the unbounded sweep, and wf_timers has no created_at column
-// — timers can only be created by a non-terminal advancement, so no racing
-// send can add one post-commit and the unbounded timer sweep is exact.
+// instance's sweep_commit_ts read in this same transaction: the terminal
+// commit's own commit timestamp (see commitTimestamp), and every swept
+// table's created_at is a commit timestamp too, so the comparison orders the
+// two commits exactly with no cross-process clock skew (Codex round-22 P2 on
+// #291). Rows created after it are the racing sends and must survive. A
+// missing instance row or ticks on neither column (legacy rows) falls back
+// to the unbounded sweep, and wf_timers has no created_at column — timers
+// can only be created by a non-terminal advancement, so no racing send can
+// add one post-commit and the unbounded timer sweep is exact.
+// Pre-commit-timestamp rows (created_at stamped by writer wall clocks
+// before the migration, or swept under a NULL sweep_commit_ts via the
+// completed_at fallback in readCompletedAt) still compare by wall time
+// against the cutoff — the same approximation as before, converging as old
+// rows age out.
 //
 // The in-commit budget deletes (commitAdvancementTxn, TerminateInstance)
 // stay unbounded: their reads are snapshot-isolated inside the status-flip
@@ -1046,7 +1055,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 			"payload":     jsonVal(payload),
 			"attempt":     int64(0),
 			"visible_at":  now,
-			"created_at":  now,
+			"created_at":  commitTimestamp(),
 		}
 		if at.MaxAttempts > 0 {
 			m["max_attempts"] = int64(at.MaxAttempts)
@@ -1065,12 +1074,13 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	}
 	if adv.Terminal != nil {
 		m := map[string]any{
-			"id":           adv.InstanceID,
-			"status":       adv.Terminal.Status,
-			"result":       jsonVal(adv.Terminal.Result),
-			"failure":      jsonVal(adv.Terminal.Failure),
-			"updated_at":   now,
-			"completed_at": now,
+			"id":              adv.InstanceID,
+			"status":          adv.Terminal.Status,
+			"result":          jsonVal(adv.Terminal.Result),
+			"failure":         jsonVal(adv.Terminal.Failure),
+			"updated_at":      now,
+			"completed_at":    now,
+			"sweep_commit_ts": commitTimestamp(),
 		}
 		muts = append(muts, spanner.UpdateMap("wf_instances", m))
 		// Terminal cleanup cannot ride along unbounded: tasks, timers,
@@ -1135,7 +1145,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 			}),
 			spanner.InsertMap("wf_tasks", map[string]any{
 				"id": newID(), "kind": "workflow", "queue": q, "instance_id": ch.ID,
-				"attempt": int64(0), "visible_at": now, "created_at": now,
+				"attempt": int64(0), "visible_at": now, "created_at": commitTimestamp(),
 			}),
 		)
 	}
@@ -1167,7 +1177,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 			spanner.InsertMap("wf_inbox", map[string]any{
 				"id": inboxID, "instance_id": parentID.StringVal,
 				"seq": pseq, "type": string(ev.Type), "ref_seq": nullInt(ev.RefSeq),
-				"payload": jsonVal(ev.Payload), "created_at": now,
+				"payload": jsonVal(ev.Payload), "created_at": commitTimestamp(),
 			}))
 		if err := txn.BufferWrite(muts); err != nil {
 			return err
@@ -1301,7 +1311,7 @@ func enqueueWorkflowTask(ctx context.Context, txn *spanner.ReadWriteTransaction,
 	if err := txn.BufferWrite([]*spanner.Mutation{
 		spanner.InsertMap("wf_tasks", map[string]any{
 			"id": newID(), "kind": "workflow", "queue": queue, "instance_id": instanceID,
-			"attempt": int64(0), "visible_at": now, "created_at": now,
+			"attempt": int64(0), "visible_at": now, "created_at": commitTimestamp(),
 		}),
 	}); err != nil {
 		return err
@@ -1415,7 +1425,7 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 		if err := txn.BufferWrite(append(inboxSeqMuts(instanceID, seq, existed),
 			spanner.InsertMap("wf_inbox", map[string]any{
 				"id": newID(), "instance_id": instanceID, "seq": seq, "type": string(ev.Type),
-				"ref_seq": nullInt(ev.RefSeq), "payload": jsonVal(ev.Payload), "created_at": now,
+				"ref_seq": nullInt(ev.RefSeq), "payload": jsonVal(ev.Payload), "created_at": commitTimestamp(),
 			}))); err != nil {
 			return err
 		}
@@ -1521,7 +1531,7 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			muts := append(inboxSeqMuts(d.instanceID, seq, existed),
 				spanner.InsertMap("wf_inbox", map[string]any{
 					"id": newID(), "instance_id": d.instanceID, "seq": seq,
-					"type": string(journal.TypeTimerFired), "ref_seq": d.seq, "created_at": now,
+					"type": string(journal.TypeTimerFired), "ref_seq": d.seq, "created_at": commitTimestamp(),
 				}))
 			if err := txn.BufferWrite(muts); err != nil {
 				return err
@@ -1556,12 +1566,12 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	now := nowUTC()
 	var inserted int
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		// now is stamped per attempt (not per call): the transaction
-		// retries on abort, and a send that loses to the terminal commit
-		// must stamp its rows with the retry time — after the terminal
-		// completed_at — so the post-commit terminal sweep's create-time
-		// cutoff preserves them instead of deleting the inbox row while
-		// its dedupe marker survives (Codex round-21 P2 on #291).
+		// Row creation order comes from commit timestamps, not this clock
+		// (see commitTimestamp): dedupe and inbox rows stamp the
+		// transaction's commit time, so a send that loses to the terminal
+		// commit and retries is ordered after the terminal completed_at no
+		// matter how skewed this worker's clock is. now is still refreshed
+		// per attempt for visible_at below.
 		now = nowUTC()
 		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"status", "queue"})
 		if err != nil {
@@ -1597,7 +1607,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					return err
 				}
 				muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-					"instance_id": instanceID, "dedupe_id": it.DedupeID, "created_at": now,
+					"instance_id": instanceID, "dedupe_id": it.DedupeID, "created_at": commitTimestamp(),
 				}))
 				created[it.DedupeID] = true
 			}
@@ -1605,7 +1615,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			seq++
 			muts = append(muts, spanner.InsertMap("wf_inbox", map[string]any{
 				"id": newID(), "instance_id": instanceID, "seq": seq, "type": string(it.Event.Type),
-				"ref_seq": nullInt(it.Event.RefSeq), "payload": jsonVal(payload), "created_at": now,
+				"ref_seq": nullInt(it.Event.RefSeq), "payload": jsonVal(payload), "created_at": commitTimestamp(),
 			}))
 			inserted++
 		}
@@ -1638,26 +1648,37 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 }
 
 // readCompletedAt returns the instance's terminal-transition time for the
-// post-commit sweep cutoff (Codex round-21 P2 on #291). ok=false when the
-// instance row is gone (a concurrent purge owns the leftovers) or
-// completed_at is NULL (legacy rows): the sweep then falls back to
-// unbounded, matching the pre-cutoff behavior so legacy residue converges.
+// post-commit sweep cutoff (Codex round-21 P2 on #291): the status commit's
+// own commit timestamp recorded in sweep_commit_ts (see commitTimestamp),
+// so comparing it against the commit-timestamp created_at of swept rows
+// orders the commits exactly (Codex round-22 P2 on #291). Rows created
+// after it are the racing sends and must survive. ok=false when the
+// instance row is gone (a concurrent purge owns the leftovers) or neither
+// tick is set (legacy rows predate both columns): the sweep then falls back
+// to unbounded, matching the pre-cutoff behavior so legacy residue
+// converges. A set completed_at with a NULL sweep_commit_ts (rows written
+// between the flip and a crashed migration, or by an older binary) falls
+// back to the client-time completed_at — the pre-round-22 skew
+// approximation, converging as those rows age out.
 func readCompletedAt(ctx context.Context, txn *spanner.ReadWriteTransaction, id string) (cutoff time.Time, ok bool, err error) {
-	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"completed_at"})
+	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"sweep_commit_ts", "completed_at"})
 	if err != nil {
 		if isNotFound(err) {
 			return time.Time{}, false, nil
 		}
 		return time.Time{}, false, err
 	}
-	var completedAt spanner.NullTime
-	if err := row.Columns(&completedAt); err != nil {
+	var sweepTs, completedAt spanner.NullTime
+	if err := row.Columns(&sweepTs, &completedAt); err != nil {
 		return time.Time{}, false, err
 	}
-	if !completedAt.Valid {
-		return time.Time{}, false, nil
+	if sweepTs.Valid {
+		return sweepTs.Time, true, nil
 	}
-	return completedAt.Time, true, nil
+	if completedAt.Valid {
+		return completedAt.Time, true, nil
+	}
+	return time.Time{}, false, nil
 }
 
 func deleteSignalDedupe(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string, limit int, cutoff time.Time, hasCutoff bool) ([]*spanner.Mutation, error) {

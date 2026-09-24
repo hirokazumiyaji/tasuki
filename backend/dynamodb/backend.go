@@ -220,39 +220,48 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	}
 	// Terminate always runs the full task cleanup (not the bounded
 	// hot-path sweep): an explicit termination must leave no claimable
-	// rows behind for the terminated ID.
-	if err := b.deleteTasksForInstanceFull(ctx, id); err != nil {
+	// rows behind for the terminated ID. Every delete below still honors
+	// the terminal-transition cutoff (see terminalSweepCutoff): a
+	// SendToInboxBatch racing this synchronous sweep is accepted after
+	// the flip above, and only pre-transition rows are removed — the
+	// racing send's rows survive (inert: ClaimTasks gates execution on
+	// instance status) until the retention purge reaps them.
+	cutoff, err := b.readTerminalCutoff(ctx, id)
+	if err != nil {
 		return err
 	}
-	if err := b.deleteTimersForInstance(ctx, id); err != nil {
+	if err := b.deleteTasksForInstanceFull(ctx, id, cutoff); err != nil {
 		return err
 	}
-	if err := b.deleteSignalDedupeForInstance(ctx, id); err != nil {
+	if err := b.deleteTimersForInstance(ctx, id, cutoff); err != nil {
 		return err
 	}
-	if err := b.deleteInboxForInstance(ctx, id); err != nil {
+	if err := b.deleteSignalDedupeForInstance(ctx, id, cutoff); err != nil {
+		return err
+	}
+	if err := b.deleteInboxForInstance(ctx, id, cutoff); err != nil {
 		return err
 	}
 	b.notifyTerminal(id)
 	return nil
 }
 
-func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
-	if err := b.deleteTasksForInstanceByGSI(ctx, id); err != nil {
+func (b *Backend) deleteTasksForInstance(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
+	if err := b.deleteTasksForInstanceByGSI(ctx, id, cutoff); err != nil {
 		if !isMissingIndexError(err) {
 			return err
 		}
 		// Backward compat: tables created before instance_gsi existed (or
 		// still backfilling it) fall back to a strongly-consistent
 		// full-table Scan; Migrate backfills the index on existing tables.
-		return b.deleteTasksForInstanceByScan(ctx, id)
+		return b.deleteTasksForInstanceByScan(ctx, id, cutoff)
 	}
 	// The GSI is eventually consistent: a sweep can report a partial match
 	// while lagging rows are still invisible to the index. Confirm with one
 	// bounded strongly-consistent Scan page (see
 	// verifyTasksFirstPageByScan): the common case stays cheap and lagging
 	// rows in the page are reaped synchronously.
-	return b.verifyTasksFirstPageByScan(ctx, id)
+	return b.verifyTasksFirstPageByScan(ctx, id, cutoff)
 }
 
 // deleteTasksForInstanceFull removes one instance's tasks with no bound on
@@ -263,14 +272,14 @@ func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
 // deleteTasksForInstance for why the hot path stays bounded) and never a
 // batch purge (see deleteTasksForInstancesFull for why the purge shares one
 // scan across all its victims instead of paying one per instance).
-func (b *Backend) deleteTasksForInstanceFull(ctx context.Context, id string) error {
-	if err := b.deleteTasksForInstanceByGSI(ctx, id); err != nil {
+func (b *Backend) deleteTasksForInstanceFull(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
+	if err := b.deleteTasksForInstanceByGSI(ctx, id, cutoff); err != nil {
 		if !isMissingIndexError(err) {
 			return err
 		}
 		// Without a queryable index the Scan below is the whole cleanup.
 	}
-	return b.deleteTasksForInstanceByScan(ctx, id)
+	return b.deleteTasksForInstanceByScan(ctx, id, cutoff)
 }
 
 // deleteTasksForInstancesFull removes the task rows of every listed instance
@@ -286,12 +295,12 @@ func (b *Backend) deleteTasksForInstanceFull(ctx context.Context, id string) err
 // O(instance rows + table) regardless of victim count: K GSI sweeps plus
 // exactly one Scan. TerminateInstance keeps the single-instance variant for
 // the common one-ID path.
-func (b *Backend) deleteTasksForInstancesFull(ctx context.Context, ids []string) error {
+func (b *Backend) deleteTasksForInstancesFull(ctx context.Context, ids []string, cutoff terminalSweepCutoff) error {
 	if len(ids) == 0 {
 		return nil
 	}
 	for _, id := range ids {
-		if err := b.deleteTasksForInstanceByGSI(ctx, id); err != nil {
+		if err := b.deleteTasksForInstanceByGSI(ctx, id, cutoff); err != nil {
 			if !isMissingIndexError(err) {
 				return err
 			}
@@ -301,7 +310,7 @@ func (b *Backend) deleteTasksForInstancesFull(ctx context.Context, ids []string)
 			break
 		}
 	}
-	return b.deleteTasksForInstancesByScan(ctx, ids)
+	return b.deleteTasksForInstancesByScan(ctx, ids, cutoff)
 }
 
 // deleteTasksForInstancesByScan performs one fully-paginated
@@ -309,7 +318,7 @@ func (b *Backend) deleteTasksForInstancesFull(ctx context.Context, ids []string)
 // instance_id belongs to ids. A single scan covers the whole purge batch no
 // matter how many victims it holds; rows of live instances are never
 // touched (see purgeTaskKeyForTargets).
-func (b *Backend) deleteTasksForInstancesByScan(ctx context.Context, ids []string) error {
+func (b *Backend) deleteTasksForInstancesByScan(ctx context.Context, ids []string, cutoff terminalSweepCutoff) error {
 	targets := purgeTaskTargets(ids)
 	var start map[string]types.AttributeValue
 	for {
@@ -320,6 +329,11 @@ func (b *Backend) deleteTasksForInstancesByScan(ctx context.Context, ids []strin
 		for _, m := range out.Items {
 			pk, ok := purgeTaskKeyForTargets(m, targets)
 			if !ok {
+				continue
+			}
+			// Retention purges pass no cutoff (unbounded); terminal
+			// sweeps preserve rows created after the transition.
+			if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
 				continue
 			}
 			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
@@ -396,7 +410,7 @@ const gsiVerifyScanLimit = 1000
 //
 // A lagging task beyond this page therefore waits for one of those
 // backstops instead of forcing every completion to scan the fleet.
-func (b *Backend) verifyTasksFirstPageByScan(ctx context.Context, id string) error {
+func (b *Backend) verifyTasksFirstPageByScan(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
 	out, err := b.client.Scan(ctx, &dynamodb.ScanInput{
 		TableName:      aws.String(b.table("wf_tasks")),
 		Limit:          aws.Int32(gsiVerifyScanLimit),
@@ -407,6 +421,11 @@ func (b *Backend) verifyTasksFirstPageByScan(ctx context.Context, id string) err
 	}
 	for _, m := range out.Items {
 		if fromS(m["instance_id"]) != id {
+			continue
+		}
+		// Preserve rows a racing post-commit send created after the
+		// terminal transition (see terminalSweepCutoff).
+		if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
 			continue
 		}
 		pk, ok := m["task_pk"]
@@ -421,8 +440,9 @@ func (b *Backend) verifyTasksFirstPageByScan(ctx context.Context, id string) err
 }
 
 // deleteTasksForInstanceByGSI removes one instance's tasks via the
-// instance_gsi Query (no full-table Scan, no RCU on unrelated tasks).
-func (b *Backend) deleteTasksForInstanceByGSI(ctx context.Context, id string) error {
+// instance_gsi Query (no full-table Scan, no RCU on unrelated tasks). Rows
+// created after the terminal transition survive (see terminalSweepCutoff).
+func (b *Backend) deleteTasksForInstanceByGSI(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
 	var start map[string]types.AttributeValue
 	for {
 		out, err := b.client.Query(ctx, &dynamodb.QueryInput{
@@ -438,6 +458,9 @@ func (b *Backend) deleteTasksForInstanceByGSI(ctx context.Context, id string) er
 		for _, m := range out.Items {
 			pk, ok := m["task_pk"]
 			if !ok {
+				continue
+			}
+			if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
 				continue
 			}
 			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
@@ -497,7 +520,7 @@ func isMissingIndexError(err error) bool {
 		strings.Contains(lower, "not active")
 }
 
-func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string) error {
+func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
 	var start map[string]types.AttributeValue
 	for {
 		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(b.table("wf_tasks")), ConsistentRead: aws.Bool(true), ExclusiveStartKey: start})
@@ -506,6 +529,11 @@ func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string) e
 		}
 		for _, m := range out.Items {
 			if fromS(m["instance_id"]) == id {
+				// Preserve rows a racing post-commit send created after
+				// the terminal transition (see terminalSweepCutoff).
+				if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
+					continue
+				}
 				if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": m["task_pk"]}}); err != nil {
 					return err
 				}
@@ -522,7 +550,10 @@ func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string) e
 // larger than 1 MB arrive in pages via LastEvaluatedKey) and removes each one.
 // The read is strongly consistent so a timer committed just before the
 // terminal transition is not missed (same gap as the terminal inbox query).
-func (b *Backend) deleteTimersForInstance(ctx context.Context, id string) error {
+// Timers created after the terminal transition survive (see
+// terminalSweepCutoff): only non-terminal advancements create timers, so in
+// practice this preserves nothing, but the filter keeps the sweep uniform.
+func (b *Backend) deleteTimersForInstance(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
 	var start map[string]types.AttributeValue
 	for {
 		out, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_timers")), KeyConditionExpression: aws.String("instance_id = :id"), ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)}, ConsistentRead: aws.Bool(true), ExclusiveStartKey: start})
@@ -530,6 +561,9 @@ func (b *Backend) deleteTimersForInstance(ctx context.Context, id string) error 
 			return err
 		}
 		for _, m := range out.Items {
+			if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
+				continue
+			}
 			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_timers")), Key: timerKey(id, fromN(m["seq"]))}); err != nil {
 				return err
 			}
@@ -1356,6 +1390,14 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		}
 	}
 	if cleanupErr != nil {
+		// Surface the retained cleanup error only after every waiter is
+		// woken: the terminal status already committed, so cross-process
+		// Result waiters must observe the terminal wake even when the
+		// post-commit sweep exhausted its retries (Codex round-22 P2 on
+		// #291), mirroring the Spanner/Firestore paths that notify before
+		// returning the retained error. notifyAfterAdvancements only fires
+		// wake hints and always returns nil.
+		_ = b.notifyAfterAdvancements(advs)
 		return cleanupErr
 	}
 	return b.notifyAfterAdvancements(advs)
@@ -1372,6 +1414,70 @@ func (b *Backend) notifyAfterAdvancements(advs []backend.Advancement) error {
 		}
 	}
 	return nil
+}
+
+// terminalSweepCutoff bounds a post-commit terminal sweep to rows predating
+// the terminal transition (Codex round-22 P2 on #291). The sweep runs on a
+// detached context after the status commit, so a SendToInboxBatch that starts
+// after the commit can accept and insert its dedupe marker plus inbox row
+// mid-sweep; an unrestricted sweep deletes the inbox row while the dedupe
+// phase already passed — the marker survives, the event is lost, and every
+// later send under the same DedupeID is discarded. Only rows with created_at
+// at or before the transition are deleted, so racing post-commit sends
+// survive, mirroring the Firestore/Spanner sweeps.
+//
+// The cutoff is the instance row's completed_at (micros since epoch, the
+// same timeToN domain as every created_at), read with a consistent read at
+// sweep time. hasCutoff is false when the instance row is gone (a concurrent
+// purge owns the leftovers) or completed_at is missing/zero (legacy rows):
+// the sweep then falls back to unbounded, matching the pre-cutoff behavior.
+//
+// LIMITATION (honest): DynamoDB exposes no server commit timestamp, so both
+// sides of the comparison are client clocks (completer's for completed_at,
+// each writer's for created_at). A racing send whose attempt started before
+// the flip but whose transaction commits after it can stamp created_at at or
+// below the cutoff and still be swept; SendToInboxBatch narrows this by
+// re-stamping now per attempt right before its transaction, but cross-worker
+// clock skew leaves a residual window no client-time cutoff can close. A
+// fast-clock pre-transition row (created_at above the cutoff) errs the safe
+// way: it survives as inert residue (ClaimTasks gates execution on instance
+// status) until the retention purge reaps it.
+type terminalSweepCutoff struct {
+	cutoff    int64
+	hasCutoff bool
+}
+
+// sweepKeepsRow reports whether a terminal-sweep candidate postdates the
+// terminal transition and must survive cleanup. Pure for unit tests.
+func sweepKeepsRow(createdAtN int64, c terminalSweepCutoff) bool {
+	if !c.hasCutoff {
+		return false
+	}
+	return createdAtN > c.cutoff
+}
+
+// readTerminalCutoff returns the instance's terminal-transition time for the
+// post-commit sweep cutoff. A read error is returned (never silently
+// downgraded to unbounded: a transient GetItem failure must retry through
+// the caller's attempts loop, not sweep unbounded and delete an accepted
+// post-commit send while reporting success).
+func (b *Backend) readTerminalCutoff(ctx context.Context, id string) (terminalSweepCutoff, error) {
+	out, err := b.client.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(b.table("wf_instances")), Key: map[string]types.AttributeValue{"id": avS(id)}, ConsistentRead: aws.Bool(true)})
+	if err != nil {
+		return terminalSweepCutoff{}, err
+	}
+	if len(out.Item) == 0 {
+		return terminalSweepCutoff{}, nil
+	}
+	av, ok := out.Item["completed_at"]
+	if !ok || av == nil {
+		return terminalSweepCutoff{}, nil
+	}
+	cutoff := fromN(av)
+	if cutoff == 0 {
+		return terminalSweepCutoff{}, nil
+	}
+	return terminalSweepCutoff{cutoff: cutoff, hasCutoff: true}, nil
 }
 
 // cleanupTerminalAdvancements sweeps residual rows for every terminal
@@ -1415,16 +1521,24 @@ func (b *Backend) cleanupTerminalInstance(ctx context.Context, id string) error 
 }
 
 func (b *Backend) cleanupTerminalInstanceOnce(ctx context.Context, id string) error {
-	if err := b.deleteSignalDedupeForInstance(ctx, id); err != nil {
+	// Read the transition cutoff first: every delete below preserves rows
+	// created after the terminal flip (see terminalSweepCutoff). A cutoff
+	// read failure aborts the attempt (retried by the caller) instead of
+	// sweeping unbounded.
+	cutoff, err := b.readTerminalCutoff(ctx, id)
+	if err != nil {
 		return err
 	}
-	if err := b.deleteTasksForInstance(ctx, id); err != nil {
+	if err := b.deleteSignalDedupeForInstance(ctx, id, cutoff); err != nil {
 		return err
 	}
-	if err := b.deleteTimersForInstance(ctx, id); err != nil {
+	if err := b.deleteTasksForInstance(ctx, id, cutoff); err != nil {
 		return err
 	}
-	if err := b.deleteInboxForInstance(ctx, id); err != nil {
+	if err := b.deleteTimersForInstance(ctx, id, cutoff); err != nil {
+		return err
+	}
+	if err := b.deleteInboxForInstance(ctx, id, cutoff); err != nil {
 		return err
 	}
 	return nil
@@ -1463,6 +1577,12 @@ func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advance
 		}
 	}
 	if cleanupErr != nil {
+		// The terminal status already committed: wake task and terminal
+		// waiters before surfacing the post-commit error (Codex round-22
+		// P2 on #291, same shape as the batch path above — a
+		// cleanup-retries-exhausted return must not skip the terminal
+		// wake for cross-process Result waiters).
+		_ = b.notifyAfterAdvancements([]backend.Advancement{adv})
 		return cleanupErr
 	}
 	if adv.Terminal != nil {
@@ -1478,7 +1598,13 @@ func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advance
 		// notifyAfterAdvancements (caller) still fires task wake hints.
 		return nil
 	}
-	return b.ensureWorkflowTask(ctx, adv.InstanceID)
+	// Post-commit ensure: the advancement already committed, so a failure
+	// here wakes waiters before surfacing, like the cleanup path above.
+	if err := b.ensureWorkflowTask(ctx, adv.InstanceID); err != nil {
+		_ = b.notifyAfterAdvancements([]backend.Advancement{adv})
+		return err
+	}
+	return nil
 }
 
 func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advancement) ([]types.TransactWriteItem, string, error) {
@@ -1804,11 +1930,18 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	pending := append([]backend.InboxItem(nil), items...)
 	wrote := false
 	for len(pending) > 0 {
-		now := nowUTC()
 		top, err := b.allocInboxSeqs(ctx, instanceID, int64(len(pending)))
 		if err != nil {
 			return err
 		}
+		// Stamp now as late as possible, right before the transaction
+		// below: the terminal sweep preserves only rows with created_at
+		// past the flip (see terminalSweepCutoff), so a flip landing
+		// between the stamp and the commit would sweep this send despite
+		// it postdating the transition. Per-attempt re-stamping (not one
+		// stamp per call) keeps retries past the flip ordered after it,
+		// within client-clock skew.
+		now := nowUTC()
 		var twi []types.TransactWriteItem
 		type meta struct {
 			pidx   int
@@ -2113,8 +2246,10 @@ func (b *Backend) recoverOrphanedPass(ctx context.Context, store recoverStore, s
 // (Query results larger than 1 MB arrive in pages via LastEvaluatedKey) and
 // removes each one. The read is strongly consistent so a dedupe key committed
 // just before the terminal transition is not missed (same gap as the
-// terminal inbox query).
-func (b *Backend) deleteSignalDedupeForInstance(ctx context.Context, id string) error {
+// terminal inbox query). Markers created after the terminal transition
+// survive (see terminalSweepCutoff): the sweep deletes the marker and its
+// inbox row only as a pre-transition pair, never a lone marker.
+func (b *Backend) deleteSignalDedupeForInstance(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
 	var start map[string]types.AttributeValue
 	for {
 		out, err := b.client.Query(ctx, &dynamodb.QueryInput{
@@ -2128,6 +2263,9 @@ func (b *Backend) deleteSignalDedupeForInstance(ctx context.Context, id string) 
 			return err
 		}
 		for _, m := range out.Items {
+			if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
+				continue
+			}
 			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 				TableName: aws.String(b.table("wf_signal_dedupe")),
 				Key: map[string]types.AttributeValue{

@@ -32,20 +32,20 @@ func countChildRows(t *testing.T, b *Backend, ctx context.Context, table, id str
 	return int(n)
 }
 
-func readCompletedAtForTest(t *testing.T, b *Backend, ctx context.Context, id string) time.Time {
+func readSweepTsForTest(t *testing.T, b *Backend, ctx context.Context, id string) time.Time {
 	t.Helper()
-	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"completed_at"})
+	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"sweep_commit_ts"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var completedAt spanner.NullTime
-	if err := row.Columns(&completedAt); err != nil {
+	var sweepTs spanner.NullTime
+	if err := row.Columns(&sweepTs); err != nil {
 		t.Fatal(err)
 	}
-	if !completedAt.Valid {
-		t.Fatal("setup: terminal commit left no completed_at")
+	if !sweepTs.Valid {
+		t.Fatal("setup: terminal commit left no sweep_commit_ts")
 	}
-	return completedAt.Time
+	return sweepTs.Time
 }
 
 // claimTerminalAdvs builds terminal advancements for freshly created
@@ -110,13 +110,12 @@ func TestCleanupTerminalInstancePreservesPostCommitSends(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The terminal commit's own sweep removes the pre-terminal signal and
-	// fixes completed_at on the instance row.
+	// fixes the sweep_commit_ts ordering tick on the instance row.
 	if err := b.CommitAdvancement(ctx, claimTerminalAdv(t, b, ctx, id, "w1")); err != nil {
 		t.Fatal(err)
 	}
-	completedAt := readCompletedAtForTest(t, b, ctx, id)
-	oldTime := completedAt.Add(-time.Hour)
-	newTime := completedAt.Add(time.Second)
+	sweepTs := readSweepTsForTest(t, b, ctx, id)
+	oldTime := sweepTs.Add(-time.Hour)
 
 	// Pre-terminal residue the sweep must still remove.
 	if _, err := b.client.Apply(ctx, []*spanner.Mutation{
@@ -132,15 +131,18 @@ func TestCleanupTerminalInstancePreservesPostCommitSends(t *testing.T) {
 	}
 	// Racing post-commit sends the sweep must preserve (accepted after the
 	// status commit: dedupe marker plus inbox row, both newer than the
-	// terminal transition).
+	// terminal transition). They stamp the commit timestamp like
+	// production sends (see commitTimestamp): an explicit future timestamp
+	// is rejected outright on commit-timestamp columns, and wall-clock now
+	// is this test's "after the flip".
 	if _, err := b.client.Apply(ctx, []*spanner.Mutation{
 		spanner.InsertMap("wf_inbox", map[string]any{
-			"id": newID(), "instance_id": id, "type": string(journal.TypeSignalReceived), "created_at": newTime}),
+			"id": newID(), "instance_id": id, "type": string(journal.TypeSignalReceived), "created_at": commitTimestamp()}),
 		spanner.InsertMap("wf_signal_dedupe", map[string]any{
-			"instance_id": id, "dedupe_id": "new", "created_at": newTime}),
+			"instance_id": id, "dedupe_id": "new", "created_at": commitTimestamp()}),
 		spanner.InsertMap("wf_tasks", map[string]any{
 			"id": newID(), "kind": "activity", "queue": "default", "instance_id": id,
-			"attempt": int64(0), "visible_at": newTime, "created_at": newTime}),
+			"attempt": int64(0), "visible_at": nowUTC(), "created_at": commitTimestamp()}),
 	}); err != nil {
 		t.Fatal(err)
 	}
