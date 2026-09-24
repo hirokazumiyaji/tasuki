@@ -630,7 +630,6 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 						}
 						return
 					}
-					w.untrackWorkflow(t)
 					w.recordStoreError(ctx, "commit_workflow", herr,
 						"instance_id", t.InstanceID, "task_id", t.ID)
 					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", herr)
@@ -640,8 +639,40 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					// Contention releases immediately for fast replay;
 					// anything else backs off via delayed nack so a
 					// persistently failing task does not spin the poll
-					// loop (see requeueWorkflowTask).
+					// loop (see requeueWorkflowTask). The turn stays
+					// tracked through the requeue (round-20 P2): the tick
+					// was live at the check above, but Shutdown may cancel
+					// it before or during the requeue, and a
+					// context-aware backend then rejects the requeue's
+					// release/nack on the canceled ctx. Untracking first
+					// would leave the task untracked so neither the
+					// rejected requeue nor Shutdown's releaseInFlight can
+					// release it, hiding the renewed lease until expiry.
+					// Tracked, a concurrent releaseInFlight still finds
+					// and releases it (a second fenced requeue op then
+					// reports ErrNotFound, which requeue tolerates); if it
+					// already passed, the post-requeue check below falls
+					// back to the detached abandonment release.
 					w.requeueWorkflowTask(ctx, t, herr)
+					if ctx.Err() != nil {
+						// Tick canceled during the requeue: the requeue's
+						// release/nack on the canceled ctx may have been
+						// rejected, leaving the lease held with nobody
+						// else guaranteed to release it. Abandon via the
+						// detached-context release instead (live detached
+						// ctx, ownership-gated like the abandon path: a
+						// concurrent releaseInFlight that already released
+						// makes the claim fail and nothing is double
+						// released).
+						if w.claimWorkflowRelease(t) {
+							w.releaseWorkflowLease(t)
+						} else {
+							w.opts.Logger.Debug("skipping workflow lease release; not in-flight owner",
+								"instance_id", t.InstanceID, "task_id", t.ID)
+						}
+						return
+					}
+					w.untrackWorkflow(t)
 					return
 				}
 				if p == nil {
