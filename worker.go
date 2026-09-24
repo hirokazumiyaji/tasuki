@@ -683,14 +683,23 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 	// claimWorkflowRelease) so a Shutdown releaseInFlight that already
 	// released (and a peer re-claimed) lease is never cleared twice.
 	if ctx.Err() != nil {
+		// Dispose under one shared release budget (see
+		// releaseWorkflowLeases): N pendings released serially with a
+		// fresh timeout each cost up to N×timeout with a blocking
+		// backend. Ownership is still claimed per task so a Shutdown
+		// releaseInFlight that already released (and a peer re-claimed)
+		// lease is never cleared twice; claimed entries stay claimed
+		// even when the shared budget runs out early.
+		var toRelease []backend.Task
 		for _, p := range pending {
 			if w.claimWorkflowRelease(p.task) {
-				w.releaseWorkflowLease(p.task)
+				toRelease = append(toRelease, p.task)
 			} else {
 				w.opts.Logger.Debug("skipping workflow lease release; not in-flight owner",
 					"instance_id", p.task.InstanceID, "task_id", p.adv.TaskID)
 			}
 		}
+		w.releaseWorkflowLeases(toRelease)
 	} else {
 		// Live tick: flush. Pending tasks stayed tracked through the
 		// flush (see above): successes are untracked inside
@@ -706,6 +715,10 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		failed := w.flushWorkflowCommits(ctx, pending)
 		if len(failed) > 0 {
 			if ctx.Err() != nil {
+				// Same shared budget as the canceled-tick dispose above:
+				// a mid-flush cancel with several failed pendings must
+				// not cost one fresh timeout per task.
+				var toRelease []backend.Task
 				for _, p := range failed {
 					// Only the in-flight owner releases (see
 					// claimWorkflowRelease): Shutdown's releaseInFlight may
@@ -714,12 +727,13 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					// by ID/key alone, so an unconditional release would
 					// clear the peer's lease.
 					if w.claimWorkflowRelease(p.task) {
-						w.releaseWorkflowLease(p.task)
+						toRelease = append(toRelease, p.task)
 					} else {
 						w.opts.Logger.Debug("skipping workflow lease release; not in-flight owner",
 							"instance_id", p.task.InstanceID, "task_id", p.adv.TaskID)
 					}
 				}
+				w.releaseWorkflowLeases(toRelease)
 			} else {
 				for _, p := range failed {
 					w.untrackPending(p)
@@ -879,6 +893,55 @@ func (w *Worker) releaseWorkflowLease(t backend.Task) {
 			return
 		}
 		w.recordStoreError(context.Background(), "release_lease", err, "task_id", t.ID)
+	}
+}
+
+// releaseWorkflowLeases releases a batch of workflow-task leases under one
+// shared ShutdownReleaseTimeout deadline (round-17 P2). Each
+// releaseWorkflowLease call mints a fresh timeout, so releasing N
+// completed pendings from a shutdown-canceled tick serially costs up to
+// N×timeout (with a blocking backend) even though the option documents a
+// single bound. Sharing one context bounds the whole batch to ~1×timeout:
+// the first blocked release consumes the budget and the rest fail fast,
+// and unreleased leases expire naturally for peer reclaim. Ownership must
+// already be claimed (see claimWorkflowRelease) before calling: entries
+// removed from the in-flight set stay removed even when the shared
+// budget runs out before their ReleaseLease is attempted.
+func (w *Worker) releaseWorkflowLeases(tasks []backend.Task) {
+	if len(tasks) == 0 {
+		return
+	}
+	timeout := w.opts.ShutdownReleaseTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	relCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for _, t := range tasks {
+		select {
+		case <-relCtx.Done():
+			w.opts.Logger.Warn("shutdown lease release timed out",
+				"remaining", len(tasks), "error", relCtx.Err())
+			w.opts.Metrics.AddStoreError(context.Background(), "release_lease")
+			return
+		default:
+		}
+		if err := w.backend.ReleaseLease(relCtx, t); err != nil {
+			// A fenced release reports ErrNotFound when the lease moved on
+			// (peer reclaim or successor turn): the lease is already
+			// released, not a failure.
+			if errors.Is(err, backend.ErrNotFound) {
+				w.opts.Logger.Debug("workflow lease already released",
+					"instance_id", t.InstanceID, "task_id", t.ID)
+				continue
+			}
+			w.recordStoreError(context.Background(), "release_lease", err, "task_id", t.ID)
+			select {
+			case <-relCtx.Done():
+				return
+			default:
+			}
+		}
 	}
 }
 
