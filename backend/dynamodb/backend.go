@@ -620,6 +620,11 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		for len(result) < req.Limit && (picker == nil || !picker.Full()) && !exhausted {
 			cands, next, done, err := b.listClaimCandidates(ctx, req.Kind, queue, now, req.Limit-len(result), picker, skip, cursor)
 			if err != nil {
+				// The batch may already hold committed leases from earlier
+				// candidates/queues: release them best-effort (fenced by
+				// the claim token) instead of abandoning the whole batch
+				// hidden for a full lease (round-17 P2 on #291).
+				b.releaseClaimedLeases(ctx, result)
 				return nil, err
 			}
 			cursor, exhausted = next, done
@@ -649,6 +654,13 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				// instead of delivering the task to the worker.
 				t, claimed, err := b.claimTaskItem(ctx, item, old, visible, req.WorkerID)
 				if err != nil {
+					// The transactional lease for THIS candidate did not
+					// commit (TransactWriteItems errors never leave a
+					// half-committed lease), but earlier candidates in
+					// result already hold committed leases: release them
+					// best-effort instead of hiding the batch for a full
+					// lease (round-17 P2 on #291).
+					b.releaseClaimedLeases(ctx, result)
 					return nil, err
 				}
 				if !claimed {
@@ -673,9 +685,15 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				// verify the owning instance is still running before
 				// handing the task out. A residual task of a terminal
 				// instance is dropped best-effort here; the terminal sweep
-				// removes whatever remains.
+				// removes whatever remains. The transact gate in
+				// claimTaskItem already covers a terminal commit landing
+				// BEFORE the claim; this read fences one landing AFTER the
+				// claim commit, so it stays (round-17 P2 on #291) — but a
+				// throttled/transient failure here must not abandon the
+				// already-committed leases below.
 				running, err := b.instanceRunning(ctx, t.InstanceID)
 				if err != nil {
+					b.releaseClaimedLeases(ctx, append(append([]backend.Task(nil), result...), t))
 					return nil, err
 				}
 				if !running {
@@ -834,6 +852,25 @@ func (b *Backend) instanceRunning(ctx context.Context, id string) (bool, error) 
 		return false, err
 	}
 	return inst.Status == "running", nil
+}
+
+// releaseClaimedLeases best-effort releases durable leases acquired during a
+// ClaimTasks call that is about to fail (round-17 P2 on #291). Without this,
+// a throttled/transient post-claim status read abandons every already-claimed
+// candidate — each holds a committed lease hiding it for the full lease
+// duration. Releases are fenced on the claim ownership token (see
+// ReleaseLease), so a task reclaimed or refreshed since the claim matches
+// nothing and is left alone; release errors are ignored because the original
+// error is already being returned. Detached from cancellation so a cancelled
+// claim still frees what it leased.
+func (b *Backend) releaseClaimedLeases(ctx context.Context, tasks []backend.Task) {
+	if len(tasks) == 0 {
+		return
+	}
+	rctx := context.WithoutCancel(ctx)
+	for _, t := range tasks {
+		_ = b.ReleaseLease(rctx, t)
+	}
 }
 
 // listClaimCandidates returns FIFO-ordered claim_gsi items for one queue.
@@ -1877,6 +1914,97 @@ type recoverStore interface {
 	PutItem(ctx context.Context, params *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
 }
 
+// recoverTransactStore is the optional transact-capable extension of
+// recoverStore: the production client implements TransactWriteItems, so
+// orphan recovery can route its put through the same atomic
+// status-conditioned transaction as ensureWorkflowTask (see
+// putWorkflowTaskIfRunning). Test fakes that lack it fall back to a
+// status re-check immediately before the Put (see recoverPutIfRunning).
+type recoverTransactStore interface {
+	recoverStore
+	TransactWriteItems(ctx context.Context, params *dynamodb.TransactWriteItemsInput, optFns ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
+}
+
+// recoverPutIfRunning recreates one orphaned workflow task only while its
+// instance is still running (round-17 P2 on #291). The scan image may be
+// stale — a terminal commit plus sweep can land between the scan and the put
+// — and a bare PutItem would then recreate the workflow task after the
+// cleanup, leaving a row that lingers unpolled (the claim gate still prevents
+// execution, but nothing reaps it). When the store supports transactions the
+// put rides the same atomic status-conditioned transaction as
+// putWorkflowTaskIfRunning (a ConditionCheck on status="running" plus the Put
+// guarded on attribute_not_exists); a terminal instance (or an existing
+// singleton) aborts as success. Stores without transaction support re-read
+// the instance status immediately before the Put and skip a terminal
+// instance, narrowing the read-then-Put gap to the minimum a bare PutItem
+// allows (same documented residual as putWorkflowTaskLegacy). It reports
+// true when the put committed.
+func (b *Backend) recoverPutIfRunning(ctx context.Context, store recoverStore, instanceID, queue string) (bool, error) {
+	item := workflowTaskItem(instanceID, queue, newID(), nowUTC())
+	if ts, ok := store.(recoverTransactStore); ok {
+		_, err := ts.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+			{ConditionCheck: &types.ConditionCheck{
+				TableName:           aws.String(b.table("wf_instances")),
+				Key:                 map[string]types.AttributeValue{"id": avS(instanceID)},
+				ConditionExpression: aws.String("#s = :running"),
+				ExpressionAttributeNames: map[string]string{
+					"#s": "status",
+				},
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":running": avS("running"),
+				},
+			}},
+			{Put: &types.Put{
+				TableName:           aws.String(b.table("wf_tasks")),
+				Item:                item,
+				ConditionExpression: aws.String("attribute_not_exists(task_pk)"),
+			}},
+		}})
+		if err == nil {
+			return true, nil
+		}
+		if conditional(err) {
+			return false, nil
+		}
+		if !isTransactionUnsupported(err) {
+			return false, err
+		}
+		// Stores without TransactWriteItems support fall through to the
+		// status re-check + Put below.
+	}
+	// Re-check the instance status immediately before the Put: the scan row
+	// above may predate a terminal transition whose sweep already finished.
+	// A missing instance reads as terminal (same as instanceRunning).
+	got, err := store.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      aws.String(b.table("wf_instances")),
+		Key:            map[string]types.AttributeValue{"id": avS(instanceID)},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return false, err
+	}
+	if len(got.Item) == 0 || fromS(got.Item["status"]) != "running" {
+		return false, nil
+	}
+	if q := fromS(got.Item["queue"]); q != "" && q != queue {
+		// Prefer the fresh queue for the recreated task over the
+		// potentially stale scan image.
+		item = workflowTaskItem(instanceID, q, newID(), nowUTC())
+	}
+	_, err = store.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:           aws.String(b.table("wf_tasks")),
+		Item:                item,
+		ConditionExpression: aws.String("attribute_not_exists(task_pk)"),
+	})
+	if err != nil {
+		if conditional(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // recoverOrphanedPass checks up to bound running instances starting from start
 // and reports where the next pass should resume. exhausted is true only when
 // the full table was visited (caller resets the cursor to nil).
@@ -1938,12 +2066,21 @@ func (b *Backend) recoverOrphanedPass(ctx context.Context, store recoverStore, s
 				continue
 			}
 			inst := decodeInstance(m)
-			_, err = store.PutItem(ctx, &dynamodb.PutItemInput{
-				TableName:           aws.String(b.table("wf_tasks")),
-				Item:                workflowTaskItem(id, inst.Queue, newID(), nowUTC()),
-				ConditionExpression: aws.String("attribute_not_exists(task_pk)"),
-			})
-			if err == nil {
+			// Gate the recreate on the live instance status (round-17 P2
+			// on #291): the scan row above may predate a terminal commit
+			// whose sweep already finished, and a bare PutItem would then
+			// recreate the workflow task after the cleanup. The gated put
+			// aborts on a terminal instance (or an existing singleton) as
+			// success; only a committed put counts as recovered.
+			ok, err := b.recoverPutIfRunning(ctx, store, id, inst.Queue)
+			if err != nil {
+				// A failed status re-read (throttling, transient) must not
+				// fail the whole pass: skip this instance like the inbox
+				// and task reads above do. It stays orphaned for the next
+				// pass instead of aborting recovery for the fleet.
+				continue
+			}
+			if ok {
 				recovered++
 			}
 		}
