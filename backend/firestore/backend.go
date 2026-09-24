@@ -799,10 +799,17 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	// persistent failure is surfaced rather than leaving claimable rows
 	// behind. The sweep uses a detached context so parent cancellation
 	// cannot strand survivors.
+	// A terminal child also owes its parent a workflow task (ParentNotify):
+	// the inbox row rode the transaction, so the parent ensure below must
+	// run DESPITE a cleanup failure (Codex round-18 P2 on #291) — returning
+	// before it leaves the retry conflicting (task/seq consumed) with the
+	// parent dormant until the orphan scan. Stash the first cleanup error,
+	// run every ensure, then surface it.
+	var cleanupErr error
 	for _, adv := range advs {
 		if adv.Terminal != nil {
-			if err := b.cleanupTerminalDocsWithRetry(context.Background(), adv.InstanceID); err != nil {
-				return err
+			if err := terminalCleanupFunc(b, context.Background(), adv.InstanceID); err != nil && cleanupErr == nil {
+				cleanupErr = err
 			}
 		}
 	}
@@ -839,7 +846,9 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			b.notifyTerminal(adv.InstanceID)
 		}
 	}
-	return nil
+	// A failed terminal sweep still surfaces, but only after every parent
+	// ensure above had its chance (see cleanupErr).
+	return cleanupErr
 }
 
 func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement, alloc *inboxSeqAlloc) (advancementPrep, error) {
@@ -994,6 +1003,13 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 // terminalCleanupBatchSize bounds post-commit terminal sweeps below
 // Firestore's 500-write transaction/batch limit.
 const terminalCleanupBatchSize = 400
+
+// terminalCleanupFunc sweeps an instance's residual docs after a terminal
+// advancement commits. It is a variable (not a direct method call) so tests
+// can fault-inject a cleanup failure and assert the parent ensure still runs
+// before the error surfaces (Codex round-18 P2 on #291); production always
+// uses cleanupTerminalDocsWithRetry.
+var terminalCleanupFunc = (*Backend).cleanupTerminalDocsWithRetry
 
 // cleanupTerminalDocsWithRetry removes an instance's residual rows after a
 // terminal advancement commits, retrying transient failures (cleanup query

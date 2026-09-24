@@ -3,6 +3,7 @@ package spanner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -430,7 +431,81 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		}
 		return nil
 	})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	return b.fenceClaimedTasks(ctx, out)
+}
+
+// fenceClaimedTasks re-validates freshly claimed tasks before handing them
+// out (Codex round-18 P1 on #291, mirroring DynamoDB's round-17 post-claim
+// gate): the in-transaction status gate above covers a terminal commit
+// landing BEFORE the claim, but a terminal commit landing AFTER the claim
+// commit still leaves a live lease in the worker's hands, which would
+// invoke user code post-completion — the terminal sweep deletes the row
+// but cannot recall the in-memory task. Each claimed task whose instance
+// is no longer running is dropped and its residue deleted best-effort here
+// (the sweep owns whatever remains). A status-read failure releases every
+// claimed lease best-effort — fenced by the claim token, detached from
+// cancellation — instead of abandoning the batch hidden for a full lease.
+func (b *Backend) fenceClaimedTasks(ctx context.Context, tasks []backend.Task) ([]backend.Task, error) {
+	kept := make([]backend.Task, 0, len(tasks))
+	for _, t := range tasks {
+		running, err := b.instanceRunning(ctx, t.InstanceID)
+		if err != nil {
+			b.releaseClaimedLeases(ctx, tasks)
+			return nil, err
+		}
+		if !running {
+			b.deleteClaimedTask(ctx, t.ID)
+			continue
+		}
+		kept = append(kept, t)
+	}
+	return kept, nil
+}
+
+// instanceRunning reports whether the instance still accepts work (status
+// "running"). A missing instance is treated as terminal: its tasks are
+// residue the terminal sweep owns.
+func (b *Backend) instanceRunning(ctx context.Context, id string) (bool, error) {
+	inst, err := b.GetInstance(ctx, id)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return inst.Status == "running", nil
+}
+
+// releaseClaimedLeases best-effort releases durable leases acquired during a
+// ClaimTasks call that is about to fail. Without this, a throttled/transient
+// post-claim status read abandons every already-claimed task — each holds a
+// committed lease hiding it for the full lease duration. Releases are fenced
+// on the claim ownership token (see ReleaseLease), so a task reclaimed or
+// refreshed since the claim matches nothing and is left alone; release
+// errors are ignored because the original error is already being returned.
+// Detached from cancellation so a cancelled claim still frees what it
+// leased.
+func (b *Backend) releaseClaimedLeases(ctx context.Context, tasks []backend.Task) {
+	if len(tasks) == 0 {
+		return
+	}
+	rctx := context.WithoutCancel(ctx)
+	for _, t := range tasks {
+		_ = b.ReleaseLease(rctx, t)
+	}
+}
+
+// deleteClaimedTask best-effort deletes one claimed task row that turned out
+// to be terminal residue. Deleting a missing row is a no-op, so a concurrent
+// terminal sweep racing this delete is harmless; failures are ignored
+// because the sweep owns whatever remains.
+func (b *Backend) deleteClaimedTask(ctx context.Context, id int64) {
+	_ = b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return txn.BufferWrite([]*spanner.Mutation{spanner.Delete("wf_tasks", spanner.Key{id})})
+	})
 }
 
 func scanTask(row *spanner.Row) (backend.Task, error) {
