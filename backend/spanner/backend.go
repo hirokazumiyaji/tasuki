@@ -3,7 +3,6 @@ package spanner
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
@@ -474,34 +473,59 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // by the claim token, detached from cancellation — instead of abandoning
 // the batch hidden for a full lease.
 func (b *Backend) fenceClaimedTasks(ctx context.Context, tasks []backend.Task) ([]backend.Task, error) {
+	// Batch the status probe into ONE single-timestamp strong read over the
+	// distinct owning instances (Codex round-27 P1 on #291): the previous
+	// loop issued one full GetInstance RPC per task, so a batch spread its
+	// fence checks across N timestamps — later tasks were fenced strictly
+	// after earlier ones, widening each task's fence-read→dispatch window,
+	// besides reading whole rows (input/result/failure payloads) only to
+	// inspect the status. One key-set read of (id, status) at a single
+	// timestamp fences every task against the same snapshot in one round
+	// trip. Semantics are unchanged: a missing instance is terminal residue
+	// (the sweep owns it), and any read error releases every claimed lease
+	// instead of abandoning the batch hidden for a full lease.
+	ids := make([]string, 0, len(tasks))
+	seen := make(map[string]struct{}, len(tasks))
+	for _, t := range tasks {
+		if _, ok := seen[t.InstanceID]; !ok {
+			seen[t.InstanceID] = struct{}{}
+			ids = append(ids, t.InstanceID)
+		}
+	}
+	statuses := make(map[string]string, len(ids))
+	if len(ids) > 0 {
+		keys := make([]spanner.Key, 0, len(ids))
+		for _, id := range ids {
+			keys = append(keys, spanner.Key{id})
+		}
+		iter := b.client.Single().Read(ctx, "wf_instances", spanner.KeySetFromKeys(keys...), []string{"id", "status"})
+		defer iter.Stop()
+		for {
+			row, err := iter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				b.releaseClaimedLeases(ctx, tasks)
+				return nil, err
+			}
+			var id, status string
+			if err := row.Columns(&id, &status); err != nil {
+				b.releaseClaimedLeases(ctx, tasks)
+				return nil, err
+			}
+			statuses[id] = status
+		}
+	}
 	kept := make([]backend.Task, 0, len(tasks))
 	for _, t := range tasks {
-		running, err := b.instanceRunning(ctx, t.InstanceID)
-		if err != nil {
-			b.releaseClaimedLeases(ctx, tasks)
-			return nil, err
-		}
-		if !running {
+		if status, ok := statuses[t.InstanceID]; !ok || status != "running" {
 			b.deleteClaimedTask(ctx, t.ID)
 			continue
 		}
 		kept = append(kept, t)
 	}
 	return kept, nil
-}
-
-// instanceRunning reports whether the instance still accepts work (status
-// "running"). A missing instance is treated as terminal: its tasks are
-// residue the terminal sweep owns.
-func (b *Backend) instanceRunning(ctx context.Context, id string) (bool, error) {
-	inst, err := b.GetInstance(ctx, id)
-	if err != nil {
-		if errors.Is(err, backend.ErrNotFound) {
-			return false, nil
-		}
-		return false, err
-	}
-	return inst.Status == "running", nil
 }
 
 // releaseClaimedLeases best-effort releases durable leases acquired during a
