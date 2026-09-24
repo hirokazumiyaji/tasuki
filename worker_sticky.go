@@ -3,6 +3,7 @@ package tasuki
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -347,7 +348,22 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 		for _, p := range legacy {
 			advs = append(advs, p.adv)
 		}
-		if err := batcher.CommitAdvancements(ctx, advs); err != nil {
+		// Aggregate detached-commit gate (round-24 P1): the batch
+		// bypasses the per-item guardedDetachedCommit above, so gate
+		// the whole submission here instead. The pre-call gate aborts
+		// when ANY member already lost its guard (fallback below
+		// re-gates per item and commits only the live ones), and the
+		// stashed batch cancel lets a cover loss observed MID-call
+		// (any member's renewal failure trips its guard, see
+		// tripDetachedGuard) abort a context-aware backend op instead
+		// of applying a stale batch by ID/sequence after a peer
+		// reclaim. See guardedDetachedBatchCommit.
+		bctx, bcancel := context.WithCancel(ctx)
+		err := w.guardedDetachedBatchCommit(gated, bcancel, func() error {
+			return batcher.CommitAdvancements(bctx, advs)
+		})
+		bcancel()
+		if err != nil {
 			w.recordStoreError(ctx, "commit_workflow", err, "n", len(advs))
 			// One conflict rolls back the whole batch transaction, so fall
 			// back to per-instance commits: healthy instances still advance
@@ -389,30 +405,116 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 	}
 }
 
+// guardedDetachedBatchCommit runs one batched advancement store op under
+// an aggregate detached-commit gate (round-24 P1). The batch fast path in
+// flushWorkflowCommits bypasses the per-item guardedDetachedCommit, so
+// without this a cover renewal that failed (or observed an
+// expired-continuity deadline) mid-flush only removes its own guard while
+// the batch still commits every member by task ID + sequence — deleting a
+// peer's reclaimed task. Atomicity is preserved: the batch submits once,
+// and the gate is all-or-nothing.
+//
+// The pre-call gate re-verifies EVERY gated member immediately before the
+// store op: any missing/superseded guard, or any continuity deadline
+// already passed, aborts the whole submission with errLeaseLost and runs
+// nothing (an expired member's guard is dropped and its cover canceled,
+// mirroring the single-item gate; the caller's per-item fallback then
+// re-gates and commits only the live members). While the op runs, the
+// batch cancel is stashed in every member's guard, so a loss observed
+// mid-call trips ANY member's guard (see tripDetachedGuard) and aborts a
+// context-aware backend op — the cancel is best-effort, as in the
+// single-item path: a backend that ignores it still applies, and the
+// fallback re-gate remains the backstop. The stash is cleared on return:
+// on success the guards are dropped (the caller ends them via
+// endFlushGuard and applies sticky), on error they are kept so the
+// fallback can re-gate.
+//
+// Advancements are row-deleting writes (like Complete/fail with
+// exclusive=false above): no writing hold and no pre-write cover join —
+// a cover renewal landing after the batch finds no rows, while one
+// running during a blocked batch must still observe loss and cancel it
+// mid-call.
+func (w *Worker) guardedDetachedBatchCommit(gated []flushGuardedCommit, commitCancel context.CancelFunc, op func() error) error {
+	w.detMu.Lock()
+	for _, g := range gated {
+		gd, ok := w.detGuard[g.task.ID]
+		if !ok || gd.epoch != g.p.tok.epoch || gd.seq != g.p.tok.seq {
+			w.detMu.Unlock()
+			w.opts.Logger.Debug("skipping detached batch commit; lease lost since the pre-commit renewal",
+				"task_id", g.task.ID)
+			return fmt.Errorf("%w: detached batch gate found lease lost", errLeaseLost)
+		}
+		if !time.Now().Before(gd.deadline) {
+			coverCancel := gd.coverCancel
+			delete(w.detGuard, g.task.ID)
+			w.detMu.Unlock()
+			if coverCancel != nil {
+				coverCancel()
+			}
+			w.opts.Logger.Debug("skipping detached batch commit; continuity deadline passed before the store op",
+				"task_id", g.task.ID)
+			return fmt.Errorf("%w: detached batch gate found lease expired", errLeaseLost)
+		}
+	}
+	for _, g := range gated {
+		gd := w.detGuard[g.task.ID]
+		gd.cancel = commitCancel
+		w.detGuard[g.task.ID] = gd
+	}
+	w.detMu.Unlock()
+	err := op()
+	// Clear the stashed cancel on every path so a later trip cannot
+	// cancel an unrelated context. On success the caller drops the
+	// guards (see endFlushGuard); on error the guards stay so the
+	// per-item fallback re-gates each member.
+	w.detMu.Lock()
+	for _, g := range gated {
+		if gd, ok := w.detGuard[g.task.ID]; ok && gd.epoch == g.p.tok.epoch && gd.seq == g.p.tok.seq {
+			gd.cancel = nil
+			w.detGuard[g.task.ID] = gd
+		}
+	}
+	w.detMu.Unlock()
+	return err
+}
+
 // startFlushCover keeps every gated flush entry's lease live until the
 // flush returns (round-23 P2). Workflow turns run no renewal loop —
 // unlike activities, whose extendLeaseLoop hands off to detached cover
 // at commit entry — so without this a turn that consumed most of its
 // lease, or a CommitAdvancement blocked past the remaining lease, lets
 // a peer reclaim mid-flush and the stale ID+sequence commit deletes the
-// peer's task. Each entry renews immediately (the turn may already be
-// near expiry; waiting half a lease would reclaim first) and then on a
-// half-lease ticker via the detached-renewal path (see
-// renewOnceDetached): any failure trips the guard so the per-commit
-// gate above aborts instead of writing stale, and the loops exit when
-// the flush is over (stop func) or their entry commits (flag cleared by
-// the committer). The returned stop func joins every loop: no renewal
-// is in flight when the flush returns.
+// peer's task.
+//
+// The FIRST renewal for every entry completes synchronously before this
+// returns (round-24 P2): the turn may already be near expiry, and an
+// async cover that has not run yet admits the commit below onto a lease
+// that a scheduling delay already let lapse — a slow CommitAdvancement
+// then applies stale while the late ID-only renewal only observes the
+// loss after the fact. Blocking here (bounded by the renewal's own
+// lease-duration timeout, entries in parallel) means no store op runs
+// until continuity is proven or the guard trips. Afterwards each covered
+// entry renews on a half-lease ticker via the detached-renewal path (see
+// renewOnceDetached): any failure trips the guard so the commit gate
+// aborts instead of writing stale, and the loops exit when the flush is
+// over (stop func) or their entry commits (flag cleared by the
+// committer). Entries whose initial renewal failed start no loop — the
+// gate already excludes them. The returned stop func joins every loop:
+// no renewal is in flight when the flush returns.
 func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit) func() {
 	if len(gated) == 0 {
 		return func() {}
 	}
-	coverDone := make(chan struct{})
-	var coverWg sync.WaitGroup
-	for _, g := range gated {
-		coverWg.Add(1)
-		go func(taskID int64, tok claimToken, flag *atomic.Bool) {
-			defer coverWg.Done()
+	// Phase 1: the initial renewal for every entry, in parallel, joined
+	// before admitting any write. A failure trips the guard (the
+	// backstop trip below covers errors that bypass the internal one)
+	// and starts no ticker loop; the commit gate then skips the entry.
+	covered := make([]bool, len(gated))
+	var initWg sync.WaitGroup
+	for i, g := range gated {
+		initWg.Add(1)
+		go func(i int, taskID int64, tok claimToken) {
+			defer initWg.Done()
 			// Renew immediately instead of waiting for the first tick:
 			// the turn may have consumed most of its lease, and the
 			// next tick is a half-lease away (== the original expiry
@@ -423,6 +525,20 @@ func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit
 				w.tripDetachedGuard(taskID, tok)
 				return
 			}
+			covered[i] = true
+		}(i, g.task.ID, g.p.tok)
+	}
+	initWg.Wait()
+	// Phase 2: periodic cover for the entries proven live above.
+	coverDone := make(chan struct{})
+	var coverWg sync.WaitGroup
+	for i, g := range gated {
+		if !covered[i] {
+			continue
+		}
+		coverWg.Add(1)
+		go func(taskID int64, tok claimToken, flag *atomic.Bool) {
+			defer coverWg.Done()
 			d := w.leaseDuration() / 2
 			if d <= 0 {
 				return
