@@ -47,20 +47,32 @@ func TestRawFallbackDedupeKeyBounded(t *testing.T) {
 	}
 }
 
-// The fallback match must key on the bounded fallback form: a long ID's own
-// hashed fallback guard matches, while a foreign ID never claims it.
+// The fallback match must key on the bounded fallback form with owner
+// verification: a long ID's own hashed fallback guard matches, while a
+// foreign ID — including a DISTINCT short ID literally equal to the hashed
+// fallback key (round-17 P2 on #296) — never claims it.
 func TestMatchDedupeRowFallbackBounded(t *testing.T) {
 	long := strings.Repeat("k", 300)
 	fb := rawFallbackDedupeKey(long)
+	owner := spanner.NullString{StringVal: escapeDedupeID(long), Valid: true}
 	v2 := spanner.NullInt64{Int64: 2, Valid: true}
-	if !matchDedupeRow(long, fb, fb, v2) {
+	if !matchDedupeRow(long, fb, fb, owner, v2) {
 		t.Fatal("bounded fallback guard does not match its owner")
 	}
-	if matchDedupeRow("x", fb, fb, v2) {
+	if matchDedupeRow("x", fb, fb, owner, v2) {
 		t.Fatal("bounded fallback guard matched a foreign ID")
 	}
-	if matchDedupeRow(long, escapeDedupeID(long), fb, v2) {
+	if matchDedupeRow(long, escapeDedupeID(long), fb, owner, v2) {
 		t.Fatal("canonical candidate matched a fallback row")
+	}
+	// Hash-reuse confusion: the fallback key reused as a literal DedupeID
+	// must not match the guard, so the genuine event is delivered.
+	if matchDedupeRow(fb, fb, fb, owner, v2) {
+		t.Fatal("fallback key reused as literal DedupeID claimed another ID's guard (genuine event would be suppressed)")
+	}
+	// The owner's own retry still dedupes.
+	if !matchDedupeRow(long, fb, fb, owner, v2) {
+		t.Fatal("owner retry stopped matching its fallback guard")
 	}
 }
 
@@ -162,5 +174,97 @@ func TestDedupeLongFallbackDelivers(t *testing.T) {
 	}
 	if len(st.Inbox) != 1 {
 		t.Fatalf("inbox=%d after retry, want 1 (fallback guard must dedupe)", len(st.Inbox))
+	}
+}
+
+// A DISTINCT send whose literal DedupeID equals another send's hashed
+// fallback key must not claim its guard (Codex round-17 P2 on #296): the
+// upgraded instance holds a legacy row at the canonical hash of long L, so
+// L's guard lives at K=__hash__:raw:<digest> (v2, owned by L); a later send
+// with literal DedupeID==K (short, so rawFallback(K)==K) shares K's key form
+// with L's guard. The owner check rejects the confusion, so the genuine
+// event delivers. On the pre-fix key-only rule the send is suppressed and
+// this fails.
+func TestDedupeFallbackHashReuseDelivers(t *testing.T) {
+	dsn := guardTestDSN(t)
+	ctx := context.Background()
+	b, err := New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const id = "spn-hash-reuse"
+	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	long := strings.Repeat("k", 300)
+	canonical := escapeDedupeID(long)
+	fallback := rawFallbackDedupeKey(long)
+	// Foreign-occupy the hashed canonical key with a legacy verbatim row so
+	// the long ID's guard falls back to the bounded hashed key.
+	_, err = b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return txn.BufferWrite([]*spanner.Mutation{
+			spanner.InsertMap("wf_signal_dedupe", map[string]any{
+				"instance_id": id, "dedupe_id": canonical, "created_at": nowUTC(),
+			}),
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := journal.Event{Type: journal.TypeSignalReceived, Name: "sig", Payload: []byte(`{}`)}
+	if err := b.SendToInbox(ctx, id, ev, long); err != nil {
+		t.Fatalf("send long: %v", err)
+	}
+	// The fallback guard records its owner's canonical form.
+	fbRow, err := b.client.Single().ReadRow(ctx, "wf_signal_dedupe",
+		spanner.Key{id, fallback}, []string{"dedupe_id", dedupeFallbackOwnerColumn, "format_version"})
+	if err != nil {
+		t.Fatalf("fallback guard missing: %v", err)
+	}
+	var fbKey string
+	var fbOwner spanner.NullString
+	var fbVer spanner.NullInt64
+	if err := fbRow.Columns(&fbKey, &fbOwner, &fbVer); err != nil {
+		t.Fatal(err)
+	}
+	if !fbVer.Valid || fbVer.Int64 != int64(dedupeFormatRawKeyVersion) {
+		t.Fatalf("fallback guard version = %v, want %d", fbVer, dedupeFormatRawKeyVersion)
+	}
+	if !fbOwner.Valid || fbOwner.StringVal != canonical {
+		t.Fatalf("fallback guard owner = %v, want %q (owner must name the long ID's canonical form)", fbOwner, canonical)
+	}
+	// The confusion send: literal DedupeID == the fallback key. It must
+	// deliver (inbox 2), not be swallowed by L's guard.
+	if err := b.SendToInbox(ctx, id, ev, fallback); err != nil {
+		t.Fatalf("send literal fallback key: %v", err)
+	}
+	st, err := b.LoadWorkflow(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Inbox) != 2 {
+		t.Fatalf("inbox=%d, want 2 (confusion send must deliver, not match L's guard)", len(st.Inbox))
+	}
+	// Both IDs still dedupe on retry: K against its own canonical guard, L
+	// against its owned fallback guard.
+	if err := b.SendToInbox(ctx, id, ev, fallback); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SendToInbox(ctx, id, ev, long); err != nil {
+		t.Fatal(err)
+	}
+	st, err = b.LoadWorkflow(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Inbox) != 2 {
+		t.Fatalf("inbox=%d after retries, want 2 (both guards must still dedupe)", len(st.Inbox))
 	}
 }

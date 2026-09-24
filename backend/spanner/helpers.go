@@ -218,14 +218,13 @@ func escapeDedupeID(dedupeID string) string {
 // so they hash into the __hash__: namespace with a domain-separated
 // second-level hash: deterministic, bounded (77 chars), byte-identical to
 // Firestore's, and structurally distinct from the occupied canonical hash
-// (no "raw:" infix). Residual caveats, both duplicate-never-drop except
-// where noted: a true double collision (canonical AND fallback keys both
-// foreign-occupied) inserts unguarded, and deliberately reusing another
-// send's 77-char fallback hash as your own DedupeID on the same instance
-// would match its guard (sender-constructible only — DedupeIDs are
-// sender-chosen — so a self-DoS shape, not a cross-user hole; Firestore
-// additionally cross-checks the stored canonical form, which Spanner cannot
-// record without a schema change since dedupe_id IS the key).
+// (no "raw:" infix). Residual caveat, duplicate-never-drop: a true double
+// collision (canonical AND fallback keys both foreign-occupied) inserts
+// unguarded. The hash-reuse confusion shape — a DISTINCT send reusing another
+// send's 77-char fallback hash as its own literal DedupeID — is closed by the
+// fallback_owner column (Codex round-17 on #296): v2 rows record their
+// owner's canonical form and probes match only on owner equality, exactly
+// like Firestore's stored canonical cross-check.
 func rawFallbackDedupeKey(dedupeID string) string {
 	if len(dedupeID) <= dedupeKeyLimit {
 		return dedupeID
@@ -275,29 +274,51 @@ const dedupeFormatVersionColumn = "format_version"
 // dedupeFormatRawKeyVersion stamps fallback guard rows written at the raw
 // (unescaped) key instead of the canonical escaped key. The fallback is used
 // when the canonical key is already occupied by a foreign legacy row (which
-// cannot be overwritten and must not be mistaken for this ID's guard): the
-// raw key with an explicit version still identifies its owner positively
-// (legacy rows read a NULL version), so retries keep deduping instead of
-// duplicating. Fallback rows keep the raw key in dedupe_id (it is the primary
-// key); the v2 match rule consults the key, never the column, so the shapes
-// stay unambiguous.
+// cannot be overwritten and must not be mistaken for this ID's guard).
+//
+// Since Codex round-17 on #296, fallback rows additionally record their
+// owner's canonical form in the fallback_owner column (see
+// dedupeFallbackOwnerColumn): dedupe_id IS the primary key, so unlike
+// Firestore — whose dedupe_id field carries the canonical form even on
+// fallback rows — Spanner had no owner metadata and matched fallback rows on
+// the key alone. A DISTINCT send whose literal DedupeID equals another
+// send's 77-char hashed fallback key (short, so rawFallback(K)==K) then
+// claimed the existing guard and its genuine event was suppressed. Probes now
+// match a v2 row only when the stored owner equals the requested ID's
+// canonical form, closing the confusion structurally (a two-level hash would
+// still be literally expressible as a user ID; the owner column is airtight).
+// Rows predating the column read a NULL owner and keep the previous key-only
+// rule, so established guards keep deduping; only pre-existing rows carry the
+// old caveat, and they drain via the terminal sweep and purge.
 const dedupeFormatRawKeyVersion = 2
+
+// dedupeFallbackOwnerColumn names the nullable wf_signal_dedupe column that
+// records a v2 fallback guard row's owner as the canonical escapeDedupeID
+// form (always within the STRING(255) budget: escapeDedupeID hashes anything
+// that would exceed it). Databases created before the column existed gain it
+// via Migrate (see ensureDedupeFallbackOwnerColumn), with existing rows
+// defaulting to NULL.
+const dedupeFallbackOwnerColumn = "fallback_owner"
 
 // matchDedupeRow reports whether a stored dedupe row guards the requested
 // raw DedupeID. candidateKey is the probed stored-key form that located the
-// row; storedDedupeID is the row's dedupe_id column; version is its
-// format_version column (NULL for legacy rows).
+// row; storedDedupeID is the row's dedupe_id column; owner is its
+// fallback_owner column (NULL for legacy rows and for fallback rows written
+// before the round-17 #296 owner column); version is its format_version
+// column (NULL for legacy rows).
 //
 //   - Versioned rows always store the canonical escapeDedupeID form, so they
 //     match iff the stored column equals the requested ID's canonical form —
 //     regardless of which candidate located them. A foreign-owner row (e.g.
 //     "__x"'s "____x" found via "____x"'s raw candidate) never matches.
 //   - Fallback rows (format_version >= 2) live at the rawFallbackDedupeKey
-//     instead of the canonical key, so they match iff the candidate IS that
-//     fallback key for the requested ID. (Firestore additionally
-//     cross-checks the stored canonical form; Spanner cannot — dedupe_id IS
-//     the key — so the documented hash-reuse caveat on rawFallbackDedupeKey
-//     applies here.)
+//     instead of the canonical key. They match iff the candidate IS that
+//     fallback key for the requested ID AND the stored owner names the
+//     requested ID's canonical form — the same positive owner identification
+//     Firestore gets from its stored dedupe_id field. A NULL owner (a row
+//     written before the owner column existed) keeps the previous key-only
+//     rule so its guard keeps deduping; only such rows retain the hash-reuse
+//     caveat.
 //   - Legacy rows were stored verbatim, so they belong to the requested ID
 //     iff the stored key IS the requested raw ID exactly. An escaped
 //     candidate hitting a legacy row is another ID's row and never matches
@@ -308,11 +329,19 @@ const dedupeFormatRawKeyVersion = 2
 // probing instance (see readDedupeRow): a no-op by construction under
 // composite keys, kept identical to Firestore's docInstanceMatches as
 // defense in depth.
-func matchDedupeRow(requestedRaw, candidateKey, storedDedupeID string, version spanner.NullInt64) bool {
+func matchDedupeRow(requestedRaw, candidateKey, storedDedupeID string, owner spanner.NullString, version spanner.NullInt64) bool {
 	if version.Valid && version.Int64 >= dedupeFormatRawKeyVersion {
-		// Fallback guard: the key IS the owner — no other ID's probe can
-		// claim it (modulo the documented hash-reuse caveat).
-		return candidateKey == rawFallbackDedupeKey(requestedRaw)
+		// Fallback guard: the key locates the row, the owner identifies it.
+		// Without the owner check, a DISTINCT short ID literally equal to
+		// another send's hashed fallback key would claim its guard and its
+		// genuine event would be suppressed (round-17 P2 on #296).
+		if candidateKey != rawFallbackDedupeKey(requestedRaw) {
+			return false
+		}
+		if !owner.Valid {
+			return true
+		}
+		return owner.StringVal == escapeDedupeID(requestedRaw)
 	}
 	if version.Valid && version.Int64 >= dedupeFormatVersion {
 		return storedDedupeID == escapeDedupeID(requestedRaw)

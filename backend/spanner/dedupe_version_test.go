@@ -16,37 +16,55 @@ import (
 func TestMatchDedupeRow(t *testing.T) {
 	longUnder := "__" + strings.Repeat("u", 300)
 	longHashed := escapeDedupeID(longUnder)
+	longK := strings.Repeat("k", 300)
+	longKFallback := rawFallbackDedupeKey(longK)
+	longKCanonical := escapeDedupeID(longK)
 	v1 := spanner.NullInt64{Int64: 1, Valid: true}
 	v2 := spanner.NullInt64{Int64: 2, Valid: true}
 	legacy := spanner.NullInt64{}
+	noOwner := spanner.NullString{}
+	ownerOf := func(raw string) spanner.NullString {
+		return spanner.NullString{StringVal: escapeDedupeID(raw), Valid: true}
+	}
 	cases := []struct {
 		name      string
 		raw       string
 		candidate string
 		stored    string
+		owner     spanner.NullString
 		version   spanner.NullInt64
 		want      bool
 	}{
-		{"versioned own via escaped candidate", "__x", "____x", "____x", v1, true},
-		{"versioned foreign via raw candidate", "____x", "____x", "____x", v1, false},
-		{"versioned own plain ID", "x", "x", "x", v1, true},
-		{"versioned hashed own", longUnder, longHashed, longHashed, v1, true},
-		{"versioned hash-like raw is not the hashed row", "__hash__:abc", "__hash__:abc", "__hash__:abc", v1, false},
-		{"legacy exact raw", "__x", "__x", "__x", legacy, true},
-		{"legacy plain exact raw", "x", "x", "x", legacy, true},
-		{"legacy row is not another ID's escaped form", "__x", "____x", "____x", legacy, false},
-		{"legacy row is not another ID's raw form", "____x", "__x", "__x", legacy, false},
-		{"raw-key fallback own", "__fresh", "__fresh", "__fresh", v2, true},
-		{"raw-key fallback foreign via escaped candidate", "__x", "____x", "____x", v2, false},
-		{"fallback hashed own", strings.Repeat("k", 300), rawFallbackDedupeKey(strings.Repeat("k", 300)), rawFallbackDedupeKey(strings.Repeat("k", 300)), v2, true},
-		{"fallback hashed foreign", "x", rawFallbackDedupeKey(strings.Repeat("k", 300)), rawFallbackDedupeKey(strings.Repeat("k", 300)), v2, false},
-		{"fallback hashed canonical candidate is not the guard", strings.Repeat("k", 300), escapeDedupeID(strings.Repeat("k", 300)), rawFallbackDedupeKey(strings.Repeat("k", 300)), v2, false},
+		{"versioned own via escaped candidate", "__x", "____x", "____x", noOwner, v1, true},
+		{"versioned foreign via raw candidate", "____x", "____x", "____x", noOwner, v1, false},
+		{"versioned own plain ID", "x", "x", "x", noOwner, v1, true},
+		{"versioned hashed own", longUnder, longHashed, longHashed, noOwner, v1, true},
+		{"versioned hash-like raw is not the hashed row", "__hash__:abc", "__hash__:abc", "__hash__:abc", noOwner, v1, false},
+		{"legacy exact raw", "__x", "__x", "__x", noOwner, legacy, true},
+		{"legacy plain exact raw", "x", "x", "x", noOwner, legacy, true},
+		{"legacy row is not another ID's escaped form", "__x", "____x", "____x", noOwner, legacy, false},
+		{"legacy row is not another ID's raw form", "____x", "__x", "__x", noOwner, legacy, false},
+		{"raw-key fallback own", "__fresh", "__fresh", "__fresh", ownerOf("__fresh"), v2, true},
+		{"raw-key fallback foreign via escaped candidate", "__x", "____x", "____x", ownerOf("____x"), v2, false},
+		{"fallback hashed own", longK, longKFallback, longKFallback, ownerOf(longK), v2, true},
+		{"fallback hashed foreign", "x", longKFallback, longKFallback, ownerOf(longK), v2, false},
+		{"fallback hashed canonical candidate is not the guard", longK, longKCanonical, longKFallback, ownerOf(longK), v2, false},
+		// Round-17 on #296: a DISTINCT short ID literally equal to another
+		// send's hashed fallback key must not claim its guard. K is short,
+		// so rawFallback(K)==K and the key-only rule would match; the
+		// stored owner (the long ID's canonical form) rejects it, and the
+		// genuine event is delivered instead of suppressed.
+		{"fallback hash-reuse confusion rejected", longKFallback, longKFallback, longKFallback, ownerOf(longK), v2, false},
+		// A pre-owner v2 row (NULL owner, written before the round-17 #296
+		// column) keeps the previous key-only rule so its established guard
+		// keeps deduping; only such rows retain the hash-reuse caveat.
+		{"fallback pre-owner row keeps key-only rule", longK, longKFallback, longKFallback, noOwner, v2, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := matchDedupeRow(tc.raw, tc.candidate, tc.stored, tc.version); got != tc.want {
-				t.Fatalf("matchDedupeRow(%q, %q, %q, %v) = %v, want %v",
-					tc.raw, tc.candidate, tc.stored, tc.version, got, tc.want)
+			if got := matchDedupeRow(tc.raw, tc.candidate, tc.stored, tc.owner, tc.version); got != tc.want {
+				t.Fatalf("matchDedupeRow(%q, %q, %q, %v, %v) = %v, want %v",
+					tc.raw, tc.candidate, tc.stored, tc.owner, tc.version, got, tc.want)
 			}
 		})
 	}

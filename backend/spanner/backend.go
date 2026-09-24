@@ -1215,28 +1215,29 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
 }
 
-// readDedupeRow reads a dedupe guard row with its format version. ok=false
-// when the row is absent. Rows predating the format_version column read a
-// NULL version, i.e. legacy (v0); see matchDedupeRow. The stored instance_id
-// is validated against the probing instance (owned=false on mismatch):
-// under composite keys a mismatch is structurally impossible, but the check
-// mirrors Firestore's docInstanceMatches so both backends enforce the same
-// ownership invariant (Codex round-16 on #296). Callers must still count an
-// unowned row as occupying its key (a Create over it would collide) while
-// never treating it as a match.
-func readDedupeRow(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID, key string) (stored string, version spanner.NullInt64, owned, ok bool, err error) {
-	row, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, key}, []string{"instance_id", "dedupe_id", dedupeFormatVersionColumn})
+// readDedupeRow reads a dedupe guard row with its format version and fallback
+// owner. ok=false when the row is absent. Rows predating the format_version
+// column read a NULL version, i.e. legacy (v0); rows predating the
+// fallback_owner column read a NULL owner (see matchDedupeRow). The stored
+// instance_id is validated against the probing instance (owned=false on
+// mismatch): under composite keys a mismatch is structurally impossible, but
+// the check mirrors Firestore's docInstanceMatches so both backends enforce
+// the same ownership invariant (Codex round-16 on #296). Callers must still
+// count an unowned row as occupying its key (a Create over it would collide)
+// while never treating it as a match.
+func readDedupeRow(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID, key string) (stored string, owner spanner.NullString, version spanner.NullInt64, owned, ok bool, err error) {
+	row, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, key}, []string{"instance_id", "dedupe_id", dedupeFallbackOwnerColumn, dedupeFormatVersionColumn})
 	if err != nil {
 		if isNotFound(err) {
-			return "", spanner.NullInt64{}, false, false, nil
+			return "", spanner.NullString{}, spanner.NullInt64{}, false, false, nil
 		}
-		return "", spanner.NullInt64{}, false, false, err
+		return "", spanner.NullString{}, spanner.NullInt64{}, false, false, err
 	}
-	var owner string
-	if err := row.Columns(&owner, &stored, &version); err != nil {
-		return "", spanner.NullInt64{}, false, false, err
+	var instOwner string
+	if err := row.Columns(&instOwner, &stored, &owner, &version); err != nil {
+		return "", spanner.NullString{}, spanner.NullInt64{}, false, false, err
 	}
-	return stored, version, owner == instanceID, true, nil
+	return stored, owner, version, instOwner == instanceID, true, nil
 }
 
 func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items []backend.InboxItem) error {
@@ -1350,7 +1351,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						if isPostTerminalMarkerKey(bk) {
 							continue
 						}
-						stored, version, owned, ok, err := readDedupeRow(ctx, txn, instanceID, bk)
+						stored, owner, version, owned, ok, err := readDedupeRow(ctx, txn, instanceID, bk)
 						if err != nil {
 							return err
 						}
@@ -1363,7 +1364,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						if !owned {
 							continue
 						}
-						if matchDedupeRow(it.DedupeID, bk, stored, version) {
+						if matchDedupeRow(it.DedupeID, bk, stored, owner, version) {
 							baseExists = true
 							break
 						}
@@ -1396,7 +1397,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					fallbackKey := rawFallbackDedupeKey(it.DedupeID)
 					fallbackOccupied := false
 					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
-						stored, version, owned, ok, err := readDedupeRow(ctx, txn, instanceID, bk)
+						stored, owner, version, owned, ok, err := readDedupeRow(ctx, txn, instanceID, bk)
 						if err != nil {
 							return err
 						}
@@ -1412,7 +1413,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						if !owned {
 							continue
 						}
-						if matchDedupeRow(it.DedupeID, bk, stored, version) {
+						if matchDedupeRow(it.DedupeID, bk, stored, owner, version) {
 							baseHit = true
 							break
 						}
@@ -1425,13 +1426,15 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					// means the canonical guard cannot be created (it would
 					// collide), so the guard falls back to the
 					// rawFallbackDedupeKey with an explicit version
-					// (dedupeFormatRawKeyVersion): delivery is preserved
-					// and retries keep deduping. The fallback key stays
-					// within the STRING(255) budget even for over-budget
-					// IDs (bounded second-level hash — Codex round-16 on
-					// #296). Only when both keys are occupied (vanishingly
-					// rare: two foreign legacy rows) does the event insert
-					// unguarded.
+					// (dedupeFormatRawKeyVersion) plus the owner's canonical
+					// form in fallback_owner (Codex round-17 on #296):
+					// delivery is preserved and retries keep deduping, and
+					// no other ID's probe can claim the guard. The fallback
+					// key stays within the STRING(255) budget even for
+					// over-budget IDs (bounded second-level hash — Codex
+					// round-16 on #296). Only when both keys are occupied
+					// (vanishingly rare: two foreign legacy rows) does the
+					// event insert unguarded.
 					if !canonicalOccupied {
 						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
 							"instance_id": instanceID, "dedupe_id": dedupeKey(it.DedupeID),
@@ -1440,7 +1443,8 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					} else if !fallbackOccupied {
 						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
 							"instance_id": instanceID, "dedupe_id": fallbackKey,
-							dedupeFormatVersionColumn: dedupeFormatRawKeyVersion, "created_at": now,
+							dedupeFormatVersionColumn: dedupeFormatRawKeyVersion,
+							dedupeFallbackOwnerColumn: escapeDedupeID(it.DedupeID), "created_at": now,
 						}))
 					}
 					created[it.DedupeID] = true

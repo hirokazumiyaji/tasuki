@@ -193,12 +193,16 @@ CREATE TABLE wf_signal_dedupe (
   instance_id STRING(255) NOT NULL,
   dedupe_id STRING(255) NOT NULL,
   created_at TIMESTAMP NOT NULL,
-  format_version INT64
+  format_version INT64,
+  fallback_owner STRING(255)
 ) PRIMARY KEY (instance_id, dedupe_id)`}); err != nil {
 			return err
 		}
 	}
 	if err := b.ensureDedupeFormatVersionColumn(ctx); err != nil {
+		return err
+	}
+	if err := b.ensureDedupeFallbackOwnerColumn(ctx); err != nil {
 		return err
 	}
 	seqExists, err := b.tableExists(ctx, "wf_inbox_seq")
@@ -291,6 +295,23 @@ func (b *Backend) ensureInt64Column(ctx context.Context, table, column string) e
 // matchDedupeRow). No row rewrite is needed.
 func (b *Backend) ensureDedupeFormatVersionColumn(ctx context.Context) error {
 	return b.ensureInt64Column(ctx, "wf_signal_dedupe", dedupeFormatVersionColumn)
+}
+
+// ensureDedupeFallbackOwnerColumn backfills the fallback_owner column on
+// wf_signal_dedupe for databases created before the round-17 (#296) owner
+// fix. The column is nullable: existing v2 fallback rows read a NULL owner
+// and keep the previous key-only match rule (see matchDedupeRow), so their
+// guards keep deduping; new fallback writes always record the owner. No row
+// rewrite is needed.
+func (b *Backend) ensureDedupeFallbackOwnerColumn(ctx context.Context) error {
+	exists, err := b.columnExists(ctx, "wf_signal_dedupe", dedupeFallbackOwnerColumn)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	return b.applyDDL(ctx, []string{fmt.Sprintf(`ALTER TABLE wf_signal_dedupe ADD COLUMN %s STRING(255)`, dedupeFallbackOwnerColumn)})
 }
 
 func (b *Backend) columnExists(ctx context.Context, table, column string) (bool, error) {
