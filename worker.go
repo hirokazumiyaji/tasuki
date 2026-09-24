@@ -154,6 +154,19 @@ type Worker struct {
 	// by NewWorker; the helpers treat nil as already drained.
 	// Guarded by renewMu.
 	renewIdle chan struct{}
+	// renewPerTask tracks admitted ordinary renewals per task ID so a
+	// row-preserving result commit joins only its own task's raced
+	// renewal (see joinOrdinaryRenewalsForCommit). The global
+	// renewInflight/renewIdle barrier above stays for Shutdown, which
+	// must join every task; the commit path must not wait on
+	// unrelated tasks (round-17 P1): an unrelated slow/stuck admitted
+	// ExtendLease — or an old-generation renewal surviving a bounded
+	// shutdown — would otherwise keep the global count nonzero (and
+	// new unrelated renewals prolong it) while the commit holds its
+	// activity slot with no result write. Entries are created on the
+	// 0→1 transition and deleted on drain to avoid leaking one entry
+	// per historical task ID. Guarded by renewMu.
+	renewPerTask map[int64]*renewTaskEntry
 	// detMu guards detGuard. Lock order with mu is mu-then-detMu, taken
 	// together only in beginDetachedCommit; renewOnceDetached,
 	// guardedDetachedCommit, and dropDetachedGuard take detMu alone and
@@ -174,22 +187,32 @@ type Worker struct {
 	lastBacklog time.Time
 }
 
+// renewTaskEntry is one task's share of the ordinary-renewal barrier:
+// the count of admitted but not yet returned ExtendLease calls for a
+// single task ID, plus the channel closed on drain that that task's
+// committer waits on (see joinOrdinaryRenewalsForCommit).
+type renewTaskEntry struct {
+	count int
+	idle  chan struct{}
+}
+
 func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 	opts = opts.withDefaults()
 	idle := make(chan struct{})
 	close(idle)
 	return &Worker{
-		backend:   b,
-		opts:      opts,
-		reg:       newRegistry(opts.Codec),
-		inFlight:  map[int64]inFlightEntry{},
-		detGuard:  map[int64]detachedGuard{},
-		wfClaim:   map[int64]time.Time{},
-		sticky:    map[string]stickyEntry{},
-		instLock:  map[string]*workflowActor{},
-		wfSem:     make(chan struct{}, opts.WorkflowConcurrency),
-		actSem:    make(chan struct{}, opts.ActivityConcurrency),
-		renewIdle: idle,
+		backend:      b,
+		opts:         opts,
+		reg:          newRegistry(opts.Codec),
+		inFlight:     map[int64]inFlightEntry{},
+		detGuard:     map[int64]detachedGuard{},
+		wfClaim:      map[int64]time.Time{},
+		sticky:       map[string]stickyEntry{},
+		instLock:     map[string]*workflowActor{},
+		wfSem:        make(chan struct{}, opts.WorkflowConcurrency),
+		actSem:       make(chan struct{}, opts.ActivityConcurrency),
+		renewIdle:    idle,
+		renewPerTask: map[int64]*renewTaskEntry{},
 	}
 }
 
@@ -494,19 +517,23 @@ func (w *Worker) shutdownRenewalJoin(ctx context.Context) {
 	}
 }
 
-// renewTryEnter registers one ordinary renewal with the shutdown join.
-// Registration, the generation check, and the stop-check are atomic
+// renewTryEnter registers one ordinary renewal for taskID with the
+// shutdown join and the per-task commit join. Registration, the
+// generation check, and the stop-check are atomic
 // under renewMu: false means Shutdown already passed grace expiry, or
 // the caller's claim belongs to a previous Start generation, and the
 // caller must issue nothing; true means the caller holds one in-flight
-// slot and must call renewExit once its ExtendLease call returns. On
-// the 0→1 transition a fresh idle channel is installed for Shutdown to
-// wait on. The token's epoch is compared against the barrier's Start
+// slot (globally and for taskID) and must call renewExit(taskID) once
+// its ExtendLease call returns. On the global 0→1 transition a fresh
+// idle channel is installed for Shutdown to wait on, and on the
+// per-task 0→1 transition a fresh per-task channel is installed for
+// that task's committer to wait on (see
+// joinOrdinaryRenewalsForCommit). The token's epoch is compared against the barrier's Start
 // generation (see renewEpoch): a stale ticker paused between ownsFresh
 // and admission across grace expiry + restart is rejected even though
 // the stop flag was reset for the new generation, so its ID-only
 // ExtendLease can never land on the reclaimed task (round-15 P1).
-func (w *Worker) renewTryEnter(tok claimToken) bool {
+func (w *Worker) renewTryEnter(taskID int64, tok claimToken) bool {
 	w.renewMu.Lock()
 	defer w.renewMu.Unlock()
 	if w.renewStopped {
@@ -519,54 +546,116 @@ func (w *Worker) renewTryEnter(tok claimToken) bool {
 		w.renewIdle = make(chan struct{})
 	}
 	w.renewInflight++
+	if w.renewPerTask == nil {
+		w.renewPerTask = map[int64]*renewTaskEntry{}
+	}
+	e := w.renewPerTask[taskID]
+	if e == nil {
+		e = &renewTaskEntry{idle: make(chan struct{})}
+		w.renewPerTask[taskID] = e
+	}
+	e.count++
 	return true
 }
 
-// renewExit releases one slot claimed by renewTryEnter, closing the idle
-// channel when the last renewal drains so a waiting shutdownRenewalJoin
-// wakes. A nil idle (zero-value Worker) is never closed.
-func (w *Worker) renewExit() {
+// renewExit releases one slot claimed by renewTryEnter(taskID), closing
+// the global idle channel when the last renewal drains so a waiting
+// shutdownRenewalJoin wakes, and closing + deleting the task's per-task
+// entry when that task's last renewal drains so a waiting
+// joinOrdinaryRenewalsForCommit wakes. A nil idle (zero-value Worker)
+// is never closed; a missing per-task entry (zero-value Worker, or an
+// exit for a task with nothing in flight) is a no-op.
+func (w *Worker) renewExit(taskID int64) {
 	w.renewMu.Lock()
 	defer w.renewMu.Unlock()
-	if w.renewInflight <= 0 {
+	if w.renewInflight > 0 {
+		w.renewInflight--
+		if w.renewInflight == 0 && w.renewIdle != nil {
+			close(w.renewIdle)
+		}
+	}
+	e := w.renewPerTask[taskID]
+	if e == nil || e.count <= 0 {
 		return
 	}
-	w.renewInflight--
-	if w.renewInflight == 0 && w.renewIdle != nil {
-		close(w.renewIdle)
+	e.count--
+	if e.count == 0 {
+		close(e.idle)
+		delete(w.renewPerTask, taskID)
 	}
 }
 
-// joinOrdinaryRenewalsForCommit waits for admitted ordinary renewals to
-// settle before a row-preserving result write (round-16 P1). An ordinary
-// ticker renewal admitted via renewTryEnter just before beginDetachedCommit
-// flips committing uses the execution context — not the commit's cover
-// context — so the post-commit cover cancel cannot stop it: it stays
-// blocked while the sync pre-commit renewal succeeds and RetryActivity (or
-// a nack) completes, then lands after the result write and overwrites what
-// it wrote (the retry delay, the nack's visible_at). The deferred
-// joinCommitStop only joins after the write, which is too late.
+// commitJoinCap bounds the per-task ordinary-renewal join below. The
+// commit's own context already bounds it (CommitTimeout normally,
+// ShutdownReleaseTimeout once Shutdown began), but with a long commit
+// timeout a same-task stuck renewal would otherwise hold the activity
+// slot for the whole timeout with no result write. The cap keeps that
+// hold predictable; a renewal settling within the cap still orders
+// correctly, and a join that gives up aborts the commit (errLeaseLost)
+// instead of running a write the stuck renewal could then overwrite.
+const commitJoinCap = 5 * time.Second
+
+// joinOrdinaryRenewalsForCommit waits for admitted ordinary renewals
+// for taskID — and only taskID — to settle before a row-preserving
+// result write (round-16 P1, scoped per task in round-17 P1). An
+// ordinary ticker renewal admitted via renewTryEnter just before
+// beginDetachedCommit flips committing uses the execution context —
+// not the commit's cover context — so the post-commit cover cancel
+// cannot stop it: it stays blocked while the sync pre-commit renewal
+// succeeds and RetryActivity (or a nack) completes, then lands after
+// the result write and overwrites what it wrote (the retry delay, the
+// nack's visible_at). The deferred joinCommitStop only joins after the
+// write, which is too late.
 //
 // Waiting here orders the write after the admitted renewal: the renewal
-// lands first and the result overwrites it. New ordinary renewals for this
-// task cannot start during the wait — the ticker takes the detached branch
-// once committing is set — so the snapshot covers the raced call; renewals
-// for other task IDs may drain or start around it without affecting this
-// task's ID-only write. Unlike shutdownRenewalJoin this sets no stop flag:
-// ordinary renewal stays armed for every task that never commits. Callers
-// re-gate the detached guard after the wait (the guard may have tripped
-// and the continuity deadline may have passed while waiting) and run the
-// store op only when the gate still holds. detMu is never held across the
-// wait, so cover renewals keep the commit covered meanwhile.
-func (w *Worker) joinOrdinaryRenewalsForCommit() {
+// lands first and the result overwrites it. New ordinary renewals for
+// this task cannot start during the wait — the ticker takes the
+// detached branch once committing is set — so the snapshot covers the
+// raced call. Renewals for OTHER task IDs are irrelevant to this
+// task's ID-only write and are never waited on: the pre-fix global
+// join parked the commit until every task's renewals drained, so one
+// unrelated slow/stuck admitted ExtendLease (or an old-generation
+// renewal surviving a bounded shutdown, or a stream of new unrelated
+// renewals) held this commit's activity slot indefinitely with no
+// result write and no bound from the commit context. Unlike
+// shutdownRenewalJoin this sets no stop flag: ordinary renewal stays
+// armed for every task that never commits. Callers re-gate the
+// detached guard after the wait (the guard may have tripped and the
+// continuity deadline may have passed while waiting) and run the
+// store op only when the gate still holds. detMu is never held across
+// the wait, so cover renewals keep the commit covered meanwhile.
+//
+// The wait is bounded by ctx (the commit's store-call context) and
+// commitJoinCap: it reports false when either fires, and the caller
+// aborts the commit with errLeaseLost instead of running a write a
+// still-blocked renewal could overwrite. A nil ctx waits up to the
+// cap.
+func (w *Worker) joinOrdinaryRenewalsForCommit(taskID int64, ctx context.Context) bool {
 	w.renewMu.Lock()
-	idle := w.renewIdle
-	n := w.renewInflight
+	e := w.renewPerTask[taskID]
+	var idle chan struct{}
+	var n int
+	if e != nil {
+		n = e.count
+		idle = e.idle
+	}
 	w.renewMu.Unlock()
 	if n == 0 || idle == nil {
-		return
+		return true
 	}
-	<-idle
+	timer := time.NewTimer(commitJoinCap)
+	defer timer.Stop()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-idle:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
 }
 
 // waitForWaitGroup blocks until wg drains or ctx ends.
@@ -966,7 +1055,13 @@ func (w *Worker) tripDetachedGuard(taskID int64, tok claimToken) {
 //
 // exclusive distinguishes row-deleting commits (Complete/fail) from
 // row-preserving ones (RetryActivity/nack, see above).
-func (w *Worker) guardedDetachedCommit(taskID int64, tok claimToken, commitCancel context.CancelFunc, exclusive bool, op func() error) error {
+//
+// commitCtx bounds the pre-write ordinary-renewal join (see
+// joinOrdinaryRenewalsForCommit): with a per-task join plus this bound
+// an unrelated stuck renewal never blocks the commit, and even a
+// same-task stuck renewal gives up and aborts with errLeaseLost
+// instead of holding the activity slot indefinitely (round-17 P1).
+func (w *Worker) guardedDetachedCommit(taskID int64, tok claimToken, commitCtx context.Context, commitCancel context.CancelFunc, exclusive bool, op func() error) error {
 	w.detMu.Lock()
 	g, ok := w.detGuard[taskID]
 	if !ok || g.epoch != tok.epoch || g.seq != tok.seq {
@@ -1001,16 +1096,35 @@ func (w *Worker) guardedDetachedCommit(taskID int64, tok claimToken, commitCance
 		w.detGuard[taskID] = g
 		w.detMu.Unlock()
 	} else {
-		// Row-preserving write: join admitted ordinary renewals
-		// BEFORE the store op (round-16 P1, see
-		// joinOrdinaryRenewalsForCommit), then re-gate. detMu is
-		// released across the wait so cover keeps the commit
-		// covered; the wait took time, so the guard may have
-		// tripped and the continuity deadline may have passed —
+		// Row-preserving write: join admitted ordinary renewals for
+		// this task BEFORE the store op (round-16 P1, scoped per task
+		// in round-17 P1, see joinOrdinaryRenewalsForCommit), then
+		// re-gate. detMu is released across the wait so cover keeps
+		// the commit covered; the wait took time, so the guard may
+		// have tripped and the continuity deadline may have passed —
 		// the op runs only when the gate still holds, with the
-		// same rejection cleanup as the initial gate.
+		// same rejection cleanup as the initial gate. A bounded join
+		// that gives up (unrelated renewals never block it; a
+		// same-task stuck renewal or a canceled commit context ends
+		// it) aborts without running the op: a still-blocked renewal
+		// landing after the write would overwrite it, while landing
+		// after an abort only extends the lease.
 		w.detMu.Unlock()
-		w.joinOrdinaryRenewalsForCommit()
+		if !w.joinOrdinaryRenewalsForCommit(taskID, commitCtx) {
+			w.detMu.Lock()
+			var coverCancel context.CancelFunc
+			if g, ok := w.detGuard[taskID]; ok && g.epoch == tok.epoch && g.seq == tok.seq {
+				coverCancel = g.coverCancel
+				delete(w.detGuard, taskID)
+			}
+			w.detMu.Unlock()
+			if coverCancel != nil {
+				coverCancel()
+			}
+			w.opts.Logger.Debug("skipping detached commit; ordinary-renewal join timed out",
+				"task_id", taskID)
+			return fmt.Errorf("%w: detached commit gate timed out joining ordinary renewals", errLeaseLost)
+		}
 		w.detMu.Lock()
 		g, ok = w.detGuard[taskID]
 		if !ok || g.epoch != tok.epoch || g.seq != tok.seq {
@@ -2018,7 +2132,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			commitCtx, commitCancel := w.commitContext(ctx)
 			// Nack rewrites visible_at in place: serialize against
 			// cover renewals (round-11 P1b).
-			rerr := w.guardedDetachedCommit(t.ID, tok, commitCancel, true, func() error {
+			rerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, true, func() error {
 				return w.nackIncompatible(commitCtx, t, "unregistered_activity", err)
 			})
 			commitCancel()
@@ -2038,7 +2152,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		// failActivity deletes the task row: shared commit, so a
 		// renewal running during a blocked Complete can still cancel
 		// it mid-call on observed loss (round-10 P1b).
-		rerr := w.guardedDetachedCommit(t.ID, tok, commitCancel, false, func() error {
+		rerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, false, func() error {
 			return w.failActivity(commitCtx, t, err)
 		})
 		commitCancel()
@@ -2141,7 +2255,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)
 			commitCtx, commitCancel := w.commitContext(ctx)
 			// failActivity deletes the task row: shared commit (see above).
-			rerr := w.guardedDetachedCommit(t.ID, tok, commitCancel, false, func() error {
+			rerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, false, func() error {
 				return w.failActivity(commitCtx, t, err)
 			})
 			commitCancel()
@@ -2171,7 +2285,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		w.opts.Metrics.AddActivityRetry(commitCtx, 1)
 		// RetryActivity rewrites visible_at in place: serialize against
 		// cover renewals (round-11 P1b).
-		if rerr := w.guardedDetachedCommit(t.ID, tok, commitCancel, true, func() error {
+		if rerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, true, func() error {
 			return w.backend.RetryActivity(commitCtx, t.ID, delay)
 		}); rerr != nil {
 			w.recordStoreError(commitCtx, "retry_activity", rerr, "instance_id", t.InstanceID, "activity", t.Name)
@@ -2195,7 +2309,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 	defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)
 	commitCtx, commitCancel := w.commitContext(ctx)
 	// CompleteActivity deletes the task row: shared commit (see above).
-	if cerr := w.guardedDetachedCommit(t.ID, tok, commitCancel, false, func() error {
+	if cerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, false, func() error {
 		return w.backend.CompleteActivity(commitCtx, t.ID, journal.Event{
 			Type:    journal.TypeActivityCompleted,
 			RefSeq:  t.Seq,
@@ -2472,13 +2586,13 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, tok claimTok
 				// race the join by construction, and a stale ticker
 				// paused across grace expiry + restart is rejected by
 				// its token epoch even after the re-arm (round-15 P1).
-				if !w.renewTryEnter(tok) {
+				if !w.renewTryEnter(taskID, tok) {
 					return
 				}
 				// Conservative lease base (see refreshLeaseAt).
 				renewStart := time.Now()
 				rerr := w.backend.ExtendLease(ctx, taskID, w.opts.LeaseDuration)
-				w.renewExit()
+				w.renewExit(taskID)
 				if rerr != nil {
 					w.recordStoreError(ctx, "extend_lease", rerr, "task_id", taskID)
 				} else {

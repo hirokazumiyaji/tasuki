@@ -230,7 +230,7 @@ func TestWorker_Round11_ExclusiveCommitDropsInflightRenewal(t *testing.T) {
 	var opDone atomic.Bool
 	commitCh := make(chan error, 1)
 	go func() {
-		commitCh <- w.guardedDetachedCommit(task.ID, tok, commitCancel, true, func() error {
+		commitCh <- w.guardedDetachedCommit(task.ID, tok, commitCtx, commitCancel, true, func() error {
 			opDone.Store(true)
 			return mem.RetryActivity(commitCtx, task.ID, 5*time.Second)
 		})

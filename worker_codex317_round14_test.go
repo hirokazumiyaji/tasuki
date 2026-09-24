@@ -24,10 +24,11 @@ func TestWorker_Round14_RenewalBarrierStopAndDrain(t *testing.T) {
 	barrierEpoch := w.epoch
 	w.mu.Unlock()
 	barrierTok := claimToken{epoch: barrierEpoch}
+	const barrierTaskID int64 = 9001
 
 	// Three renewals in flight before grace expiry.
 	for i := 0; i < 3; i++ {
-		if !w.renewTryEnter(barrierTok) {
+		if !w.renewTryEnter(barrierTaskID, barrierTok) {
 			t.Fatalf("renewTryEnter(%d) = false, want true (no shutdown yet)", i)
 		}
 	}
@@ -43,14 +44,14 @@ func TestWorker_Round14_RenewalBarrierStopAndDrain(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 	// Grace expiry: new admissions stop, even with live-looking leases.
-	if w.renewTryEnter(barrierTok) {
-		w.renewExit()
+	if w.renewTryEnter(barrierTaskID, barrierTok) {
+		w.renewExit(barrierTaskID)
 		t.Fatal("renewTryEnter = true after stop, want false (no renewal may slip past the join)")
 	}
 	// Draining the held slots wakes the join.
-	w.renewExit()
-	w.renewExit()
-	w.renewExit()
+	w.renewExit(barrierTaskID)
+	w.renewExit(barrierTaskID)
+	w.renewExit(barrierTaskID)
 	select {
 	case <-joinDone:
 	case <-time.After(5 * time.Second):
@@ -70,10 +71,10 @@ func TestWorker_Round14_RenewalBarrierStopAndDrain(t *testing.T) {
 	barrierGen := w.renewEpoch
 	w.renewMu.Unlock()
 	barrierTok = claimToken{epoch: barrierGen}
-	if !w.renewTryEnter(barrierTok) {
+	if !w.renewTryEnter(barrierTaskID, barrierTok) {
 		t.Fatal("renewTryEnter = false after re-arm, want true")
 	}
-	w.renewExit()
+	w.renewExit(barrierTaskID)
 }
 
 // TestWorker_Round14_RenewalBarrierChurn stresses the barrier the way
@@ -86,6 +87,7 @@ func TestWorker_Round14_RenewalBarrierChurn(t *testing.T) {
 	churnEpoch := w.epoch
 	w.mu.Unlock()
 	churnTok := claimToken{epoch: churnEpoch}
+	const churnTaskID int64 = 9002
 	for round := 0; round < 30; round++ {
 		// Start equivalent: re-arm admissions for the round.
 		w.renewMu.Lock()
@@ -104,13 +106,13 @@ func TestWorker_Round14_RenewalBarrierChurn(t *testing.T) {
 						return
 					default:
 					}
-					if !w.renewTryEnter(churnTok) {
+					if !w.renewTryEnter(churnTaskID, churnTok) {
 						return // stop set; done for the round
 					}
 					// Widen the in-flight window so registrations race
 					// the join instead of only seeing a drained barrier.
 					time.Sleep(time.Microsecond)
-					w.renewExit()
+					w.renewExit(churnTaskID)
 				}
 			}()
 		}
@@ -120,8 +122,8 @@ func TestWorker_Round14_RenewalBarrierChurn(t *testing.T) {
 		joinCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		w.shutdownRenewalJoin(joinCtx)
 		cancel()
-		if w.renewTryEnter(churnTok) {
-			w.renewExit()
+		if w.renewTryEnter(churnTaskID, churnTok) {
+			w.renewExit(churnTaskID)
 			close(stop)
 			wg.Wait()
 			t.Fatalf("round %d: renewTryEnter succeeded after the join set stop", round)
@@ -236,9 +238,10 @@ func TestWorker_Round14_ShutdownJoinsUnderRenewalChurn(t *testing.T) {
 	shutdownEpoch := w.epoch
 	w.mu.Unlock()
 	shutdownTok := claimToken{epoch: shutdownEpoch}
+	const shutdownTaskID int64 = 9003
 	const held = 4
 	for i := 0; i < held; i++ {
-		if !w.renewTryEnter(shutdownTok) {
+		if !w.renewTryEnter(shutdownTaskID, shutdownTok) {
 			t.Fatalf("renewTryEnter(%d) = false, want true (no shutdown yet)", i)
 		}
 	}
@@ -250,10 +253,10 @@ func TestWorker_Round14_ShutdownJoinsUnderRenewalChurn(t *testing.T) {
 		go func() {
 			defer churn.Done()
 			for j := 0; j < 200; j++ {
-				if !w.renewTryEnter(shutdownTok) {
+				if !w.renewTryEnter(shutdownTaskID, shutdownTok) {
 					return
 				}
-				w.renewExit()
+				w.renewExit(shutdownTaskID)
 			}
 		}()
 	}
@@ -262,7 +265,7 @@ func TestWorker_Round14_ShutdownJoinsUnderRenewalChurn(t *testing.T) {
 	// Let Shutdown park in the renewal join, then drain the held slots.
 	time.Sleep(200 * time.Millisecond)
 	for i := 0; i < held; i++ {
-		w.renewExit()
+		w.renewExit(shutdownTaskID)
 	}
 	select {
 	case err := <-shDone:

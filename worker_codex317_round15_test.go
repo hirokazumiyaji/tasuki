@@ -65,15 +65,15 @@ func TestWorker_Round15_RenewalBarrierGenerationScoped(t *testing.T) {
 
 	// The old ticker resumes: even though the stop flag is clear for the
 	// new generation, its stale epoch must be rejected.
-	if w.renewTryEnter(tokOld) {
-		w.renewExit()
+	if w.renewTryEnter(taskID, tokOld) {
+		w.renewExit(taskID)
 		t.Fatal("renewTryEnter(stale) = true, want false (old generation must not observe the new generation's re-arm)")
 	}
 	// The new generation is admitted.
-	if !w.renewTryEnter(tokNew) {
+	if !w.renewTryEnter(taskID, tokNew) {
 		t.Fatal("renewTryEnter(current) = false, want true (re-arm must admit the new generation)")
 	}
-	w.renewExit()
+	w.renewExit(taskID)
 }
 
 // TestWorker_Round15_DeadlineExpiryCancelsCover is the regression test for
@@ -148,9 +148,9 @@ func TestWorker_Round15_DeadlineExpiryCancelsCover(t *testing.T) {
 	// The commit reaches the gate after the deadline: it must be rejected
 	// without running the store op.
 	opRan := false
-	_, commitCancel := context.WithCancel(context.Background())
+	commitCtx, commitCancel := context.WithCancel(context.Background())
 	defer commitCancel()
-	gerr := w.guardedDetachedCommit(task.ID, tok, commitCancel, true, func() error {
+	gerr := w.guardedDetachedCommit(task.ID, tok, commitCtx, commitCancel, true, func() error {
 		opRan = true
 		return nil
 	})

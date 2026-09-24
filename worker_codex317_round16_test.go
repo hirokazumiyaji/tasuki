@@ -59,14 +59,14 @@ func TestWorker_Round16_OrdinaryRenewalJoinedBeforeExclusiveCommit(t *testing.T)
 	// Admit the ordinary renewal BEFORE the commit transfer, exactly as a
 	// ticker tick racing the handler would: registration succeeds, then
 	// the ExtendLease call blocks in the backend.
-	if !w.renewTryEnter(tok) {
+	if !w.renewTryEnter(task.ID, tok) {
 		t.Fatal("renewTryEnter = false, want true (fresh lease must admit the ordinary renewal)")
 	}
 	ordCh := make(chan error, 1)
 	go func() {
 		renewStart := time.Now()
 		rerr := store.ExtendLease(ctx, task.ID, 10*time.Second)
-		w.renewExit()
+		w.renewExit(task.ID)
 		if rerr == nil {
 			w.refreshLeaseAt(task.ID, tok, renewStart)
 		}
@@ -75,7 +75,7 @@ func TestWorker_Round16_OrdinaryRenewalJoinedBeforeExclusiveCommit(t *testing.T)
 	select {
 	case <-store.entered:
 	case <-time.After(5 * time.Second):
-		w.renewExit()
+		w.renewExit(task.ID)
 		t.Fatal("ordinary renewal never entered ExtendLease")
 	}
 
@@ -96,7 +96,7 @@ func TestWorker_Round16_OrdinaryRenewalJoinedBeforeExclusiveCommit(t *testing.T)
 	var opDone atomic.Bool
 	commitCh := make(chan error, 1)
 	go func() {
-		commitCh <- w.guardedDetachedCommit(task.ID, tok, commitCancel, true, func() error {
+		commitCh <- w.guardedDetachedCommit(task.ID, tok, commitCtx, commitCancel, true, func() error {
 			opDone.Store(true)
 			return mem.RetryActivity(commitCtx, task.ID, 5*time.Second)
 		})

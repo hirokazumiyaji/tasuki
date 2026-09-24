@@ -89,7 +89,8 @@ func TestWorker_Round9_ShutdownJoinsInFlightRenewal(t *testing.T) {
 	round9Epoch := w.epoch
 	w.mu.Unlock()
 	round9Tok := claimToken{epoch: round9Epoch}
-	if !w.renewTryEnter(round9Tok) {
+	const round9TaskID int64 = 9004
+	if !w.renewTryEnter(round9TaskID, round9Tok) {
 		t.Fatal("renewTryEnter = false, want true (no shutdown yet)")
 	}
 	shCtx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
@@ -101,13 +102,13 @@ func TestWorker_Round9_ShutdownJoinsInFlightRenewal(t *testing.T) {
 	// outstanding renewal slot, the old code releases immediately.
 	time.Sleep(800 * time.Millisecond)
 	if store.hasEvent("release-enter") {
-		w.renewExit()
+		w.renewExit(round9TaskID)
 		close(allowReturn)
 		<-shutdownDone
 		t.Fatal("release fired while an ordinary renewal was still in flight (Shutdown must join renewals first)")
 	}
 
-	w.renewExit()
+	w.renewExit(round9TaskID)
 	close(allowReturn)
 	select {
 	case <-shutdownDone:
