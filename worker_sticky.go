@@ -148,12 +148,21 @@ func (w *Worker) commitWorkflow(ctx context.Context, task backend.Task, baseJour
 
 // trackWfClaim records the local wall-clock claim time of a workflow task.
 func (w *Worker) trackWfClaim(taskID int64) {
+	w.trackWfClaimAt(taskID, time.Now())
+}
+
+// trackWfClaimAt records the local claim time of a workflow task stamped
+// from at, the instant BEFORE the ClaimTasks call that produced it
+// (round-23 P2a, see tickWorkflows). Backends stamp the visible lease
+// during the claim, so measuring from after the call returns stretches
+// the local estimate past the actual lease by the call latency.
+func (w *Worker) trackWfClaimAt(taskID int64, at time.Time) {
 	w.wfClaimMu.Lock()
 	defer w.wfClaimMu.Unlock()
 	if w.wfClaim == nil {
 		w.wfClaim = map[int64]time.Time{}
 	}
-	w.wfClaim[taskID] = time.Now()
+	w.wfClaim[taskID] = at
 }
 
 // clearWfClaims drops local claim records after the tick's flush.

@@ -171,7 +171,7 @@ func TestWorker_StaleRenewalStopsQuietly(t *testing.T) {
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		w.extendLeaseLoop(ctx, stale[0], done, nil)
+		w.extendLeaseLoop(ctx, stale[0], done, nil, time.Now())
 	}()
 	select {
 	case <-finished:

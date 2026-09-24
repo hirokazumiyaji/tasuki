@@ -500,6 +500,15 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 	if limit <= 0 || limit > avail {
 		limit = avail
 	}
+	// Conservative lease base (round-23 P2a): backends stamp visible_at
+	// during the claim transaction, so a slow ClaimTasks (scan-heavy
+	// stores) returns claims whose store lease already started. Measuring
+	// the retry deadline from loop entry (after the call returns) extends
+	// the window past the actual lease by the call latency; a peer then
+	// reclaims mid-turn while this worker still runs side effects.
+	// Capturing the instant BEFORE the call can only bound the window
+	// early, never late.
+	claimStart := time.Now()
 	wtasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
 		Kind: "workflow", Queues: w.opts.Queues, Limit: limit,
 		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
@@ -514,9 +523,10 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 	}
 	// Record local claim times so the delayed nack can be fenced against
 	// a reclaim race (see requeueWorkflowTask). Cleared after the flush
-	// below; entries are wall-clock only, never store time.
+	// below; entries are wall-clock only, never store time. Stamped from
+	// the pre-claim instant above for the same conservatism.
 	for _, t := range wtasks {
-		w.trackWfClaim(t.ID)
+		w.trackWfClaimAt(t.ID, claimStart)
 	}
 	defer w.clearWfClaims(wtasks)
 	var wg sync.WaitGroup
@@ -562,7 +572,7 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		}
 		renewalStops = append(renewalStops, stopRenewal)
 		wg.Add(1)
-		go func(t backend.Task, leaseDone chan struct{}, stopRenewal func()) {
+		go func(t backend.Task, leaseDone chan struct{}, stopRenewal func(), claimBase time.Time) {
 			defer wg.Done()
 			defer func() { <-w.wfSem }()
 			// Track the claim and start renewal BEFORE waiting on the
@@ -605,7 +615,10 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 				// + duplicate execution). cancelTurn travels only as
 				// the loss callback; the loop returns right after
 				// signaling, so it never observes its own signal.
-				w.extendLeaseLoop(ctx, t, leaseDone, cancelTurn)
+				// claimBase bounds the retry window below (see
+				// extendLeaseLoop): the renewal deadline derives
+				// from the actual claim, not from loop entry.
+				w.extendLeaseLoop(ctx, t, leaseDone, cancelTurn, claimBase)
 			}()
 			if !w.dispatchWorkflow(ctx, t.InstanceID, func() {
 				w.opts.Metrics.AddWorkflowTask(ctx, 1)
@@ -746,7 +759,7 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 						"instance_id", t.InstanceID, "task_id", t.ID)
 				}
 			}
-		}(t, leaseDone, stopRenewal)
+		}(t, leaseDone, stopRenewal, claimStart)
 	}
 	wg.Wait()
 	// A canceled tick must not flush: a turn may have completed (pending)
@@ -844,6 +857,9 @@ func (w *Worker) tickActivities(ctx context.Context) {
 	if limit <= 0 || limit > avail {
 		limit = avail
 	}
+	// Conservative lease base (round-23 P2a, see tickWorkflows): the
+	// renewal deadline derives from the actual claim, not handler start.
+	claimStart := time.Now()
 	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
 		Kind: "activity", Queues: w.opts.Queues, Limit: limit,
 		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
@@ -874,15 +890,15 @@ func (w *Worker) tickActivities(ctx context.Context) {
 			_ = w.backend.ReleaseLease(ctx, t)
 			continue
 		}
-		go func(t backend.Task) {
+		go func(t backend.Task, claimBase time.Time) {
 			defer done()
 			defer func() { <-w.actSem }()
 			defer w.untrack(t.ID)
-			if herr := w.handleActivity(ctx, t); herr != nil {
+			if herr := w.handleActivity(ctx, t, claimBase); herr != nil {
 				w.opts.Logger.Debug("activity task error",
 					"instance_id", t.InstanceID, "task_id", t.ID, "err", herr)
 			}
-		}(t)
+		}(t, claimStart)
 	}
 	// Do not wait: long activities must not block the next tick's timers
 	// or workflow progress. Concurrency stays bounded by actSem and Lease
@@ -903,6 +919,8 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 	if limit <= 0 || limit > avail {
 		limit = avail
 	}
+	// Conservative lease base (round-23 P2a, see tickWorkflows).
+	claimStart := time.Now()
 	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
 		Kind: "activity", Queues: w.opts.Queues, Limit: limit,
 		Lease: w.opts.LeaseDuration, WorkerID: w.opts.WorkerID,
@@ -926,18 +944,18 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
 		w.track(t)
 		done, global := w.trackActivity()
-		go func(t backend.Task) {
+		go func(t backend.Task, claimBase time.Time) {
 			defer wg.Done()
 			if global {
 				defer done()
 			}
 			defer func() { <-w.actSem }()
 			defer w.untrack(t.ID)
-			if herr := w.handleActivity(ctx, t); herr != nil {
+			if herr := w.handleActivity(ctx, t, claimBase); herr != nil {
 				w.opts.Logger.Debug("activity task error",
 					"instance_id", t.InstanceID, "task_id", t.ID, "err", herr)
 			}
-		}(t)
+		}(t, claimStart)
 	}
 	wg.Wait()
 }
@@ -1455,7 +1473,7 @@ func (w *Worker) fitAdvancementToBudget(adv *backend.Advancement, commands []jou
 	return nil
 }
 
-func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
+func (w *Worker) handleActivity(ctx context.Context, t backend.Task, claimBase time.Time) error {
 	act, err := w.reg.activity(t.Name)
 	if err != nil {
 		if errors.Is(err, ErrActivityNotRegistered) {
@@ -1466,7 +1484,9 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task) error {
 
 	done := make(chan struct{})
 	defer close(done)
-	go w.extendLeaseLoop(ctx, t, done, nil)
+	// claimBase bounds the retry window below (see extendLeaseLoop): the
+	// renewal deadline derives from the actual claim, not handler start.
+	go w.extendLeaseLoop(ctx, t, done, nil, claimBase)
 
 	attempt := t.Attempt
 	if attempt < 1 {
@@ -1776,7 +1796,7 @@ func (w *Worker) nackIncompatible(ctx context.Context, t backend.Task, reason st
 	return w.backend.NackTask(ctx, t, delay)
 }
 
-func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-chan struct{}, onLeaseLost func()) {
+func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-chan struct{}, onLeaseLost func(), claimBase time.Time) {
 	lease := w.opts.LeaseDuration
 	d := lease / 2
 	if d <= 0 {
@@ -1785,11 +1805,19 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 	ticker := time.NewTicker(d)
 	defer ticker.Stop()
 	// lastSuccess is the wall-clock instant of the last renewal that moved
-	// the store lease forward; loop entry counts as the claim itself. It
-	// bounds the retry window below (round-21 P2b). It approximates the
-	// store clock, which production backends keep aligned with wall time;
-	// tests align them manually when they move the store clock.
-	lastSuccess := time.Now()
+	// the store lease forward. It bounds the retry window below (round-21
+	// P2b). It approximates the store clock, which production backends
+	// keep aligned with wall time; tests align them manually when they
+	// move the store clock.
+	//
+	// The base is the actual claim (round-23 P2a), not loop entry: the
+	// loop starts after ClaimTasks returns plus dispatch queueing, and a
+	// slow ClaimTasks (scan-heavy stores stamp visible_at during the
+	// call) would otherwise stretch the retry deadline past the store
+	// lease by that latency. lastSuccess bounds conservatively from the
+	// earlier of the pre-claim wall instant and the claim's own
+	// VisibleAt-derived start (see leaseBaseFromClaim).
+	lastSuccess := leaseBaseFromClaim(t, claimBase, lease)
 	for {
 		select {
 		case <-done:
@@ -1842,6 +1870,26 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 			w.refreshWfClaim(t.ID)
 		}
 	}
+}
+
+// leaseBaseFromClaim derives the conservative renewal baseline for a
+// claimed task (round-23 P2a). The pre-claim wall instant is always a
+// valid lower bound for the store-visible lease start; when the claim
+// itself carries a VisibleAt-derived start that is EARLIER (wall clock
+// jumped forward, or the caller passed a post-claim instant), the
+// earlier instant wins so the retry deadline never stretches past the
+// actual store lease. A zero claimBase falls back to now (older/test
+// call sites that never captured the pre-claim instant).
+func leaseBaseFromClaim(t backend.Task, claimBase time.Time, lease time.Duration) time.Time {
+	if claimBase.IsZero() {
+		claimBase = time.Now()
+	}
+	if lease > 0 && !t.VisibleAt.IsZero() {
+		if storeStart := t.VisibleAt.Add(-lease); storeStart.Before(claimBase) {
+			return storeStart
+		}
+	}
+	return claimBase
 }
 
 // renewAbandonMargin bounds how close to lease expiry retryRenewal may keep
@@ -1904,14 +1952,27 @@ func (w *Worker) retryRenewal(ctx context.Context, t backend.Task, done <-chan s
 			return lastSuccess, false
 		default:
 		}
-		if time.Until(lastSuccess.Add(lease-margin)) <= 0 {
+		// Cap every sleep at the abandonment deadline (round-23 P2b):
+		// an uncapped backoff overshoots lastSuccess+lease-margin, so
+		// the turn keeps running side effects past the abandonment
+		// point — and, for short leases, past the store expiry itself
+		// (a 100ms lease fails its first renewal at ~50ms and would
+		// sleep 100ms while a peer reclaims at 100ms). Waking at the
+		// deadline routes back through the abandonment check above,
+		// which signals the loss before a peer can reclaim.
+		remaining := time.Until(lastSuccess.Add(lease - margin))
+		if remaining <= 0 {
 			w.opts.Logger.Warn("lease renewal unrestorable; abandoning turn before expiry",
 				"task_id", t.ID)
 			w.recordStoreError(ctx, "extend_lease", errors.New("tasuki: lease renewal unrestorable"), "task_id", t.ID)
 			w.signalLeaseLost(onLeaseLost, t)
 			return lastSuccess, false
 		}
-		timer := time.NewTimer(backoff)
+		sleep := backoff
+		if sleep > remaining {
+			sleep = remaining
+		}
+		timer := time.NewTimer(sleep)
 		select {
 		case <-done:
 			timer.Stop()

@@ -54,7 +54,7 @@ func TestRequeueWorkflowTask_RenewedClaimStillNacks(t *testing.T) {
 	loopDone := make(chan struct{})
 	go func() {
 		defer close(loopDone)
-		w.extendLeaseLoop(ctx, task, done, nil)
+		w.extendLeaseLoop(ctx, task, done, nil, time.Now())
 	}()
 	// ~75/150/225/300ms ticks all renew successfully (no reclaim); the
 	// last refresh lands ~300ms in, keeping the estimate fresh.
