@@ -1442,6 +1442,13 @@ func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context, runCtx contex
 					"activity", name, "panic", fmt.Sprint(r))
 				out = nil
 				err = fmt.Errorf("activity panic: %v", r)
+				// Worker cancellation wins over even a panic result,
+				// unifying with acceptLocalResult's prioritization
+				// (round-16 P2): the turn is abandoned either way.
+				if runCtx != nil && runCtx.Err() != nil {
+					out = nil
+					err = runCtx.Err()
+				}
 			}
 		}()
 		act, err := w.reg.activity(name)
@@ -1456,7 +1463,21 @@ func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context, runCtx contex
 		}
 		timeout := w.opts.LocalActivityTimeout
 		if timeout <= 0 {
-			return act.fn(ctx, input)
+			// No timeout: the call above runs inline, but worker
+			// cancellation (runCtx: Shutdown or Start-parent cancel)
+			// still wins over a returned value or domain error
+			// (round-16 P2). Without this check an activity that
+			// observes the cancellation yet returns a value is
+			// accepted, and the workflow keeps invoking further
+			// local activities — with side effects — until wf.fn
+			// returns, even though handleWorkflow abandons the turn
+			// afterwards anyway. This unifies the timeout-disabled
+			// branch with acceptLocalResult's prioritization.
+			out, err := act.fn(ctx, input)
+			if runCtx != nil && runCtx.Err() != nil {
+				return nil, runCtx.Err()
+			}
+			return out, err
 		}
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
