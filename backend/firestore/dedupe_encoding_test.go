@@ -90,22 +90,30 @@ func TestDedupeKeyCandidatesLegacyFirst(t *testing.T) {
 	if len(got) != 2 || got[0] != "__x" || got[1] != "____x" {
 		t.Fatalf("candidates(__x) = %q, want [__x ____x] (raw first)", got)
 	}
+	// The fallback guard key comes last: it is only consulted when the
+	// canonical key is occupied (Codex round-16 on #296). Short IDs fall
+	// back to the raw key itself, so short candidate lists are unchanged.
 	long := "__" + strings.Repeat("k", 300)
 	lg := dedupeKeyCandidates(long)
-	if len(lg) < 3 || lg[0] != long {
-		t.Fatalf("long candidates must start with legacy raw, got %q", lg)
+	wantLong := []string{long, "__" + long, escapeDedupeID(long), rawFallbackDedupeKey(long)}
+	if len(lg) != len(wantLong) {
+		t.Fatalf("long candidates = %q, want %q", lg, wantLong)
 	}
-	if lg[len(lg)-1] != escapeDedupeID(long) {
-		t.Fatalf("long candidates must end with current encoding, got %q", lg)
-	}
-	foundEscaped := false
-	for _, k := range lg {
-		if k == "__"+long {
-			foundEscaped = true
+	for i := range wantLong {
+		if lg[i] != wantLong[i] {
+			t.Fatalf("long candidates = %q, want %q", lg, wantLong)
 		}
 	}
-	if !foundEscaped {
-		t.Fatalf("long candidates miss the intermediate escaped form, got %q", lg)
+	plain := strings.Repeat("p", 300)
+	pg := dedupeKeyCandidates(plain)
+	wantPlain := []string{plain, escapeDedupeID(plain), rawFallbackDedupeKey(plain)}
+	if len(pg) != len(wantPlain) {
+		t.Fatalf("plain-long candidates = %q, want %q", pg, wantPlain)
+	}
+	for i := range wantPlain {
+		if pg[i] != wantPlain[i] {
+			t.Fatalf("plain-long candidates = %q, want %q", pg, wantPlain)
+		}
 	}
 }
 
@@ -124,15 +132,28 @@ func TestPostTerminalMarkerDocSeparation(t *testing.T) {
 	for _, u := range adversarial {
 		for _, bk := range dedupeKeyCandidates(u) {
 			for _, m := range adversarial {
-				if inst+":"+bk == postTerminalMarkerDocID(inst, m) && !isPostTerminalMarkerKey(bk) {
-					t.Fatalf("user candidate %q (for %q) matches marker doc for %q yet is not probe-skipped", bk, u, m)
+				// Compare under both doc-ID framings: the framed form is
+				// injective, so equality there reduces to key equality,
+				// while the legacy concatenation can alias across
+				// (instance, key) pairs — either way a user candidate
+				// matching a marker document must be marker-shaped
+				// (hence probe-skipped).
+				for _, userDoc := range dedupeDocIDs(inst, []string{bk}) {
+					for _, md := range markerDocIDs(inst, m) {
+						if userDoc == md && !isPostTerminalMarkerKey(bk) {
+							t.Fatalf("user candidate %q (for %q) matches marker doc for %q yet is not probe-skipped", bk, u, m)
+						}
+					}
 				}
 			}
 		}
 	}
 	long := strings.Repeat("k", 300)
-	if got := postTerminalMarkerDocID(inst, long); !strings.HasPrefix(got, inst+":") {
-		t.Fatalf("long marker doc %q must stay instance-scoped", got)
+	if got := postTerminalMarkerDocID(inst, long); true {
+		ri, _, ok := splitDedupeDocID(got)
+		if !ok || ri != inst {
+			t.Fatalf("long marker doc %q must stay instance-scoped under framing", got)
+		}
 	}
 }
 
@@ -150,7 +171,7 @@ func TestIsPostTerminalMarkerKey(t *testing.T) {
 			t.Fatalf("marker key %q not detected", k)
 		}
 	}
-	for _, k := range []string{"x", "____x", "__hash__:abc", escapeDedupeID(strings.Repeat("k", 300))} {
+	for _, k := range []string{"x", "____x", "__hash__:abc", escapeDedupeID(strings.Repeat("k", 300)), rawFallbackDedupeKey(strings.Repeat("k", 300))} {
 		if isPostTerminalMarkerKey(k) {
 			t.Fatalf("user key %q misdetected as marker", k)
 		}
@@ -166,9 +187,17 @@ func TestFilterTerminateDedupePreservesMarkers(t *testing.T) {
 	base := escapeDedupeID("k1")
 	marker := postTerminalDedupeMarker("k2")
 	hashedMarker := postTerminalDedupeMarker(strings.Repeat("k", 300))
-	snapshot := []string{inst + ":" + base, inst + ":" + marker, inst + ":" + hashedMarker}
+	// Base keys arrive in both doc-ID framings (framed writes plus
+	// pre-framing legacy rows); markers in the dedupe collection are
+	// pre-upgrade inert rows, always legacy-framed.
+	snapshot := []string{
+		signalDedupeID(inst, "k1"),
+		legacyDedupeDocID(inst, base),
+		legacyDedupeDocID(inst, marker),
+		legacyDedupeDocID(inst, hashedMarker),
+	}
 	got := filterTerminateDedupeDocs(snapshot, inst)
-	if len(got) != 1 || got[0] != inst+":"+base {
-		t.Fatalf("filtered sweep = %q, want only the base key", got)
+	if len(got) != 2 || got[0] != signalDedupeID(inst, "k1") || got[1] != legacyDedupeDocID(inst, base) {
+		t.Fatalf("filtered sweep = %q, want only the base keys", got)
 	}
 }

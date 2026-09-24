@@ -38,6 +38,9 @@ func TestMatchDedupeRow(t *testing.T) {
 		{"legacy row is not another ID's raw form", "____x", "__x", "__x", legacy, false},
 		{"raw-key fallback own", "__fresh", "__fresh", "__fresh", v2, true},
 		{"raw-key fallback foreign via escaped candidate", "__x", "____x", "____x", v2, false},
+		{"fallback hashed own", strings.Repeat("k", 300), rawFallbackDedupeKey(strings.Repeat("k", 300)), rawFallbackDedupeKey(strings.Repeat("k", 300)), v2, true},
+		{"fallback hashed foreign", "x", rawFallbackDedupeKey(strings.Repeat("k", 300)), rawFallbackDedupeKey(strings.Repeat("k", 300)), v2, false},
+		{"fallback hashed canonical candidate is not the guard", strings.Repeat("k", 300), escapeDedupeID(strings.Repeat("k", 300)), rawFallbackDedupeKey(strings.Repeat("k", 300)), v2, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

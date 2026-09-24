@@ -33,7 +33,7 @@ func TestDedupeMarkerNamespaceDisjoint(t *testing.T) {
 				continue
 			}
 			for _, m := range adversarial {
-				if userDoc, markerDoc := inst+":"+bk, postTerminalMarkerDocID(inst, m); userDoc == markerDoc {
+				if userDoc, markerDoc := frameDedupeDocID(inst, bk), postTerminalMarkerDocID(inst, m); userDoc == markerDoc {
 					t.Fatalf("user doc %q (for %q) collides with marker doc for %q", userDoc, u, m)
 				}
 			}
@@ -45,16 +45,19 @@ func TestDedupeMarkerNamespaceDisjoint(t *testing.T) {
 	// for pre-escape compat.
 	seen := map[string]string{}
 	for _, u := range adversarial {
-		key := inst + ":" + escapeDedupeID(u)
+		key := signalDedupeID(inst, u)
 		if prev, dup := seen[key]; dup {
 			t.Fatalf("user IDs %q and %q share document %q", prev, u, key)
 		}
 		seen[key] = u
 	}
-	// Escape is minimal: ordinary IDs are stored verbatim.
+	// Framing round-trips: ordinary IDs keep their exact key text after the
+	// length-prefixed instance scope (no escape/remap at the doc-ID layer).
 	for _, u := range []string{"", "x", "pay-42", "a:b"} {
-		if got := signalDedupeID(inst, u); got != inst+":"+u {
-			t.Fatalf("ordinary ID %q remapped to %q", u, got)
+		got := signalDedupeID(inst, u)
+		ri, rk, ok := splitDedupeDocID(got)
+		if !ok || ri != inst || rk != u {
+			t.Fatalf("doc ID %q does not round-trip to (%q, %q)", got, inst, u)
 		}
 	}
 	if !strings.HasPrefix(postTerminalDedupeMarker("x"), "__post_terminal__v1:") {
@@ -78,9 +81,27 @@ func TestDedupeMarkerProbeExcludesLegacyUserRow(t *testing.T) {
 	// TestTerminalLegacyV1UserRowDelivers; here pin that every such
 	// textual match is a probe-skipped marker shape.
 	const inst = "ns-probe-test"
-	for _, legacyRow := range []string{"__post_terminal__:x", "__post_terminal__v1:x"} {
-		if got := postTerminalMarkerDocID(inst, "x"); got == inst+":"+legacyRow && !isPostTerminalMarkerKey(legacyRow) {
-			t.Fatalf("textual marker match %q is not probe-skipped", legacyRow)
+	// The v1 marker probe reaches the v1-shaped legacy verbatim row (upgrade
+	// dual-read) and skips it as marker-shaped, so it can never swallow a
+	// post-terminal send...
+	v1row := legacyDedupeDocID(inst, "__post_terminal__v1:x")
+	found := false
+	for _, md := range markerDocIDs(inst, "x") {
+		if md == v1row {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("marker probe for %q misses legacy verbatim row %q", "x", "__post_terminal__v1:x")
+	}
+	if !isPostTerminalMarkerKey("__post_terminal__v1:x") {
+		t.Fatal("v1-shaped row is not probe-skipped")
+	}
+	// ...while the unversioned legacy marker namespace is never probed as a
+	// v1 marker (round-9 versioning invariant).
+	for _, md := range markerDocIDs(inst, "x") {
+		if md == legacyDedupeDocID(inst, "__post_terminal__:x") {
+			t.Fatalf("v1 marker probe reaches unversioned legacy row %q", "__post_terminal__:x")
 		}
 	}
 }

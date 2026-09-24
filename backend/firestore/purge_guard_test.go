@@ -76,7 +76,7 @@ func TestPurgeVictimGuards(t *testing.T) {
 	if done, residual, _, err := b.deletePurgedInstanceDoc(ctx, victim); err != nil || !done {
 		t.Fatalf("own delete: done=%v err=%v", done, err)
 	} else {
-		if residual == nil || len(residual.dedupe) != 1 || residual.dedupe[0].ref.ID != id+":"+escapeDedupeID("guard-key") {
+		if residual == nil || len(residual.dedupe) != 1 || residual.dedupe[0].ref.ID != signalDedupeID(id, "guard-key") {
 			t.Fatalf("own delete must snapshot the straggler dedupe row in-txn, got %+v", residual)
 		}
 		if len(residual.inbox) != 1 {

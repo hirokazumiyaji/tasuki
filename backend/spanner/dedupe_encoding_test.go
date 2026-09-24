@@ -88,11 +88,14 @@ func TestDedupeKeyCandidatesLegacyFirst(t *testing.T) {
 	}
 	long := "__" + strings.Repeat("k", 300)
 	lg := dedupeKeyCandidates(long)
-	if len(lg) < 3 || lg[0] != long {
-		t.Fatalf("long candidates must start with legacy raw, got %q", lg)
+	wantLong := []string{long, "__" + long, dedupeKey(long), rawFallbackDedupeKey(long)}
+	if len(lg) != len(wantLong) {
+		t.Fatalf("long candidates = %q, want %q", lg, wantLong)
 	}
-	if lg[len(lg)-1] != dedupeKey(long) {
-		t.Fatalf("long candidates must end with current encoding, got %q", lg)
+	for i := range wantLong {
+		if lg[i] != wantLong[i] {
+			t.Fatalf("long candidates = %q, want %q", lg, wantLong)
+		}
 	}
 }
 
@@ -133,7 +136,7 @@ func TestIsPostTerminalMarkerKey(t *testing.T) {
 			t.Fatalf("marker key %q not detected", k)
 		}
 	}
-	for _, k := range []string{"x", "____x", "__hash__:abc", dedupeKey(strings.Repeat("k", 300))} {
+	for _, k := range []string{"x", "____x", "__hash__:abc", dedupeKey(strings.Repeat("k", 300)), rawFallbackDedupeKey(strings.Repeat("k", 300))} {
 		if isPostTerminalMarkerKey(k) {
 			t.Fatalf("user key %q misdetected as marker", k)
 		}

@@ -186,6 +186,17 @@ func postTerminalDedupeMarker(dedupeID string) string {
 // Long IDs that would exceed the STRING(255) budget hash into a bounded
 // "__hash__:" form instead (Codex round 8 on #327); the mapping applies on
 // write and lookup alike, so it stays transparent.
+//
+// NOTE on framing (Codex round-16 on #296): unlike Firestore, which
+// concatenates instance and key into one document ID (length-prefixed since
+// the round-16 fix — see frameDedupeDocID there), Spanner keys are composite
+// (instance_id, dedupe_id), so (instance, key) pairs are structurally
+// unambiguous here; there is no concatenation to reframe. The key-level
+// encodings below are byte-identical to Firestore's, and lookups validate
+// the stored instance_id exactly like Firestore's docInstanceMatches (a
+// no-op by construction here — the key's instance component always equals
+// the stored column — kept as defense in depth so both backends enforce the
+// same ownership invariant).
 func escapeDedupeID(dedupeID string) string {
 	var esc string
 	if strings.HasPrefix(dedupeID, "__") {
@@ -197,6 +208,30 @@ func escapeDedupeID(dedupeID string) string {
 		return esc
 	}
 	return dedupeHashedUserPrefix + hashDedupeID(dedupeID)
+}
+
+// rawFallbackDedupeKey derives the fallback guard key for a DedupeID whose
+// canonical key is already occupied by a foreign legacy row (Codex round-16
+// on #296). Short IDs fall back to the raw key itself, exactly as before.
+// Over-budget IDs cannot: writing the raw long ID would exceed the
+// STRING(255) budget, the commit fails, and the event is never delivered —
+// so they hash into the __hash__: namespace with a domain-separated
+// second-level hash: deterministic, bounded (77 chars), byte-identical to
+// Firestore's, and structurally distinct from the occupied canonical hash
+// (no "raw:" infix). Residual caveats, both duplicate-never-drop except
+// where noted: a true double collision (canonical AND fallback keys both
+// foreign-occupied) inserts unguarded, and deliberately reusing another
+// send's 77-char fallback hash as your own DedupeID on the same instance
+// would match its guard (sender-constructible only — DedupeIDs are
+// sender-chosen — so a self-DoS shape, not a cross-user hole; Firestore
+// additionally cross-checks the stored canonical form, which Spanner cannot
+// record without a schema change since dedupe_id IS the key).
+func rawFallbackDedupeKey(dedupeID string) string {
+	if len(dedupeID) <= dedupeKeyLimit {
+		return dedupeID
+	}
+	sum := sha256.Sum256([]byte("tasuki/dedupe-raw-fallback/v1\x00" + dedupeID))
+	return dedupeHashedUserPrefix + "raw:" + hex.EncodeToString(sum[:])
 }
 
 // isPostTerminalMarkerKey reports whether a stored wf_signal_dedupe key is
@@ -257,16 +292,27 @@ const dedupeFormatRawKeyVersion = 2
 //     match iff the stored column equals the requested ID's canonical form —
 //     regardless of which candidate located them. A foreign-owner row (e.g.
 //     "__x"'s "____x" found via "____x"'s raw candidate) never matches.
+//   - Fallback rows (format_version >= 2) live at the rawFallbackDedupeKey
+//     instead of the canonical key, so they match iff the candidate IS that
+//     fallback key for the requested ID. (Firestore additionally
+//     cross-checks the stored canonical form; Spanner cannot — dedupe_id IS
+//     the key — so the documented hash-reuse caveat on rawFallbackDedupeKey
+//     applies here.)
 //   - Legacy rows were stored verbatim, so they belong to the requested ID
 //     iff the stored key IS the requested raw ID exactly. An escaped
 //     candidate hitting a legacy row is another ID's row and never matches
 //     (safe direction: the send inserts, possibly duplicating, but is never
 //     dropped).
+//
+// Callers additionally gate every hit on the stored instance_id equaling the
+// probing instance (see readDedupeRow): a no-op by construction under
+// composite keys, kept identical to Firestore's docInstanceMatches as
+// defense in depth.
 func matchDedupeRow(requestedRaw, candidateKey, storedDedupeID string, version spanner.NullInt64) bool {
 	if version.Valid && version.Int64 >= dedupeFormatRawKeyVersion {
-		// Raw-keyed versioned row (fallback guard): the key IS the owner,
-		// positively — no other ID's probe can claim it.
-		return candidateKey == requestedRaw
+		// Fallback guard: the key IS the owner — no other ID's probe can
+		// claim it (modulo the documented hash-reuse caveat).
+		return candidateKey == rawFallbackDedupeKey(requestedRaw)
 	}
 	if version.Valid && version.Int64 >= dedupeFormatVersion {
 		return storedDedupeID == escapeDedupeID(requestedRaw)
@@ -275,8 +321,9 @@ func matchDedupeRow(requestedRaw, candidateKey, storedDedupeID string, version s
 }
 
 // dedupeKeyCandidates lists the stored user-key forms to probe on
-// dedupe-check reads, legacy raw first (Codex round 8 on #327). Terminal
-// base-key probes skip marker-shaped candidates (see
+// dedupe-check reads, legacy raw first (Codex round 8 on #327). The fallback
+// guard key comes last: it is only consulted when the canonical key is
+// occupied. Terminal base-key probes skip marker-shaped candidates (see
 // isPostTerminalMarkerKey); running probes honor every candidate, since a
 // marker-shaped row on a running instance is unambiguously a legacy user
 // key (Codex round 12 on #296).
@@ -294,11 +341,23 @@ func dedupeKeyCandidates(dedupeID string) []string {
 		add("__" + dedupeID)
 	}
 	add(escapeDedupeID(dedupeID))
+	add(rawFallbackDedupeKey(dedupeID))
 	return out
 }
 
 func dedupeKey(dedupeID string) string       { return escapeDedupeID(dedupeID) }
 func dedupeMarkerKey(dedupeID string) string { return postTerminalDedupeMarker(dedupeID) }
+
+// Exported key-encoding accessors for the cross-backend parity test (see
+// backend/firestore/dedupe_parity_test.go): both backends must encode
+// DedupeIDs byte-identically even though they store them differently
+// (framed Firestore document IDs vs. Spanner composite keys).
+func EscapeDedupeID(dedupeID string) string { return escapeDedupeID(dedupeID) }
+func PostTerminalDedupeMarker(dedupeID string) string {
+	return postTerminalDedupeMarker(dedupeID)
+}
+func RawFallbackDedupeKey(dedupeID string) string  { return rawFallbackDedupeKey(dedupeID) }
+func DedupeKeyCandidates(dedupeID string) []string { return dedupeKeyCandidates(dedupeID) }
 
 func unwrapInboxPayload(payload []byte) (string, []byte) {
 	if len(payload) == 0 {

@@ -37,8 +37,101 @@ func journalID(instanceID string, seq int64) string {
 func inboxID(instanceID string, id int64) string {
 	return instanceID + ":" + strconv.FormatInt(id, 10)
 }
+
+// frameDedupeDocID derives the document ID holding a stored dedupe key for
+// one instance (Codex round-16 on #296). The framing length-prefixes the
+// instance ID, so the (instance, key) pair maps injectively: the old
+// instanceID + ":" + key concatenation was ambiguous when both parts are
+// free-form strings (user doc ("a", "b:c") and ("a:b", "c") shared "a:b:c"),
+// and lookups never validated the stored instance_id, so one instance's
+// legacy row could suppress another instance's send (cross-instance skip).
+// Probes construct both framings and validate ownership (see
+// docInstanceMatches); they never parse doc IDs back, so only the
+// terminate-sweep marker classifier parses (via dedupeDocKeySuffix), where
+// both misclassification directions stay safe (delayed cleanup or a
+// duplicate, never a drop).
+func frameDedupeDocID(instanceID, key string) string {
+	return strconv.Itoa(len(instanceID)) + ":" + instanceID + ":" + key
+}
+
+// legacyDedupeDocID derives the pre-framing document ID for a stored key.
+// Rows written before framing keep this form; probes consult it after the
+// framed form (upgrade dual-read) until purge reaps them.
+func legacyDedupeDocID(instanceID, key string) string {
+	return instanceID + ":" + key
+}
+
 func signalDedupeID(instanceID, dedupeID string) string {
-	return instanceID + ":" + escapeDedupeID(dedupeID)
+	return frameDedupeDocID(instanceID, escapeDedupeID(dedupeID))
+}
+
+// splitDedupeDocID parses frameDedupeDocID back into its components.
+// ok=false for legacy-framed or malformed IDs. Lengths are bytes, matching
+// len() at framing time, so multibyte instance IDs round-trip exactly.
+func splitDedupeDocID(docID string) (instanceID, key string, ok bool) {
+	i := strings.IndexByte(docID, ':')
+	if i <= 0 {
+		return "", "", false
+	}
+	n, err := strconv.Atoi(docID[:i])
+	if err != nil || n < 0 {
+		return "", "", false
+	}
+	rest := docID[i+1:]
+	if len(rest) < n+1 || rest[n] != ':' {
+		return "", "", false
+	}
+	return rest[:n], rest[n+1:], true
+}
+
+// dedupeDocKeySuffix extracts the stored-key suffix of a dedupe document ID
+// for one instance under either framing (framed first, legacy strip as
+// fallback). Only the terminate-sweep marker classifier parses IDs; send
+// probes construct both framings instead (see dedupeDocIDs).
+func dedupeDocKeySuffix(docID, instanceID string) (string, bool) {
+	if inst, key, ok := splitDedupeDocID(docID); ok && inst == instanceID {
+		return key, true
+	}
+	return cutPrefix(docID, instanceID+":")
+}
+
+// dedupeDocIDs lists the document IDs to probe for stored-key forms: the
+// framed form first, then the legacy form for pre-framing rows (upgrade
+// dual-read; writes use the framed form only).
+func dedupeDocIDs(instanceID string, keys []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(id string) {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	for _, k := range keys {
+		add(frameDedupeDocID(instanceID, k))
+	}
+	for _, k := range keys {
+		add(legacyDedupeDocID(instanceID, k))
+	}
+	return out
+}
+
+// markerDocIDs lists the marker documents to probe for a DedupeID: the
+// framed form first, then the legacy form for pre-framing markers.
+func markerDocIDs(instanceID, dedupeID string) []string {
+	return dedupeDocIDs(instanceID, []string{postTerminalDedupeMarker(dedupeID)})
+}
+
+// docInstanceMatches validates that a stored dedupe/marker row belongs to
+// the probing instance (Codex round-16 on #296, defense in depth with the
+// framed IDs above): under legacy framing two (instance, key) pairs could
+// share one document, so a hit counts only when the row's instance_id field
+// agrees. Rows predate the field only in theory (it has ridden every dedupe
+// write since introduction), so a missing field falls back to the
+// key/version match instead of forcing a duplicate.
+func docInstanceMatches(doc map[string]any, instanceID string) bool {
+	owner, _ := doc["instance_id"].(string)
+	return owner == "" || owner == instanceID
 }
 
 // postTerminalMarkersCollection holds post-terminal retry markers OUTSIDE
@@ -61,9 +154,12 @@ func signalDedupeID(instanceID, dedupeID string) string {
 const postTerminalMarkersCollection = "wf_post_terminal_markers"
 
 // postTerminalMarkerDocID derives the document ID of the post-terminal send
-// marker for a DedupeID in postTerminalMarkersCollection.
+// marker for a DedupeID in postTerminalMarkersCollection. The framed form
+// keeps (instance, marker) pairs injective (see frameDedupeDocID); probes
+// consult the legacy concatenation for pre-framing markers (see
+// markerDocIDs).
 func postTerminalMarkerDocID(instanceID, dedupeID string) string {
-	return instanceID + ":" + postTerminalDedupeMarker(dedupeID)
+	return frameDedupeDocID(instanceID, postTerminalDedupeMarker(dedupeID))
 }
 
 // dedupeKeyLimit is the Spanner wf_signal_dedupe.dedupe_id STRING(255)
@@ -208,6 +304,28 @@ const dedupeFormatVersionField = "format_version"
 // duplicating. The dedupe_id field still carries the canonical escaped form.
 const dedupeFormatRawKeyVersion = 2
 
+// rawFallbackDedupeKey derives the fallback guard key for a DedupeID whose
+// canonical key is already occupied by a foreign legacy row (Codex round-16
+// on #296). Short IDs fall back to the raw key itself, exactly as before.
+// Over-budget IDs cannot: writing the raw long ID would exceed the shared
+// STRING(255) budget (Spanner rejects the commit and the event is never
+// delivered), so they hash into the __hash__: namespace with a
+// domain-separated second-level hash — deterministic, bounded (77 chars),
+// and structurally distinct from the occupied canonical hash (which carries
+// no "raw:" infix). Residual caveats, both duplicate-never-drop: a true
+// double collision (canonical AND fallback keys both foreign-occupied)
+// inserts unguarded, and deliberately reusing another ID's 77-char fallback
+// hash as your own DedupeID on the same instance would match its guard (the
+// v2 rule below still positively identifies the owner for every
+// non-adversarial shape).
+func rawFallbackDedupeKey(dedupeID string) string {
+	if len(dedupeID) <= dedupeKeyLimit {
+		return dedupeID
+	}
+	sum := sha256.Sum256([]byte("tasuki/dedupe-raw-fallback/v1\x00" + dedupeID))
+	return dedupeHashedUserPrefix + "raw:" + hex.EncodeToString(sum[:])
+}
+
 // matchDedupeRow reports whether a stored dedupe row guards the requested
 // raw DedupeID. candidateKey is the probed stored-key form that located the
 // row; doc is the row's field map.
@@ -217,17 +335,29 @@ const dedupeFormatRawKeyVersion = 2
 //     equals the requested ID's canonical form — regardless of which
 //     candidate located them. A foreign-owner row (e.g. "__x"'s "____x"
 //     found via "____x"'s raw candidate) never matches.
+//   - Fallback rows (format_version >= 2) live at the rawFallbackDedupeKey
+//     instead of the canonical key, so they match iff the candidate IS that
+//     fallback key for the requested ID — and the stored dedupe_id still
+//     names the canonical form (or, for pre-refinement Spanner rows, the raw
+//     key itself), so a deliberately reused fallback hash cannot claim
+//     another ID's guard.
 //   - Legacy rows (no format_version) were stored verbatim, so they belong
 //     to the requested ID iff the stored key IS the requested raw ID
 //     exactly. An escaped candidate hitting a legacy row is another ID's
 //     row and never matches (safe direction: the send inserts, possibly
 //     duplicating, but is never dropped).
+//
+// Callers additionally gate every hit on docInstanceMatches: under legacy
+// framing a document may hold another instance's row.
 func matchDedupeRow(requestedRaw, candidateKey string, doc map[string]any) bool {
 	version := i64(doc, dedupeFormatVersionField)
 	if version >= dedupeFormatRawKeyVersion {
-		// Raw-keyed versioned row (fallback guard): the key IS the owner,
-		// positively — no other ID's probe can claim it.
-		return candidateKey == requestedRaw
+		// Raw-keyed versioned row (fallback guard): the key IS the owner —
+		// no other ID's probe can claim it — with the stored canonical
+		// form as a second opinion against hash-reuse confusion.
+		stored := str(doc, "dedupe_id")
+		return candidateKey == rawFallbackDedupeKey(requestedRaw) &&
+			(stored == escapeDedupeID(requestedRaw) || stored == requestedRaw)
 	}
 	if version >= dedupeFormatVersion {
 		return str(doc, "dedupe_id") == escapeDedupeID(requestedRaw)
@@ -241,9 +371,10 @@ func matchDedupeRow(requestedRaw, candidateKey string, doc map[string]any) bool 
 // for "__x" must probe "__x" before the current "____x", or it misses and
 // duplicates the event. Long-ID rows written between round 6 and the round-8
 // hash could also hold the over-budget escaped form on Firestore (Spanner
-// would have rejected it), so all three forms are probed. Writes always use
-// the current escapeDedupeID form. Terminal base-key probes skip
-// marker-shaped candidates (see isPostTerminalMarkerKey); running probes
+// would have rejected it), so all three forms are probed. The fallback guard
+// key comes last: it is only consulted when the canonical key is occupied.
+// Writes always use the current escapeDedupeID form. Terminal base-key probes
+// skip marker-shaped candidates (see isPostTerminalMarkerKey); running probes
 // honor every candidate, since a marker-shaped row on a running instance is
 // unambiguously a legacy user key (Codex round 12 on #296).
 func dedupeKeyCandidates(dedupeID string) []string {
@@ -260,16 +391,18 @@ func dedupeKeyCandidates(dedupeID string) []string {
 		add("__" + dedupeID)
 	}
 	add(escapeDedupeID(dedupeID))
+	add(rawFallbackDedupeKey(dedupeID))
 	return out
 }
 
 // isPostTerminalMarkerDocID reports whether a wf_signal_dedupe document ID
-// holds a post-terminal retry marker. Doc IDs are instanceID + ":" +
-// storedKey, so the stored suffix is tested (Codex round 8 on #327).
+// holds a post-terminal retry marker. The stored suffix is extracted under
+// either doc-ID framing (Codex round-16 on #296) and tested for a marker
+// shape (Codex round 8 on #327).
 func isPostTerminalMarkerDocID(docID, instanceID string) bool {
-	suffix := docID
-	if rest, ok := cutPrefix(docID, instanceID+":"); ok {
-		suffix = rest
+	suffix, ok := dedupeDocKeySuffix(docID, instanceID)
+	if !ok {
+		return false
 	}
 	return isPostTerminalMarkerKey(suffix)
 }

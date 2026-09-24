@@ -20,6 +20,23 @@ func (b *Backend) Capabilities() backend.Capabilities {
 func (b *Backend) col(name string) *gcf.CollectionRef  { return b.client.Collection(name) }
 func (b *Backend) ref(col, id string) *gcf.DocumentRef { return b.col(col).Doc(id) }
 
+// getDocEitherFraming fetches the document for a stored dedupe/marker key
+// under either doc-ID framing: the framed form first, then the legacy
+// concatenation for pre-framing rows (Codex round-16 on #296). It returns the
+// first existing document's fields (nil when absent).
+func (b *Backend) getDocEitherFraming(tx *gcf.Transaction, col, instanceID, key string) (map[string]any, error) {
+	for _, docID := range dedupeDocIDs(instanceID, []string{key}) {
+		snap, err := tx.Get(b.ref(col, docID))
+		if err != nil && !isNotFound(err) {
+			return nil, err
+		}
+		if err == nil && snap.Exists() {
+			return snap.Data(), nil
+		}
+	}
+	return nil, nil
+}
+
 func instanceDoc(inst backend.NewInstance, queue string, now time.Time) map[string]any {
 	m := map[string]any{
 		"id": inst.ID, "name": inst.Name, "queue": queue, "status": "running",
@@ -1256,13 +1273,18 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				// marker-shaped — can match this probe, and pre-upgrade
 				// marker rows left behind in wf_signal_dedupe are inert
 				// (a pre-upgrade retry may duplicate once, never drop;
-				// purge reaps the rows).
+				// purge reaps the rows). Both doc-ID framings are probed
+				// (framed first, legacy for pre-framing markers), and the
+				// stored instance_id is validated: under legacy framing
+				// two (instance, marker) pairs could share one document,
+				// so a foreign row never suppresses this instance (Codex
+				// round-16 on #296, see docInstanceMatches).
 				markerExists := false
-				msnap, merr := tx.Get(b.ref(postTerminalMarkersCollection, postTerminalMarkerDocID(instanceID, it.DedupeID)))
-				if merr != nil && !isNotFound(merr) {
+				mdoc, merr := b.getDocEitherFraming(tx, postTerminalMarkersCollection, instanceID, postTerminalDedupeMarker(it.DedupeID))
+				if merr != nil {
 					return merr
 				}
-				if merr == nil && msnap.Exists() {
+				if mdoc != nil && docInstanceMatches(mdoc, instanceID) {
 					markerExists = true
 				}
 				if markerExists {
@@ -1304,18 +1326,30 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					if isPostTerminalMarkerKey(bk) {
 						continue
 					}
-					snap, err := tx.Get(b.ref("wf_signal_dedupe", instanceID+":"+bk))
-					if err != nil && !isNotFound(err) {
+					doc, err := b.getDocEitherFraming(tx, "wf_signal_dedupe", instanceID, bk)
+					if err != nil {
 						return err
 					}
-					if err == nil && snap.Exists() {
+					if doc == nil {
+						continue
+					}
+					if !docInstanceMatches(doc, instanceID) {
+						// Foreign row under a colliding legacy doc ID:
+						// never this DedupeID's guard (Codex round-16 on
+						// #296). The key still counts as occupied below
+						// (the write would collide), so only the marker
+						// is stamped for it.
 						if bk == escapeDedupeID(it.DedupeID) {
 							canonicalOccupied = true
 						}
-						if matchDedupeRow(it.DedupeID, bk, snap.Data()) {
-							baseExists = true
-							break
-						}
+						continue
+					}
+					if bk == escapeDedupeID(it.DedupeID) {
+						canonicalOccupied = true
+					}
+					if matchDedupeRow(it.DedupeID, bk, doc) {
+						baseExists = true
+						break
 					}
 				}
 				created[it.DedupeID] = true
@@ -1339,35 +1373,45 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			// instances keep the marker-only rule (see the terminal base
 			// check above).
 			// Ownership is version-aware (Codex round 13 on #296, see
-			// matchDedupeRow): a hit counts only when the row guards THIS
-			// DedupeID — a legacy row on exact raw equality, a versioned
-			// row on canonical-form equality (v1) or raw-key equality (v2
-			// fallback). A foreign-owner row at this DedupeID's canonical
-			// key means the canonical guard cannot be created (it would
-			// collide), so the guard falls back to the raw key with an
-			// explicit version (dedupeFormatRawKeyVersion): delivery is
-			// preserved and retries keep deduping. Only when both keys are
-			// occupied (vanishingly rare: two foreign legacy rows) does
-			// the event insert unguarded.
+			// matchDedupeRow) and instance-aware (Codex round-16 on #296,
+			// see docInstanceMatches): a hit counts only when the row guards
+			// THIS DedupeID of THIS instance — a legacy row on exact raw
+			// equality, a versioned row on canonical-form equality (v1) or
+			// fallback-key equality (v2). A foreign-owner row at this
+			// DedupeID's canonical key means the canonical guard cannot be
+			// created (it would collide), so the guard falls back to the
+			// rawFallbackDedupeKey with an explicit version
+			// (dedupeFormatRawKeyVersion): delivery is preserved and retries
+			// keep deduping. The fallback key is the raw ID for short IDs
+			// but a bounded second-level hash for over-budget IDs, so the
+			// write stays within the shared STRING(255) budget on Spanner
+			// (Codex round-16 on #296). Only when both keys are occupied
+			// (vanishingly rare: two foreign legacy rows) does the event
+			// insert unguarded.
 			baseHit := false
 			canonicalOccupied := false
-			rawOccupied := false
+			fallbackKey := rawFallbackDedupeKey(it.DedupeID)
+			fallbackOccupied := false
 			for _, bk := range dedupeKeyCandidates(it.DedupeID) {
-				snap, err := tx.Get(b.ref("wf_signal_dedupe", instanceID+":"+bk))
-				if err != nil && !isNotFound(err) {
+				doc, err := b.getDocEitherFraming(tx, "wf_signal_dedupe", instanceID, bk)
+				if err != nil {
 					return err
 				}
-				if err == nil && snap.Exists() {
-					if bk == escapeDedupeID(it.DedupeID) {
-						canonicalOccupied = true
-					}
-					if bk == it.DedupeID {
-						rawOccupied = true
-					}
-					if matchDedupeRow(it.DedupeID, bk, snap.Data()) {
-						baseHit = true
-						break
-					}
+				if doc == nil {
+					continue
+				}
+				if bk == escapeDedupeID(it.DedupeID) {
+					canonicalOccupied = true
+				}
+				if bk == fallbackKey {
+					fallbackOccupied = true
+				}
+				if !docInstanceMatches(doc, instanceID) {
+					continue
+				}
+				if matchDedupeRow(it.DedupeID, bk, doc) {
+					baseHit = true
+					break
 				}
 			}
 			if baseHit {
@@ -1377,7 +1421,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			}
 			created[it.DedupeID] = true
 			createKey[i] = !canonicalOccupied
-			createRawKey[i] = canonicalOccupied && !rawOccupied
+			createRawKey[i] = canonicalOccupied && !fallbackOccupied
 		}
 		for i, it := range items {
 			if skip[i] {
@@ -1402,7 +1446,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			if it.DedupeID != "" && (createKey[i] || createRawKey[i]) {
 				key, ver := signalDedupeID(instanceID, it.DedupeID), int64(dedupeFormatVersion)
 				if createRawKey[i] {
-					key, ver = instanceID+":"+it.DedupeID, int64(dedupeFormatRawKeyVersion)
+					key, ver = frameDedupeDocID(instanceID, rawFallbackDedupeKey(it.DedupeID)), int64(dedupeFormatRawKeyVersion)
 				}
 				if err := tx.Create(b.ref("wf_signal_dedupe", key), map[string]any{
 					"instance_id":            instanceID,
