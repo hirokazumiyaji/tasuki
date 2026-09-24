@@ -278,9 +278,12 @@ type migrationQueryer interface {
 // claim row to clean up, and no cleanup that could reuse a canceled context.
 //
 // Column-backfill ALTERs tolerate duplicate-column errors (the column is
-// already there, e.g. the database was created by a newer schema) but every
-// other failure - permission denied, missing table, syntax errors - aborts
-// the migration with an error instead of being silently ignored.
+// already there, e.g. the database was created by a newer schema), CREATE
+// INDEX tolerates duplicate-index errors, and DROP INDEX tolerates
+// missing-index errors (error 1091: a retry after a crash between a
+// rebuild's DROP and CREATE, whose effects MySQL autocommits piecemeal); but
+// every other failure - permission denied, missing table, syntax errors -
+// aborts the migration with an error instead of being silently ignored.
 func (b *Backend) Migrate(ctx context.Context) error {
 	migs, err := loadMigrations()
 	if err != nil {
@@ -403,6 +406,9 @@ func applyMigration(ctx context.Context, q migrationQueryer, m migration) error 
 			if isCreateIndex(stmt) && isDuplicateIndexError(err) {
 				continue // index already present; keep going
 			}
+			if isDropIndex(stmt) && isMissingIndexError(err) {
+				continue // index already gone (retry after a crash between DROP and CREATE); keep going
+			}
 			return fmt.Errorf("mysql migrate: %w\nstmt: %s", err, stmt)
 		}
 	}
@@ -485,6 +491,15 @@ func isAddColumn(stmt string) bool {
 // every other failure is fatal.
 func isCreateIndex(stmt string) bool {
 	return strings.Contains(strings.ToUpper(stmt), "CREATE INDEX")
+}
+
+// isDropIndex reports whether stmt drops an index. Only such statements may
+// have missing-index errors tolerated (the index is already gone, e.g. a
+// retry after a crash between this migration's DROP and CREATE — MySQL DDL
+// autocommits per statement, so the DROP's effect survives while the version
+// row does not); every other failure is fatal.
+func isDropIndex(stmt string) bool {
+	return strings.Contains(strings.ToUpper(stmt), "DROP INDEX")
 }
 
 // SchemaVersion returns the highest applied migration version, or 0 when the

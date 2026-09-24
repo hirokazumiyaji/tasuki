@@ -38,6 +38,18 @@ func isDuplicateIndexError(err error) bool {
 	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1061
 }
 
+// isMissingIndexError reports MySQL error 1091 (ER_CANT_DROP_FIELD_OR_KEY):
+// DROP INDEX named an index that does not exist. MySQL DDL autocommits per
+// statement, so a crash between this migration's DROP and CREATE leaves the
+// version unrecorded with the index already gone; the retry's DROP then hits
+// 1091. Only this class of DROP INDEX failure may be tolerated by Migrate
+// (the index is already gone, i.e. the DROP's effect holds); everything else
+// (permissions, missing table, syntax) must abort the migration.
+func isMissingIndexError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1091
+}
+
 // isDuplicateColumnError reports whether err is a duplicate-column error
 // (MySQL error 1060). Only this class of ALTER TABLE ... ADD COLUMN failure
 // may be tolerated by Migrate; everything else (permissions, missing table,

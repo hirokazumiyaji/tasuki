@@ -11,5 +11,8 @@
 -- tolerating the duplicate-index error when the baseline already did); a
 -- retry after a crash between DROP and CREATE re-runs this version's DDL
 -- because the version row is recorded only after all statements complete.
+-- (MySQL DDL autocommits per statement, so that retry's DROP meets an
+-- already-gone index: applyMigration tolerates error 1091 for DROP INDEX
+-- statements and proceeds to the CREATE. See isMissingIndexError.)
 ALTER TABLE wf_instances DROP INDEX wf_instances_completed_at_idx;
 CREATE INDEX wf_instances_completed_at_idx ON wf_instances (completed_at, id);
