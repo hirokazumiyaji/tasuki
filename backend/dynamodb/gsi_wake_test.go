@@ -36,6 +36,9 @@ type fakeDynamo struct {
 	queryErr   error
 	scanItems  []map[string]types.AttributeValue
 	scanErr    error
+	// scanFn, when set, runs instead of the canned scanItems response so a
+	// test can script multi-page Scans via LastEvaluatedKey.
+	scanFn func(ctx context.Context, in *dynamodb.ScanInput, call int64) (*dynamodb.ScanOutput, error)
 
 	deleted []string
 
@@ -93,7 +96,7 @@ func (f *fakeDynamo) UpdateTable(ctx context.Context, in *dynamodb.UpdateTableIn
 	return &dynamodb.UpdateTableOutput{}, nil
 }
 func (f *fakeDynamo) Scan(ctx context.Context, in *dynamodb.ScanInput, _ ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
-	atomic.AddInt64(&f.scanCalls, 1)
+	call := atomic.AddInt64(&f.scanCalls, 1)
 	f.mu.Lock()
 	if in.Limit != nil {
 		f.lastScanLimit = aws.ToInt32(in.Limit)
@@ -101,7 +104,11 @@ func (f *fakeDynamo) Scan(ctx context.Context, in *dynamodb.ScanInput, _ ...func
 		f.lastScanLimit = 0
 	}
 	f.lastScanConsistent = aws.ToBool(in.ConsistentRead)
+	fn := f.scanFn
 	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, in, call)
+	}
 	if f.scanErr != nil {
 		return nil, f.scanErr
 	}
@@ -172,12 +179,14 @@ func newTestBackend(f *fakeDynamo) *Backend {
 
 func TestDeleteTasksForInstance_UsesQueryNotScan(t *testing.T) {
 	// MERGE (issue-291 into main): the hot path still deletes via the
-	// instance_gsi Query, but follows it with one bounded
-	// strongly-consistent verification Scan page
-	// (verifyTasksFirstPageByScan, Limit gsiVerifyScanLimit) to reap rows
+	// instance_gsi Query, but follows it with a bounded
+	// strongly-consistent verification Scan run
+	// (verifyTasksBoundedScan, Limit gsiVerifyScanLimit, up to
+	// gsiVerifyScanMaxPages pages) to reap rows
 	// the eventually-consistent index has not caught up with yet. The pin
-	// below therefore allows exactly that single bounded page while still
-	// forbidding unbounded fleet-wide Scans.
+	// below therefore allows that bounded run (one page here: the stubbed
+	// Scan ends the table) while still forbidding unbounded fleet-wide
+	// Scans.
 	f := &fakeDynamo{
 		queryItems: []map[string]types.AttributeValue{
 			{"task_pk": avS("WF#inst-1"), "instance_id": avS("inst-1")},
@@ -192,7 +201,7 @@ func TestDeleteTasksForInstance_UsesQueryNotScan(t *testing.T) {
 		t.Fatalf("Query calls = %d, want 1", got)
 	}
 	if got := atomic.LoadInt64(&f.scanCalls); got != 1 {
-		t.Fatalf("Scan calls = %d, want 1 (single bounded verification page)", got)
+		t.Fatalf("Scan calls = %d, want 1 (bounded run ends at the table end)", got)
 	}
 	if got := atomic.LoadInt64(&f.deleteCalls); got != 2 {
 		t.Fatalf("Delete calls = %d, want 2", got)
@@ -210,6 +219,69 @@ func TestDeleteTasksForInstance_UsesQueryNotScan(t *testing.T) {
 	}
 	if !scanConsistent {
 		t.Fatal("verification Scan must use a consistent read")
+	}
+}
+
+// TestVerifyTasksBoundedScan_ReapsLaggingRowsAcrossPages covers Codex
+// round-23 P2 (b) on #291: a lagging task invisible to the GSI but sitting
+// past the first Scan page must still be reaped by the bounded
+// verification run. Without pagination (the single-page round-10 shape) the
+// row on page 2 survives as residue.
+func TestVerifyTasksBoundedScan_ReapsLaggingRowsAcrossPages(t *testing.T) {
+	more := map[string]types.AttributeValue{"task_pk": avS("more")}
+	lag1 := map[string]types.AttributeValue{"task_pk": avS("ACT#lag1"), "instance_id": avS("inst-lag")}
+	lag2 := map[string]types.AttributeValue{"task_pk": avS("ACT#lag2"), "instance_id": avS("inst-lag")}
+	other := map[string]types.AttributeValue{"task_pk": avS("ACT#other"), "instance_id": avS("other")}
+	f := &fakeDynamo{}
+	f.scanFn = func(_ context.Context, _ *dynamodb.ScanInput, call int64) (*dynamodb.ScanOutput, error) {
+		if call == 1 {
+			return &dynamodb.ScanOutput{Items: []map[string]types.AttributeValue{other, lag1}, LastEvaluatedKey: more}, nil
+		}
+		return &dynamodb.ScanOutput{Items: []map[string]types.AttributeValue{lag2}}, nil
+	}
+	b := newTestBackend(f)
+	// Unbounded cutoff: every instance row here predates the transition.
+	if err := b.verifyTasksBoundedScan(context.Background(), "inst-lag", terminalSweepCutoff{}); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if got := atomic.LoadInt64(&f.scanCalls); got != 2 {
+		t.Fatalf("Scan calls = %d, want 2 (lagging row past the first page)", got)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := map[string]bool{"ACT#lag1": true, "ACT#lag2": true}
+	if len(f.deleted) != len(want) {
+		t.Fatalf("deleted = %v, want %v (never the unrelated row)", f.deleted, want)
+	}
+	for _, k := range f.deleted {
+		if !want[k] {
+			t.Fatalf("deleted = %v, want %v (never the unrelated row)", f.deleted, want)
+		}
+	}
+}
+
+// TestVerifyTasksBoundedScan_StopsAtPageBound pins the cost ceiling from the
+// other side: a table that never ends still costs at most
+// gsiVerifyScanMaxPages verification pages per terminal advancement; rows
+// past the bound wait for the TerminateInstance/PurgeInstances backstops.
+func TestVerifyTasksBoundedScan_StopsAtPageBound(t *testing.T) {
+	more := map[string]types.AttributeValue{"task_pk": avS("more")}
+	f := &fakeDynamo{}
+	f.scanFn = func(_ context.Context, _ *dynamodb.ScanInput, _ int64) (*dynamodb.ScanOutput, error) {
+		return &dynamodb.ScanOutput{
+			Items:            []map[string]types.AttributeValue{{"task_pk": avS("ACT#live"), "instance_id": avS("live")}},
+			LastEvaluatedKey: more,
+		}, nil
+	}
+	b := newTestBackend(f)
+	if err := b.verifyTasksBoundedScan(context.Background(), "inst-lag", terminalSweepCutoff{}); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if got := atomic.LoadInt64(&f.scanCalls); got != gsiVerifyScanMaxPages {
+		t.Fatalf("Scan calls = %d, want %d (bounded run stops at the page bound)", got, gsiVerifyScanMaxPages)
+	}
+	if got := atomic.LoadInt64(&f.deleteCalls); got != 0 {
+		t.Fatalf("Delete calls = %d, want 0 (no rows belong to the instance)", got)
 	}
 }
 

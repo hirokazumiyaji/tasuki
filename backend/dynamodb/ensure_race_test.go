@@ -154,7 +154,7 @@ func TestPutWorkflowTaskIfRunning_CreatesForRunning(t *testing.T) {
 // TerminateInstance must leave no task rows behind even with several
 // activity tasks outstanding: it always runs the full (unbounded)
 // cleanup, which is the backstop for the bounded per-completion sweep
-// (see verifyTasksFirstPageByScan).
+// (see verifyTasksBoundedScan).
 func TestTerminateInstanceFullTaskCleanup(t *testing.T) {
 	ctx := context.Background()
 	b := ensureTestBackend(t)

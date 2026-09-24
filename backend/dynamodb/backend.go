@@ -257,11 +257,11 @@ func (b *Backend) deleteTasksForInstance(ctx context.Context, id string, cutoff 
 		return b.deleteTasksForInstanceByScan(ctx, id, cutoff)
 	}
 	// The GSI is eventually consistent: a sweep can report a partial match
-	// while lagging rows are still invisible to the index. Confirm with one
-	// bounded strongly-consistent Scan page (see
-	// verifyTasksFirstPageByScan): the common case stays cheap and lagging
-	// rows in the page are reaped synchronously.
-	return b.verifyTasksFirstPageByScan(ctx, id, cutoff)
+	// while lagging rows are still invisible to the index. Confirm with a
+	// bounded strongly-consistent Scan run (see
+	// verifyTasksBoundedScan): the common case stays cheap and lagging
+	// rows in the pages are reaped synchronously.
+	return b.verifyTasksBoundedScan(ctx, id, cutoff)
 }
 
 // deleteTasksForInstanceFull removes one instance's tasks with no bound on
@@ -376,18 +376,27 @@ func purgeTaskKeyForTargets(m map[string]types.AttributeValue, targets map[strin
 	return pk, true
 }
 
-// gsiVerifyScanLimit bounds the strongly-consistent verification Scan page
-// on the terminal hot path. Only one page is read per terminal
-// advancement: verification cost stays O(instance rows + one page) instead
-// of scaling with fleet work (see verifyTasksFirstPageByScan).
+// gsiVerifyScanLimit bounds each strongly-consistent verification Scan page
+// on the terminal hot path, and gsiVerifyScanMaxPages bounds the page count
+// (Codex round-23 P2 on #291): verification cost stays O(instance rows +
+// maxPages pages) instead of scaling with fleet work (see
+// verifyTasksBoundedScan). GSI-lag rows are rare, so a bounded multi-page
+// verify covers realistic lag while a lagging row past the bound still waits
+// for the TerminateInstance/PurgeInstances backstops.
 const gsiVerifyScanLimit = 1000
 
-// verifyTasksFirstPageByScan deletes the instance's tasks visible to a
-// single strongly-consistent Scan page.
+// gsiVerifyScanMaxPages caps the hot-path verification pages per terminal
+// advancement: 5 pages of 1000 items bound the fleet read while covering
+// realistic GSI lag depth.
+const gsiVerifyScanMaxPages = 5
+
+// verifyTasksBoundedScan deletes the instance's tasks visible to a bounded
+// run of strongly-consistent Scan pages (up to gsiVerifyScanMaxPages,
+// stopping early at the end of the table).
 //
-// DESIGN (Codex round 7 on #328): the previous fully-paginated
-// verification Scan ran after every terminal advancement and scaled with
-// the fleet's queued work — every completion paid a full
+// DESIGN (Codex round 7 on #328, extended round-23 on #291): the previous
+// fully-paginated verification Scan ran after every terminal advancement
+// and scaled with the fleet's queued work — every completion paid a full
 // strongly-consistent table Scan, and throttling mid-scan errored the
 // cleanup after the terminal status had already committed. Scoping the
 // verification to the instance is not directly possible — the base table's
@@ -397,7 +406,7 @@ const gsiVerifyScanLimit = 1000
 //
 //   - The GSI sweep (instance-keyed Query, fully paginated over the
 //     instance's own rows) removes everything the index has observed, and
-//     this single strong page reaps lagging rows visible to consistent
+//     these bounded strong pages reap lagging rows visible to consistent
 //     state near the head of the table.
 //   - Correctness never depends on the sweep: a lagging row that survives
 //     cannot execute — ClaimTasks gates the lease on instance status in
@@ -408,33 +417,41 @@ const gsiVerifyScanLimit = 1000
 //     PurgeInstances, plus best-effort deletion when residue is met by a
 //     later claim.
 //
-// A lagging task beyond this page therefore waits for one of those
+// A lagging task beyond these pages therefore waits for one of those
 // backstops instead of forcing every completion to scan the fleet.
-func (b *Backend) verifyTasksFirstPageByScan(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
-	out, err := b.client.Scan(ctx, &dynamodb.ScanInput{
-		TableName:      aws.String(b.table("wf_tasks")),
-		Limit:          aws.Int32(gsiVerifyScanLimit),
-		ConsistentRead: aws.Bool(true),
-	})
-	if err != nil {
-		return err
-	}
-	for _, m := range out.Items {
-		if fromS(m["instance_id"]) != id {
-			continue
-		}
-		// Preserve rows a racing post-commit send created after the
-		// terminal transition (see terminalSweepCutoff).
-		if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
-			continue
-		}
-		pk, ok := m["task_pk"]
-		if !ok {
-			continue
-		}
-		if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
+func (b *Backend) verifyTasksBoundedScan(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
+	var start map[string]types.AttributeValue
+	for page := 0; page < gsiVerifyScanMaxPages; page++ {
+		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{
+			TableName:         aws.String(b.table("wf_tasks")),
+			Limit:             aws.Int32(gsiVerifyScanLimit),
+			ConsistentRead:    aws.Bool(true),
+			ExclusiveStartKey: start,
+		})
+		if err != nil {
 			return err
 		}
+		for _, m := range out.Items {
+			if fromS(m["instance_id"]) != id {
+				continue
+			}
+			// Preserve rows a racing post-commit send created after the
+			// terminal transition (see terminalSweepCutoff).
+			if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
+				continue
+			}
+			pk, ok := m["task_pk"]
+			if !ok {
+				continue
+			}
+			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
+				return err
+			}
+		}
+		if out.LastEvaluatedKey == nil {
+			return nil
+		}
+		start = out.LastEvaluatedKey
 	}
 	return nil
 }
@@ -1432,16 +1449,28 @@ func (b *Backend) notifyAfterAdvancements(advs []backend.Advancement) error {
 // purge owns the leftovers) or completed_at is missing/zero (legacy rows):
 // the sweep then falls back to unbounded, matching the pre-cutoff behavior.
 //
-// LIMITATION (honest): DynamoDB exposes no server commit timestamp, so both
-// sides of the comparison are client clocks (completer's for completed_at,
-// each writer's for created_at). A racing send whose attempt started before
-// the flip but whose transaction commits after it can stamp created_at at or
-// below the cutoff and still be swept; SendToInboxBatch narrows this by
-// re-stamping now per attempt right before its transaction, but cross-worker
-// clock skew leaves a residual window no client-time cutoff can close. A
-// fast-clock pre-transition row (created_at above the cutoff) errs the safe
-// way: it survives as inert residue (ClaimTasks gates execution on instance
-// status) until the retention purge reaps it.
+// ORDERING (Codex round-23 P2 on #291): the comparison above is exact —
+// same-tick rows sweep — because the conformance suite pins synchronous
+// exact cleanup (a pre-commit signal sent under the same clock must be
+// gone after the terminal commit; TerminateInstance must leave an empty
+// inbox). A positive skew margin here would preserve those rows and break
+// the advertised CleansTerminalState contract, so skew safety comes from
+// the writer side instead: SendToInboxBatch clamps its stamps after an
+// OBSERVED terminal transition (see clampSendNow), making a post-flip send
+// provably post-transition however skewed its clock. (Firestore/Spanner
+// need neither: their sweeps are ordered by server update time / commit
+// timestamp — verified, not redone here.)
+//
+// LIMITATION (honest): DynamoDB exposes no server commit timestamp, so the
+// residual race is a send that observes the instance RUNNING (pre-flip,
+// hence unclamped) but whose transaction commits post-flip under a slow
+// clock: its created_at lands at or below completed_at and the sweep
+// deletes it. SendToInboxBatch narrows this by re-stamping now per attempt
+// right before its transaction, but no client-time cutoff can close a skew
+// window it cannot see. Skew errs the safe way in the other direction: a
+// fast-clock pre-transition row (created_at above the cutoff) survives as
+// inert residue (ClaimTasks gates execution on instance status) until the
+// retention purge reaps it.
 type terminalSweepCutoff struct {
 	cutoff    int64
 	hasCutoff bool
@@ -1454,6 +1483,21 @@ func sweepKeepsRow(createdAtN int64, c terminalSweepCutoff) bool {
 		return false
 	}
 	return createdAtN > c.cutoff
+}
+
+// clampSendNow orders a send after an observed terminal transition (Codex
+// round-23 P2 on #291): when SendToInboxBatch observes the instance already
+// terminal, its stamps must land strictly after completed_at however skewed
+// the sender's clock, or the exact terminal-sweep cutoff classifies the
+// accepted send pre-transition and deletes it. sendFloorN is
+// completed_at+1 micros, or 0 when the instance was observed running (no
+// floor: the send may genuinely predate the transition). Pure for unit
+// tests.
+func clampSendNow(now time.Time, sendFloorN int64) time.Time {
+	if sendFloorN > 0 && timeToN(now) < sendFloorN {
+		return nToTime(sendFloorN)
+	}
+	return now
 }
 
 // readTerminalCutoff returns the instance's terminal-transition time for the
@@ -1927,6 +1971,25 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	if err != nil {
 		return err
 	}
+	// Order this send after an observed terminal transition (see
+	// clampSendNow): a send that starts after the flip must stamp strictly
+	// past completed_at, or the exact terminal-sweep cutoff classifies it
+	// pre-transition on skewed hosts and deletes the accepted event. One
+	// extra consistent read, and only for sends that already observe a
+	// non-running instance — the running hot path is untouched. A terminal
+	// read failure fails the send (retryable) rather than risk a
+	// misordered stamp; a send that observes running takes no floor and
+	// keeps the documented residual race.
+	var sendFloorN int64
+	if inst.Status != "running" {
+		cutoff, err := b.readTerminalCutoff(ctx, instanceID)
+		if err != nil {
+			return err
+		}
+		if cutoff.hasCutoff {
+			sendFloorN = cutoff.cutoff + 1
+		}
+	}
 	pending := append([]backend.InboxItem(nil), items...)
 	wrote := false
 	for len(pending) > 0 {
@@ -1940,8 +2003,9 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		// between the stamp and the commit would sweep this send despite
 		// it postdating the transition. Per-attempt re-stamping (not one
 		// stamp per call) keeps retries past the flip ordered after it,
-		// within client-clock skew.
-		now := nowUTC()
+		// within client-clock skew; the floor above covers observed
+		// terminal state regardless of skew.
+		now := clampSendNow(nowUTC(), sendFloorN)
 		var twi []types.TransactWriteItem
 		type meta struct {
 			pidx   int

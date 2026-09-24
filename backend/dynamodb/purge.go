@@ -58,7 +58,7 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 
 	purged := 0
 	// Purge is the backstop for hot-path residue (see
-	// verifyTasksFirstPageByScan), so task cleanup is always the full
+	// verifyTasksBoundedScan), so task cleanup is always the full
 	// variant, not the bounded per-completion sweep — shared across the
 	// whole call (see deleteTasksForInstancesFull): one Scan covers every
 	// victim instead of one Scan per victim. A shared-scan failure aborts

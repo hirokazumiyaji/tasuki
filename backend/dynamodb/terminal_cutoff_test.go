@@ -17,7 +17,11 @@ import (
 // TestSweepKeepsRow pins the terminal-sweep cutoff predicate (Codex
 // round-22 P2 on #291): only rows created after the terminal transition
 // survive; a zero cutoff (missing instance, legacy row without
-// completed_at, retention purge) sweeps everything.
+// completed_at, retention purge) sweeps everything. The comparison is
+// deliberately exact — same-tick rows sweep — because the conformance
+// suite pins synchronous exact cleanup (see terminalSweepCutoff); skew
+// safety for post-flip sends comes from the writer-side clamp
+// (clampSendNow), not a sweep margin.
 func TestSweepKeepsRow(t *testing.T) {
 	const cutoff = int64(1_000_000)
 	withCutoff := terminalSweepCutoff{cutoff: cutoff, hasCutoff: true}
@@ -37,6 +41,89 @@ func TestSweepKeepsRow(t *testing.T) {
 		if got := sweepKeepsRow(c.createdAt, c.c); got != c.keep {
 			t.Errorf("%s: sweepKeepsRow = %v, want %v", c.name, got, c.keep)
 		}
+	}
+}
+
+// TestClampSendNow pins the writer-side ordering (Codex round-23 P2 on
+// #291): a send that observes a terminal transition stamps at or past the
+// floor (completed_at+1) however skewed its clock, so the exact sweep
+// cutoff provably preserves it; running sends (floor 0) stamp unclamped.
+func TestClampSendNow(t *testing.T) {
+	floor := int64(1_700_000_000_000_001)
+	now := nToTime(1_700_000_000_000_000)
+	if got := clampSendNow(now, 0); !got.Equal(now) {
+		t.Errorf("running send clamped to %v, want unclamped %v", got, now)
+	}
+	if got := clampSendNow(nToTime(floor+1000), floor); timeToN(got) != floor+1000 {
+		t.Errorf("fast-clock send clamped to %d, want unclamped %d", timeToN(got), floor+1000)
+	}
+	if got := clampSendNow(now, floor); timeToN(got) != floor {
+		t.Errorf("slow-clock post-flip send stamped %d, want floor %d", timeToN(got), floor)
+	}
+	if got := clampSendNow(nToTime(floor), floor); timeToN(got) != floor {
+		t.Errorf("boundary send stamped %d, want floor %d", timeToN(got), floor)
+	}
+}
+
+// TestSendToInboxBatch_OrdersAfterObservedTermination covers the writer
+// side of Codex round-23 P2 (a) on #291: a send that observes the instance
+// already terminal stamps its rows strictly after completed_at — even when
+// the sender's clock runs behind the completer's (completed_at in the
+// sender's future) — so the exact terminal-sweep cutoff provably preserves
+// the accepted send. Without the clamp the slow-clock stamps land at or
+// below the cutoff and the sweep deletes them.
+func TestSendToInboxBatch_OrdersAfterObservedTermination(t *testing.T) {
+	ctx := context.Background()
+	const id = "clamp-send"
+	// Fast completer clock: completed_at sits an hour in the sender's
+	// future, so unclamped stamps would classify pre-transition.
+	completedAt := timeToN(nowUTC().Add(time.Hour))
+	var mu sync.Mutex
+	var inboxCreated, dedupeCreated int64
+	f := &fakeDynamo{
+		getItemFn: func(_ context.Context, in *dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error) {
+			return &dynamodb.GetItemOutput{Item: map[string]types.AttributeValue{
+				"id": avS(id), "name": avS("WF"), "queue": avS("default"),
+				"status": avS("terminated"), "next_seq": avN(2),
+				"completed_at": avN(completedAt),
+			}}, nil
+		},
+		updateItemFn: func(_ context.Context, _ *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error) {
+			return &dynamodb.UpdateItemOutput{Attributes: map[string]types.AttributeValue{"seq": avN(41)}}, nil
+		},
+		transactFn: func(_ context.Context, in *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			for _, twi := range in.TransactItems {
+				if twi.Put == nil || twi.Put.TableName == nil {
+					continue
+				}
+				switch (*twi.Put.TableName)[len("tasuki_"):] {
+				case "wf_inbox":
+					inboxCreated = fromN(twi.Put.Item["created_at"])
+				case "wf_signal_dedupe":
+					dedupeCreated = fromN(twi.Put.Item["created_at"])
+				}
+			}
+			return &dynamodb.TransactWriteItemsOutput{}, nil
+		},
+	}
+	b := newTestBackend(f)
+	ev := journal.Event{Type: journal.TypeSignalReceived, Name: "late"}
+	if err := b.SendToInbox(ctx, id, ev, "K"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if inboxCreated != completedAt+1 {
+		t.Errorf("inbox created_at = %d, want %d (completed_at+1: provably post-transition)", inboxCreated, completedAt+1)
+	}
+	if dedupeCreated != completedAt+1 {
+		t.Errorf("dedupe created_at = %d, want %d (marker and event ordered as a pair)", dedupeCreated, completedAt+1)
+	}
+	// The clamped rows survive the exact sweep cutoff by construction.
+	if !sweepKeepsRow(inboxCreated, terminalSweepCutoff{cutoff: completedAt, hasCutoff: true}) {
+		t.Error("clamped inbox row not preserved by the sweep cutoff")
 	}
 }
 
