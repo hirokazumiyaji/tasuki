@@ -1810,12 +1810,15 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 				}
 				if p != nil {
 					// A commit follows in flushWorkflowCommits: stay
-					// tracked until it succeeds (see skipStaleCommit).
-					// Untracking here would hide a leased, uncommitted
-					// task from releaseInFlight, and the flush could no
-					// longer tell a Shutdown-released pending from a
-					// live one. The flush transfers ownership out via
-					// claimCommitOwnership, so exactly one side wins.
+					// tracked until it succeeds (see the freshness
+					// gate there). Untracking here would hide a
+					// leased, uncommitted task from releaseInFlight,
+					// and the flush could no longer tell a
+					// Shutdown-released pending from a live one. The
+					// flush transfers ownership out via
+					// beginDetachedCommit, so exactly one side wins —
+					// and a won flush keeps the lease live through
+					// the write (see startFlushCover).
 					p.tok = tok
 					p.hasTok = true
 					pendingMu.Lock()
