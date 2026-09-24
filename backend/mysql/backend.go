@@ -486,10 +486,14 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 				// fixed quota+margin window above permanently forgets
 				// rows past it (see the postgres claim loop for the
 				// A1..A68/B1 scenario). The FIFO-next dropped row
-				// rides along in trimmed (the keyset requery below is
-				// exclusive), and the cursor arms the pre-overflow
-				// snapshot so a later underfilled pass re-issues a
-				// bounded requery FROM the dropped tail instead of
+				// rides along in trimmed as the retained boundary, and
+				// the cursor IS that boundary (issue #294 round-20 P1:
+				// the keyset requery below is exclusive, so a cursor
+				// at the first dropped row would skip it — resuming
+				// strictly after the retained boundary re-fetches the
+				// dropped tail instead). The cursor arms the
+				// pre-overflow snapshot so a later underfilled pass
+				// re-issues a bounded requery FROM the dropped tail instead of
 				// rescanning the head. Keep the earliest snapshot and
 				// record this pass's picks (via overflowSeen) so the
 				// requery skips already-attempted rows. No requery

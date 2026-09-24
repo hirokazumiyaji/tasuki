@@ -98,6 +98,27 @@ func TestMigratePurgeSearchIndexes(t *testing.T) {
 	if !strings.Contains(purgePlan, "wf_instances_completed_at_idx") {
 		t.Fatalf("purge victim SELECT does not use wf_instances_completed_at_idx:\n%s", purgePlan)
 	}
+	// Round-20 P2: the victim index leads with (completed_at, id) so the
+	// ordered scan serves ORDER BY without a residual sort over
+	// equal-timestamp groups (the sqlite purge test asserts the same via
+	// "no TEMP B-TREE"; postgres surfaces it as a Sort node).
+	if strings.Contains(purgePlan, "Sort") {
+		t.Fatalf("purge victim SELECT sorts instead of walking wf_instances_completed_at_idx in order:\n%s", purgePlan)
+	}
+
+	// The index definition itself must lead with both ordering columns, so
+	// the no-Sort plan above comes from the index shape and not from the
+	// tiny seed (which could otherwise hide a regression behind a
+	// planner shortcut).
+	var indexDef string
+	if err := b.Pool().QueryRow(ctx,
+		`SELECT pg_get_indexdef(indexrelid) FROM pg_index WHERE indexrelid = 'wf_instances_completed_at_idx'::regclass`,
+	).Scan(&indexDef); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(indexDef, "(completed_at, id)") {
+		t.Fatalf("victim index definition = %q, want leading (completed_at, id)", indexDef)
+	}
 
 	saPlan := explain(`
 		EXPLAIN SELECT id FROM wf_instances

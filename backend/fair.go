@@ -395,13 +395,20 @@ func FairRefBefore(a, b FairTaskRef) bool {
 // short while the head stays locked and A68 (unlocked) starves.
 //
 // kept carries the quota fill, the fallback margin, AND the FIFO-next
-// dropped row (boundary). The boundary rides along because the overflow
-// keyset requery is exclusive (`>` the snapshot): resuming exactly at the
-// dropped minimum would skip it. resume is the FIFO-smallest row still
-// dropped — the cursor the caller arms its overflow-requery snapshot from —
-// and dropped reports whether any row remains dropped (false when the whole
-// carry fit, in which case no requery is needed). Retention stays
-// O(limit+margin+1): one cursor plus one boundary row, not O(carry).
+// dropped row (boundary). The boundary rides along AND serves as the resume
+// cursor: the overflow keyset requery is exclusive (`>` the cursor), so the
+// cursor must be the last RETAINED row — resuming strictly after it
+// re-fetches the first unretained row onward. Returning the first dropped
+// row as the cursor instead skips it forever: it is neither retained nor
+// re-fetched (issue #294 round-20 P1: the round-19 helper returned tail[1]
+// as the cursor while retaining only tail[0], so with A67 retained and the
+// cursor at A68 the exclusive requery skipped A68 and every poll came back
+// empty while the head stayed locked). resume is therefore the retained
+// boundary itself, and dropped reports whether any row past the boundary
+// remains dropped (false when the whole carry fit or only the boundary
+// spilled, in which case no requery is needed). Retention stays
+// O(limit+margin+1): one boundary row plus the cursor copy of it, not
+// O(carry).
 func TrimFairCarryWithResume(pending, secured []FairTaskRef, limit, perInstance int) (kept []FairTaskRef, resume FairTaskRef, dropped bool) {
 	kept = TrimFairCarry(pending, secured, limit, perInstance)
 	if len(pending) == 0 || limit <= 0 || perInstance <= 0 || len(kept) == 0 {
@@ -422,13 +429,14 @@ func TrimFairCarryWithResume(pending, secured []FairTaskRef, limit, perInstance 
 	if len(tail) == 0 {
 		return kept, FairTaskRef{}, false
 	}
-	// The FIFO-head of the dropped tail rides along so the exclusive
-	// requery from resume cannot skip it; resume covers the rest.
+	// The FIFO-head of the dropped tail rides along as the retained
+	// boundary, and the exclusive requery resumes strictly after it — so
+	// the first unretained row (tail[1]) is re-fetched, never skipped.
 	kept = append(kept, tail[0])
 	if len(tail) == 1 {
 		return kept, FairTaskRef{}, false
 	}
-	return kept, tail[1], true
+	return kept, tail[0], true
 }
 
 // NoteFairLoss records per-instance outstanding lock/lease losses from one

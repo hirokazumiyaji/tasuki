@@ -34,9 +34,11 @@ func TestTrimFairCarryDropsViableTail(t *testing.T) {
 
 // TestTrimFairCarryWithResumeSpillsResumeCursor covers the round-19 P1 fix
 // for the scenario above: the same trim must spill a resume cursor for the
-// dropped tail, with the FIFO-next dropped row riding along (the overflow
-// keyset requery is exclusive, so resuming exactly at the dropped minimum
-// would skip it).
+// dropped tail, with the FIFO-next dropped row riding along as the retained
+// boundary. Round-20 P1 corrected the cursor itself: it is the retained
+// boundary (tail[0]), not the first dropped row (tail[1]) — the overflow
+// keyset requery is exclusive, so a tail[1] cursor would skip A68 forever
+// while a tail[0] cursor re-fetches it.
 func TestTrimFairCarryWithResumeSpillsResumeCursor(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	ref := func(id int64, inst string) backend.FairTaskRef {
@@ -58,14 +60,27 @@ func TestTrimFairCarryWithResumeSpillsResumeCursor(t *testing.T) {
 	if kept[len(kept)-1].ID != 67 {
 		t.Fatalf("kept tail = A%d, want boundary A67", kept[len(kept)-1].ID)
 	}
-	if resume.ID != 68 || resume.InstanceID != "A" {
-		t.Fatalf("resume = %v, want A68", resume)
+	// Round-20 P1: the cursor is the retained boundary A67, so the
+	// exclusive requery (`>` the cursor) resumes at the first unretained
+	// row A68 instead of skipping it.
+	if resume.ID != 67 || resume.InstanceID != "A" {
+		t.Fatalf("resume = %v, want retained boundary A67", resume)
 	}
-	// The requery from the cursor (exclusive) revisits exactly the dropped
-	// remainder: everything at or before the boundary is retained.
+	found := false
 	for _, r := range kept {
-		if !backend.FairRefBefore(r, resume) {
-			t.Fatalf("kept row A%d sorts at/after resume A68", r.ID)
+		if r.ID == resume.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("resume A%d is not retained in kept (cursor must be a retained row)", resume.ID)
+	}
+	// The exclusive requery from the cursor revisits exactly the dropped
+	// remainder: everything retained sorts at or before the cursor, and
+	// everything past it is still dropped.
+	for _, r := range kept {
+		if backend.FairRefBefore(resume, r) {
+			t.Fatalf("kept row A%d sorts after resume A67", r.ID)
 		}
 	}
 }

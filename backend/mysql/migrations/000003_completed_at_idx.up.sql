@@ -3,4 +3,9 @@
 -- (MySQL has no CREATE INDEX IF NOT EXISTS); Migrate tolerates the
 -- duplicate-index error when the index is already present but fails on
 -- anything else (permission denied, missing table, ...).
-CREATE INDEX wf_instances_completed_at_idx ON wf_instances (completed_at);
+-- The index leads with both victim-scan ordering columns (issue #294
+-- round-20 P2): PurgeInstances orders by completed_at, id, and a
+-- single-column (completed_at) index leaves a residual filesort over
+-- equal-timestamp groups. Databases already carrying the single-column shape
+-- (created by an older 000001/000003) are rebuilt by 000004.
+CREATE INDEX wf_instances_completed_at_idx ON wf_instances (completed_at, id);

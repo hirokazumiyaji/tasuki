@@ -6,8 +6,13 @@
 -- Without an index this degrades to a sequential scan. The partial B-tree
 -- below covers the range + ordering (`completed_at <= $x` implies the
 -- partial predicate `completed_at IS NOT NULL`, so the planner can use it).
+-- The index leads with BOTH ordering columns (issue #294 round-20 P2): a
+-- single-column (completed_at) index cannot serve ORDER BY completed_at, id
+-- and the victim scan falls back to a residual sort over equal-timestamp
+-- groups. Databases already migrated at version 3 keep the old shape (applied
+-- versions never re-run); 000004 rebuilds them in place.
 CREATE INDEX IF NOT EXISTS wf_instances_completed_at_idx
-    ON wf_instances (completed_at) WHERE completed_at IS NOT NULL;
+    ON wf_instances (completed_at, id) WHERE completed_at IS NOT NULL;
 
 -- ListInstances filters with `search_attributes @> $1::jsonb`. A GIN index
 -- with jsonb_path_ops accelerates containment queries.

@@ -17,7 +17,10 @@ CREATE TABLE IF NOT EXISTS wf_instances (
     updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     completed_at DATETIME(6) NULL,
     INDEX wf_instances_visibility_idx (status, name, created_at),
-    INDEX wf_instances_completed_at_idx (completed_at)
+    -- PurgeInstances victim scan orders by (completed_at, id): the index
+    -- leads with both ordering columns (issue #294 round-20 P2) so the scan
+    -- walks victims in order instead of filesorting equal-timestamp groups.
+    INDEX wf_instances_completed_at_idx (completed_at, id)
 );
 
 CREATE TABLE IF NOT EXISTS wf_journal (

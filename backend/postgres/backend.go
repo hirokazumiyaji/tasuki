@@ -416,11 +416,15 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 				// A2..A66 while A67,A68 are dropped before either is
 				// ever attempted, so every poll returns short while
 				// the head stays locked). The FIFO-next dropped row
-				// rides along in trimmed (the keyset requery below is
-				// exclusive), and the cursor arms the pre-overflow
-				// snapshot so a later underfilled pass re-issues a
-				// bounded requery FROM the dropped tail instead of
-				// rescanning the head. Keep the earliest snapshot:
+				// rides along in trimmed as the retained boundary, and
+				// the cursor IS that boundary (issue #294 round-20 P1:
+				// the keyset requery below is exclusive, so a cursor
+				// at the first dropped row would skip it — resuming
+				// strictly after the retained boundary re-fetches the
+				// dropped tail instead). The cursor arms the
+				// pre-overflow snapshot so a later underfilled pass
+				// re-issues a bounded requery FROM the dropped tail
+				// instead of rescanning the head. Keep the earliest snapshot:
 				// the dropped tail is FIFO-earlier than the scan
 				// cursor. Arming overflowSeen also records this
 				// pass's picks in attempted, so the requery skips
