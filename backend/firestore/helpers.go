@@ -407,6 +407,110 @@ func isPostTerminalMarkerDocID(docID, instanceID string) bool {
 	return isPostTerminalMarkerKey(suffix)
 }
 
+// dedupeKeyProbe is the ownership-aware probe of one stored dedupe/marker
+// key under both doc-ID framings (Codex round-18 on #296). framedDoc and
+// legacyDoc are the existing rows at each framing (nil when absent); callers
+// match owned rows framed-first via matchOwnedDedupeRow and treat either
+// framing as blocking creation there (a foreign row still collides).
+type dedupeKeyProbe struct {
+	framedDoc  map[string]any
+	legacyDoc  map[string]any
+	framedFree bool
+	legacyFree bool
+}
+
+// selectOwnedDedupeDoc picks the owned row from the framed/legacy documents
+// holding one stored key: the framed row when owned, else the legacy row
+// when owned, else none — while reporting occupancy of either framing even
+// for foreign rows. An upgraded DB can hold another instance's legacy row
+// exactly where this instance's framed probe lands
+// (frameDedupeDocID("A","x") == legacyDedupeDocID("1:A","x") == "1:A:x"), so
+// returning the first existing document — as getDocEitherFraming did —
+// handed the caller a foreign row and skipped the owned legacy candidate:
+// the guard was missed and every retry appended unguarded. Ownership-aware
+// selection consults both framings and lets the first OWNED match win.
+// Marker probes use this directly (any owned marker suppresses); user-key
+// probes use matchOwnedDedupeRow below so an owned-but-not-matching framed
+// row cannot hide an owned matching legacy row either.
+func selectOwnedDedupeDoc(framed, legacy map[string]any, instanceID string) (owned map[string]any, occupied bool) {
+	if framed != nil {
+		occupied = true
+		if docInstanceMatches(framed, instanceID) {
+			return framed, true
+		}
+	}
+	if legacy != nil {
+		occupied = true
+		if docInstanceMatches(legacy, instanceID) {
+			return legacy, true
+		}
+	}
+	return nil, occupied
+}
+
+// matchOwnedDedupeRow reports whether either framing's row guards the
+// requested raw DedupeID: the framed row when owned AND matching, else the
+// legacy row when owned AND matching. Ownership alone is not enough — a
+// framed row owned by this instance need not guard THIS ID (e.g. another
+// ID's canonical guard, or a same-instance foreign-key row), and stopping
+// at it would hide the owned legacy guard and duplicate the send.
+func matchOwnedDedupeRow(requestedRaw, candidateKey string, pr dedupeKeyProbe, instanceID string) bool {
+	if pr.framedDoc != nil && docInstanceMatches(pr.framedDoc, instanceID) &&
+		matchDedupeRow(requestedRaw, candidateKey, pr.framedDoc) {
+		return true
+	}
+	return pr.legacyDoc != nil && docInstanceMatches(pr.legacyDoc, instanceID) &&
+		matchDedupeRow(requestedRaw, candidateKey, pr.legacyDoc)
+}
+
+// dedupeGuardTarget is where a new dedupe guard row is created: the full
+// document ID plus the version stamp (dedupeFormatVersion for a canonical
+// key, dedupeFormatRawKeyVersion for a fallback key — the stamp travels with
+// the KEY, not the framing, so a canonical guard at a legacy-framed doc
+// still matches by stored canonical form).
+type dedupeGuardTarget struct {
+	docID string
+	ver   int64
+}
+
+// pickDedupeGuardTarget chooses where to create the guard for a DedupeID
+// with no owned guard found (Codex round-18 on #296). Each availability flag
+// reports whether that candidate doc is free (unoccupied). Preference is
+// existing behavior first — framed canonical when the whole canonical key is
+// free, then framed fallback when the whole fallback key is free (a row at
+// either framing occupies the key: creating over the other framing would
+// fork the guard) — with the legacy framings as overflow for framed docs
+// occupied by other rows: the legacy leg is consulted by probes (see
+// matchOwnedDedupeRow), so the guard still dedupes retries. Docs already
+// reserved by earlier items of the same batch count as unavailable:
+// transaction reads don't see buffered Creates, so two items choosing one
+// doc fail the whole batch deterministically on every retry (round-18 P2).
+// ok=false when nothing is free: the caller inserts unguarded
+// (duplicate-never-drop) instead of failing the batch.
+func pickDedupeGuardTarget(instanceID, canonicalKey, fallbackKey string, canonFramedFree, canonLegacyFree, fbFramedFree, fbLegacyFree bool, reserved map[string]bool) (dedupeGuardTarget, bool) {
+	canonFree := canonFramedFree && canonLegacyFree
+	fbFree := fbFramedFree && fbLegacyFree
+	cands := []dedupeGuardTarget{
+		{frameDedupeDocID(instanceID, canonicalKey), dedupeFormatVersion},
+		{frameDedupeDocID(instanceID, fallbackKey), dedupeFormatRawKeyVersion},
+		{legacyDedupeDocID(instanceID, canonicalKey), dedupeFormatVersion},
+		{legacyDedupeDocID(instanceID, fallbackKey), dedupeFormatRawKeyVersion},
+	}
+	free := []bool{
+		canonFree,
+		fbFree,
+		!canonFramedFree && canonLegacyFree,
+		!fbFramedFree && fbLegacyFree,
+	}
+	for i, c := range cands {
+		if !free[i] || reserved[c.docID] {
+			continue
+		}
+		return c, true
+	}
+	return dedupeGuardTarget{}, false
+}
+
 func cutPrefix(s, prefix string) (string, bool) {
 	if len(s) < len(prefix) || s[:len(prefix)] != prefix {
 		return s, false

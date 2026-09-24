@@ -377,6 +377,28 @@ func dedupeKeyCandidates(dedupeID string) []string {
 func dedupeKey(dedupeID string) string       { return escapeDedupeID(dedupeID) }
 func dedupeMarkerKey(dedupeID string) string { return postTerminalDedupeMarker(dedupeID) }
 
+// pickSpannerDedupeInsert chooses the guard key for a DedupeID with no owned
+// guard found (Codex round-18 on #296 P2): the canonical key when free, else
+// the fallback key when free — the same preference the inline code had, with
+// the owner's canonical form recorded on fallback rows (see
+// dedupeFallbackOwnerColumn). Keys already reserved by earlier items of the
+// same batch count as occupied: the transaction's reads don't see buffered
+// mutations, so two items choosing one key (e.g. batch "____x" + "__x" with
+// "______x" foreign-occupied: the first falls back to "____x", the second's
+// canonical probe misses the buffered insert and chooses the same key) fail
+// the whole batch deterministically on every retry. insert=false when
+// nothing is free: the caller inserts unguarded (duplicate-never-drop)
+// instead of failing the batch.
+func pickSpannerDedupeInsert(canonicalKey, fallbackKey string, canonicalOccupied, fallbackOccupied bool, reserved map[string]bool) (key string, version int64, insert bool) {
+	if !canonicalOccupied && !reserved[canonicalKey] {
+		return canonicalKey, dedupeFormatVersion, true
+	}
+	if !fallbackOccupied && !reserved[fallbackKey] {
+		return fallbackKey, dedupeFormatRawKeyVersion, true
+	}
+	return "", 0, false
+}
+
 // Exported key-encoding accessors for the cross-backend parity test (see
 // backend/firestore/dedupe_parity_test.go): both backends must encode
 // DedupeIDs byte-identically even though they store them differently

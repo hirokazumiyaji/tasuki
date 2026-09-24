@@ -1273,6 +1273,11 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		var muts []*spanner.Mutation
 		// Track DedupeIDs reserved in this transaction: ReadRow only sees committed
 		// rows, so same-batch duplicates would otherwise emit colliding InsertMaps.
+		// The same holds for guard storage keys across DISTINCT IDs (Codex
+		// round-18 on #296 P2): one item's fallback key can be another's
+		// canonical key, and buffered inserts stay invisible to later probes,
+		// so every chosen guard key is reserved in reservedGuardKeys below
+		// and treated as occupied.
 		// Terminal sends must not be swallowed by pre-terminal dedupe keys:
 		// a SendToInbox racing a terminal transition (CommitAdvancements or
 		// TerminateInstance) can observe a key snapshotted for the post-commit
@@ -1290,6 +1295,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		// a terminal insert — only the marker does.
 		terminal := status != "running"
 		created := map[string]bool{}
+		reservedGuardKeys := map[string]bool{}
 		for _, it := range items {
 			if it.DedupeID != "" {
 				if created[it.DedupeID] {
@@ -1432,20 +1438,23 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					// no other ID's probe can claim the guard. The fallback
 					// key stays within the STRING(255) budget even for
 					// over-budget IDs (bounded second-level hash — Codex
-					// round-16 on #296). Only when both keys are occupied
-					// (vanishingly rare: two foreign legacy rows) does the
-					// event insert unguarded.
-					if !canonicalOccupied {
-						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-							"instance_id": instanceID, "dedupe_id": dedupeKey(it.DedupeID),
-							dedupeFormatVersionColumn: dedupeFormatVersion, "created_at": now,
-						}))
-					} else if !fallbackOccupied {
-						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-							"instance_id": instanceID, "dedupe_id": fallbackKey,
-							dedupeFormatVersionColumn: dedupeFormatRawKeyVersion,
-							dedupeFallbackOwnerColumn: escapeDedupeID(it.DedupeID), "created_at": now,
-						}))
+					// round-16 on #296). Guard keys chosen earlier in this
+					// batch count as occupied (Codex round-18 on #296 P2,
+					// see pickSpannerDedupeInsert): without the reservation
+					// two items choosing one key fail the whole batch
+					// deterministically. Only when no key is free does the
+					// event insert unguarded (duplicate-never-drop).
+					canonKey := dedupeKey(it.DedupeID)
+					if key, ver, ok := pickSpannerDedupeInsert(canonKey, fallbackKey, canonicalOccupied, fallbackOccupied, reservedGuardKeys); ok {
+						reservedGuardKeys[key] = true
+						m := map[string]any{
+							"instance_id": instanceID, "dedupe_id": key,
+							dedupeFormatVersionColumn: ver, "created_at": now,
+						}
+						if ver >= dedupeFormatRawKeyVersion {
+							m[dedupeFallbackOwnerColumn] = escapeDedupeID(it.DedupeID)
+						}
+						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", m))
 					}
 					created[it.DedupeID] = true
 				}
