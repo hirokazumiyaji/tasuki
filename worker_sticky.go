@@ -312,7 +312,8 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 	// rejection returns errLeaseLost: no store op ran, so — like the
 	// activity retry/complete paths — it is debug-logged, not counted
 	// as a store failure. Other errors share commitWorkflow's
-	// post-handling (sticky + fenced requeue).
+	// post-handling (sticky + fenced requeue), with the requeue ordered
+	// after in-flight cover first (see joinStaleCoverForRequeue).
 	commitOne := func(g flushGuardedCommit) {
 		defer g.committing.Store(false)
 		cctx, ccancel := context.WithCancel(ctx)
@@ -335,6 +336,16 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 				return
 			}
 			w.recordStoreError(ctx, "commit_workflow", err, "instance_id", g.p.instanceID)
+			// Order the failure requeue after in-flight cover
+			// (round-27 P2a, see joinStaleCoverForRequeue): the
+			// release/nack below rewrites visible_at in place, so a
+			// periodic cover ExtendLease blocked across this failed
+			// commit would otherwise land after it and overwrite
+			// what it wrote. Stop new cover from issuing and join
+			// the admitted calls (bounded like the exclusive-commit
+			// path) before requeueing.
+			g.committing.Store(false)
+			w.joinStaleCoverForRequeue(g.task.ID, cctx)
 			_ = w.finishWorkflowCommit(ctx, g.task, g.p.baseJournal, g.p.adv, err)
 			return
 		}
@@ -656,9 +667,11 @@ func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit
 		// Snapshot the continuity deadline for the stale-call fence
 		// below (round-26 P1a): the guard is seeded by
 		// beginDetachedCommit from the entry's local lease-expiry
-		// estimate, and no success has refreshed it yet, so this is
-		// the instant past which the local lease is considered
-		// expired.
+		// estimate, and no success has refreshed it yet. A zero value
+		// means no guard was ever seeded, so there is nothing to
+		// fence; any non-zero value fences unconditionally (round-27
+		// P2b — even a still-fresh lease, since no commit is ever
+		// admitted for a tripped entry).
 		go func(i int, g flushGuardedCommit, leaseExpiry time.Time) {
 			defer initWg.Done()
 			// Renew immediately instead of waiting for the first tick:
@@ -698,9 +711,10 @@ func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit
 	// trip finds the missing guard and reports loss without refreshing
 	// (see renewOnceDetached), so it cannot resurrect the entry. A late
 	// backend-side landing is fenced separately: the Phase 1 wrapper
-	// issues a token-fenced compensation release when the local lease
-	// already expired (see compensateStaleCoverRenewal), so the survived
-	// call cannot re-hide the task past return (round-26 P1a).
+	// always issues a token-fenced compensation release (see
+	// compensateStaleCoverRenewal) — no commit is ever admitted for a
+	// tripped entry, so the survived call cannot re-hide the task past
+	// return (round-26 P1a, extended round-27 P2b to fresh leases).
 	initDone := make(chan struct{})
 	go func() {
 		initWg.Wait()
@@ -800,31 +814,34 @@ func (w *Worker) detGuardDeadline(taskID int64, tok claimToken) time.Time {
 }
 
 // compensateStaleCoverRenewal fences a detached cover renewal whose call
-// survived its guard's teardown (round-26 P1a). When the flush commit
-// context expires while an initial renewal is still blocked in a
-// context-ignoring backend, the bounded Phase 1 join trips the guard and
-// lets the flush return with the backend call still in flight: its result
-// is dropped on return (see renewOnceDetached), but the ID-only ExtendLease
-// may still land afterwards. Landing on our own expired lease re-hides the
-// task for a full lease with no renewal loop left to own it, delaying peer
-// reclaim until the extension lapses.
+// survived its guard's teardown (round-26 P1a, extended round-27 P2b).
+// When the flush commit context expires while an initial renewal is still
+// blocked in a context-ignoring backend, the bounded Phase 1 join trips
+// the guard and lets the flush return with the backend call still in
+// flight: its result is dropped on return (see renewOnceDetached), but
+// the ID-only ExtendLease may still land afterwards. Landing on our own
+// lease re-hides the task for a full lease with no renewal loop left to
+// own it, delaying peer reclaim until the extension lapses — and no
+// commit was admitted for the entry (a tripped entry's gates all skip),
+// so the task would sit unowned and hidden.
 //
-// When the local lease estimate already expired, this issues a best-effort
-// token-fenced ReleaseLease undoing such an extension so the task becomes
-// reclaimable promptly instead. The fence (worker + attempt, plus
-// kind/instance routing) keeps it safe: a peer that reclaimed the task in
-// the meantime holds a new attempt, so the stale release is rejected with
-// ErrNotFound and the peer's fresh lease is never disturbed; a deleted
-// (committed) row reports ErrNotFound the same way. Both rejections are
-// quiet. While the lease still looks live nothing is issued: an extension
-// that landed (or lands) is on our own live lease, and releasing it early
-// would hand a task no peer has claimed to a third worker while this
-// flush's successors may still reference it.
+// This therefore ALWAYS issues a best-effort token-fenced ReleaseLease
+// undoing such an extension so the task becomes reclaimable promptly
+// instead — even when the original local lease still looks fresh
+// (round-27 P2b): a renewal that lands just before the original expiry
+// still moved visible_at a full lease out on a task no commit will ever
+// reference (every successor gate re-checks the tripped guard and
+// skips), and the fence keeps the release safe pre-reclaim too. No peer
+// can hold the lease before the original expiry (reclaim requires
+// expiry), so the release either undoes our own extension or — when a
+// peer did reclaim after expiry — is rejected with ErrNotFound without
+// disturbing the peer's fresh lease; a deleted (committed) row reports
+// ErrNotFound the same way. Both rejections are quiet.
 //
 // Like the other fencing paths this is debug-logged, never recorded as a
 // store error: a routine teardown race must not raise backend-error alerts.
 func (w *Worker) compensateStaleCoverRenewal(ctx context.Context, task backend.Task, leaseExpiry time.Time) {
-	if leaseExpiry.IsZero() || time.Now().Before(leaseExpiry) {
+	if leaseExpiry.IsZero() {
 		return
 	}
 	relCtx, cancel := w.releaseContext(ctx)

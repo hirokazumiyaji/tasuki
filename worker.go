@@ -756,6 +756,56 @@ func (w *Worker) coverRenewExit(taskID int64) {
 	}
 }
 
+// joinStaleCoverForRequeue waits for taskID's in-flight detached-cover
+// renewals to settle before a failed workflow commit requeues the task
+// (round-27 P2a). The failure requeue (ReleaseLease/NackTask, see
+// requeueWorkflowTask) rewrites visible_at in place — a row-preserving
+// write like RetryActivity/nack — so a periodic cover ExtendLease blocked
+// in the backend across the failed CommitAdvancement would land after the
+// release/nack and overwrite what it wrote: a conflict retry stays hidden
+// for a full lease instead of replaying promptly, or the nack's
+// IncompatibleRetryDelay is replaced by the lease duration. The per-item
+// commit runs row-deleting writes (exclusive=false, see
+// guardedDetachedCommit) and holds no writing hold, and the guard is
+// already dropped by the time the commit returns an error, so this joins
+// the per-task cover barrier directly instead of via
+// joinCoverRenewalsForCommit (which requires the guard).
+//
+// The caller stops the periodic loop first (clearing its committing flag,
+// see flushWorkflowCommits) and the dropped guard already stops new cover
+// from issuing — renewOnceDetached without a guard reports loss without a
+// store call — so the snapshot covers every call that can overlap the
+// requeue, except a tick registering in the gap between the snapshot and
+// the requeue store op. That residual is far narrower than the pre-fix
+// window (every already-blocked renewal) and bounded the same way.
+//
+// The wait is bounded by ctx and commitJoinCap like the exclusive-commit
+// path. On give-up the requeue still proceeds — the task must become
+// visible, and unlike the pre-write join there is nothing to abort —
+// leaving the same bounded-overwrite residual as other give-ups.
+func (w *Worker) joinStaleCoverForRequeue(taskID int64, ctx context.Context) {
+	w.detMu.Lock()
+	e := w.coverInflight[taskID]
+	var idle chan struct{}
+	if e != nil {
+		idle = e.idle
+	}
+	w.detMu.Unlock()
+	if idle == nil {
+		return
+	}
+	timer := time.NewTimer(commitJoinCap)
+	defer timer.Stop()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-idle:
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
 // waitForWaitGroup blocks until wg drains or ctx ends.
 func waitForWaitGroup(wg *sync.WaitGroup, ctx context.Context) {
 	done := make(chan struct{})
@@ -2679,7 +2729,6 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		}
 		defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)()
 		commitCtx, commitCancel := w.commitContext(ctx)
-		w.opts.Metrics.AddActivityRetry(commitCtx, 1)
 		// RetryActivity rewrites visible_at in place: serialize against
 		// cover renewals (round-11 P1b).
 		if rerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, true, func() error {
@@ -2700,6 +2749,12 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			commitCancel()
 			return rerr
 		}
+		// Count the retry only once the store accepted it (round-27
+		// P2c): the gate above can reject the retry (continuity loss,
+		// renewal-join timeout) with errLeaseLost without scheduling
+		// anything, and counting before the gate records phantom
+		// retries that never ran.
+		w.opts.Metrics.AddActivityRetry(commitCtx, 1)
 		commitCancel()
 		return nil
 	}
