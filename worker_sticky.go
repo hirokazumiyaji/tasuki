@@ -221,9 +221,37 @@ type pendingWorkflowCommit struct {
 	// release on commit failure). Older call sites may leave it zero; the
 	// release then falls back to adv-derived routing without fencing.
 	task backend.Task
+	// tok is the claiming invocation's in-flight token (see claimToken),
+	// stamped by tickWorkflows when the turn completes. The flush transfers
+	// ownership out via claimCommitOwnership before touching the store (see
+	// skipStaleCommit), so a Shutdown releaseInFlight racing the flush wins
+	// exactly once: either the release wins and the flush skips, or the
+	// flush wins and the release finds nothing. hasTok distinguishes
+	// production pendings from older/test call sites that only set adv
+	// (which commit ungated, as before).
+	tok    claimToken
+	hasTok bool
 }
 
 func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWorkflowCommit) {
+	if len(pending) == 0 {
+		return
+	}
+	// Ownership gate (round-21 P2): a Shutdown timeout + restart may have
+	// released a finished pending turn (removing it from the in-flight set)
+	// while a peer re-claimed the task; the flush runs on a detached commit
+	// ctx that outlives the shutdown, and backends validate the advancement
+	// by task ID + sequence alone — so committing the stale advancement
+	// would delete the peer's active task after duplicate execution. Skip
+	// entries that lost ownership instead of touching the store.
+	owned := make([]pendingWorkflowCommit, 0, len(pending))
+	for _, p := range pending {
+		if w.skipStaleCommit(p) {
+			continue
+		}
+		owned = append(owned, p)
+	}
+	pending = owned
 	if len(pending) == 0 {
 		return
 	}
@@ -256,6 +284,31 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 			w.recordStoreError(ctx, "commit_workflow", err, "instance_id", p.instanceID)
 		}
 	}
+}
+
+// skipStaleCommit gates one pending workflow commit on in-flight ownership
+// (round-21 P2, ownsWorkflowCommit-style). It transfers the entry out via
+// claimCommitOwnership — atomically with the ownership check under mu — so
+// the entry is gone before the store op runs and a concurrent Shutdown
+// releaseInFlight cannot hand the committing task to a peer mid-commit.
+// It reports true when the commit must be skipped: Shutdown already
+// released the lease (entry absent — a peer may own it now), or a restart
+// re-tracked the same task ID under a new token (entry mismatched — the new
+// generation owns it). Skipped entries issue no store op and need no local
+// cleanup: absent entries were already released, and mismatched entries
+// belong to the live owner. Pendings without a production token (older or
+// test call sites carrying only adv) commit ungated, as before.
+func (w *Worker) skipStaleCommit(p pendingWorkflowCommit) bool {
+	if !p.hasTok {
+		return false
+	}
+	t := w.taskForCommit(p)
+	if w.claimCommitOwnership(t.ID, p.tok) {
+		return false
+	}
+	w.opts.Logger.Debug("skipping stale workflow commit; lease already released",
+		"instance_id", p.instanceID, "task_id", t.ID)
+	return true
 }
 
 // taskForCommit resolves the fenced release token for a pending commit.

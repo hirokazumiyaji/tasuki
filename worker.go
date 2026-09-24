@@ -862,12 +862,72 @@ func (w *Worker) trackAt(taskID int64, at time.Time) claimToken {
 // the lease-expiry estimate matters; unfenced Task{ID} fallbacks still
 // release correctly since backend fencing predicates skip empty fields.
 func (w *Worker) trackTaskAt(t backend.Task, at time.Time) claimToken {
+	tok, _ := w.trackTaskAtEpoch(t, at, w.claimEpoch())
+	return tok
+}
+
+// claimEpoch reports the worker's current Start generation. Claim sites
+// capture it BEFORE the blocking ClaimTasks call so the returned claims can
+// be bound to the generation that issued them (see trackTaskAtEpoch).
+func (w *Worker) claimEpoch() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.epoch
+}
+
+// isCurrentEpoch reports whether epoch still identifies this worker's Start
+// generation. A blocked ClaimTasks that returns after a Shutdown timeout +
+// restart observes a new generation; its results must be dropped, not
+// dispatched (see dropStaleClaims).
+func (w *Worker) isCurrentEpoch(epoch uint64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.epoch == epoch
+}
+
+// trackTaskAtEpoch is trackTaskAt gated on the claiming call's generation:
+// the entry is stamped only when epoch still matches the worker's Start
+// generation, atomically with the check under mu. It reports false when the
+// generation moved on (Shutdown timeout + restart while the claim was
+// blocked in the backend or its dispatch sat queued): the caller must drop
+// the stale claim — fenced-release its lease so it does not linger, never
+// dispatch it — instead of stamping the new generation's epoch onto an entry
+// the restarted loop may already own for the same task ID. Stamping the
+// current epoch unconditionally lets the stale invocation overwrite the new
+// generation's entry; its token-fenced untrack/release then removes the live
+// entry, so the genuine new invocation fails its token checks and discards
+// its result after side effects (round-21 P1).
+//
+// The check and the stamp must be atomic: a batch-level epoch check after
+// ClaimTasks returns still races a restart landing before the individual
+// track, so every production claim site uses this helper, never bare
+// trackTaskAt.
+func (w *Worker) trackTaskAtEpoch(t backend.Task, at time.Time, epoch uint64) (claimToken, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.epoch != epoch {
+		return claimToken{}, false
+	}
 	w.claimSeq++
 	tok := claimToken{epoch: w.epoch, seq: w.claimSeq}
 	w.inFlight[t.ID] = inFlightEntry{expiry: at.Add(w.leaseDuration()), epoch: tok.epoch, seq: tok.seq, task: t}
-	return tok
+	return tok, true
+}
+
+// dropStaleClaims releases claims from a superseded worker generation (see
+// trackTaskAtEpoch). Every release carries the just-claimed token (worker +
+// attempt), so a task the new generation already reclaimed — a new attempt —
+// is fenced: backends (memory, sqlite, dynamodb, firestore) release
+// conditionally on the token and report ErrNotFound instead of clearing the
+// new lease. Dropping without release would leave the stale lease hidden
+// until expiry; the fenced release is prompt and cannot disturb the new
+// owner, so it is preferred and documented here.
+func (w *Worker) dropStaleClaims(ctx context.Context, tasks []backend.Task) {
+	for _, t := range tasks {
+		relCtx, relCancel := w.releaseContext(ctx)
+		_ = w.backend.ReleaseLease(relCtx, t)
+		relCancel()
+	}
 }
 
 func (w *Worker) untrack(taskID int64, tok claimToken) {
@@ -1649,6 +1709,11 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 	if limit <= 0 || limit > avail {
 		limit = avail
 	}
+	// Bind the claims to this Start generation (see trackTaskAtEpoch): a
+	// ClaimTasks blocked across a Shutdown timeout + restart returns claims
+	// owned by a superseded generation, which must be dropped rather than
+	// dispatched under the new generation's epoch.
+	claimEpoch := w.claimEpoch()
 	// Conservative lease base (see trackAt): the local expiry is measured
 	// from before the claim, not after it returns.
 	claimStart := time.Now()
@@ -1662,6 +1727,15 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		return
 	}
 	if len(wtasks) == 0 {
+		return
+	}
+	if !w.isCurrentEpoch(claimEpoch) {
+		// Superseded generation: drop every claim via a detached fenced
+		// release (see dropStaleClaims) and dispatch nothing. Nothing is
+		// tracked yet, so no local cleanup is needed.
+		w.opts.Logger.Debug("dropping workflow claims from a superseded generation",
+			"n", len(wtasks))
+		w.dropStaleClaims(ctx, wtasks)
 		return
 	}
 	// Record local claim times so the delayed nack can be fenced against
@@ -1701,10 +1775,26 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 			actor.dispatch(func() {
 				w.opts.Metrics.AddWorkflowTask(ctx, 1)
 				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
-				tok := w.trackTaskAt(t, claimStart)
+				// Generation-gated track (see trackTaskAtEpoch): the
+				// dispatch may run after a restart queued it behind a
+				// long turn, so the claim-time epoch — not the current
+				// one — decides ownership. A superseded claim is
+				// fenced-released, never executed: Shutdown already
+				// released it (or the new generation owns it now), and
+				// a ctx-ignoring backend would otherwise run it to a
+				// pending whose ungated flush deletes a peer's task.
+				tok, ok := w.trackTaskAtEpoch(t, claimStart, claimEpoch)
+				if !ok {
+					w.opts.Logger.Debug("dropping workflow claim from a superseded generation",
+						"instance_id", t.InstanceID, "task_id", t.ID)
+					relCtx, relCancel := w.releaseContext(ctx)
+					_ = w.backend.ReleaseLease(relCtx, t)
+					relCancel()
+					return
+				}
 				p, herr := w.handleWorkflow(ctx, t)
-				w.untrack(t.ID, tok)
 				if herr != nil {
+					w.untrack(t.ID, tok)
 					w.recordStoreError(ctx, "commit_workflow", herr,
 						"instance_id", t.InstanceID, "task_id", t.ID)
 					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", herr)
@@ -1719,9 +1809,20 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					return
 				}
 				if p != nil {
+					// A commit follows in flushWorkflowCommits: stay
+					// tracked until it succeeds (see skipStaleCommit).
+					// Untracking here would hide a leased, uncommitted
+					// task from releaseInFlight, and the flush could no
+					// longer tell a Shutdown-released pending from a
+					// live one. The flush transfers ownership out via
+					// claimCommitOwnership, so exactly one side wins.
+					p.tok = tok
+					p.hasTok = true
 					pendingMu.Lock()
 					pending = append(pending, *p)
 					pendingMu.Unlock()
+				} else {
+					w.untrack(t.ID, tok)
 				}
 			})
 		}(t)
@@ -1752,6 +1853,14 @@ func (w *Worker) tickActivities(ctx context.Context) {
 	// run's live context and executing an already-released task (whose
 	// side effects fencing cannot undo).
 	execCtx := w.execContext(ctx)
+	// Bind the claims to this Start generation as well (see
+	// trackTaskAtEpoch): a ClaimTasks blocked across a Shutdown timeout +
+	// restart returns claims owned by a superseded generation. The captured
+	// execCtx above aborts cancellation-aware activities, but a
+	// cancellation-ignoring backend still returns the stale claim, and
+	// stamping the current epoch onto it would overwrite an entry the
+	// restarted loop already re-tracked for the same task ID.
+	claimEpoch := w.claimEpoch()
 	// Conservative lease base (see trackAt): backends stamp the visible
 	// lease during the claim, so the local expiry is measured from before
 	// the call, not after it returns.
@@ -1763,6 +1872,15 @@ func (w *Worker) tickActivities(ctx context.Context) {
 	})
 	if err != nil {
 		w.recordStoreError(ctx, "claim_activity", err)
+		return
+	}
+	if len(atasks) > 0 && !w.isCurrentEpoch(claimEpoch) {
+		// Superseded generation: drop every claim via a detached fenced
+		// release (see dropStaleClaims) and dispatch nothing. Nothing is
+		// tracked yet, so no local cleanup is needed.
+		w.opts.Logger.Debug("dropping activity claims from a superseded generation",
+			"n", len(atasks))
+		w.dropStaleClaims(ctx, atasks)
 		return
 	}
 	for _, t := range atasks {
@@ -1783,7 +1901,20 @@ func (w *Worker) tickActivities(ctx context.Context) {
 		w.opts.Metrics.AddActivityTask(ctx, 1)
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
-		tok := w.trackTaskAt(t, claimStart)
+		// Generation-gated track (see trackTaskAtEpoch): reject a claim
+		// superseded by a restart between the batch check above and this
+		// track. The slot was already reserved, so release it, then
+		// fenced-release the lease (never dispatch).
+		tok, ok := w.trackTaskAtEpoch(t, claimStart, claimEpoch)
+		if !ok {
+			w.opts.Logger.Debug("dropping activity claim from a superseded generation",
+				"instance_id", t.InstanceID, "task_id", t.ID)
+			<-w.actSem
+			relCtx, relCancel := w.releaseContext(ctx)
+			_ = w.backend.ReleaseLease(relCtx, t)
+			relCancel()
+			continue
+		}
 		done, ok := w.trackActivity()
 		if !ok {
 			w.untrack(t.ID, tok)
@@ -1832,6 +1963,11 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 		limit = avail
 	}
 	// Conservative lease base (see trackAt).
+	// Bind the claims to this Start generation (see trackTaskAtEpoch): a
+	// ClaimTasks blocked across a Shutdown timeout + restart returns claims
+	// owned by a superseded generation, which must be dropped rather than
+	// run under the new generation's epoch.
+	claimEpoch := w.claimEpoch()
 	claimStart := time.Now()
 	atasks, err := w.backend.ClaimTasks(ctx, backend.ClaimRequest{
 		Kind: "activity", Queues: w.opts.Queues, Limit: limit,
@@ -1840,6 +1976,12 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 	})
 	if err != nil {
 		w.recordStoreError(ctx, "claim_activity", err)
+		return
+	}
+	if len(atasks) > 0 && !w.isCurrentEpoch(claimEpoch) {
+		w.opts.Logger.Debug("dropping sync activity claims from a superseded generation",
+			"n", len(atasks))
+		w.dropStaleClaims(ctx, atasks)
 		return
 	}
 	var wg sync.WaitGroup
@@ -1859,7 +2001,18 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 		w.opts.Metrics.AddActivityTask(ctx, 1)
 		w.opts.Logger.Debug("activity task",
 			"instance_id", t.InstanceID, "task_id", t.ID, "activity", t.Name, "attempt", t.Attempt)
-		tok := w.trackTaskAt(t, claimStart)
+		// Generation-gated track (see trackTaskAtEpoch).
+		tok, ok := w.trackTaskAtEpoch(t, claimStart, claimEpoch)
+		if !ok {
+			wg.Done()
+			<-w.actSem
+			w.opts.Logger.Debug("dropping sync activity claim from a superseded generation",
+				"instance_id", t.InstanceID, "task_id", t.ID)
+			relCtx, relCancel := w.releaseContext(ctx)
+			_ = w.backend.ReleaseLease(relCtx, t)
+			relCancel()
+			continue
+		}
 		done, global := w.trackActivity()
 		go func(t backend.Task, tok claimToken) {
 			defer wg.Done()
