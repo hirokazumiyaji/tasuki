@@ -123,9 +123,10 @@ func TestWorker_Round23_RetrySleepsCappedAtAbandonment(t *testing.T) {
 }
 
 // TestWorker_Round23_LeaseBaseFromClaim pins the conservative baseline:
-// the earlier of the pre-claim wall instant and the claim's
-// VisibleAt-derived store start wins, so the deadline never stretches
-// past the actual store lease. Zero inputs fall back safely.
+// the pre-claim LOCAL wall instant always wins — the claim's
+// VisibleAt-derived store start is never consulted (round-27: store time
+// and worker time are incomparable under clock skew). Zero inputs fall
+// back safely.
 func TestWorker_Round23_LeaseBaseFromClaim(t *testing.T) {
 	const lease = time.Minute
 	now := time.Now()
@@ -136,10 +137,17 @@ func TestWorker_Round23_LeaseBaseFromClaim(t *testing.T) {
 	if got := leaseBaseFromClaim(task, now.Add(-2*time.Second), lease); !got.Equal(now.Add(-2 * time.Second)) {
 		t.Fatalf("slow claim base = %v, want the earlier pre-claim instant %v", got, now.Add(-2*time.Second))
 	}
-	// Wall clock jumped forward: the VisibleAt-derived start is earlier
-	// and wins.
-	if got := leaseBaseFromClaim(task, now.Add(time.Hour), lease); !got.Equal(storeStart) {
-		t.Fatalf("jumped clock base = %v, want the earlier store start %v", got, storeStart)
+	// Skewed store clock: the VisibleAt-derived start is earlier, but it
+	// is measured on the store clock and must not move the local
+	// baseline — the pre-claim instant wins.
+	if got := leaseBaseFromClaim(task, now, lease); !got.Equal(now) {
+		t.Fatalf("skewed store base = %v, want the local pre-claim instant %v", got, now)
+	}
+	// A caller-passed post-claim instant is used as-is: all production
+	// claim sites capture the pre-claim instant, so the baseline can
+	// only bound the window early, never late.
+	if got := leaseBaseFromClaim(task, now.Add(time.Hour), lease); !got.Equal(now.Add(time.Hour)) {
+		t.Fatalf("post-claim base = %v, want %v", got, now.Add(time.Hour))
 	}
 	// No VisibleAt (backends that do not report it): pre-claim instant.
 	if got := leaseBaseFromClaim(backend.Task{}, now, lease); !got.Equal(now) {

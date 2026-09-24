@@ -1926,13 +1926,14 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 	// keep aligned with wall time; tests align them manually when they
 	// move the store clock.
 	//
-	// The base is the actual claim (round-23 P2a), not loop entry: the
-	// loop starts after ClaimTasks returns plus dispatch queueing, and a
-	// slow ClaimTasks (scan-heavy stores stamp visible_at during the
-	// call) would otherwise stretch the retry deadline past the store
-	// lease by that latency. lastSuccess bounds conservatively from the
-	// earlier of the pre-claim wall instant and the claim's own
-	// VisibleAt-derived start (see leaseBaseFromClaim).
+	// The base is the actual claim (round-23 P2a), measured on the LOCAL
+	// clock only (round-27): the loop starts after ClaimTasks returns
+	// plus dispatch queueing, and a slow ClaimTasks (scan-heavy stores
+	// stamp visible_at during the call) would otherwise stretch the
+	// retry deadline past the store lease by that latency. The claim's
+	// own VisibleAt is NOT consulted (see leaseBaseFromClaim): it is
+	// stamped by the store clock and incomparable with local instants
+	// under skew.
 	//
 	// Every success stamps the pre-call instant (round-24 P2b), not the
 	// response time: a successful ExtendLease delayed in flight was
@@ -2048,21 +2049,28 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 }
 
 // leaseBaseFromClaim derives the conservative renewal baseline for a
-// claimed task (round-23 P2a). The pre-claim wall instant is always a
-// valid lower bound for the store-visible lease start; when the claim
-// itself carries a VisibleAt-derived start that is EARLIER (wall clock
-// jumped forward, or the caller passed a post-claim instant), the
-// earlier instant wins so the retry deadline never stretches past the
-// actual store lease. A zero claimBase falls back to now (older/test
-// call sites that never captured the pre-claim instant).
+// claimed task (round-23 P2a, hardened round-27: local clock only). The
+// pre-claim wall instant is always a valid lower bound for the
+// store-visible lease start: backends stamp the visible lease during the
+// claim transaction, which runs after the pre-claim instant, so measuring
+// from here can only bound the retry window early, never late (same
+// conservatism as refreshLeaseAt/trackAt).
+//
+// The claim's VisibleAt is deliberately IGNORED, even when its derived
+// store start (VisibleAt minus the lease) is earlier: VisibleAt is
+// stamped by the STORE clock (postgres now()) while claimBase is measured
+// by the WORKER clock, and the two are incomparable under skew. With the
+// store clock behind, a short lease plus skew puts the VisibleAt-derived
+// start before the local abandonment deadline, so the first renewal
+// instantly cancels every turn though the DB lease is still valid. All
+// production claim sites capture claimBase before the ClaimTasks call,
+// so the local instant alone is the correct conservative base; no
+// store-clock offset translation is needed. A zero claimBase falls back
+// to now (older/test call sites that never captured the pre-claim
+// instant).
 func leaseBaseFromClaim(t backend.Task, claimBase time.Time, lease time.Duration) time.Time {
 	if claimBase.IsZero() {
-		claimBase = time.Now()
-	}
-	if lease > 0 && !t.VisibleAt.IsZero() {
-		if storeStart := t.VisibleAt.Add(-lease); storeStart.Before(claimBase) {
-			return storeStart
-		}
+		return time.Now()
 	}
 	return claimBase
 }
