@@ -67,7 +67,24 @@ func TestSweepSignalDedupeSnapshotPreservesPostCommitKeys(t *testing.T) {
 	put("post-commit", time.Now().UTC().Add(-time.Second))
 	put("post-commit-fresh", time.Now().UTC().Add(time.Second))
 
-	if err := b.sweepSignalDedupeIDs(ctx, id, nil, snapshot); err != nil {
+	// The fenced sweep (Codex round 20 on #296) still removes exactly the
+	// snapshot while the instance carries its pre-commit incarnation.
+	var createdAt time.Time
+	func() {
+		row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"created_at"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := row.Columns(&createdAt); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	victim := purgeVictim{id: id, createdAt: createdAt}
+	guard := func(ctx context.Context) error { return b.checkPurgeVictim(ctx, victim) }
+	guardTx := func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return b.checkPurgeVictimTx(ctx, txn, victim)
+	}
+	if err := b.sweepSignalDedupeIDs(ctx, id, guard, guardTx, snapshot); err != nil {
 		t.Fatal(err)
 	}
 	if b.dedupeKeyExists(ctx, id, "pre-commit") {

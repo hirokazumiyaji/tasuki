@@ -2,16 +2,19 @@ package spanner
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"cloud.google.com/go/spanner"
 	"google.golang.org/api/iterator"
 )
 
-// sweepGuard re-validates, once per sweep page, that a purge still owns the
-// victim incarnation it is deleting (see purge.go). Nil disables the check;
-// the terminate path passes nil because the instance row still exists there,
-// so no replacement incarnation can appear mid-sweep.
+// sweepGuard re-validates, once per sweep page, that a sweep still owns the
+// incarnation it is deleting (see purge.go). Purge arms it with the listed
+// victim; terminal sweeps arm it with the pre-commit incarnation (see
+// sweepTerminateDocs) — the instance row still exists on the terminal path,
+// but a purge interleaved with the paused sweep can delete it and let
+// CreateInstance reuse the ID, so the fence is load-bearing there too.
 //
 // The out-of-transaction pre-check is a cheap early exit only: the
 // load-bearing fence is the in-transaction check (sweepGuardTx), which runs
@@ -124,22 +127,46 @@ func chunkInt64s(in []int64, size int) [][]int64 {
 }
 
 // sweepTerminateDocs removes a terminated instance's task/timer/dedupe rows in
-// paged transactions. The status flip already committed, so each batch is
-// independent. Inbox/journal rows (if any) are left for purge: terminate never
-// owned them and they need no prompt reclaim to unblock anything. Dedupe
-// cleanup deletes only the pre-termination non-marker keys snapshotted inside
-// the flip transaction: post-terminal sends committing after the flip survive,
-// and markers in the snapshot itself are filtered out (Codex round 8 on #327:
-// sweeping a marker while its inbox event remains duplicates the next retry).
-// Purge reaps leftovers.
-func (b *Backend) sweepTerminateDocs(ctx context.Context, id string, dedupeSnapshot []string) error {
-	if err := b.deleteTasksForInstance(ctx, id, nil, nil); err != nil {
+// fenced paged transactions. The status flip already committed, so each page
+// is independent — but every page still re-validates the terminal fence (see
+// below): a PurgeInstances that deletes the terminal instance, clears its
+// marker, and lets CreateInstance reuse the ID while this sweep is paused
+// must stop the resumed sweep before it deletes the replacement's rows
+// (Codex round 20 on #296). The fence pins the pre-commit incarnation (id +
+// created_at captured inside the flip transaction); on mismatch the sweep
+// aborts with a nil return and purge owns the leftovers — leaked rows are
+// always preferable to deleting a live incarnation's rows. Inbox/journal rows
+// (if any) are left for purge: terminate never owned them and they need no
+// prompt reclaim to unblock anything. Dedupe cleanup deletes only the
+// pre-termination non-marker keys snapshotted inside the flip transaction:
+// post-terminal sends committing after the flip survive, and markers in the
+// snapshot itself are filtered out (Codex round 8 on #327: sweeping a marker
+// while its inbox event remains duplicates the next retry). Purge reaps
+// leftovers.
+func (b *Backend) sweepTerminateDocs(ctx context.Context, id string, createdAt time.Time, dedupeSnapshot []string) error {
+	// The present-incarnation fence (see purgeVictim): the sweep proceeds
+	// only while the instance row still carries the created_at captured at
+	// the terminal commit. A missing row (purge deleted it) or a different
+	// created_at (the ID was recreated after such a delete) aborts the
+	// sweep before it touches another incarnation's rows.
+	victim := purgeVictim{id: id, createdAt: createdAt}
+	guard := func(ctx context.Context) error { return b.checkPurgeVictim(ctx, victim) }
+	guardTx := func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return b.checkPurgeVictimTx(ctx, txn, victim)
+	}
+	if err := b.deleteTasksForInstance(ctx, id, guard, guardTx); err != nil {
+		if errors.Is(err, errPurgeSuperseded) {
+			return nil
+		}
 		return err
 	}
-	if err := b.deleteTimersForInstance(ctx, id, nil, nil); err != nil {
+	if err := b.deleteTimersForInstance(ctx, id, guard, guardTx); err != nil {
+		if errors.Is(err, errPurgeSuperseded) {
+			return nil
+		}
 		return err
 	}
-	return b.sweepSignalDedupeIDs(ctx, id, nil, filterTerminateDedupeKeys(dedupeSnapshot))
+	return b.sweepSignalDedupeIDs(ctx, id, guard, guardTx, filterTerminateDedupeKeys(dedupeSnapshot))
 }
 
 // filterTerminateDedupeKeys keeps only the pre-termination non-marker keys of
@@ -182,6 +209,29 @@ func (b *Backend) listSignalDedupeIDs(ctx context.Context, id string) ([]string,
 	}
 }
 
+// terminalSweep carries one terminal advancement's post-commit sweep: the
+// pre-commit incarnation fencing it plus the exact dedupe keys to remove.
+type terminalSweep struct {
+	createdAt time.Time
+	dedupeIDs []string
+}
+
+// queryInstanceCreatedAtTx reads an instance's incarnation marker inside the
+// commit transaction for the terminal sweep fence (see terminalSweep).
+// created_at is written once by CreateInstance and never updated, so a row
+// carrying a different value after a purge is a replacement incarnation.
+func queryInstanceCreatedAtTx(ctx context.Context, txn *spanner.ReadWriteTransaction, id string) (time.Time, error) {
+	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"created_at"})
+	if err != nil {
+		return time.Time{}, err
+	}
+	var createdAt time.Time
+	if err := row.Columns(&createdAt); err != nil {
+		return time.Time{}, err
+	}
+	return createdAt, nil
+}
+
 // querySignalDedupeIDsTx reads the same key set inside a read-write
 // transaction. CommitAdvancements uses this so the snapshot is a
 // serializable read: a SendToInbox serializing before the terminal commit is
@@ -209,9 +259,11 @@ func querySignalDedupeIDsTx(ctx context.Context, txn *spanner.ReadWriteTransacti
 	}
 }
 
-// sweepSignalDedupeIDs removes exactly the given dedupe keys in paged
+// sweepSignalDedupeIDs removes exactly the given dedupe keys in fenced paged
 // transactions. Called best-effort after terminal advancements commit with
-// the in-transaction snapshot from querySignalDedupeIDsTx.
+// the in-transaction snapshot from querySignalDedupeIDsTx. Terminal-only:
+// purge reaps by full key listing instead (see deleteAllSignalDedupe), so a
+// tripped fence aborts with a nil return and purge owns the leftovers.
 //
 // Keys are classified by transaction serialization order, not client
 // timestamps: a SendToInbox that captures created_at before the terminal
@@ -226,25 +278,45 @@ func querySignalDedupeIDsTx(ctx context.Context, txn *spanner.ReadWriteTransacti
 // send committing after the snapshot read but before the terminal commit
 // lands is preserved for purge even though it logically predates the commit.
 //
+// Every page runs in one read-write transaction that first re-validates the
+// terminal fence (the instance row must still carry the pre-commit
+// incarnation) and then deletes the page: dedupe keys are deterministic
+// ((instance_id, dedupe_id)), so a replacement incarnation reusing the ID
+// after a purge can recreate the very same row. An unfenced exact-key delete
+// would then strip the replacement's live guard while its inbox event
+// remains, duplicating a later retry (Codex round 20 on #296). The fence
+// read and the deletes share the transaction, so a recreation is either
+// invisible to both (only provably-old rows are deleted) or visible to both
+// (the fence trips and the page aborts).
+//
 // The sweep stays synchronous so a redelivered DedupeID inserts anew once
 // CommitAdvancements returns, but runs under a bounded context so a stuck
 // store delays only this cleanup, never the caller. Purge reaps leftovers.
-func (b *Backend) sweepSignalDedupeIDs(ctx context.Context, id string, guard sweepGuard, ids []string) error {
+func (b *Backend) sweepSignalDedupeIDs(ctx context.Context, id string, guard sweepGuard, guardTx sweepGuardTx, ids []string) error {
 	for _, chunk := range chunkStrings(ids, spannerSweepBatchSize) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if err := checkGuard(ctx, guard); err != nil {
+			if errors.Is(err, errPurgeSuperseded) {
+				return nil
+			}
 			return err
 		}
 		keys := chunk
 		err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			if err := checkGuardTx(ctx, txn, guardTx); err != nil {
+				return err
+			}
 			var muts []*spanner.Mutation
 			for _, k := range keys {
 				muts = append(muts, spanner.Delete("wf_signal_dedupe", spanner.Key{id, k}))
 			}
 			return txn.BufferWrite(muts)
 		})
+		if errors.Is(err, errPurgeSuperseded) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}

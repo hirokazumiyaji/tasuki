@@ -20,7 +20,9 @@ var errPurgeSuperseded = errors.New("spanner: purge victim superseded")
 // purgeVictim is one instance selected for purging. createdAt is the
 // incarnation marker: wf_instances.created_at is written once by
 // CreateInstance and never updated, so a row carrying a different value is a
-// replacement created after this purge's victim was deleted.
+// replacement created after this purge's victim was deleted. Terminal sweeps
+// reuse the same carrier with the incarnation captured inside the
+// terminal-status commit (see sweepTerminateDocs).
 type purgeVictim struct {
 	id        string
 	createdAt time.Time

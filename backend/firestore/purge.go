@@ -25,12 +25,17 @@ type purgeVictim struct {
 	createdAt time.Time
 }
 
-// purgeFence pins one purge victim's ID-reuse fence for every sweep page:
-// the victim incarnation (id + createdAt observed at listing) and which
-// side of the victim delete the sweep runs on. The first sweep requires the
-// victim doc to still carry the listed created_at; the second requires the
-// doc to stay gone — any doc present then is a replacement incarnation
-// whose documents must never be deleted.
+// purgeFence pins one incarnation's ID-reuse fence for every sweep page: the
+// victim incarnation (id + createdAt observed at listing, or — for terminal
+// sweeps — captured inside the terminal-status commit) and which side of the
+// victim delete the sweep runs on. The first sweep requires the victim doc
+// to still carry the listed created_at; the second requires the doc to stay
+// gone — any doc present then is a replacement incarnation whose documents
+// must never be deleted. Terminal sweeps (see sweepTerminateDocs,
+// sweepSignalDedupeIDs) arm the first-sweep fence with their pre-commit
+// incarnation, so a purge that deletes the instance and lets CreateInstance
+// reuse the ID mid-sweep aborts the sweep instead of corrupting the
+// replacement.
 type purgeFence struct {
 	victim purgeVictim
 	// absent selects the second-sweep fence (victim doc must stay gone);

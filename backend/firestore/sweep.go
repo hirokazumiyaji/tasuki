@@ -2,6 +2,7 @@ package firestore
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	gcf "cloud.google.com/go/firestore"
@@ -23,18 +24,6 @@ const (
 // timeout the leftovers stay for purge and terminal notification has already
 // fired (it is emitted before the sweep).
 const signalDedupeSweepTimeout = 30 * time.Second
-
-// sweepGuard re-validates, once per sweep page, that a purge still owns the
-// victim incarnation it is deleting (see purge.go). Nil disables the check;
-// the terminate path passes nil because the instance doc still exists there,
-// so no replacement incarnation can appear mid-sweep.
-//
-// The out-of-transaction check is a cheap early exit only. The load-bearing
-// fence for purge sweeps runs inside a transaction (see
-// deleteDocsByInstanceFenced): a standalone check outside the delete leaves
-// a gap where CreateInstance can recreate the ID before the delete commits,
-// and the delete would then remove the replacement's documents.
-type sweepGuard func(ctx context.Context) error
 
 // batchesNeeded reports how many sweep batches cover total rows at the given
 // batch size. It documents the chunking math behind the paged sweeps below
@@ -73,21 +62,37 @@ func chunkStrings(in []string, size int) [][]string {
 }
 
 // sweepTerminateDocs removes the mutable child documents of a terminated
-// instance in paged batches. The status flip already committed, so each batch
-// is an independent non-transactional commit. Dedupe cleanup deletes only
-// the pre-termination non-marker keys snapshotted inside the flip
-// transaction: post-terminal sends committing after the flip (marker plus
-// inbox event) are absent from the snapshot and survive, and markers present
-// in the snapshot itself are filtered out (Codex round 8 on #327: sweeping a
-// marker while its inbox event remains duplicates the next retry). Purge
-// reaps leftovers.
-func (b *Backend) sweepTerminateDocs(ctx context.Context, id string, dedupeSnapshot []string) error {
+// instance in transactionally fenced pages. The status flip already
+// committed, so each page is an independent commit — but every page still
+// re-validates the terminal fence (see below): a PurgeInstances that deletes
+// the terminal instance, clears its marker, and lets CreateInstance reuse
+// the ID while this sweep is paused must stop the resumed sweep before it
+// deletes the replacement's documents (Codex round 20 on #296). The fence
+// pins the pre-commit incarnation (id + created_at captured inside the flip
+// transaction); on mismatch the sweep aborts with a nil return and purge
+// owns the leftovers — leaked rows are always preferable to deleting a live
+// incarnation's documents. Dedupe cleanup deletes only the pre-termination
+// non-marker keys snapshotted inside the flip transaction: post-terminal
+// sends committing after the flip (marker plus inbox event) are absent from
+// the snapshot and survive, and markers present in the snapshot itself are
+// filtered out (Codex round 8 on #327: sweeping a marker while its inbox
+// event remains duplicates the next retry). Purge reaps leftovers.
+func (b *Backend) sweepTerminateDocs(ctx context.Context, id string, createdAt time.Time, dedupeSnapshot []string) error {
+	// The present-incarnation fence (see purgeFence): the sweep proceeds
+	// only while the instance doc still carries the created_at captured at
+	// the terminal commit. A missing doc (purge deleted it) or a different
+	// created_at (the ID was recreated after such a delete) aborts the
+	// sweep before it touches another incarnation's documents.
+	fence := purgeFence{victim: purgeVictim{id: id, createdAt: createdAt}}
 	for _, col := range []string{"wf_tasks", "wf_timers"} {
-		if err := b.deleteDocsByInstance(ctx, col, id, nil); err != nil {
+		if err := b.deleteDocsByInstanceFenced(ctx, col, fence); err != nil {
+			if errors.Is(err, errPurgeSuperseded) {
+				return nil
+			}
 			return err
 		}
 	}
-	return b.sweepSignalDedupeIDs(ctx, filterTerminateDedupeDocs(dedupeSnapshot, id))
+	return b.sweepSignalDedupeIDs(ctx, fence, filterTerminateDedupeDocs(dedupeSnapshot, id))
 }
 
 // filterTerminateDedupeDocs keeps only the pre-termination non-marker keys of
@@ -148,9 +153,10 @@ func listSignalDedupeIDsTx(tx *gcf.Transaction, col *gcf.CollectionRef, id strin
 	return out, nil
 }
 
-// sweepSignalDedupeIDs removes exactly the given dedupe documents in paged
-// batches. Called best-effort after terminal advancements commit with the
-// in-transaction snapshot from listSignalDedupeIDsTx.
+// sweepSignalDedupeIDs removes exactly the given dedupe documents in
+// transactionally fenced pages. Called best-effort after terminal
+// advancements commit with the in-transaction snapshot from
+// listSignalDedupeIDsTx.
 //
 // Keys are classified by transaction serialization order, not client
 // timestamps: a SendToInbox that captures created_at before the terminal
@@ -165,82 +171,64 @@ func listSignalDedupeIDsTx(tx *gcf.Transaction, col *gcf.CollectionRef, id strin
 // send committing after the snapshot read but before the terminal commit
 // lands is preserved for purge even though it logically predates the commit.
 //
+// Every page runs in one transaction that first re-validates the terminal
+// fence (the instance doc must still carry the pre-commit incarnation) and
+// then deletes the page: dedupe document IDs are deterministic
+// (instanceID + escaped DedupeID), so a replacement incarnation reusing the
+// ID after a purge can recreate the very same document. An unfenced
+// exact-key delete would then strip the replacement's live guard while its
+// inbox event remains, duplicating a later retry (Codex round 20 on #296).
+// The fence read and the deletes share the transaction's snapshot, so a
+// recreation is either invisible to both (only provably-old rows are
+// deleted) or visible to both (the fence trips and the page aborts). On a
+// tripped fence the sweep aborts with a nil return: purge owns the
+// leftovers.
+//
 // The sweep stays synchronous so a redelivered DedupeID inserts anew once
 // CommitAdvancements returns, but runs under a bounded context so a stuck
 // store delays only this cleanup, never the caller. Purge reaps leftovers.
-func (b *Backend) sweepSignalDedupeIDs(ctx context.Context, ids []string) error {
+func (b *Backend) sweepSignalDedupeIDs(ctx context.Context, fence purgeFence, ids []string) error {
 	for _, chunk := range chunkStrings(ids, firestoreSweepBatchSize) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		batch := b.client.Batch()
-		for _, docID := range chunk {
-			batch.Delete(b.ref("wf_signal_dedupe", docID))
+		chunk := chunk
+		err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+			if err := b.checkFenceTx(tx, fence); err != nil {
+				return err
+			}
+			// All reads precede all writes (Firestore transaction rule):
+			// the fence read above is the only read; the deletes follow.
+			for _, docID := range chunk {
+				if err := tx.Delete(b.ref("wf_signal_dedupe", docID)); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if errors.Is(err, errPurgeSuperseded) {
+			return nil
 		}
-		if _, err := batch.Commit(ctx); err != nil {
+		if err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// deleteDocsByInstance deletes every document in col with instance_id == id,
-// one Limit-sized batch commit at a time. The loop re-queries until a page
-// comes back empty, so arbitrarily many rows converge without ever buffering
-// them all or exceeding the write cap in one commit. Used only by the
-// terminate path, where the instance doc still exists (no ID reuse can
-// appear mid-sweep), so no fence is needed; purge sweeps use the
-// transactionally fenced deleteDocsByInstanceFenced instead.
-func (b *Backend) deleteDocsByInstance(ctx context.Context, col, id string, guard sweepGuard) error {
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if guard != nil {
-			if err := guard(ctx); err != nil {
-				return err
-			}
-		}
-		it := b.col(col).Where("instance_id", "==", id).Limit(firestoreSweepBatchSize).Documents(ctx)
-		batch := b.client.Batch()
-		n := 0
-		for {
-			dsnap, err := it.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				it.Stop()
-				return err
-			}
-			batch.Delete(dsnap.Ref)
-			n++
-		}
-		it.Stop()
-		if n == 0 {
-			return nil
-		}
-		if _, err := batch.Commit(ctx); err != nil {
-			return err
-		}
-		if n < firestoreSweepBatchSize {
-			return nil
-		}
-	}
-}
-
 // deleteDocsByInstanceFenced deletes every document in col with
 // instance_id == id in transactionally fenced pages: each page runs in one
-// Firestore transaction that first re-validates the purge fence against the
-// victim doc and then reads and deletes the page. The fence read and the
-// page query share the transaction's snapshot, so a CreateInstance that
-// recreates the ID is either invisible to both (only provably-old rows are
-// deleted) or visible to both (the fence trips and the page aborts before
-// deleting anything). A standalone guard checked outside the delete leaves
-// a gap where the recreation commits between check and delete, and the
-// delete would then corrupt the replacement — hence one transaction per
-// page instead of the non-transactional batches deleteDocsByInstance uses
-// for the (unfenced) terminate path.
+// Firestore transaction that first re-validates the incarnation fence
+// against the instance doc and then reads and deletes the page. The fence
+// read and the page query share the transaction's snapshot, so a
+// CreateInstance that recreates the ID is either invisible to both (only
+// provably-old rows are deleted) or visible to both (the fence trips and
+// the page aborts before deleting anything). A standalone check outside the
+// delete would leave a gap where the recreation commits between check and
+// delete, and the delete would then corrupt the replacement — hence one
+// transaction per page. Purge sweeps arm the fence with their listed victim
+// (see purgeInstanceDocs); terminal sweeps arm it with the pre-commit
+// incarnation (see sweepTerminateDocs).
 //
 // The transaction function is idempotent (fence re-read, page re-query,
 // same deletes) so Firestore's internal retries on contention are safe.

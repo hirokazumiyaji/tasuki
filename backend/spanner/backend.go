@@ -257,15 +257,18 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	// next retry re-inserted a duplicate). Markers in the snapshot itself are
 	// filtered out as well; purge reaps leftovers.
 	var dedupeSnapshot []string
+	var createdAt time.Time
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"id"})
+		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"created_at"})
 		if err != nil {
 			if isNotFound(err) {
 				return backend.ErrNotFound
 			}
 			return err
 		}
-		_ = row
+		if err := row.Columns(&createdAt); err != nil {
+			return err
+		}
 		ids, err := querySignalDedupeIDsTx(ctx, txn, id)
 		if err != nil {
 			return err
@@ -285,12 +288,15 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	}
 	// Await the sweep before returning so previously seen DedupeIDs insert
 	// anew and claimed tasks observe no leftovers. Terminal instances are
-	// immutable, so the paged sweep cannot race with advancement commits;
-	// purge reaps anything left by a failed sweep.
+	// immutable, so the sweep cannot race with advancement commits — but it
+	// can race with a purge that deletes the instance and lets CreateInstance
+	// reuse the ID, which the incarnation fence aborts on (see
+	// sweepTerminateDocs); purge reaps anything left by a failed or fenced
+	// sweep.
 	// The status flip above already committed, so subscribers must wake even
 	// when the sweep fails: GetInstance permanently reports terminated while
 	// a skipped notifyTerminal would leave waiters asleep until a retry.
-	if err := b.sweepTerminateDocs(ctx, id, dedupeSnapshot); err != nil {
+	if err := b.sweepTerminateDocs(ctx, id, createdAt, dedupeSnapshot); err != nil {
 		b.notifyTerminal(id)
 		return err
 	}
@@ -685,11 +691,14 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	// duplicate of a promised post-terminal event). Keys created after the
 	// snapshot read stay for purge. The sweep itself still runs after the
 	// commit so the mutation count never scales with accumulated keys.
-	var snapshots map[string][]string
+	// The pre-commit incarnation is captured alongside for the sweep fence
+	// (see terminalSweep): a purge plus ID reuse interleaved with the sweep
+	// aborts it instead of deleting the replacement's recreated guard.
+	var snapshots map[string]terminalSweep
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		// Reset per attempt: the transaction function may run more than
 		// once, and only the committing attempt's reads classify the sweep.
-		snapshots = make(map[string][]string, len(advs))
+		snapshots = make(map[string]terminalSweep, len(advs))
 		for _, adv := range advs {
 			if adv.Terminal != nil {
 				if _, ok := snapshots[adv.InstanceID]; !ok {
@@ -697,7 +706,11 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 					if err != nil {
 						return err
 					}
-					snapshots[adv.InstanceID] = ids
+					createdAt, err := queryInstanceCreatedAtTx(ctx, txn, adv.InstanceID)
+					if err != nil {
+						return err
+					}
+					snapshots[adv.InstanceID] = terminalSweep{createdAt: createdAt, dedupeIDs: ids}
 				}
 			}
 			if err := b.commitAdvancementTxn(ctx, txn, adv); err != nil {
@@ -736,12 +749,22 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			// Only keys snapshotted before the commit are removed: a
 			// concurrent SendToInbox with a new DedupeID can land after
 			// notifyTerminal fired above, and sweeping its key while the
-			// inbox event remains would duplicate a later retry. The sweep
+			// inbox event remains would duplicate a later retry. Every page
+			// re-validates the pre-commit incarnation: a purge plus ID
+			// reuse interleaved with the sweep aborts it instead of
+			// deleting the replacement's recreated guard (see
+			// sweepSignalDedupeIDs); purge owns the leftovers. The sweep
 			// stays synchronous so a redelivered DedupeID inserts anew once
 			// this call returns, but runs under a bounded context so a
 			// stuck store delays only this cleanup, never the caller.
 			cctx, cancel := context.WithTimeout(context.Background(), signalDedupeSweepTimeout)
-			_ = b.sweepSignalDedupeIDs(cctx, adv.InstanceID, nil, snapshots[adv.InstanceID])
+			sw := snapshots[adv.InstanceID]
+			victim := purgeVictim{id: adv.InstanceID, createdAt: sw.createdAt}
+			guard := func(ctx context.Context) error { return b.checkPurgeVictim(ctx, victim) }
+			guardTx := func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+				return b.checkPurgeVictimTx(ctx, txn, victim)
+			}
+			_ = b.sweepSignalDedupeIDs(cctx, adv.InstanceID, guard, guardTx, sw.dedupeIDs)
 			cancel()
 		}
 	}
