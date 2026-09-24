@@ -359,11 +359,44 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 		// of applying a stale batch by ID/sequence after a peer
 		// reclaim. See guardedDetachedBatchCommit.
 		bctx, bcancel := context.WithCancel(ctx)
-		err := w.guardedDetachedBatchCommit(gated, bcancel, func() error {
+		committed, lost, err := w.guardedDetachedBatchCommit(gated, bcancel, func() error {
 			return batcher.CommitAdvancements(bctx, advs)
 		})
 		bcancel()
 		if err != nil {
+			if errors.Is(err, errBatchMemberLost) {
+				// Partial batch success (round-26 P1b): the store
+				// applied the batch, but members in lost lost
+				// their guards mid-call (cover failure or expired
+				// continuity) and may have been reclaimed by a
+				// peer mid-write. Committed members really
+				// committed: end their guards and apply sticky
+				// exactly like the all-live path below. Lost
+				// members are NOT marked committed: no sticky,
+				// and the per-item fallback re-gates each one —
+				// its gate finds the missing/expired guard and
+				// skips the store op — instead of treating the
+				// stale apply as success. Legacy batch members
+				// carry no guard and were applied with the
+				// batch, so they keep the success handling. No
+				// store error is recorded: the batch op itself
+				// succeeded; the loss is fencing, debug-logged
+				// like the per-item errLeaseLost path.
+				w.opts.Logger.Debug("marking batch members failed after mid-call lease loss",
+					"committed", len(committed), "lost", len(lost))
+				for _, g := range committed {
+					g.committing.Store(false)
+					w.endFlushGuard(g.task.ID, g.p.tok)
+					w.applyStickyAfterCommit(g.p.instanceID, g.p.baseJournal, g.p.adv)
+				}
+				for _, p := range legacy {
+					w.applyStickyAfterCommit(p.instanceID, p.baseJournal, p.adv)
+				}
+				for _, g := range lost {
+					commitOne(g)
+				}
+				return
+			}
 			if errors.Is(err, errLeaseLost) {
 				// Fencing rejection, not a backend failure: the
 				// aggregate gate refused the batch before any store
@@ -398,7 +431,7 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 		// Batch applied atomically: end every guard (drop + stop its
 		// cover, mirroring guardedDetachedCommit's post-op cleanup) and
 		// apply sticky for all members.
-		for _, g := range gated {
+		for _, g := range committed {
 			g.committing.Store(false)
 			w.endFlushGuard(g.task.ID, g.p.tok)
 			w.applyStickyAfterCommit(g.p.instanceID, g.p.baseJournal, g.p.adv)
@@ -417,6 +450,17 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 		}
 	}
 }
+
+// errBatchMemberLost marks a batch advancement store op that APPLIED
+// (returned nil) while at least one member had lost its guard mid-call
+// (round-26 P1b). Unlike errLeaseLost — which aborts BEFORE any store op
+// runs — the batch already wrote: members that kept their guards committed
+// and must keep their result (the caller ends their guards and applies
+// sticky), while members that lost theirs must NOT be treated as committed
+// (no sticky; the caller's per-item fallback re-gates and skips their store
+// op). It is fencing, not a backend failure: like errLeaseLost it is
+// debug-logged, never recorded as a store error.
+var errBatchMemberLost = errors.New("tasuki: batch applied while a member lost its lease; member not committed")
 
 // guardedDetachedBatchCommit runs one batched advancement store op under
 // an aggregate detached-commit gate (round-24 P1). The batch fast path in
@@ -438,16 +482,29 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 // context-aware backend op — the cancel is best-effort, as in the
 // single-item path: a backend that ignores it still applies, and the
 // fallback re-gate remains the backstop. The stash is cleared on return:
-// on success the guards are dropped (the caller ends them via
-// endFlushGuard and applies sticky), on error they are kept so the
-// fallback can re-gate.
+// on error the guards stay so the per-item fallback re-gates each member.
+//
+// A successful op is RECHECKED member-by-member before the caller treats
+// anyone as committed (round-26 P1b): a cover renewal that tripped a
+// member's guard — or a continuity deadline that passed — while op() was
+// blocked only cancels the shared batch context, so a context-ignoring
+// batcher still applies the stale batch and returns nil. Without the
+// recheck the caller would mark every member committed even though a peer
+// may have reclaimed one mid-call. Members that kept a valid guard are
+// returned as committed (the caller ends their guards and applies sticky,
+// as on the all-live path); members that lost theirs are returned as lost
+// with errBatchMemberLost (the caller applies no sticky for them and runs
+// the per-item fallback, which re-gates and skips their store op). The
+// stale write itself cannot be undone — the recheck bounds the aftermath
+// (no committed marking, no sticky, no double apply) instead of
+// pretending the batch was clean.
 //
 // Advancements are row-deleting writes (like Complete/fail with
 // exclusive=false above): no writing hold and no pre-write cover join —
 // a cover renewal landing after the batch finds no rows, while one
 // running during a blocked batch must still observe loss and cancel it
 // mid-call.
-func (w *Worker) guardedDetachedBatchCommit(gated []flushGuardedCommit, commitCancel context.CancelFunc, op func() error) error {
+func (w *Worker) guardedDetachedBatchCommit(gated []flushGuardedCommit, commitCancel context.CancelFunc, op func() error) (committed, lost []flushGuardedCommit, err error) {
 	w.detMu.Lock()
 	for _, g := range gated {
 		gd, ok := w.detGuard[g.task.ID]
@@ -455,7 +512,7 @@ func (w *Worker) guardedDetachedBatchCommit(gated []flushGuardedCommit, commitCa
 			w.detMu.Unlock()
 			w.opts.Logger.Debug("skipping detached batch commit; lease lost since the pre-commit renewal",
 				"task_id", g.task.ID)
-			return fmt.Errorf("%w: detached batch gate found lease lost", errLeaseLost)
+			return nil, nil, fmt.Errorf("%w: detached batch gate found lease lost", errLeaseLost)
 		}
 		if !time.Now().Before(gd.deadline) {
 			coverCancel := gd.coverCancel
@@ -466,7 +523,7 @@ func (w *Worker) guardedDetachedBatchCommit(gated []flushGuardedCommit, commitCa
 			}
 			w.opts.Logger.Debug("skipping detached batch commit; continuity deadline passed before the store op",
 				"task_id", g.task.ID)
-			return fmt.Errorf("%w: detached batch gate found lease expired", errLeaseLost)
+			return nil, nil, fmt.Errorf("%w: detached batch gate found lease expired", errLeaseLost)
 		}
 	}
 	for _, g := range gated {
@@ -475,10 +532,9 @@ func (w *Worker) guardedDetachedBatchCommit(gated []flushGuardedCommit, commitCa
 		w.detGuard[g.task.ID] = gd
 	}
 	w.detMu.Unlock()
-	err := op()
+	err = op()
 	// Clear the stashed cancel on every path so a later trip cannot
-	// cancel an unrelated context. On success the caller drops the
-	// guards (see endFlushGuard); on error the guards stay so the
+	// cancel an unrelated context. On error the guards stay so the
 	// per-item fallback re-gates each member.
 	w.detMu.Lock()
 	for _, g := range gated {
@@ -487,8 +543,47 @@ func (w *Worker) guardedDetachedBatchCommit(gated []flushGuardedCommit, commitCa
 			w.detGuard[g.task.ID] = gd
 		}
 	}
+	if err != nil {
+		w.detMu.Unlock()
+		return nil, nil, err
+	}
+	// Post-op recheck (round-26 P1b, see the doc comment): classify every
+	// member while still holding detMu so a trip racing the return is
+	// observed, not missed. Members whose guard survived the call
+	// committed with it; members whose guard is gone — or whose
+	// continuity deadline passed mid-call — did not, even though the
+	// batch applied. An expired-but-present member is dropped with its
+	// cover canceled here, mirroring the pre-call stale-deadline
+	// rejection; a tripped member's guard is already gone.
+	now := time.Now()
+	var live, failed []flushGuardedCommit
+	var coverCancels []context.CancelFunc
+	for _, g := range gated {
+		gd, ok := w.detGuard[g.task.ID]
+		if !ok || gd.epoch != g.p.tok.epoch || gd.seq != g.p.tok.seq {
+			failed = append(failed, g)
+			continue
+		}
+		if !now.Before(gd.deadline) {
+			coverCancels = append(coverCancels, gd.coverCancel)
+			delete(w.detGuard, g.task.ID)
+			failed = append(failed, g)
+			continue
+		}
+		live = append(live, g)
+	}
 	w.detMu.Unlock()
-	return err
+	for _, cancel := range coverCancels {
+		if cancel != nil {
+			cancel()
+		}
+	}
+	if len(failed) > 0 {
+		w.opts.Logger.Debug("detached batch applied while members lost their lease; treating them as failed",
+			"committed", len(live), "lost", len(failed))
+		return live, failed, errBatchMemberLost
+	}
+	return live, nil, nil
 }
 
 // startFlushCover keeps every gated flush entry's lease live until the
@@ -558,7 +653,13 @@ func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit
 	var initWg sync.WaitGroup
 	for i, g := range gated {
 		initWg.Add(1)
-		go func(i int, taskID int64, tok claimToken) {
+		// Snapshot the continuity deadline for the stale-call fence
+		// below (round-26 P1a): the guard is seeded by
+		// beginDetachedCommit from the entry's local lease-expiry
+		// estimate, and no success has refreshed it yet, so this is
+		// the instant past which the local lease is considered
+		// expired.
+		go func(i int, g flushGuardedCommit, leaseExpiry time.Time) {
 			defer initWg.Done()
 			// Renew immediately instead of waiting for the first tick:
 			// the turn may have consumed most of its lease, and the
@@ -566,12 +667,25 @@ func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit
 			// for the first renewal). Waiting would let a peer
 			// reclaim the still-committing task mid-commit (same
 			// reasoning as renewUntilDone's immediate renewal).
-			if err := w.renewOnceDetached(ctx, taskID, tok); err != nil {
-				w.tripDetachedGuard(taskID, tok)
+			if err := w.renewOnceDetached(ctx, g.task.ID, g.p.tok); err != nil {
+				w.tripDetachedGuard(g.task.ID, g.p.tok)
+				// Fence the survived call (round-26 P1a, see
+				// compensateStaleCoverRenewal): when the commit
+				// context expires while this renewal is still
+				// blocked in a context-ignoring backend, the
+				// bounded join below trips the guard and lets the
+				// flush return with the call still in flight. Its
+				// result is already dropped (a missing guard
+				// reports loss without refreshing, see
+				// renewOnceDetached), but its backend-side ID-only
+				// write may still land afterwards and re-hide the
+				// task for a full lease with no renewal loop left
+				// to own it.
+				w.compensateStaleCoverRenewal(ctx, g.task, leaseExpiry)
 				return
 			}
 			covered[i].Store(true)
-		}(i, g.task.ID, g.p.tok)
+		}(i, g, w.detGuardDeadline(g.task.ID, g.p.tok))
 	}
 	// Bounded join (round-25 P1): the pre-fix initWg.Wait held the flush
 	// past CommitTimeout when ExtendLease stalled in a context-ignoring
@@ -582,7 +696,11 @@ func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit
 	// entry is tripped so its gate skips without touching the store —
 	// continuity was never proven — and a late renewal landing after the
 	// trip finds the missing guard and reports loss without refreshing
-	// (see renewOnceDetached), so it cannot resurrect the entry.
+	// (see renewOnceDetached), so it cannot resurrect the entry. A late
+	// backend-side landing is fenced separately: the Phase 1 wrapper
+	// issues a token-fenced compensation release when the local lease
+	// already expired (see compensateStaleCoverRenewal), so the survived
+	// call cannot re-hide the task past return (round-26 P1a).
 	initDone := make(chan struct{})
 	go func() {
 		initWg.Wait()
@@ -665,6 +783,64 @@ func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit
 			w.dropDetachedGuard(g.task.ID, g.p.tok)
 		}
 	}
+}
+
+// detGuardDeadline reports the continuity deadline of taskID's detached
+// guard when it still carries tok, or the zero time when the guard is
+// missing or superseded. Callers snapshot it to fence a renewal that may
+// still be in flight after the guard is gone (see
+// compensateStaleCoverRenewal).
+func (w *Worker) detGuardDeadline(taskID int64, tok claimToken) time.Time {
+	w.detMu.Lock()
+	defer w.detMu.Unlock()
+	if gd, ok := w.detGuard[taskID]; ok && gd.epoch == tok.epoch && gd.seq == tok.seq {
+		return gd.deadline
+	}
+	return time.Time{}
+}
+
+// compensateStaleCoverRenewal fences a detached cover renewal whose call
+// survived its guard's teardown (round-26 P1a). When the flush commit
+// context expires while an initial renewal is still blocked in a
+// context-ignoring backend, the bounded Phase 1 join trips the guard and
+// lets the flush return with the backend call still in flight: its result
+// is dropped on return (see renewOnceDetached), but the ID-only ExtendLease
+// may still land afterwards. Landing on our own expired lease re-hides the
+// task for a full lease with no renewal loop left to own it, delaying peer
+// reclaim until the extension lapses.
+//
+// When the local lease estimate already expired, this issues a best-effort
+// token-fenced ReleaseLease undoing such an extension so the task becomes
+// reclaimable promptly instead. The fence (worker + attempt, plus
+// kind/instance routing) keeps it safe: a peer that reclaimed the task in
+// the meantime holds a new attempt, so the stale release is rejected with
+// ErrNotFound and the peer's fresh lease is never disturbed; a deleted
+// (committed) row reports ErrNotFound the same way. Both rejections are
+// quiet. While the lease still looks live nothing is issued: an extension
+// that landed (or lands) is on our own live lease, and releasing it early
+// would hand a task no peer has claimed to a third worker while this
+// flush's successors may still reference it.
+//
+// Like the other fencing paths this is debug-logged, never recorded as a
+// store error: a routine teardown race must not raise backend-error alerts.
+func (w *Worker) compensateStaleCoverRenewal(ctx context.Context, task backend.Task, leaseExpiry time.Time) {
+	if leaseExpiry.IsZero() || time.Now().Before(leaseExpiry) {
+		return
+	}
+	relCtx, cancel := w.releaseContext(ctx)
+	defer cancel()
+	if err := w.backend.ReleaseLease(relCtx, task); err != nil {
+		if errors.Is(err, backend.ErrNotFound) {
+			w.opts.Logger.Debug("stale cover renewal compensation skipped; lease already moved on",
+				"task_id", task.ID)
+			return
+		}
+		w.opts.Logger.Debug("stale cover renewal compensation release failed",
+			"task_id", task.ID, "err", err)
+		return
+	}
+	w.opts.Logger.Debug("released lease after stale cover renewal; task reclaimable",
+		"task_id", task.ID)
 }
 
 // endFlushGuard applies guardedDetachedCommit's post-op cleanup for one
