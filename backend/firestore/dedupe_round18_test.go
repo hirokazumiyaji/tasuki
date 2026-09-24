@@ -109,10 +109,16 @@ func TestPickDedupeGuardTarget(t *testing.T) {
 	// physically but never matches the requested ID, so it blocks only the
 	// framing it occupies (round-25 P2: it must not veto the other framing).
 	foreignRow := map[string]any{"instance_id": "other", "dedupe_id": "other"}
-	t.Run("all free prefers framed canonical", func(t *testing.T) {
+	t.Run("all free prefers framed fallback for ambiguous IDs", func(t *testing.T) {
+		// Round-28 P1 on #296: "__x" is ambiguously encoded (canonical
+		// "____x" aliases another ID's verbatim probe key), so the
+		// canonical slots are ineligible and the guard goes to the framed
+		// fallback with v2 even with everything free. Non-ambiguous IDs
+		// keep the canonical-first order (see
+		// TestFramedGuardSurvivesLegacyCollision).
 		got, ok := pickDedupeGuardTarget(inst, "__x", canon, fallback, freeProbe(), freeProbe(), map[string]bool{})
-		if !ok || got.docID != frameDedupeDocID(inst, canon) || got.ver != int64(dedupeFormatVersion) {
-			t.Fatalf("got %+v %v, want framed canonical v1", got, ok)
+		if !ok || got.docID != frameDedupeDocID(inst, fallback) || got.ver != int64(dedupeFormatRawKeyVersion) {
+			t.Fatalf("got %+v %v, want framed fallback v2 (canonical ineligible for ambiguous IDs)", got, ok)
 		}
 	})
 	t.Run("occupied canonical falls back to framed fallback", func(t *testing.T) {
@@ -136,16 +142,18 @@ func TestPickDedupeGuardTarget(t *testing.T) {
 			t.Fatalf("got %+v %v, want framed fallback v2", got, ok)
 		}
 	})
-	t.Run("foreign legacy does not veto the framed canonical", func(t *testing.T) {
-		// Round-25 P2 regression: the legacy leg holds another key's row
-		// (same instance, different stored key), so the free framed slot
-		// remains usable. Old code required both legs free and created no
-		// guard here, leaving every retry unguarded.
+	t.Run("foreign legacy does not veto the framed fallback", func(t *testing.T) {
+		// Round-25 P2 regression, re-anchored round-28 P1 on #296: the
+		// legacy leg holds another key's row (same instance, different
+		// stored key), so the free framed slot remains usable — and since
+		// "__x" is ambiguously encoded, that usable slot is the framed
+		// fallback, not the canonical doc. Old code required both legs
+		// free and created no guard here, leaving every retry unguarded.
 		foreignLegacy := map[string]any{"instance_id": inst, "dedupe_id": "other", dedupeFormatVersionField: int64(1)}
 		canonProbe := probeWith(nil, foreignLegacy)
 		got, ok := pickDedupeGuardTarget(inst, "__x", canon, fallback, canonProbe, freeProbe(), map[string]bool{})
-		if !ok || got.docID != frameDedupeDocID(inst, canon) || got.ver != int64(dedupeFormatVersion) {
-			t.Fatalf("got %+v %v, want framed canonical v1 (foreign legacy must not veto)", got, ok)
+		if !ok || got.docID != frameDedupeDocID(inst, fallback) || got.ver != int64(dedupeFormatRawKeyVersion) {
+			t.Fatalf("got %+v %v, want framed fallback v2 (foreign legacy must not veto)", got, ok)
 		}
 	})
 	t.Run("foreign-occupied framed short ID creates at legacy framing", func(t *testing.T) {

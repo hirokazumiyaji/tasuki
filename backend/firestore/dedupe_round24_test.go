@@ -37,14 +37,21 @@ func TestDualDedupeGuardDocCoversOldReader(t *testing.T) {
 		// Old-format reader simulation: it reads ONLY the raw legacy doc ID
 		// (never the framed form, never the encoded key's legacy doc) and
 		// validates ownership + version. Both rows must match the
-		// requested ID identically.
+		// requested ID identically. The framed row is simulated at the
+		// TARGET's key (round-28 P1 on #296: ambiguously-encoded IDs guard
+		// at the framed fallback, not the canonical doc — the stored
+		// canonical form is unchanged, only the locating candidate moves).
 		framedRow := map[string]any{"instance_id": inst, "dedupe_id": canon, dedupeFormatVersionField: target.ver}
 		legacyRow := map[string]any{"instance_id": inst, "dedupe_id": canon, dedupeFormatVersionField: dual.ver}
 		if !docInstanceMatches(legacyRow, inst) || !matchDedupeRow(dedupe, dedupe, legacyRow) {
 			t.Fatalf("%q: old-format reader misses the raw legacy duplicate", dedupe)
 		}
-		if !docInstanceMatches(framedRow, inst) || !matchDedupeRow(dedupe, canon, framedRow) {
-			t.Fatalf("%q: new reader misses the framed primary", dedupe)
+		framedKey := canon
+		if target.docID == frameDedupeDocID(inst, fallback) {
+			framedKey = fallback
+		}
+		if !docInstanceMatches(framedRow, inst) || !matchDedupeRow(dedupe, framedKey, framedRow) {
+			t.Fatalf("%q: new reader misses the framed guard", dedupe)
 		}
 		// Fail-without-fix pin: the framed-only write of the old code is
 		// invisible at the raw legacy doc ID by construction (distinct IDs

@@ -1300,9 +1300,12 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	// 100*3+1=301 mutations, far below the 20,000-mutation commit limit, and
 	// composite (instance_id, dedupe_id) keys never alias across IDs, so no
 	// FRAMING dual-write is needed (cf. Firestore's framed/legacy doc IDs).
-	// The RAW-escape compat leg (rawCompatGuardKey, Codex round-26 P1 on
-	// #296, extended to the terminal path in round-27) IS written on both
-	// paths: old nodes probe the verbatim key.
+	// Old-node visibility comes from the guards' keys themselves, not a
+	// second leg: ambiguously-encoded IDs guard solely at the fallback key
+	// (the raw verbatim key for short IDs — exactly what old nodes probe),
+	// and identity-encoded IDs store verbatim anyway (Codex round-28 P1 on
+	// #296, superseding the round-26/27 raw compat leg, which always
+	// duplicated the sole guard or exceeded the key budget).
 	var inserted int
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		// Stamp inside the transaction (per attempt): a transaction that
@@ -1409,8 +1412,9 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					}))
 					baseExists := false
 					canonicalOccupied := false
-					rawOccupied := false
 					canonKey := escapeDedupeID(it.DedupeID)
+					fallbackKey := rawFallbackDedupeKey(it.DedupeID)
+					fallbackOccupied := false
 					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 						if isPostTerminalMarkerKey(bk) {
 							continue
@@ -1425,8 +1429,8 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						if bk == canonKey {
 							canonicalOccupied = true
 						}
-						if bk == it.DedupeID {
-							rawOccupied = true
+						if bk == fallbackKey {
+							fallbackOccupied = true
 						}
 						if !owned {
 							continue
@@ -1444,7 +1448,37 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					if reservedGuardKeys[canonKey] {
 						canonicalOccupied = true
 					}
-					if baseExists || canonicalOccupied {
+					if reservedGuardKeys[fallbackKey] {
+						fallbackOccupied = true
+					}
+					if canonKey != it.DedupeID {
+						// Ambiguously-encoded ID (Codex round-28 P1 on #296):
+						// the escaped base guard would sit at another ID's
+						// verbatim probe key, where a pre-upgrade node
+						// mistakes it for its own guard and silently drops
+						// that ID's first send. Guard solely at the fallback
+						// key instead (see soleAmbiguousGuardKey, same shape
+						// as the running path above); an occupied fallback
+						// degrades to marker-only like the occupied case
+						// below. No round-27 raw leg rides along — short: it
+						// would duplicate the primary; long: over budget.
+						if baseExists || fallbackOccupied {
+							created[it.DedupeID] = true
+						} else if key, ver, ok := soleAmbiguousGuardKey(it.DedupeID, fallbackKey, false, reservedGuardKeys); ok {
+							reservedGuardKeys[key] = true
+							m := map[string]any{
+								"instance_id": instanceID, "dedupe_id": key, "created_at": now,
+							}
+							if ver >= dedupeFormatRawKeyVersion {
+								m[dedupeFormatVersionColumn] = ver
+								m[dedupeFallbackOwnerColumn] = escapeDedupeID(it.DedupeID)
+							}
+							muts = append(muts, spanner.InsertMap("wf_signal_dedupe", m))
+							created[it.DedupeID] = true
+						} else {
+							created[it.DedupeID] = true
+						}
+					} else if baseExists || canonicalOccupied {
 						created[it.DedupeID] = true
 					} else {
 						reservedGuardKeys[canonKey] = true
@@ -1452,19 +1486,6 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 							"instance_id": instanceID, "dedupe_id": canonKey,
 							dedupeFormatVersionColumn: dedupeFormatVersion, "created_at": now,
 						}))
-						// Rolling-upgrade compat, same as the running path
-						// below (Codex round-27 P1 on #296): the terminal base
-						// guard above is stored escaped, so without the raw
-						// legacy leg an old-node retry probing the verbatim
-						// key misses and duplicates. The round-26 fix covered
-						// only the running path; the terminal path wrote the
-						// escaped primary alone.
-						if raw, ok := rawCompatGuardKey(it.DedupeID, canonKey, rawOccupied, reservedGuardKeys); ok {
-							reservedGuardKeys[raw] = true
-							muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-								"instance_id": instanceID, "dedupe_id": raw, "created_at": now,
-							}))
-						}
 						created[it.DedupeID] = true
 					}
 				} else {
@@ -1485,7 +1506,6 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					canonicalOccupied := false
 					fallbackKey := rawFallbackDedupeKey(it.DedupeID)
 					fallbackOccupied := false
-					rawOccupied := false
 					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 						stored, owner, version, owned, ok, err := readDedupeRow(ctx, txn, instanceID, bk)
 						if err != nil {
@@ -1499,9 +1519,6 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						}
 						if bk == fallbackKey {
 							fallbackOccupied = true
-						}
-						if bk == it.DedupeID {
-							rawOccupied = true
 						}
 						if !owned {
 							continue
@@ -1532,7 +1549,61 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					// deterministically. Only when no key is free does the
 					// event insert unguarded (duplicate-never-drop).
 					canonKey := dedupeKey(it.DedupeID)
-					if key, ver, ok := pickSpannerDedupeInsert(canonKey, fallbackKey, canonicalOccupied, fallbackOccupied, reservedGuardKeys); ok {
+					if canonKey != it.DedupeID {
+						// Ambiguously-encoded ID (Codex round-28 P1 on #296):
+						// a canonical row at escapeDedupeID(X) would sit at
+						// another ID's verbatim probe key, where a
+						// pre-upgrade node (existence-only probes, no
+						// version metadata) mistakes it for its own guard
+						// and silently drops that ID's first send. The sole
+						// guard lives at the fallback key instead (see
+						// soleAmbiguousGuardKey): no other ID probes that
+						// key as anything but X's own raw/fallback
+						// candidate, and when it matches it matches only X
+						// (legacy exact-raw rule for short IDs, owner-gated
+						// v2 rule for over-budget IDs). No canonical row and
+						// no round-26 raw leg ride along — short: the leg
+						// would duplicate the primary; long: the raw form is
+						// over budget. Fallback occupied/reserved degrades
+						// to an unguarded insert (duplicate-never-drop),
+						// same as pickSpannerDedupeInsert's ok=false below.
+						if key, ver, ok := soleAmbiguousGuardKey(it.DedupeID, fallbackKey, fallbackOccupied, reservedGuardKeys); ok {
+							reservedGuardKeys[key] = true
+							m := map[string]any{
+								"instance_id": instanceID, "dedupe_id": key, "created_at": now,
+							}
+							if ver >= dedupeFormatRawKeyVersion {
+								m[dedupeFormatVersionColumn] = ver
+								m[dedupeFallbackOwnerColumn] = escapeDedupeID(it.DedupeID)
+							}
+							muts = append(muts, spanner.InsertMap("wf_signal_dedupe", m))
+						} else if fallbackOccupied && !reservedGuardKeys[fallbackKey] && !canonicalOccupied && !reservedGuardKeys[canonKey] {
+							// Last resort (round-17 preservation): the fallback
+							// key is foreign-occupied by a committed row —
+							// reachable only for over-budget IDs (for short
+							// IDs every occupant matches its own key, so an
+							// unmatched occupant is impossible and short IDs
+							// never land here). Without a guard every retry
+							// of X would insert unguarded forever, so the
+							// canonical v1 row keeps a permanent guard for
+							// current readers (ownership rules stop foreign
+							// IDs from claiming it). Pre-upgrade nodes
+							// probing escape(X) verbatim may mistake it
+							// during the rollout window — the round-28
+							// residual, now confined to hash-shaped third
+							// IDs — while the "__x"/"____x" natural pair
+							// stays fully isolated (short IDs only ever
+							// write the sole guard above).
+							reservedGuardKeys[canonKey] = true
+							muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
+								"instance_id": instanceID, "dedupe_id": canonKey,
+								dedupeFormatVersionColumn: dedupeFormatVersion, "created_at": now,
+							}))
+						}
+						// else: batch-reserved or fully occupied — insert
+						// unguarded (duplicate-never-drop), same as
+						// pickSpannerDedupeInsert's ok=false below.
+					} else if key, ver, ok := pickSpannerDedupeInsert(canonKey, fallbackKey, canonicalOccupied, fallbackOccupied, reservedGuardKeys); ok {
 						reservedGuardKeys[key] = true
 						m := map[string]any{
 							"instance_id": instanceID, "dedupe_id": key,
@@ -1542,23 +1613,6 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 							m[dedupeFallbackOwnerColumn] = escapeDedupeID(it.DedupeID)
 						}
 						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", m))
-						// Rolling-upgrade compat (Codex round-26 P1 on #296):
-						// nodes predating the escape probe the RAW verbatim
-						// key, so a new-node send of "__x" (stored as
-						// "____x") is invisible to an old-node retry probing
-						// "__x" — a miss followed by a duplicate. Write the
-						// raw legacy form as a second guard leg (see
-						// rawCompatGuardKey): legacy-shaped (no version,
-						// stored raw) so both verbatim-era readers
-						// (stored == raw) and current readers (legacy rule)
-						// match it, while no other ID's probe can claim it
-						// (the key itself differs).
-						if raw, ok := rawCompatGuardKey(it.DedupeID, key, rawOccupied, reservedGuardKeys); ok {
-							reservedGuardKeys[raw] = true
-							muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-								"instance_id": instanceID, "dedupe_id": raw, "created_at": now,
-							}))
-						}
 					}
 					created[it.DedupeID] = true
 				}

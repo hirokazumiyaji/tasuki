@@ -555,6 +555,20 @@ func pickDedupeGuardTarget(instanceID, requestedRaw, canonicalKey, fallbackKey s
 		!canonProbe.framedFree && canonProbe.legacyFree,
 		!fbProbe.framedFree && fbProbe.legacyFree,
 	}
+	if canonicalKey != requestedRaw {
+		// Ambiguously-encoded ID (Codex round-28 P1 on #296): the requested
+		// ID differs from its canonical escapeDedupeID form ("__"-prefixed
+		// short IDs and every over-budget ID), so a canonical guard doc
+		// would sit at another ID's verbatim probe key, where a pre-upgrade
+		// node (existence-only probes under either framing) mistakes it for
+		// its own guard and silently drops that ID's first send. Only the
+		// fallback slots stay eligible: the framed fallback still dual-writes
+		// its raw legacy leg for old readers (see dualDedupeGuardDoc), and a
+		// legacy-framed fallback is visible to them directly. Probes resolve
+		// every fallback shape (see matchOwnedDedupeRow), so retries keep
+		// deduping and no new row shape is introduced.
+		free[0], free[2] = false, false
+	}
 	for i, c := range cands {
 		if !free[i] || reserved[c.docID] {
 			continue

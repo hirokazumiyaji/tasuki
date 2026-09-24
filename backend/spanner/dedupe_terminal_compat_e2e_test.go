@@ -13,14 +13,16 @@ import (
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
-// TestCompatRawLegTerminalEndToEnd is the round-27 P1 emulator regression
-// test on #296: a new-node TERMINAL send of "__x" must leave, besides the
-// escaped "____x" base guard, a raw legacy "__x" row so an old-node retry
-// probing only the verbatim key hits. The round-26 fix dual-wrote the raw
-// leg on the running path only; the terminal path wrote the escaped primary
-// alone (miss, then duplicate on old-node retry).
-// Fail-without-fix: the pre-fix terminal write is escaped-only, so the raw
-// ReadRow below is NotFound.
+// TestCompatRawLegTerminalEndToEnd is the round-28 P1 emulator regression
+// test on #296 (successor to the round-27 terminal dual-write test): a
+// new-node TERMINAL send of "__x" must guard SOLELY with the raw legacy
+// "__x" base row and leave NO escaped "____x" row behind — the same
+// old-reader isolation as the running path. The round-27 fix dual-wrote the
+// raw leg on the terminal path but kept the escaped primary, which a
+// pre-upgrade node handling the distinct first send DedupeID="____x" still
+// mistakes for its own guard, silently dropping the event.
+// Fail-without-fix: the pre-fix terminal write emits the escaped base
+// guard, so the "____x must be absent" ReadRow below finds it.
 func TestCompatRawLegTerminalEndToEnd(t *testing.T) {
 	dsn := dsnOrSkip(t)
 	ctx := context.Background()
@@ -48,21 +50,21 @@ func TestCompatRawLegTerminalEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	// Escaped primary exists.
-	if _, err := raw.Single().ReadRow(ctx, "wf_signal_dedupe", spanner.Key{inst, "____x"}, []string{"dedupe_id"}); err != nil {
-		t.Fatalf("terminal escaped primary (____x) missing: %v", err)
+	// No escaped base guard: an old node probing "____x" verbatim must miss.
+	if _, err := raw.Single().ReadRow(ctx, "wf_signal_dedupe", spanner.Key{inst, "____x"}, []string{"dedupe_id"}); err == nil {
+		t.Fatal("terminal escaped base guard (____x) present: an old-node first send of ____x would mistake it for its own guard and drop the event")
 	}
-	// Raw legacy compat leg exists.
+	// Sole raw legacy base guard exists.
 	row, err := raw.Single().ReadRow(ctx, "wf_signal_dedupe", spanner.Key{inst, "__x"}, []string{"dedupe_id"})
 	if err != nil {
-		t.Fatalf("terminal raw compat leg (__x) missing: %v (old-node retry would duplicate)", err)
+		t.Fatalf("terminal sole raw guard (__x) missing: %v (old-node retry would duplicate)", err)
 	}
 	var stored string
 	if err := row.Columns(&stored); err != nil {
 		t.Fatal(err)
 	}
 	if stored != "__x" {
-		t.Fatalf("terminal raw compat leg stores %q, want verbatim __x", stored)
+		t.Fatalf("terminal sole raw guard stores %q, want verbatim __x", stored)
 	}
 	// Retry dedupes via the post-terminal marker (still one inbox event).
 	if err := b.SendToInbox(ctx, inst, ev, "__x"); err != nil {
@@ -74,5 +76,16 @@ func TestCompatRawLegTerminalEndToEnd(t *testing.T) {
 	}
 	if len(st.Inbox) != 1 {
 		t.Fatalf("inbox=%d after terminal retry, want 1", len(st.Inbox))
+	}
+	// The distinct ID "____x" still delivers its own post-terminal event.
+	if err := b.SendToInbox(ctx, inst, ev, "____x"); err != nil {
+		t.Fatal(err)
+	}
+	st, err = b.LoadWorkflow(ctx, inst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Inbox) != 2 {
+		t.Fatalf("inbox=%d after distinct ____x terminal send, want 2", len(st.Inbox))
 	}
 }

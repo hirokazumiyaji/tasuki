@@ -13,11 +13,14 @@ import (
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
-// TestCompatRawLegEndToEnd is the round-26 P1 emulator regression test on
-// #296: a new-node running send of "__x" must leave, besides the escaped
-// "____x" primary, a raw legacy "__x" row so an old-node retry probing only
-// the verbatim key hits. Fail-without-fix: the pre-fix write is
-// escaped-only, so the raw ReadRow below is NotFound.
+// TestCompatRawLegEndToEnd is the round-28 P1 emulator regression test on
+// #296 (successor to the round-26 raw-leg test): a new-node running send of
+// "__x" must guard SOLELY with the raw legacy "__x" row and leave NO escaped
+// "____x" row behind. A pre-upgrade node handling the distinct first send
+// DedupeID="____x" probes that exact verbatim key with an existence-only
+// read: any canonical row there is mistaken for its own guard and the event
+// is silently dropped. Fail-without-fix: the pre-fix write emits the escaped
+// primary, so the "____x must be absent" ReadRow below finds it.
 func TestCompatRawLegEndToEnd(t *testing.T) {
 	dsn := dsnOrSkip(t)
 	ctx := context.Background()
@@ -42,31 +45,49 @@ func TestCompatRawLegEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	// Escaped primary exists.
-	if _, err := raw.Single().ReadRow(ctx, "wf_signal_dedupe", spanner.Key{inst, "____x"}, []string{"dedupe_id"}); err != nil {
-		t.Fatalf("escaped primary (____x) missing: %v", err)
+	// No escaped row: an old node probing "____x" verbatim must miss.
+	if _, err := raw.Single().ReadRow(ctx, "wf_signal_dedupe", spanner.Key{inst, "____x"}, []string{"dedupe_id"}); err == nil {
+		t.Fatal("escaped row (____x) present: an old-node first send of ____x would mistake it for its own guard and drop the event")
 	}
-	// Raw legacy compat leg exists.
+	// Sole raw legacy guard exists, verbatim and version-free.
 	row, err := raw.Single().ReadRow(ctx, "wf_signal_dedupe", spanner.Key{inst, "__x"}, []string{"dedupe_id"})
 	if err != nil {
-		t.Fatalf("raw compat leg (__x) missing: %v (old-node retry would duplicate)", err)
+		t.Fatalf("sole raw guard (__x) missing: %v (old-node retry would duplicate)", err)
 	}
 	var stored string
 	if err := row.Columns(&stored); err != nil {
 		t.Fatal(err)
 	}
 	if stored != "__x" {
-		t.Fatalf("raw compat leg stores %q, want verbatim __x", stored)
+		t.Fatalf("sole raw guard stores %q, want verbatim __x", stored)
 	}
-	// Retry dedupes (still one inbox event).
+	// Retry of "__x" still dedupes, and the distinct ID "____x" delivers
+	// alongside (both directions coexist without claiming each other).
 	if err := b.SendToInbox(ctx, inst, ev, "__x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SendToInbox(ctx, inst, ev, "____x"); err != nil {
 		t.Fatal(err)
 	}
 	st, err := b.LoadWorkflow(ctx, inst)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(st.Inbox) != 1 {
-		t.Fatalf("inbox=%d after retry, want 1", len(st.Inbox))
+	if len(st.Inbox) != 2 {
+		t.Fatalf("inbox=%d, want 2 (retry deduped, distinct ____x delivered)", len(st.Inbox))
+	}
+	if _, err := raw.Single().ReadRow(ctx, "wf_signal_dedupe", spanner.Key{inst, "____x"}, []string{"dedupe_id"}); err != nil {
+		t.Fatalf("distinct ____x guard missing after delivery: %v", err)
+	}
+	// A further retry of "__x" still dedupes against the sole guard.
+	if err := b.SendToInbox(ctx, inst, ev, "__x"); err != nil {
+		t.Fatal(err)
+	}
+	st, err = b.LoadWorkflow(ctx, inst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Inbox) != 2 {
+		t.Fatalf("inbox=%d after retry, want 2", len(st.Inbox))
 	}
 }
