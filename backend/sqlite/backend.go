@@ -862,10 +862,12 @@ func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Du
 // the default purge: the index predicate covers exactly
 // backend.DefaultPurgeStatuses, so the default filter matches the index
 // contents row for row and the scan stops at LIMIT without walking unrelated
-// history. Any other filter runs unhinted, for two distinct reasons:
-//   - a filter naming a non-default status (e.g. statuses=["continued"], or
-//     defaults plus continued) is not served by the index at all — forcing
-//     it would miss victims (continued rows are not in the index);
+// history. Continued-only purges force their own partial index instead (see
+// purgeContinuedOrderingHint, round-24 P2); every other filter runs unhinted,
+// for two distinct reasons:
+//   - a filter naming a non-default status alongside defaults (e.g. defaults
+//     plus continued) is served by neither partial index — forcing either
+//     would miss victims;
 //   - a proper subset of the defaults (e.g. statuses=["completed"]) is
 //     selective: the unhinted planner seeks the (status, ...) visibility
 //     index and sorts only the few matches instead of walking every
@@ -893,22 +895,42 @@ func purgeUsesOrderingHint(sts []string) bool {
 	return true
 }
 
+// purgeContinuedOrderingHint reports whether the victim SELECT should force
+// the continued-only partial ordering index (issue #294 round-24 P2). The
+// 000005 restriction removed continued rows from every purge-order index, so
+// explicit statuses=["continued"] purges sorted via visibility_idx + TEMP
+// B-TREE. The wf_instances_continued_purge_idx partial index covers exactly
+// the continued filter, restoring the ordered walk-and-stop-at-LIMIT path
+// for that shape. Only the singleton continued set hints; defaults plus
+// continued runs unhinted (neither partial index covers the union — forcing
+// either would miss victims) and selective default subsets keep seeking the
+// visibility index.
+func purgeContinuedOrderingHint(sts []string) bool {
+	return len(sts) == 1 && sts[0] == "continued"
+}
+
 // purgeVictimQuery builds the PurgeInstances victim SELECT for len(sts)
-// statuses, forcing the ordering index only when purgeUsesOrderingHint
-// holds. Extracted so tests pin the hint decision without a database.
+// statuses, forcing the ordering index for the default set
+// (purgeUsesOrderingHint) or for continued-only
+// (purgeContinuedOrderingHint). Extracted so tests pin the hint decision
+// without a database.
 //
-// The hinted query inlines the default status set as literals instead of
-// bind parameters: INDEXED BY a partial index is a prepare-time "no query
+// A hinted query inlines its status set as literals instead of bind
+// parameters: INDEXED BY a partial index is a prepare-time "no query
 // solution" error unless the WHERE clause provably implies the index
-// predicate, which placeholders cannot satisfy. sts equals the default set
-// exactly whenever the hint applies (nil included — it normalizes to the
-// defaults upstream), so the literal list is semantically identical.
+// predicate, which placeholders cannot satisfy. The default hint applies
+// exactly when sts equals the default set (nil included — it normalizes to
+// the defaults upstream) and the continued hint exactly when sts is
+// ["continued"], so the literal lists are semantically identical.
 func purgeVictimQuery(sts []string) string {
 	hint := ""
 	statusCond := "status IN (" + inClause(len(sts)) + ")"
 	if purgeUsesOrderingHint(sts) {
 		hint = " INDEXED BY wf_instances_completed_at_idx"
 		statusCond = "status IN ('completed', 'failed', 'terminated', 'canceled')"
+	} else if purgeContinuedOrderingHint(sts) {
+		hint = " INDEXED BY wf_instances_continued_purge_idx"
+		statusCond = "status = 'continued'"
 	}
 	return `
 		SELECT id FROM wf_instances` + hint + `
@@ -919,10 +941,10 @@ func purgeVictimQuery(sts []string) string {
 }
 
 // purgeVictimStatusArgs returns the bind arguments for the victim SELECT's
-// status filter: none when the hint applies (the default set is inlined as
-// literals — see purgeVictimQuery), otherwise sts in order.
+// status filter: none when either ordering hint applies (the status set is
+// inlined as literals — see purgeVictimQuery), otherwise sts in order.
 func purgeVictimStatusArgs(sts []string) []any {
-	if purgeUsesOrderingHint(sts) {
+	if purgeUsesOrderingHint(sts) || purgeContinuedOrderingHint(sts) {
 		return nil
 	}
 	args := make([]any, 0, len(sts))
@@ -946,16 +968,19 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 		args := purgeVictimStatusArgs(sts)
 		args = append(args, cutoff, lim)
 		// The ordering-index hint is conditional (see
-		// purgeUsesOrderingHint): forcing the (completed_at, id) partial
-		// victim index (issue #294 round-19 P2, restricted to the default
-		// purge statuses round-23) keeps the default purge bounded —
-		// without stat1 the planner prefers the status seek plus a TEMP
-		// B-TREE sort, which scales with every completed row — but any
-		// other status set runs unhinted: non-default statuses are not in
-		// the index (forcing it would miss victims) and selective subsets
-		// seek the visibility index instead of walking unrelated rows.
-		// The index always exists post-Migrate (000001 creates it, 000004
-		// rebuilt the pre-fix shape, 000005 the pre-restriction one).
+		// purgeUsesOrderingHint and purgeContinuedOrderingHint): forcing the
+		// (completed_at, id) partial victim index (issue #294 round-19 P2,
+		// restricted to the default purge statuses round-23, continued-only
+		// index added round-24) keeps the default and continued purges
+		// bounded — without stat1 the planner prefers the status seek plus
+		// a TEMP B-TREE sort, which scales with every completed row — but
+		// any other status set runs unhinted: mixed/non-default sets are in
+		// neither partial index (forcing either would miss victims) and
+		// selective subsets seek the visibility index instead of walking
+		// unrelated rows.
+		// The indexes always exist post-Migrate (000001 creates them, 000004
+		// rebuilt the pre-fix shape, 000005 the pre-restriction one, 000006
+		// the continued one).
 		rows, err := conn.QueryContext(ctx, purgeVictimQuery(sts), args...)
 		if err != nil {
 			return err

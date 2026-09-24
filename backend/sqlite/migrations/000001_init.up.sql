@@ -38,6 +38,15 @@ CREATE INDEX IF NOT EXISTS wf_instances_visibility_idx ON wf_instances (status, 
 -- migrations 000003 (legacy-stamped version-1 databases skip the baseline),
 -- 000004 (ordering shape) and 000005 (default-status predicate).
 CREATE INDEX IF NOT EXISTS wf_instances_completed_at_idx ON wf_instances (completed_at, id) WHERE completed_at IS NOT NULL AND status IN ('completed', 'failed', 'terminated', 'canceled');
+-- Continued-purge victim scan (issue #294 round-24 P2): explicit
+-- statuses=["continued"] purges filter status = 'continued' AND
+-- completed_at IS NOT NULL AND completed_at <= ? ORDER BY completed_at, id.
+-- The default partial index above excludes continued rows, so without this
+-- index continued purges sort via visibility_idx + TEMP B-TREE. This index
+-- covers exactly the continued filter (see purgeOrderingHint, which forces
+-- it only for continued-only purges). Fresh databases gain it here;
+-- pre-existing databases through migration 000006.
+CREATE INDEX IF NOT EXISTS wf_instances_continued_purge_idx ON wf_instances (completed_at, id) WHERE completed_at IS NOT NULL AND status = 'continued';
 
 CREATE TABLE IF NOT EXISTS wf_journal (
     instance_id TEXT    NOT NULL,
