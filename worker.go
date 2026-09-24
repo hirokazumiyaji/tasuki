@@ -2682,6 +2682,17 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		if rerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, true, func() error {
 			return w.backend.RetryActivity(commitCtx, t.ID, delay)
 		}); rerr != nil {
+			if errors.Is(rerr, errLeaseLost) {
+				// Fencing rejection, not a backend failure: the
+				// continuity gate or a renewal join refused the
+				// commit before any store op ran, so there is no
+				// store error to count — recording it would raise
+				// false backend-error alerts on routine fencing.
+				w.opts.Logger.Debug("activity retry skipped; lease lost before store op",
+					"instance_id", t.InstanceID, "activity", t.Name, "err", rerr)
+				commitCancel()
+				return rerr
+			}
 			w.recordStoreError(commitCtx, "retry_activity", rerr, "instance_id", t.InstanceID, "activity", t.Name)
 			commitCancel()
 			return rerr
@@ -2710,6 +2721,17 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			Payload: out,
 		})
 	}); cerr != nil {
+		if errors.Is(cerr, errLeaseLost) {
+			// Fencing rejection, not a backend failure: the
+			// continuity gate refused the commit before any store
+			// op ran, so there is no store error to count —
+			// recording it would raise false backend-error alerts
+			// on routine fencing.
+			w.opts.Logger.Debug("activity completion skipped; lease lost before store op",
+				"instance_id", t.InstanceID, "activity", t.Name, "err", cerr)
+			commitCancel()
+			return cerr
+		}
 		w.recordStoreError(commitCtx, "complete_activity", cerr, "instance_id", t.InstanceID, "activity", t.Name)
 		commitCancel()
 		return cerr
