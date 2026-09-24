@@ -167,6 +167,15 @@ type Worker struct {
 	// 0→1 transition and deleted on drain to avoid leaking one entry
 	// per historical task ID. Guarded by renewMu.
 	renewPerTask map[int64]*renewTaskEntry
+	// coverInflight tracks admitted detached-cover renewals per task ID
+	// so a row-preserving result commit joins its own task's in-flight
+	// cover before writing (round-20 P1b, see
+	// joinCoverRenewalsForCommit): without it a cover ExtendLease
+	// blocked in a context-ignoring backend across the write lands
+	// after it and overwrites what it wrote. Entries are created on
+	// the 0→1 transition and deleted on drain, like renewPerTask.
+	// Guarded by detMu (cover renewals register under detMu, never mu).
+	coverInflight map[int64]*renewTaskEntry
 	// detMu guards detGuard. Lock order with mu is mu-then-detMu, taken
 	// together only in beginDetachedCommit; renewOnceDetached,
 	// guardedDetachedCommit, and dropDetachedGuard take detMu alone and
@@ -201,18 +210,19 @@ func NewWorker(b backend.Backend, opts WorkerOptions) *Worker {
 	idle := make(chan struct{})
 	close(idle)
 	return &Worker{
-		backend:      b,
-		opts:         opts,
-		reg:          newRegistry(opts.Codec),
-		inFlight:     map[int64]inFlightEntry{},
-		detGuard:     map[int64]detachedGuard{},
-		wfClaim:      map[int64]time.Time{},
-		sticky:       map[string]stickyEntry{},
-		instLock:     map[string]*workflowActor{},
-		wfSem:        make(chan struct{}, opts.WorkflowConcurrency),
-		actSem:       make(chan struct{}, opts.ActivityConcurrency),
-		renewIdle:    idle,
-		renewPerTask: map[int64]*renewTaskEntry{},
+		backend:       b,
+		opts:          opts,
+		reg:           newRegistry(opts.Codec),
+		inFlight:      map[int64]inFlightEntry{},
+		detGuard:      map[int64]detachedGuard{},
+		wfClaim:       map[int64]time.Time{},
+		sticky:        map[string]stickyEntry{},
+		instLock:      map[string]*workflowActor{},
+		wfSem:         make(chan struct{}, opts.WorkflowConcurrency),
+		actSem:        make(chan struct{}, opts.ActivityConcurrency),
+		renewIdle:     idle,
+		renewPerTask:  map[int64]*renewTaskEntry{},
+		coverInflight: map[int64]*renewTaskEntry{},
 	}
 }
 
@@ -282,6 +292,17 @@ type detachedGuard struct {
 	// already over) instead of recording a store error.
 	coverCtx    context.Context
 	coverCancel context.CancelFunc
+	// writing holds cover renewals while a row-preserving result store
+	// op runs (round-20 P1b, see guardedDetachedCommit): a cover
+	// ExtendLease already blocked in a context-ignoring backend when
+	// the write completes ignores the post-write cover cancel and
+	// lands after it, overwriting what it wrote (the retry delay, the
+	// nack's visible_at) — and the bounded post-commit join
+	// (joinCommitStop) gives up instead of ordering it. Set before the
+	// pre-write cover join and cleared with the guard after the op;
+	// renewOnceDetached skips issuing (without tripping) while set, so
+	// no cover renewal can overlap the write.
+	writing bool
 }
 
 func (w *Worker) Start(parent context.Context) {
@@ -662,6 +683,79 @@ func (w *Worker) joinOrdinaryRenewalsForCommit(taskID int64, ctx context.Context
 	}
 }
 
+// joinCoverRenewalsForCommit waits for admitted detached-cover renewals
+// for taskID — and only taskID — to settle before a row-preserving
+// result write (round-20 P1b). Cover renewals run on the commit's cover
+// context, so the post-write cover cancel cannot stop one already
+// blocked in a context-ignoring backend: it lands after the write and
+// overwrites what it wrote (the retry delay, the nack's visible_at),
+// and the bounded post-commit join (joinCommitStop) gives up instead of
+// ordering it. Waiting here orders the write after the admitted cover:
+// the renewal lands first and the result overwrites it.
+//
+// The caller sets the guard's writing hold BEFORE this join (see
+// guardedDetachedCommit), so the snapshot covers the raced call: a
+// renewal registering after the hold skips issuing, and one registered
+// before it is counted here. detMu is never held across the wait, so
+// cover keeps the commit covered meanwhile.
+//
+// The wait is bounded by ctx (the commit's store-call context) and
+// commitJoinCap: it reports false when either fires, and the caller
+// aborts the commit with errLeaseLost instead of running a write a
+// still-blocked renewal could overwrite. A missing or superseded guard
+// also reports false (the commit must abort anyway). A nil ctx waits up
+// to the cap.
+func (w *Worker) joinCoverRenewalsForCommit(taskID int64, tok claimToken, ctx context.Context) bool {
+	w.detMu.Lock()
+	g, ok := w.detGuard[taskID]
+	if !ok || g.epoch != tok.epoch || g.seq != tok.seq {
+		w.detMu.Unlock()
+		return false
+	}
+	e := w.coverInflight[taskID]
+	var idle chan struct{}
+	var n int
+	if e != nil {
+		n = e.count
+		idle = e.idle
+	}
+	w.detMu.Unlock()
+	if n == 0 || idle == nil {
+		return true
+	}
+	timer := time.NewTimer(commitJoinCap)
+	defer timer.Stop()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-idle:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
+// coverRenewExit releases one cover slot claimed in renewOnceDetached,
+// closing + deleting the task's entry when that task's last cover
+// drains so a waiting joinCoverRenewalsForCommit wakes. A missing entry
+// (guard dropped with no cover in flight) is a no-op.
+func (w *Worker) coverRenewExit(taskID int64) {
+	w.detMu.Lock()
+	defer w.detMu.Unlock()
+	e := w.coverInflight[taskID]
+	if e == nil || e.count <= 0 {
+		return
+	}
+	e.count--
+	if e.count == 0 {
+		close(e.idle)
+		delete(w.coverInflight, taskID)
+	}
+}
+
 // waitForWaitGroup blocks until wg drains or ctx ends.
 func waitForWaitGroup(wg *sync.WaitGroup, ctx context.Context) {
 	done := make(chan struct{})
@@ -1028,20 +1122,27 @@ func (w *Worker) tripDetachedGuard(taskID int64, tok claimToken) {
 //
 // The result write is coordinated against cover renewals for
 // row-preserving writes — RetryActivity and nack, which rewrite
-// visible_at in place (round-11 P1b): detMu is released before the
-// store call, so without coordination a periodic renewal blocked in
-// the backend across the commit would land after the result write and
-// overwrite what it wrote (the retry delay, the nack's visible_at),
-// which the post-commit join cannot undo. Once the store op returns,
+// visible_at in place (round-11 P1b, hardened round-20 P1b): detMu is
+// released before the store call, so without coordination a periodic
+// renewal blocked in the backend across the commit would land after
+// the result write and overwrite what it wrote (the retry delay, the
+// nack's visible_at), which the post-commit join cannot undo — the
+// post-write cover cancel is best-effort (a context-ignoring backend
+// lands the renewal anyway) and the bounded post-commit join gives up
+// instead of ordering it. The commit therefore sets the guard's
+// writing hold BEFORE joining admitted cover renewals for this task
+// (see joinCoverRenewalsForCommit) and re-gates after the wait: the
+// hold stops new cover from issuing, the join orders the write after
+// the raced call, and a join that gives up aborts with errLeaseLost
+// instead of writing under a live renewal. Once the store op returns,
 // the guard is dropped AND this commit's cover context is canceled:
-// the drop stops new renewals from issuing, and the cancel aborts a
-// renewal still blocked in the backend so a context-aware backend
-// drops its write instead of landing it after the result. A renewal
-// aborted this way exits quietly (the commit is already over) rather
-// than recording a store error. Row-deleting writes (Complete/fail)
-// skip the cover cancel: a renewal landing after them finds no row,
-// while one running during a blocked Complete must still observe loss
-// and cancel it mid-call (round-10 P1b).
+// with the hold+join no cover call is in flight or issuing, so the
+// drop+cancel only stops the loops (a renewal aborted this way exits
+// quietly — the commit is already over — rather than recording a
+// store error). Row-deleting writes (Complete/fail) skip the hold,
+// the join, and the cover cancel: a renewal landing after them finds
+// no row, while one running during a blocked Complete must still
+// observe loss and cancel it mid-call (round-10 P1b).
 //
 // An ordinary (non-cover) renewal admitted just before the commit
 // transfer needs the same ordering on the other side of the write
@@ -1148,6 +1249,57 @@ func (w *Worker) guardedDetachedCommit(taskID int64, tok claimToken, commitCtx c
 				"task_id", taskID)
 			return fmt.Errorf("%w: detached commit gate found lease expired", errLeaseLost)
 		}
+		// Hold cover from issuing, then join in-flight cover BEFORE
+		// the store op (round-20 P1b, see joinCoverRenewalsForCommit).
+		// The hold is set under detMu before the join's snapshot, so
+		// the snapshot covers the raced call: a cover renewal that
+		// registered before the hold is counted and joined, while one
+		// arriving after it skips issuing (see renewOnceDetached) —
+		// no cover call can overlap the write below. detMu is released
+		// across the wait; the wait took time, so re-gate after it
+		// like above. A bounded join that gives up (a same-task stuck
+		// cover renewal or a canceled commit context ends it) aborts
+		// without running the op, with the same drop+cancel cleanup:
+		// a still-blocked cover renewal landing after the write would
+		// overwrite it, while landing after an abort only extends the
+		// lease.
+		g.writing = true
+		w.detGuard[taskID] = g
+		w.detMu.Unlock()
+		if !w.joinCoverRenewalsForCommit(taskID, tok, commitCtx) {
+			w.detMu.Lock()
+			var coverCancel context.CancelFunc
+			if g, ok := w.detGuard[taskID]; ok && g.epoch == tok.epoch && g.seq == tok.seq {
+				coverCancel = g.coverCancel
+				delete(w.detGuard, taskID)
+			}
+			w.detMu.Unlock()
+			if coverCancel != nil {
+				coverCancel()
+			}
+			w.opts.Logger.Debug("skipping detached commit; cover-renewal join timed out",
+				"task_id", taskID)
+			return fmt.Errorf("%w: detached commit gate timed out joining cover renewals", errLeaseLost)
+		}
+		w.detMu.Lock()
+		g, ok = w.detGuard[taskID]
+		if !ok || g.epoch != tok.epoch || g.seq != tok.seq {
+			w.detMu.Unlock()
+			w.opts.Logger.Debug("skipping detached commit; lease lost while joining cover renewals",
+				"task_id", taskID)
+			return fmt.Errorf("%w: detached commit gate found lease lost", errLeaseLost)
+		}
+		if !time.Now().Before(g.deadline) {
+			coverCancel := g.coverCancel
+			delete(w.detGuard, taskID)
+			w.detMu.Unlock()
+			if coverCancel != nil {
+				coverCancel()
+			}
+			w.opts.Logger.Debug("skipping detached commit; continuity deadline passed while joining cover renewals",
+				"task_id", taskID)
+			return fmt.Errorf("%w: detached commit gate found lease expired", errLeaseLost)
+		}
 		g.cancel = commitCancel
 		w.detGuard[taskID] = g
 		w.detMu.Unlock()
@@ -1158,9 +1310,11 @@ func (w *Worker) guardedDetachedCommit(taskID int64, tok claimToken, commitCtx c
 	// wrote (a RetryActivity delay, a nack's visible_at). The renewal
 	// loops observe the missing guard and exit without issuing (the
 	// entry is gone too), and the handler's deferred guard drop becomes
-	// a no-op. For row-preserving writes also cancel the cover context
-	// (see above) so a renewal still blocked in the backend cannot
-	// land after the result write.
+	// a no-op. For row-preserving writes also cancel the cover context:
+	// the pre-write hold+join (see above) means no cover call is in
+	// flight or issuing, so this only stops the loops promptly — the
+	// backstop for a context-aware backend, and a no-op for one that
+	// already settled.
 	w.detMu.Lock()
 	var coverCancel context.CancelFunc
 	if g, ok := w.detGuard[taskID]; ok && g.epoch == tok.epoch && g.seq == tok.seq {
@@ -1182,13 +1336,14 @@ func (w *Worker) guardedDetachedCommit(taskID int64, tok claimToken, commitCtx c
 // such a backend ignores), so an unconditional wait would hold the
 // activity slot forever: the handler would never actWg.Done nor release
 // its semaphore slot, and with ActivityConcurrency==1 a restarted worker
-// could not execute activities. Giving up releases the slot; the stuck
-// renewal landing later is harmless: ordinary renewals refresh only
-// token-matching in-flight entries (transferred out or released, so the
-// refresh is a no-op) and admission stays generation- and expiry-gated,
-// while cover renewals observe the dropped guard and exit without
-// issuing. Reports true when the loop exited, false on give-up (the
-// caller drops the guard and proceeds).
+// could not execute activities. Giving up releases the slot — but the
+// stuck renewal is still live, so the caller must NOT proceed to a
+// lease release (round-20 P1a, see the cancellation path in
+// handleActivity): a release issued now lands before the stuck renewal,
+// which then re-hides the task or extends a peer's fresh lease. The
+// caller drops the guard and untracks without releasing, leaving the
+// task to natural expiry. Reports true when the loop exited, false on
+// give-up.
 func waitRenewDoneBounded(renewDone <-chan struct{}) bool {
 	if renewDone == nil {
 		return true
@@ -2297,11 +2452,21 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		// renewDone open forever while the context-aware activity already
 		// returned — bypassing the bounded joinCommitStop teardown (not
 		// yet installed on this path) and holding the activity slot
-		// forever. On give-up the guard is dropped and the release
-		// proceeds; the late renewal is harmless per above.
+		// forever. On give-up the guard is dropped and the entry is
+		// untracked WITHOUT releasing (round-20 P1a, see below): the
+		// stuck renewal is still live and keeps the backend lease
+		// extended, so a ReleaseLease issued now would land before it —
+		// the renewal then lands after the release, re-hiding the task
+		// for a full lease when the local lease is fresh, or extending
+		// a peer's fresh lease when it already expired and was
+		// reclaimed. The task is left to natural expiry instead; the
+		// late renewal only extends the lease, which the expiry reclaim
+		// already accounts for.
 		committing.Store(false)
 		if !waitRenewDoneBounded(renewDone) {
 			w.dropDetachedGuard(t.ID, tok)
+			w.untrack(t.ID, tok)
+			return ctx.Err()
 		}
 		if w.claimReleaseOwnership(t.ID, tok) {
 			commitCtx, commitCancel := w.commitContext(ctx)
@@ -2819,9 +2984,14 @@ func (w *Worker) renewUntilDone(ctx context.Context, taskID int64, tok claimToke
 // The ExtendLease runs on the commit's cover context (see
 // detachedGuard): a renewal still blocked in the backend when a
 // row-preserving result write completes is aborted instead of landing
-// after it (round-11 P1b), and trips/drops stop all cover. detMu is
-// released across the call, so a stuck backend stalls just this task,
-// never the guard map.
+// after it (round-11 P1b) — best-effort, since a context-ignoring
+// backend lands it anyway — and trips/drops stop all cover. Ordering
+// against such backends comes from the pre-write cover join plus the
+// writing hold (round-20 P1b, see guardedDetachedCommit): no cover call
+// is in flight or issuing when the write runs. detMu is released
+// across the call, so a stuck backend stalls just this task, never the
+// guard map. The call registers in the per-task cover barrier across
+// the backend call (see coverRenewExit) so the join observes it.
 func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimToken) error {
 	w.detMu.Lock()
 	g, ok := w.detGuard[taskID]
@@ -2860,22 +3030,57 @@ func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimT
 	// (round-11 P1b) and the guard drop/trip cancels it when the commit
 	// is over. A renewal aborted that way exits quietly below instead
 	// of recording a store error.
-	coverCtx := g.coverCtx
+	//
+	// While a row-preserving store op runs, its writing hold is set
+	// (round-20 P1b, see guardedDetachedCommit): skip issuing without
+	// tripping — the write is the commit, and the post-write cleanup
+	// drops the guard — so no cover renewal can overlap the write and
+	// land after it. Returning nil (rather than an error) keeps the
+	// loops alive without tripping the guard or canceling the op.
+	// Re-checked under detMu: the guard may have been replaced (or the
+	// hold set) since the unlocked read above.
+	w.detMu.Lock()
+	curHold, okHold := w.detGuard[taskID]
+	if !okHold || curHold.epoch != tok.epoch || curHold.seq != tok.seq {
+		w.detMu.Unlock()
+		return fmt.Errorf("%w: detached commit finished during renewal", errLeaseLost)
+	}
+	if curHold.writing {
+		w.detMu.Unlock()
+		return nil
+	}
+	// Register this cover call in the per-task barrier (round-20 P1b,
+	// see joinCoverRenewalsForCommit) so a row-preserving commit can
+	// join it before writing. Deregistered once the call below
+	// returns, on every path.
+	if w.coverInflight == nil {
+		w.coverInflight = map[int64]*renewTaskEntry{}
+	}
+	ce := w.coverInflight[taskID]
+	if ce == nil {
+		ce = &renewTaskEntry{idle: make(chan struct{})}
+		w.coverInflight[taskID] = ce
+	}
+	ce.count++
+	coverCtx := curHold.coverCtx
 	if coverCtx == nil {
 		coverCtx = context.WithoutCancel(ctx)
 	}
+	w.detMu.Unlock()
 	rctx, cancel := context.WithTimeout(coverCtx, w.leaseDuration())
 	defer cancel()
 	w.detMu.Lock()
 	cur, ok := w.detGuard[taskID]
 	if !ok || cur.epoch != tok.epoch || cur.seq != tok.seq {
 		w.detMu.Unlock()
+		w.coverRenewExit(taskID)
 		return fmt.Errorf("%w: detached commit finished during renewal", errLeaseLost)
 	}
 	// Conservative lease base (see refreshLeaseAt).
 	renewStart := time.Now()
 	w.detMu.Unlock()
 	if err := w.backend.ExtendLease(rctx, taskID, w.opts.LeaseDuration); err != nil {
+		w.coverRenewExit(taskID)
 		// Our own commit ended first (result write completed, guard
 		// tripped by a concurrent loss): the cover context is
 		// canceled, the write was dropped, and there is nothing to
@@ -2895,6 +3100,11 @@ func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimT
 		}
 		return fmt.Errorf("%w: detached renewal failed: %v", errLeaseLost, err)
 	}
+	// The store call settled: release the barrier slot so a concurrent
+	// pre-write cover join can proceed. Gap checks below still run —
+	// the join only orders the write after the call's return, not after
+	// its verdict.
+	w.coverRenewExit(taskID)
 	completedAt := time.Now()
 	// Gap detection on the call-start instant: starting after the
 	// continuity deadline means the backend lease may have expired and

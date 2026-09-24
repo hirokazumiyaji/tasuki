@@ -2,6 +2,7 @@ package tasuki
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,12 +63,29 @@ func (b *gateCommitBackend) CompleteActivity(ctx context.Context, taskID int64, 
 
 // gateNackBackend pins NackTask on a test-controlled gate once armed, so
 // the test can hold a detached incompatible-activity nack past the lease.
+// extendCalls counts ExtendLease wrapper calls so tests can prove cover
+// ticks arriving mid-write issue nothing while the writing hold is set.
 type gateNackBackend struct {
 	backend.Backend
 	armNack     atomic.Bool
 	nackOnce    atomic.Bool
 	nackEntered chan struct{}
 	nackRelease chan struct{}
+	mu          sync.Mutex
+	extendCalls int
+}
+
+func (b *gateNackBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+	b.mu.Lock()
+	b.extendCalls++
+	b.mu.Unlock()
+	return b.Backend.ExtendLease(ctx, taskID, d)
+}
+
+func (b *gateNackBackend) extendCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.extendCalls
 }
 
 func (b *gateNackBackend) NackTask(ctx context.Context, task backend.Task, delay time.Duration) error {
@@ -250,6 +268,9 @@ func TestWorker_UnregisteredActivityRenewalCoversEarlyNack(t *testing.T) {
 	tok := w.track(task.ID)
 	defer w.untrack(task.ID, tok)
 	store.armNack.Store(true)
+	// Baseline AFTER setup: setup's own PollOnce turns may have renewed
+	// through this backend; only the gated run's calls matter below.
+	base := store.extendCount()
 	herrCh := make(chan error, 1)
 	go func() { herrCh <- w.handleActivity(ctx, task, tok) }()
 	select {
@@ -258,12 +279,20 @@ func TestWorker_UnregisteredActivityRenewalCoversEarlyNack(t *testing.T) {
 		t.Fatal("detached nack did not start")
 	}
 
-	mem.SetNow(t0.Add(10 * time.Second))
-	time.Sleep(300 * time.Millisecond)
-	if peer := probeActivityTasks(t, ctx, mem); len(peer) != 0 {
+	// The early nack is covered BEFORE its write (the synchronous
+	// pre-commit renewal proves the lease while the guard is seeded),
+	// and the row-preserving write holds cover while it runs (round-20
+	// P1b): renewal ticks arriving mid-write must issue nothing, so no
+	// cover renewal can land after the write and overwrite the nack's
+	// visible_at. Hold the write open across several ticks (tick every
+	// ~100ms) and prove exactly one ExtendLease — the pre-commit one —
+	// ever runs. Without the hold every tick issues (and succeeds
+	// against this healthy backend), so the count grows.
+	time.Sleep(500 * time.Millisecond)
+	if n := store.extendCount() - base; n != 1 {
 		close(store.nackRelease)
 		<-herrCh
-		t.Fatalf("peer claimed %d tasks mid-nack, want 0 (renewal must cover early result paths)", len(peer))
+		t.Fatalf("ExtendLease calls = %d mid-nack, want 1 (cover ticks arriving during a row-preserving write must be held, not issued)", n)
 	}
 	close(store.nackRelease)
 	select {
@@ -273,5 +302,10 @@ func TestWorker_UnregisteredActivityRenewalCoversEarlyNack(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("handler did not return after the nack was released")
+	}
+	// Still exactly one renewal: the post-write guard drop stops the
+	// loops, so nothing issues after the write either.
+	if n := store.extendCount() - base; n != 1 {
+		t.Fatalf("ExtendLease calls = %d after the nack, want 1 (no cover may issue during or after a row-preserving write)", n)
 	}
 }

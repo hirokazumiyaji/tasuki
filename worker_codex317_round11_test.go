@@ -165,24 +165,29 @@ func (b *stallExtendBackend) landedCount() int {
 	return b.landed
 }
 
-// TestWorker_Round11_ExclusiveCommitDropsInflightRenewal is the
-// regression test for round-11 P1b (no renewal write after the result
-// write): a periodic renewal blocked in the backend across a
-// row-preserving result commit (RetryActivity/nack, which rewrite
-// visible_at in place) must not land after the result write and
-// overwrite it. Once the store op returns, the commit drops the guard
-// (stopping new renewals) AND cancels the commit's cover context, so a
-// context-aware backend drops the still-blocked write instead of
-// landing it after the result. The aborted renewal exits quietly with
-// lease loss (the commit is already over) rather than recording a
-// store error.
+// TestWorker_Round11_ExclusiveCommitAbortsOnStuckCover is the successor
+// of the round-11 P1b test (no renewal write after the result write),
+// updated for round-20 P1b. The old contract let a row-preserving result
+// commit (RetryActivity/nack, which rewrite visible_at in place) run
+// while a cover renewal was still blocked, relying on the post-write
+// cover cancel to drop it. That cancel is best-effort: a
+// context-ignoring backend lands the renewal after the write anyway,
+// overwriting what it wrote, and the bounded post-commit join gives up
+// instead of ordering it.
 //
-// Without the fix nothing cancels the blocked renewal: releasing it
-// lands the ExtendLease after the RetryActivity and overwrites the
-// retry delay with the lease duration (peer probe reclaims the task
-// early); with the fix the commit's cover cancel drops the write
-// (zero landed backend writes) and the retry delay stands.
-func TestWorker_Round11_ExclusiveCommitDropsInflightRenewal(t *testing.T) {
+// The new contract joins admitted cover renewals BEFORE the write and
+// aborts when the bounded join gives up: a periodic renewal blocked in
+// the backend across the commit's whole join budget means the commit
+// returns errLeaseLost WITHOUT running its store op. Landing after an
+// abort only extends the lease, while landing after a write would
+// overwrite it. A renewal blocked across the budget then released lands
+// against a dropped guard and exits quietly with lease loss.
+//
+// Layout mirrors the old test: a cover renewal is planted and blocked,
+// then the exclusive commit must abort (not run) after the join budget.
+// The context-aware stall backend still proves the old backstop: the
+// abort's cover cancel drops the blocked write (zero landed writes).
+func TestWorker_Round11_ExclusiveCommitAbortsOnStuckCover(t *testing.T) {
 	ctx := context.Background()
 	t0 := time.Now().UTC()
 	mem := memory.New()
@@ -221,14 +226,15 @@ func TestWorker_Round11_ExclusiveCommitDropsInflightRenewal(t *testing.T) {
 		t.Fatal("cover renewal never entered ExtendLease")
 	}
 
-	// A row-preserving result commit runs while the renewal is still
-	// blocked. Cover keeps working during the op (early result paths
-	// must stay renewed), but the op's completion must drop the
-	// in-flight write.
+	// A row-preserving result commit approaches while the renewal is
+	// still blocked. It must NOT run under the live renewal: the
+	// bounded pre-write cover join gives up and the commit aborts with
+	// errLeaseLost, leaving the task untracked for natural expiry.
 	commitCtx, commitCancel := context.WithCancel(context.Background())
 	defer commitCancel()
 	var opDone atomic.Bool
 	commitCh := make(chan error, 1)
+	start := time.Now()
 	go func() {
 		commitCh <- w.guardedDetachedCommit(task.ID, tok, commitCtx, commitCancel, true, func() error {
 			opDone.Store(true)
@@ -237,19 +243,24 @@ func TestWorker_Round11_ExclusiveCommitDropsInflightRenewal(t *testing.T) {
 	}()
 	select {
 	case cerr := <-commitCh:
-		if cerr != nil {
-			t.Fatalf("exclusive commit = %v, want nil", cerr)
+		if !errors.Is(cerr, errLeaseLost) {
+			t.Fatalf("exclusive commit = %v, want errLeaseLost (a row-preserving write under a live cover renewal must abort, not write)", cerr)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("exclusive commit did not run while the renewal was blocked (cover must not stall result commits)")
+	case <-time.After(15 * time.Second):
+		t.Fatal("exclusive commit did not abort while the renewal was blocked (pre-write cover join must be bounded by commitJoinCap)")
 	}
-	if !opDone.Load() {
-		t.Fatal("exclusive commit op never ran")
+	// The cover join must actually engage — not skip the wait — so the
+	// floor sits far from both (~0s skipped vs ~5s capped).
+	if elapsed := time.Since(start); elapsed < 3*time.Second {
+		t.Fatalf("exclusive commit returned in %v, want >=3s (pre-write cover join must wait — boundedly, not skip — for the stuck cover)", elapsed)
 	}
-	// The commit's cover cancel aborts the still-blocked renewal: it
+	if opDone.Load() {
+		t.Fatal("exclusive commit op ran under a live cover renewal (timed-out cover join must abort the write)")
+	}
+	// The abort's cover cancel drops the still-blocked renewal: it
 	// returns lease loss without delegating to the backend. The wait
 	// bound (3s) sits well under the renewal's own 10s lease timeout,
-	// so only the commit's cancel — not the timeout backstop — can
+	// so only the abort's cancel — not the timeout backstop — can
 	// pass this.
 	select {
 	case rerr := <-renewCh:
@@ -260,14 +271,14 @@ func TestWorker_Round11_ExclusiveCommitDropsInflightRenewal(t *testing.T) {
 		t.Fatal("blocked cover renewal was not aborted by the commit's cover cancel")
 	}
 	if n := store.landedCount(); n != 0 {
-		t.Fatalf("landed ExtendLease writes=%d, want 0 (in-flight renewal must be dropped, not landed after the result)", n)
+		t.Fatalf("landed ExtendLease writes=%d, want 0 (in-flight renewal must be dropped, not landed after the abort)", n)
 	}
 
 	// Releasing the gate now must change nothing: the write was
-	// already dropped, so the retry delay stands. At t0+3s the task is
-	// still hidden; a renewal landing after the RetryActivity would
-	// have overwritten visible_at with the 10s lease and the probe
-	// would reclaim it.
+	// already dropped and no result write ever ran, so no retry delay
+	// hides the task. At t0+3s the task is visible for natural reclaim
+	// (the setup claim's short lease expired); a renewal landing after
+	// a result write would instead have overwritten visible_at.
 	close(store.release)
 	time.Sleep(100 * time.Millisecond) // let a non-dropped write land, if any
 	mem.SetNow(t0.Add(3 * time.Second))
@@ -278,19 +289,19 @@ func TestWorker_Round11_ExclusiveCommitDropsInflightRenewal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(probe) != 0 {
-		t.Fatalf("peer claimed %d tasks, want 0 (retry delay must survive the overlapped renewal)", len(probe))
+	if len(probe) != 1 {
+		t.Fatalf("peer claimed %d tasks, want 1 (aborted commit wrote nothing; the task is left to natural expiry reclaim)", len(probe))
 	}
 	if n := store.landedCount(); n != 0 {
 		t.Fatalf("landed ExtendLease writes=%d, want 0 (released gate must not land a dropped write)", n)
 	}
 
-	// No renewal may issue after the result write: the guard is dropped,
-	// so a late renewal reports loss without touching the backend.
+	// No renewal may issue after the abort: the guard is dropped, so a
+	// late renewal reports loss without touching the backend.
 	if rerr := w.renewOnceDetached(ctx, task.ID, tok); !errors.Is(rerr, errLeaseLost) {
 		t.Fatalf("post-commit renewal = %v, want errLeaseLost", rerr)
 	}
 	if n := store.callCount(); n != 1 {
-		t.Fatalf("ExtendLease calls=%d, want 1 (no renewal may issue after the result write)", n)
+		t.Fatalf("ExtendLease calls=%d, want 1 (no renewal may issue after the abort)", n)
 	}
 }
