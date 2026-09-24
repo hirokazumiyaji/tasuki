@@ -565,10 +565,33 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		// closing leaseDone alone does not join extendLeaseLoop, which
 		// may be inside an ExtendLease call that would land after a
 		// NackTask below and overwrite its visible_at. Every store op
-		// after a stop therefore sees no renewal in flight.
+		// after a stop therefore sees no renewal in flight. The join is
+		// bounded by the lease scale (round-26 P1): every renewal store
+		// call ends at the abandonment deadline (see renewOnceBounded)
+		// and every sleep selects on done, so the loop always exits by
+		// then; the explicit cap only guards against a future blocking
+		// addition. Giving up still proceeds to the release/nack while
+		// an orphaned context-ignoring call may land later (the same
+		// documented residual as a pre-existing blocked renewal).
 		stopRenewal := func() {
 			leaseOnce.Do(func() { close(leaseDone) })
-			leaseWg.Wait()
+			joinDone := make(chan struct{})
+			go func() {
+				defer close(joinDone)
+				leaseWg.Wait()
+			}()
+			bound := w.opts.LeaseDuration
+			if bound <= 0 {
+				bound = 30 * time.Second
+			}
+			timer := time.NewTimer(bound)
+			defer timer.Stop()
+			select {
+			case <-joinDone:
+			case <-timer.C:
+				w.opts.Logger.Warn("renewal loop did not exit in lease bound; proceeding without the join",
+					"task_id", t.ID)
+			}
 		}
 		renewalStops = append(renewalStops, stopRenewal)
 		wg.Add(1)
@@ -620,7 +643,20 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 				// from the actual claim, not from loop entry.
 				w.extendLeaseLoop(ctx, t, leaseDone, cancelTurn, claimBase)
 			}()
-			if !w.dispatchWorkflow(ctx, t.InstanceID, func() {
+			// The actor wait observes the per-turn context, not just the
+			// tick context (round-26 P2): a renewal failure or
+			// ErrNotFound cancels turnCtx (see extendLeaseLoop), and
+			// a turn still queued on the instance actor behind an
+			// old context-ignoring turn must abandon acquisition
+			// instead of blocking forever on the live tick ctx —
+			// holding its workflow slot and stalling wg.Wait (and
+			// the flush of other turns) behind a lease it already
+			// lost. Shutdown still cancels every turn through the
+			// tick-ctx parent, preserving the existing abandon path
+			// below; the release there stays ownership-gated so a
+			// concurrent releaseInFlight can never be followed by a
+			// second release.
+			if !w.dispatchWorkflow(turnCtx, t.InstanceID, func() {
 				w.opts.Metrics.AddWorkflowTask(ctx, 1)
 				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
 				p, herr := w.handleWorkflow(turnCtx, t, stopRenewal)
@@ -1796,6 +1832,88 @@ func (w *Worker) nackIncompatible(ctx context.Context, t backend.Task, reason st
 	return w.backend.NackTask(ctx, t, delay)
 }
 
+// renewCallResult carries one bounded ExtendLease attempt's store outcome
+// from the issuing goroutine to the waiting renewal loop.
+type renewCallResult struct {
+	err error
+}
+
+// renewSettleGrace bounds how long renewOnceBounded waits past the
+// abandonment deadline for an in-window call that settles in the same
+// instant the deadline fires (goroutine scheduling). A fast backend's
+// verdict then arrives microseconds later; discarding it would abandon a
+// success the pre-fix code accepted (round-22 in-window recovery) and make
+// boundary attempts flaky. The grace stays far below the abandonment
+// margin floor (25ms, see renewAbandonMargin), so the loss signal still
+// precedes any peer reclaim at expiry by at least half the margin.
+const renewSettleGrace = 10 * time.Millisecond
+
+// renewOnceBounded issues one ExtendLease for t and waits for it
+// abandonably (round-26 P1). The store call runs with a context ending at
+// deadline — the abandonment deadline lastSuccess+lease-margin — instead of
+// the long-lived tick context, so a blocked call cannot hold the renewal
+// loop past the point where the turn must be abandoned: the loop would
+// otherwise keep the turn's side effects running after a peer reclaims at
+// expiry, and stopRenewal would hang behind the call.
+//
+// It reports settled=true with the call's result (at is the conservative
+// pre-call instant, mirroring the round-24 P2b stamping) when the call
+// returns first. It reports settled=false when done or the tick context
+// ends first (quiet stop — Shutdown owns the abandonment there) or when
+// the deadline passes while the call is still blocked (expired=true — the
+// caller signals lease loss so the turn cancels before a peer reclaims).
+// A call settling within renewSettleGrace past the deadline still reports
+// settled: it was issued in-window and its success extends our own live
+// lease (expiry sits a full margin later), so accepting it preserves the
+// round-22 short-lease recovery instead of abandoning on scheduling noise.
+// The orphaned call settles on its own (buffered channel, no waiter
+// leak): a context-aware backend aborts on the canceled call context,
+// while a context-ignoring one landing later is the same documented
+// residual as a pre-existing blocked renewal.
+func (w *Worker) renewOnceBounded(ctx context.Context, done <-chan struct{}, t backend.Task, lease time.Duration, deadline time.Time, margin time.Duration) (at time.Time, err error, settled bool, expired bool) {
+	callCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	resCh := make(chan renewCallResult, 1)
+	at = time.Now()
+	go func() {
+		resCh <- renewCallResult{err: w.backend.ExtendLease(callCtx, t, lease)}
+	}()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-done:
+		return time.Time{}, nil, false, false
+	case <-ctx.Done():
+		return time.Time{}, nil, false, false
+	case <-timer.C:
+		// Boundary tie-break (see renewSettleGrace): prefer a
+		// verdict that lands with the deadline over abandoning on
+		// scheduling noise. Past the grace the call is genuinely
+		// stuck and the caller signals loss.
+		grace := margin / 2
+		if grace > renewSettleGrace {
+			grace = renewSettleGrace
+		}
+		if grace < 0 {
+			grace = 0
+		}
+		gtimer := time.NewTimer(grace)
+		defer gtimer.Stop()
+		select {
+		case <-done:
+			return time.Time{}, nil, false, false
+		case <-ctx.Done():
+			return time.Time{}, nil, false, false
+		case res := <-resCh:
+			return at, res.err, true, false
+		case <-gtimer.C:
+			return time.Time{}, nil, false, true
+		}
+	case res := <-resCh:
+		return at, res.err, true, false
+	}
+}
+
 func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-chan struct{}, onLeaseLost func(), claimBase time.Time) {
 	lease := w.opts.LeaseDuration
 	d := lease / 2
@@ -1861,8 +1979,28 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 			if first {
 				first = false
 			}
-			renewStart := time.Now()
-			if err := w.backend.ExtendLease(ctx, t, lease); err != nil {
+			// Bound the store call to the remaining lease window
+			// (round-26 P1): a blocked ExtendLease must not hold
+			// the loop past the abandonment deadline — the turn
+			// would keep running side effects after a peer
+			// reclaims at expiry, and stopRenewal would hang
+			// behind the call.
+			deadline := lastSuccess.Add(lease - margin)
+			at, rerr, settled, expired := w.renewOnceBounded(ctx, done, t, lease, deadline, margin)
+			if expired {
+				// The call was still blocked at the abandonment
+				// deadline: the lease may expire (or already
+				// have expired) while it is in flight, so
+				// signal loss now — the turn cancels and
+				// abandons instead of executing beside the peer
+				// that reclaims at expiry.
+				w.signalLeaseLost(onLeaseLost, t)
+				return
+			}
+			if !settled {
+				return
+			}
+			if rerr != nil {
 				// A fenced renewal reports ErrNotFound when the lease
 				// moved on (task completed/deleted, or a peer reclaim
 				// after a nack or an expired lease advanced the
@@ -1871,7 +2009,7 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 				// running side effects concurrently with the peer)
 				// and stop renewing quietly instead of warning and
 				// retrying a renewal the backend will keep rejecting.
-				if errors.Is(err, backend.ErrNotFound) {
+				if errors.Is(rerr, backend.ErrNotFound) {
 					w.opts.Logger.Debug("lease moved on; stopping renewal",
 						"task_id", t.ID)
 					w.signalLeaseLost(onLeaseLost, t)
@@ -1880,7 +2018,7 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 				if ctx.Err() != nil {
 					return
 				}
-				w.recordStoreError(ctx, "extend_lease", err, "task_id", t.ID)
+				w.recordStoreError(ctx, "extend_lease", rerr, "task_id", t.ID)
 				// A transient failure must not idle until the next
 				// half-lease tick: that tick lands at the original
 				// deadline, so a peer reclaims first and executes
@@ -1899,7 +2037,7 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, t backend.Task, done <-cha
 				}
 				return
 			}
-			lastSuccess = renewStart
+			lastSuccess = at
 			// The store lease moved forward: the local
 			// claim-time estimate used by the delayed nack
 			// (see requeueWorkflowTask) must move with it
@@ -2023,10 +2161,22 @@ func (w *Worker) retryRenewal(ctx context.Context, t backend.Task, done <-chan s
 		// claimBase pattern from round-23): the store lease was already
 		// aging while this call was in flight, so the retry window
 		// bounds from the pre-call instant, never the delayed response.
-		renewStart := time.Now()
-		if err := w.backend.ExtendLease(ctx, t, lease); err == nil {
-			return renewStart, true
-		} else if errors.Is(err, backend.ErrNotFound) {
+		// Bound each attempt to the remaining lease window (round-26
+		// P1): a blocked attempt must not hold the retry past the
+		// abandonment deadline (same reasoning as the ticker path in
+		// extendLeaseLoop above).
+		deadline := lastSuccess.Add(lease - margin)
+		at, rerr, settled, expired := w.renewOnceBounded(ctx, done, t, lease, deadline, margin)
+		if expired {
+			w.signalLeaseLost(onLeaseLost, t)
+			return lastSuccess, false
+		}
+		if !settled {
+			return lastSuccess, false
+		}
+		if rerr == nil {
+			return at, true
+		} else if errors.Is(rerr, backend.ErrNotFound) {
 			w.opts.Logger.Debug("lease moved on; stopping renewal",
 				"task_id", t.ID)
 			w.signalLeaseLost(onLeaseLost, t)
@@ -2035,7 +2185,7 @@ func (w *Worker) retryRenewal(ctx context.Context, t backend.Task, done <-chan s
 			return lastSuccess, false
 		} else {
 			w.opts.Logger.Debug("lease renewal retry failed",
-				"task_id", t.ID, "err", err)
+				"task_id", t.ID, "err", rerr)
 		}
 		backoff *= 2
 		if backoff > maxBackoff {
