@@ -32,6 +32,18 @@ func instanceCreatedAt(t *testing.T, b *Backend, ctx context.Context, id string)
 	return timestamp(snap.Data(), "created_at")
 }
 
+// instanceVictim captures the fence identity the terminal commit observes:
+// the pre-commit incarnation (created_at plus the unique token) for the
+// post-commit sweep fence.
+func instanceVictim(t *testing.T, b *Backend, ctx context.Context, id string) purgeVictim {
+	t.Helper()
+	snap, err := b.ref("wf_instances", id).Get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return purgeVictim{id: id, createdAt: timestamp(snap.Data(), "created_at"), incarnation: str(snap.Data(), incarnationField)}
+}
+
 func fenceDocExists(t *testing.T, b *Backend, ctx context.Context, col, docID string) bool {
 	t.Helper()
 	snap, err := b.ref(col, docID).Get(ctx)
@@ -89,7 +101,7 @@ func TestTerminalSweepStaleFenceKeepsReplacement(t *testing.T) {
 	}
 	// What the terminal commit observes: the pre-commit incarnation plus
 	// the exact dedupe key set the post-commit sweep would remove.
-	oldCreatedAt := instanceCreatedAt(t, b, ctx, id)
+	oldVictim := instanceVictim(t, b, ctx, id)
 	snapshot, err := b.listSignalDedupeIDs(ctx, id)
 	if err != nil {
 		t.Fatal(err)
@@ -132,8 +144,8 @@ func TestTerminalSweepStaleFenceKeepsReplacement(t *testing.T) {
 
 	// The paused sweep resumes with its stale pre-commit fence: it must
 	// abort (nil) instead of deleting the replacement's rows.
-	stale := purgeFence{victim: purgeVictim{id: id, createdAt: oldCreatedAt}}
-	if err := b.sweepTerminateDocs(ctx, id, oldCreatedAt, snapshot); err != nil {
+	stale := purgeFence{victim: oldVictim}
+	if err := b.sweepTerminateDocs(ctx, oldVictim, snapshot); err != nil {
 		t.Fatalf("stale terminate sweep: %v (want fenced abort to nil)", err)
 	}
 	if err := b.sweepSignalDedupeIDs(ctx, stale, snapshot); err != nil {
@@ -153,12 +165,12 @@ func TestTerminalSweepStaleFenceKeepsReplacement(t *testing.T) {
 	// cleans up. Flip the replacement terminal (sweep paused again), sweep
 	// with its own fence, and require every row gone.
 	flipStatusWithoutSweep(t, b, ctx, id)
-	curCreatedAt := instanceCreatedAt(t, b, ctx, id)
+	curVictim := instanceVictim(t, b, ctx, id)
 	curSnapshot, err := b.listSignalDedupeIDs(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.sweepTerminateDocs(ctx, id, curCreatedAt, curSnapshot); err != nil {
+	if err := b.sweepTerminateDocs(ctx, curVictim, curSnapshot); err != nil {
 		t.Fatal(err)
 	}
 	for kind, docID := range replacement {

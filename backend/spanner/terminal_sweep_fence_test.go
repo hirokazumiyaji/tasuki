@@ -30,15 +30,27 @@ func seedFenceTimer(t *testing.T, b *Backend, ctx context.Context, id string, se
 
 func instanceCreatedAtTx(t *testing.T, b *Backend, ctx context.Context, id string) time.Time {
 	t.Helper()
-	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"created_at"})
+	return instanceVictimTx(t, b, ctx, id).createdAt
+}
+
+// instanceVictimTx captures the fence identity the terminal commit observes:
+// the pre-commit incarnation (created_at plus the unique token) for the
+// post-commit sweep fence.
+func instanceVictimTx(t *testing.T, b *Backend, ctx context.Context, id string) purgeVictim {
+	t.Helper()
+	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"created_at", "incarnation"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var createdAt time.Time
-	if err := row.Columns(&createdAt); err != nil {
+	v := purgeVictim{id: id}
+	var incarnation spanner.NullString
+	if err := row.Columns(&v.createdAt, &incarnation); err != nil {
 		t.Fatal(err)
 	}
-	return createdAt
+	if incarnation.Valid {
+		v.incarnation = incarnation.StringVal
+	}
+	return v
 }
 
 // fenceChildCount counts rows of one instance in a child table.
@@ -96,7 +108,7 @@ func TestTerminalSweepStaleFenceKeepsReplacement(t *testing.T) {
 	}
 	// What the terminal commit observes: the pre-commit incarnation plus
 	// the exact dedupe key set the post-commit sweep would remove.
-	oldCreatedAt := instanceCreatedAtTx(t, b, ctx, id)
+	oldVictim := instanceVictimTx(t, b, ctx, id)
 	snapshot, err := b.listSignalDedupeIDs(ctx, id)
 	if err != nil {
 		t.Fatal(err)
@@ -137,10 +149,10 @@ func TestTerminalSweepStaleFenceKeepsReplacement(t *testing.T) {
 
 	// The paused sweep resumes with its stale pre-commit fence: it must
 	// abort (nil) instead of deleting the replacement's rows.
-	if err := b.sweepTerminateDocs(ctx, id, oldCreatedAt, snapshot); err != nil {
+	if err := b.sweepTerminateDocs(ctx, oldVictim, snapshot); err != nil {
 		t.Fatalf("stale terminate sweep: %v (want fenced abort to nil)", err)
 	}
-	victim := purgeVictim{id: id, createdAt: oldCreatedAt}
+	victim := oldVictim
 	guard := func(ctx context.Context) error { return b.checkPurgeVictim(ctx, victim) }
 	guardTx := func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		return b.checkPurgeVictimTx(ctx, txn, victim)
@@ -165,12 +177,12 @@ func TestTerminalSweepStaleFenceKeepsReplacement(t *testing.T) {
 	// cleans up. Flip the replacement terminal (sweep paused again), sweep
 	// with its own fence, and require every row gone.
 	flipStatusWithoutSweep(t, b, ctx, id)
-	curCreatedAt := instanceCreatedAtTx(t, b, ctx, id)
+	curVictim := instanceVictimTx(t, b, ctx, id)
 	curSnapshot, err := b.listSignalDedupeIDs(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.sweepTerminateDocs(ctx, id, curCreatedAt, curSnapshot); err != nil {
+	if err := b.sweepTerminateDocs(ctx, curVictim, curSnapshot); err != nil {
 		t.Fatal(err)
 	}
 	if n := fenceChildCount(t, b, ctx, "wf_tasks", "id", id); n != 0 {

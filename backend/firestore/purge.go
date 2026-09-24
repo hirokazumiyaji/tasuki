@@ -17,12 +17,31 @@ import (
 var errPurgeSuperseded = errors.New("firestore: purge victim superseded")
 
 // purgeVictim is one instance selected for purging. createdAt is the
-// incarnation marker: wf_instances.created_at is written once by
+// legacy incarnation marker: wf_instances.created_at is written once by
 // CreateInstance and never updated, so a doc carrying a different value is a
-// replacement created after this purge's victim was deleted.
+// replacement created after this purge's victim was deleted. incarnation is
+// the unique per-incarnation token (see newIncarnation), empty on legacy
+// instance docs that predate the field.
 type purgeVictim struct {
-	id        string
-	createdAt time.Time
+	id          string
+	createdAt   time.Time
+	incarnation string
+}
+
+// victimMatches reports whether the instance doc currently carrying
+// curCreatedAt/curIncarnation is still the fenced incarnation (Codex
+// round-21 P1 on #296). When both sides carry a token the tokens must match
+// exactly: created_at equality alone breaks on clock rollback, VM restore,
+// or timestamp precision truncation, any of which can recreate an ID with
+// the same created_at and let a stale sweep delete the replacement's
+// documents. When either side lacks a token (legacy rows) the check falls
+// back to created_at equality with that documented caveat. Pure for unit
+// tests.
+func victimMatches(v purgeVictim, curCreatedAt time.Time, curIncarnation string) bool {
+	if v.incarnation != "" && curIncarnation != "" {
+		return v.incarnation == curIncarnation
+	}
+	return curCreatedAt.Equal(v.createdAt)
 }
 
 // purgeFence pins one incarnation's ID-reuse fence for every sweep page: the
@@ -69,18 +88,20 @@ const purgeMarkersCollection = "wf_purge_markers"
 // incarnation overwrites the marker with its own incarnation instead of
 // colliding (collision-safe by key).
 type purgeMarker struct {
-	id        string
-	createdAt time.Time
-	purgedAt  time.Time
+	id          string
+	createdAt   time.Time
+	purgedAt    time.Time
+	incarnation string
 }
 
 // purgeMarkerDoc builds the marker document for a victim delete. Pure for
 // unit tests.
 func purgeMarkerDoc(v purgeVictim, now time.Time) map[string]any {
 	return map[string]any{
-		"instance_id": v.id,
-		"created_at":  v.createdAt,
-		"purged_at":   now,
+		"instance_id":    v.id,
+		"created_at":     v.createdAt,
+		"purged_at":      now,
+		incarnationField: v.incarnation,
 	}
 }
 
@@ -94,7 +115,7 @@ func decodePurgeMarker(snapID string, m map[string]any) (purgeMarker, bool) {
 	if id == "" {
 		return purgeMarker{}, false
 	}
-	return purgeMarker{id: id, createdAt: timestamp(m, "created_at"), purgedAt: timestamp(m, "purged_at")}, true
+	return purgeMarker{id: id, createdAt: timestamp(m, "created_at"), purgedAt: timestamp(m, "purged_at"), incarnation: str(m, incarnationField)}, true
 }
 
 // purgeMarkerExpired reports whether a marker with a live replacement may be
@@ -144,7 +165,7 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 		if _, ok := statuses2[str(snap.Data(), "status")]; !ok {
 			continue
 		}
-		victims = append(victims, purgeVictim{id: snap.Ref.ID, createdAt: timestamp(snap.Data(), "created_at")})
+		victims = append(victims, purgeVictim{id: snap.Ref.ID, createdAt: timestamp(snap.Data(), "created_at"), incarnation: str(snap.Data(), incarnationField)})
 	}
 
 	purged := 0
@@ -224,7 +245,7 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 	}
 	// The marker version this purge just committed: the conditional clear
 	// below removes exactly it, never a newer incarnation's marker.
-	ownMarker := purgeMarker{id: v.id, createdAt: v.createdAt, purgedAt: purgedAt}
+	ownMarker := purgeMarker{id: v.id, createdAt: v.createdAt, purgedAt: purgedAt, incarnation: v.incarnation}
 	second := purgeFence{victim: v, absent: true}
 	if err := b.purgeInstanceDocs(ctx, second); err != nil {
 		if errors.Is(err, errPurgeSuperseded) {
@@ -283,7 +304,8 @@ func (b *Backend) clearPurgeMarker(ctx context.Context, marker purgeMarker) erro
 			return err
 		}
 		cur, ok := decodePurgeMarker(snap.Ref.ID, snap.Data())
-		if !ok || !cur.createdAt.Equal(marker.createdAt) || !cur.purgedAt.Equal(marker.purgedAt) {
+		if !ok || !cur.createdAt.Equal(marker.createdAt) || !cur.purgedAt.Equal(marker.purgedAt) ||
+			(cur.incarnation != "" && marker.incarnation != "" && cur.incarnation != marker.incarnation) {
 			// A newer incarnation's purge overwrote the marker after this
 			// purge's victim delete: leave it for its own purge.
 			return nil
@@ -334,7 +356,8 @@ func (b *Backend) resumeOnePurgeMarker(ctx context.Context, marker purgeMarker, 
 		return err
 	}
 	if err == nil && snap.Exists() {
-		if timestamp(snap.Data(), "created_at").Equal(marker.createdAt) {
+		if victimMatches(purgeVictim{id: marker.id, createdAt: marker.createdAt, incarnation: marker.incarnation},
+			timestamp(snap.Data(), "created_at"), str(snap.Data(), incarnationField)) {
 			// Same incarnation present: the delete transaction writes the
 			// marker and the delete atomically, so this is unreachable
 			// barring manual writes. Leave the marker: a later purge of
@@ -348,7 +371,7 @@ func (b *Backend) resumeOnePurgeMarker(ctx context.Context, marker purgeMarker, 
 		}
 		return nil
 	}
-	fence := purgeFence{victim: purgeVictim{id: marker.id, createdAt: marker.createdAt}, absent: true}
+	fence := purgeFence{victim: purgeVictim{id: marker.id, createdAt: marker.createdAt, incarnation: marker.incarnation}, absent: true}
 	if err := b.purgeInstanceDocs(ctx, fence); err != nil {
 		if errors.Is(err, errPurgeSuperseded) {
 			// A replacement appeared mid-resume: rows are ambiguous now.
@@ -374,7 +397,7 @@ func (b *Backend) checkPurgeVictim(ctx context.Context, v purgeVictim) error {
 	if err != nil {
 		return err
 	}
-	if !timestamp(snap.Data(), "created_at").Equal(v.createdAt) {
+	if !victimMatches(v, timestamp(snap.Data(), "created_at"), str(snap.Data(), incarnationField)) {
 		return errPurgeSuperseded
 	}
 	return nil
@@ -415,7 +438,7 @@ func (b *Backend) checkFenceTx(tx *gcf.Transaction, fence purgeFence) error {
 	if fence.absent {
 		return errPurgeSuperseded
 	}
-	if !timestamp(snap.Data(), "created_at").Equal(fence.victim.createdAt) {
+	if !victimMatches(fence.victim, timestamp(snap.Data(), "created_at"), str(snap.Data(), incarnationField)) {
 		return errPurgeSuperseded
 	}
 	return nil
@@ -467,7 +490,7 @@ func (b *Backend) deletePurgedInstanceDoc(ctx context.Context, v purgeVictim) (b
 		if err != nil {
 			return err
 		}
-		if !timestamp(snap.Data(), "created_at").Equal(v.createdAt) {
+		if !victimMatches(v, timestamp(snap.Data(), "created_at"), str(snap.Data(), incarnationField)) {
 			return errPurgeSuperseded
 		}
 		if err := queryResidualDedupeTx(tx, b.col("wf_signal_dedupe"), v.id, &residual); err != nil {

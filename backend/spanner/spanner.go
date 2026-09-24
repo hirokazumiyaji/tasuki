@@ -226,12 +226,17 @@ CREATE TABLE wf_inbox_seq (
 	if err != nil {
 		return err
 	}
-	if !markerExists {
+	if markerExists {
+		if err := b.ensureStringColumn(ctx, "wf_purge_markers", incarnationColumn); err != nil {
+			return err
+		}
+	} else {
 		if err := b.applyDDL(ctx, []string{`
 CREATE TABLE wf_purge_markers (
   instance_id STRING(255) NOT NULL,
   created_at TIMESTAMP NOT NULL,
-  purged_at TIMESTAMP NOT NULL
+  purged_at TIMESTAMP NOT NULL,
+  incarnation STRING(32)
 ) PRIMARY KEY (instance_id)`}); err != nil {
 			return err
 		}
@@ -254,6 +259,9 @@ CREATE TABLE wf_post_terminal_markers (
 		}
 	}
 	if err := b.ensureSearchAttributesColumn(ctx); err != nil {
+		return err
+	}
+	if err := b.ensureIncarnationColumn(ctx); err != nil {
 		return err
 	}
 	return b.ensureInt64Column(ctx, "wf_inbox", "seq")
@@ -286,6 +294,27 @@ func (b *Backend) ensureInt64Column(ctx context.Context, table, column string) e
 		return nil
 	}
 	return b.applyDDL(ctx, []string{fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s INT64`, table, column)})
+}
+
+// ensureIncarnationColumn backfills the incarnation token column on
+// wf_instances for databases created before the round-21 (#296) identity
+// fix. The column is nullable: existing rows read NULL, i.e. legacy
+// (tokenless), and fences fall back to created_at comparison for them (see
+// victimMatches). No row rewrite is needed; new incarnations always record
+// a token at CreateInstance.
+func (b *Backend) ensureIncarnationColumn(ctx context.Context) error {
+	return b.ensureStringColumn(ctx, "wf_instances", incarnationColumn)
+}
+
+func (b *Backend) ensureStringColumn(ctx context.Context, table, column string) error {
+	exists, err := b.columnExists(ctx, table, column)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	return b.applyDDL(ctx, []string{fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s STRING(32)`, table, column)})
 }
 
 // ensureDedupeFormatVersionColumn backfills the format_version column on

@@ -143,13 +143,15 @@ func chunkInt64s(in []int64, size int) [][]int64 {
 // snapshot itself are filtered out (Codex round 8 on #327: sweeping a marker
 // while its inbox event remains duplicates the next retry). Purge reaps
 // leftovers.
-func (b *Backend) sweepTerminateDocs(ctx context.Context, id string, createdAt time.Time, dedupeSnapshot []string) error {
+func (b *Backend) sweepTerminateDocs(ctx context.Context, victim purgeVictim, dedupeSnapshot []string) error {
 	// The present-incarnation fence (see purgeVictim): the sweep proceeds
-	// only while the instance row still carries the created_at captured at
+	// only while the instance row still carries the incarnation captured at
 	// the terminal commit. A missing row (purge deleted it) or a different
-	// created_at (the ID was recreated after such a delete) aborts the
-	// sweep before it touches another incarnation's rows.
-	victim := purgeVictim{id: id, createdAt: createdAt}
+	// incarnation (the ID was recreated after such a delete) aborts the
+	// sweep before it touches another incarnation's rows. The token
+	// comparison (see victimMatches) survives clock rollback, VM restore,
+	// and timestamp truncation that can all reproduce the same created_at.
+	id := victim.id
 	guard := func(ctx context.Context) error { return b.checkPurgeVictim(ctx, victim) }
 	guardTx := func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		return b.checkPurgeVictimTx(ctx, txn, victim)
@@ -212,24 +214,32 @@ func (b *Backend) listSignalDedupeIDs(ctx context.Context, id string) ([]string,
 // terminalSweep carries one terminal advancement's post-commit sweep: the
 // pre-commit incarnation fencing it plus the exact dedupe keys to remove.
 type terminalSweep struct {
-	createdAt time.Time
-	dedupeIDs []string
+	createdAt   time.Time
+	incarnation string
+	dedupeIDs   []string
 }
 
-// queryInstanceCreatedAtTx reads an instance's incarnation marker inside the
-// commit transaction for the terminal sweep fence (see terminalSweep).
+// queryInstanceVictimTx reads an instance's fence identity inside the commit
+// transaction for the terminal sweep fence (see terminalSweep): the
+// created_at marker plus the unique incarnation token (see newIncarnation).
 // created_at is written once by CreateInstance and never updated, so a row
-// carrying a different value after a purge is a replacement incarnation.
-func queryInstanceCreatedAtTx(ctx context.Context, txn *spanner.ReadWriteTransaction, id string) (time.Time, error) {
-	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"created_at"})
+// carrying a different value after a purge is a replacement incarnation —
+// as is a row carrying a different token when created_at coincides through
+// clock rollback, VM restore, or precision truncation.
+func queryInstanceVictimTx(ctx context.Context, txn *spanner.ReadWriteTransaction, id string) (purgeVictim, error) {
+	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"created_at", "incarnation"})
 	if err != nil {
-		return time.Time{}, err
+		return purgeVictim{}, err
 	}
-	var createdAt time.Time
-	if err := row.Columns(&createdAt); err != nil {
-		return time.Time{}, err
+	v := purgeVictim{id: id}
+	var incarnation spanner.NullString
+	if err := row.Columns(&v.createdAt, &incarnation); err != nil {
+		return purgeVictim{}, err
 	}
-	return createdAt, nil
+	if incarnation.Valid {
+		v.incarnation = incarnation.StringVal
+	}
+	return v, nil
 }
 
 // querySignalDedupeIDsTx reads the same key set inside a read-write

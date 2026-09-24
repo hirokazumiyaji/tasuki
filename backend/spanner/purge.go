@@ -18,14 +18,32 @@ import (
 var errPurgeSuperseded = errors.New("spanner: purge victim superseded")
 
 // purgeVictim is one instance selected for purging. createdAt is the
-// incarnation marker: wf_instances.created_at is written once by
+// legacy incarnation marker: wf_instances.created_at is written once by
 // CreateInstance and never updated, so a row carrying a different value is a
-// replacement created after this purge's victim was deleted. Terminal sweeps
-// reuse the same carrier with the incarnation captured inside the
-// terminal-status commit (see sweepTerminateDocs).
+// replacement created after this purge's victim was deleted. incarnation is
+// the unique per-incarnation token (see newIncarnation), NULL on legacy
+// instance rows that predate the column. Terminal sweeps reuse the same
+// carrier with the incarnation captured inside the terminal-status commit
+// (see sweepTerminateDocs).
 type purgeVictim struct {
-	id        string
-	createdAt time.Time
+	id          string
+	createdAt   time.Time
+	incarnation string
+}
+
+// victimMatches reports whether the instance row currently carrying
+// curCreatedAt/curIncarnation is still the fenced incarnation (Codex
+// round-21 P1 on #296). When both sides carry a token the tokens must match
+// exactly: created_at equality alone breaks on clock rollback, VM restore,
+// or timestamp precision truncation, any of which can recreate an ID with
+// the same created_at and let a stale sweep delete the replacement's rows.
+// When either side lacks a token (legacy rows) the check falls back to
+// created_at equality with that documented caveat. Pure for unit tests.
+func victimMatches(v purgeVictim, curCreatedAt time.Time, curIncarnation string) bool {
+	if v.incarnation != "" && curIncarnation != "" {
+		return v.incarnation == curIncarnation
+	}
+	return curCreatedAt.Equal(v.createdAt)
 }
 
 // purgeMarkerTTL bounds a purge marker's life once a replacement incarnation
@@ -49,18 +67,20 @@ const purgeMarkerTTL = 7 * 24 * time.Hour
 // incarnation overwrites the marker with its own incarnation instead of
 // colliding (collision-safe by key; InsertOrUpdate, never bare Insert).
 type purgeMarker struct {
-	id        string
-	createdAt time.Time
-	purgedAt  time.Time
+	id          string
+	createdAt   time.Time
+	purgedAt    time.Time
+	incarnation string
 }
 
 // purgeMarkerMutation builds the marker upsert for a victim delete. Pure
 // save for the timestamp for unit tests (see purgeMarkerExpired).
 func purgeMarkerMutation(v purgeVictim, now time.Time) *spanner.Mutation {
 	return spanner.InsertOrUpdateMap("wf_purge_markers", map[string]any{
-		"instance_id": v.id,
-		"created_at":  v.createdAt,
-		"purged_at":   now,
+		"instance_id":     v.id,
+		"created_at":      v.createdAt,
+		"purged_at":       now,
+		incarnationColumn: v.incarnation,
 	})
 }
 
@@ -87,7 +107,7 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 	cutoff := nowUTC().Add(-olderThan)
 	var victims []purgeVictim
 	iter := b.client.Single().Query(ctx, spanner.Statement{
-		SQL: `SELECT id, created_at FROM wf_instances
+		SQL: `SELECT id, created_at, incarnation FROM wf_instances
 			      WHERE status IN UNNEST(@sts)
 			        AND completed_at IS NOT NULL AND completed_at <= @cutoff
 			      ORDER BY completed_at, id LIMIT @limit`,
@@ -103,9 +123,13 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 			return 0, err
 		}
 		var v purgeVictim
-		if err := row.Columns(&v.id, &v.createdAt); err != nil {
+		var incarnation spanner.NullString
+		if err := row.Columns(&v.id, &v.createdAt, &incarnation); err != nil {
 			iter.Stop()
 			return 0, err
+		}
+		if incarnation.Valid {
+			v.incarnation = incarnation.StringVal
 		}
 		victims = append(victims, v)
 	}
@@ -183,7 +207,7 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 	}
 	// The marker version this purge just committed: the conditional clear
 	// below removes exactly it, never a newer incarnation's marker.
-	ownMarker := purgeMarker{id: v.id, createdAt: v.createdAt, purgedAt: purgedAt}
+	ownMarker := purgeMarker{id: v.id, createdAt: v.createdAt, purgedAt: purgedAt, incarnation: v.incarnation}
 	gone := func(ctx context.Context) error { return b.checkPurgeAbsent(ctx, v.id) }
 	goneTx := func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		return b.checkPurgeAbsentTx(ctx, txn, v.id)
@@ -235,7 +259,7 @@ func (b *Backend) purgeOneInstance(ctx context.Context, v purgeVictim) (bool, er
 func (b *Backend) clearPurgeMarker(ctx context.Context, marker purgeMarker) error {
 	return b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		row, err := txn.ReadRow(ctx, "wf_purge_markers", spanner.Key{marker.id},
-			[]string{"instance_id", "created_at", "purged_at"})
+			[]string{"instance_id", "created_at", "purged_at", "incarnation"})
 		if isNotFound(err) {
 			return nil
 		}
@@ -243,10 +267,15 @@ func (b *Backend) clearPurgeMarker(ctx context.Context, marker purgeMarker) erro
 			return err
 		}
 		var cur purgeMarker
-		if err := row.Columns(&cur.id, &cur.createdAt, &cur.purgedAt); err != nil {
+		var curIncarnation spanner.NullString
+		if err := row.Columns(&cur.id, &cur.createdAt, &cur.purgedAt, &curIncarnation); err != nil {
 			return err
 		}
-		if cur.id == "" || !cur.createdAt.Equal(marker.createdAt) || !cur.purgedAt.Equal(marker.purgedAt) {
+		if curIncarnation.Valid {
+			cur.incarnation = curIncarnation.StringVal
+		}
+		if cur.id == "" || !cur.createdAt.Equal(marker.createdAt) || !cur.purgedAt.Equal(marker.purgedAt) ||
+			(cur.incarnation != "" && marker.incarnation != "" && cur.incarnation != marker.incarnation) {
 			// A newer incarnation's purge overwrote the marker after this
 			// purge's victim delete: leave it for its own purge.
 			return nil
@@ -270,7 +299,7 @@ func (b *Backend) clearPurgeMarker(ctx context.Context, marker purgeMarker) erro
 // purge (leak-safe); only the marker itself ages out via purgeMarkerTTL.
 func (b *Backend) resumeStalePurgeMarkers(ctx context.Context, now time.Time) error {
 	iter := b.client.Single().Query(ctx, spanner.Statement{
-		SQL: `SELECT instance_id, created_at, purged_at FROM wf_purge_markers`,
+		SQL: `SELECT instance_id, created_at, purged_at, incarnation FROM wf_purge_markers`,
 	})
 	defer iter.Stop()
 	for {
@@ -282,8 +311,12 @@ func (b *Backend) resumeStalePurgeMarkers(ctx context.Context, now time.Time) er
 			return err
 		}
 		var marker purgeMarker
-		if err := row.Columns(&marker.id, &marker.createdAt, &marker.purgedAt); err != nil {
+		var incarnation spanner.NullString
+		if err := row.Columns(&marker.id, &marker.createdAt, &marker.purgedAt, &incarnation); err != nil {
 			return err
+		}
+		if incarnation.Valid {
+			marker.incarnation = incarnation.StringVal
 		}
 		if marker.id == "" {
 			continue
@@ -299,16 +332,21 @@ func (b *Backend) resumeStalePurgeMarkers(ctx context.Context, now time.Time) er
 // clears the marker; a resume racing a fresh replacement trips the absent
 // fence and keeps the marker for a later pass.
 func (b *Backend) resumeOnePurgeMarker(ctx context.Context, marker purgeMarker, now time.Time) error {
-	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{marker.id}, []string{"created_at"})
+	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{marker.id}, []string{"created_at", "incarnation"})
 	if err != nil && !isNotFound(err) {
 		return err
 	}
 	if err == nil {
 		var createdAt time.Time
-		if err := row.Columns(&createdAt); err != nil {
+		var incarnation spanner.NullString
+		if err := row.Columns(&createdAt, &incarnation); err != nil {
 			return err
 		}
-		if createdAt.Equal(marker.createdAt) {
+		var curIncarnation string
+		if incarnation.Valid {
+			curIncarnation = incarnation.StringVal
+		}
+		if victimMatches(purgeVictim{id: marker.id, createdAt: marker.createdAt, incarnation: marker.incarnation}, createdAt, curIncarnation) {
 			// Same incarnation present: the delete transaction writes the
 			// marker and the delete atomically, so this is unreachable
 			// barring manual writes. Leave the marker: a later purge of
@@ -344,7 +382,7 @@ func (b *Backend) resumeOnePurgeMarker(ctx context.Context, marker purgeMarker, 
 // was recreated after such a delete. Either way the sweep must stop before it
 // touches another incarnation's rows.
 func (b *Backend) checkPurgeVictim(ctx context.Context, v purgeVictim) error {
-	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{v.id}, []string{"created_at"})
+	row, err := b.client.Single().ReadRow(ctx, "wf_instances", spanner.Key{v.id}, []string{"created_at", "incarnation"})
 	if isNotFound(err) {
 		return errPurgeSuperseded
 	}
@@ -352,10 +390,15 @@ func (b *Backend) checkPurgeVictim(ctx context.Context, v purgeVictim) error {
 		return err
 	}
 	var createdAt time.Time
-	if err := row.Columns(&createdAt); err != nil {
+	var incarnation spanner.NullString
+	if err := row.Columns(&createdAt, &incarnation); err != nil {
 		return err
 	}
-	if !createdAt.Equal(v.createdAt) {
+	var curIncarnation string
+	if incarnation.Valid {
+		curIncarnation = incarnation.StringVal
+	}
+	if !victimMatches(v, createdAt, curIncarnation) {
 		return errPurgeSuperseded
 	}
 	return nil
@@ -384,7 +427,7 @@ func (b *Backend) checkPurgeAbsent(ctx context.Context, id string) error {
 // anything). A missing row means a concurrent purge already deleted it; a
 // different created_at means the ID was recreated after such a delete.
 func (b *Backend) checkPurgeVictimTx(ctx context.Context, txn *spanner.ReadWriteTransaction, v purgeVictim) error {
-	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{v.id}, []string{"created_at"})
+	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{v.id}, []string{"created_at", "incarnation"})
 	if isNotFound(err) {
 		return errPurgeSuperseded
 	}
@@ -392,10 +435,15 @@ func (b *Backend) checkPurgeVictimTx(ctx context.Context, txn *spanner.ReadWrite
 		return err
 	}
 	var createdAt time.Time
-	if err := row.Columns(&createdAt); err != nil {
+	var incarnation spanner.NullString
+	if err := row.Columns(&createdAt, &incarnation); err != nil {
 		return err
 	}
-	if !createdAt.Equal(v.createdAt) {
+	var curIncarnation string
+	if incarnation.Valid {
+		curIncarnation = incarnation.StringVal
+	}
+	if !victimMatches(v, createdAt, curIncarnation) {
 		return errPurgeSuperseded
 	}
 	return nil
@@ -448,7 +496,7 @@ func (b *Backend) deletePurgedInstanceRow(ctx context.Context, v purgeVictim) (b
 		// residual reap.
 		deleted = false
 		residual = residualStragglers{}
-		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{v.id}, []string{"created_at"})
+		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{v.id}, []string{"created_at", "incarnation"})
 		if isNotFound(err) {
 			return errPurgeSuperseded
 		}
@@ -456,10 +504,15 @@ func (b *Backend) deletePurgedInstanceRow(ctx context.Context, v purgeVictim) (b
 			return err
 		}
 		var createdAt time.Time
-		if err := row.Columns(&createdAt); err != nil {
+		var incarnation spanner.NullString
+		if err := row.Columns(&createdAt, &incarnation); err != nil {
 			return err
 		}
-		if !createdAt.Equal(v.createdAt) {
+		var curIncarnation string
+		if incarnation.Valid {
+			curIncarnation = incarnation.StringVal
+		}
+		if !victimMatches(v, createdAt, curIncarnation) {
 			return errPurgeSuperseded
 		}
 		if err := queryResidualDedupeTx(ctx, txn, v.id, &residual); err != nil {

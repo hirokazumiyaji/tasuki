@@ -95,6 +95,7 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 				"memo":              jsonVal(backend.MarshalSearchAttributes(inst.Memo)),
 				"created_at":        now,
 				"updated_at":        now,
+				incarnationColumn:   newIncarnation(),
 			}),
 			spanner.InsertMap("wf_journal", map[string]any{
 				"instance_id": inst.ID,
@@ -257,18 +258,16 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	// next retry re-inserted a duplicate). Markers in the snapshot itself are
 	// filtered out as well; purge reaps leftovers.
 	var dedupeSnapshot []string
-	var createdAt time.Time
+	var victim purgeVictim
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"created_at"})
+		v, err := queryInstanceVictimTx(ctx, txn, id)
 		if err != nil {
 			if isNotFound(err) {
 				return backend.ErrNotFound
 			}
 			return err
 		}
-		if err := row.Columns(&createdAt); err != nil {
-			return err
-		}
+		victim = v
 		ids, err := querySignalDedupeIDsTx(ctx, txn, id)
 		if err != nil {
 			return err
@@ -296,7 +295,7 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	// The status flip above already committed, so subscribers must wake even
 	// when the sweep fails: GetInstance permanently reports terminated while
 	// a skipped notifyTerminal would leave waiters asleep until a retry.
-	if err := b.sweepTerminateDocs(ctx, id, createdAt, dedupeSnapshot); err != nil {
+	if err := b.sweepTerminateDocs(ctx, victim, dedupeSnapshot); err != nil {
 		b.notifyTerminal(id)
 		return err
 	}
@@ -706,11 +705,11 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 					if err != nil {
 						return err
 					}
-					createdAt, err := queryInstanceCreatedAtTx(ctx, txn, adv.InstanceID)
+					victim, err := queryInstanceVictimTx(ctx, txn, adv.InstanceID)
 					if err != nil {
 						return err
 					}
-					snapshots[adv.InstanceID] = terminalSweep{createdAt: createdAt, dedupeIDs: ids}
+					snapshots[adv.InstanceID] = terminalSweep{createdAt: victim.createdAt, incarnation: victim.incarnation, dedupeIDs: ids}
 				}
 			}
 			if err := b.commitAdvancementTxn(ctx, txn, adv); err != nil {
@@ -759,7 +758,7 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			// stuck store delays only this cleanup, never the caller.
 			cctx, cancel := context.WithTimeout(context.Background(), signalDedupeSweepTimeout)
 			sw := snapshots[adv.InstanceID]
-			victim := purgeVictim{id: adv.InstanceID, createdAt: sw.createdAt}
+			victim := purgeVictim{id: adv.InstanceID, createdAt: sw.createdAt, incarnation: sw.incarnation}
 			guard := func(ctx context.Context) error { return b.checkPurgeVictim(ctx, victim) }
 			guardTx := func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 				return b.checkPurgeVictimTx(ctx, txn, victim)
@@ -940,6 +939,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 				"search_attributes": jsonVal(backend.MarshalSearchAttributes(ch.SearchAttributes)),
 				"memo":              jsonVal(backend.MarshalSearchAttributes(ch.Memo)),
 				"created_at":        now, "updated_at": now,
+				incarnationColumn: newIncarnation(),
 			}),
 			spanner.InsertMap("wf_journal", map[string]any{
 				"instance_id": ch.ID, "seq": int64(1),

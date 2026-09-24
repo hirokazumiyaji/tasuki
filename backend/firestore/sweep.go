@@ -68,22 +68,25 @@ func chunkStrings(in []string, size int) [][]string {
 // the terminal instance, clears its marker, and lets CreateInstance reuse
 // the ID while this sweep is paused must stop the resumed sweep before it
 // deletes the replacement's documents (Codex round 20 on #296). The fence
-// pins the pre-commit incarnation (id + created_at captured inside the flip
-// transaction); on mismatch the sweep aborts with a nil return and purge
-// owns the leftovers — leaked rows are always preferable to deleting a live
-// incarnation's documents. Dedupe cleanup deletes only the pre-termination
+// pins the pre-commit incarnation (token plus created_at captured inside
+// the flip transaction); on mismatch the sweep aborts with a nil return and
+// purge owns the leftovers — leaked rows are always preferable to deleting
+// a live incarnation's documents. Dedupe cleanup deletes only the pre-termination
 // non-marker keys snapshotted inside the flip transaction: post-terminal
 // sends committing after the flip (marker plus inbox event) are absent from
 // the snapshot and survive, and markers present in the snapshot itself are
 // filtered out (Codex round 8 on #327: sweeping a marker while its inbox
 // event remains duplicates the next retry). Purge reaps leftovers.
-func (b *Backend) sweepTerminateDocs(ctx context.Context, id string, createdAt time.Time, dedupeSnapshot []string) error {
+func (b *Backend) sweepTerminateDocs(ctx context.Context, victim purgeVictim, dedupeSnapshot []string) error {
 	// The present-incarnation fence (see purgeFence): the sweep proceeds
-	// only while the instance doc still carries the created_at captured at
+	// only while the instance doc still carries the incarnation captured at
 	// the terminal commit. A missing doc (purge deleted it) or a different
-	// created_at (the ID was recreated after such a delete) aborts the
-	// sweep before it touches another incarnation's documents.
-	fence := purgeFence{victim: purgeVictim{id: id, createdAt: createdAt}}
+	// incarnation (the ID was recreated after such a delete) aborts the
+	// sweep before it touches another incarnation's documents. The token
+	// comparison (see victimMatches) survives clock rollback, VM restore,
+	// and timestamp truncation that can all reproduce the same created_at.
+	fence := purgeFence{victim: victim}
+	id := victim.id
 	for _, col := range []string{"wf_tasks", "wf_timers"} {
 		if err := b.deleteDocsByInstanceFenced(ctx, col, fence); err != nil {
 			if errors.Is(err, errPurgeSuperseded) {

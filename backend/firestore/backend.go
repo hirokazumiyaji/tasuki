@@ -49,6 +49,7 @@ func instanceDoc(inst backend.NewInstance, queue string, now time.Time) map[stri
 	m := map[string]any{
 		"id": inst.ID, "name": inst.Name, "queue": queue, "status": "running",
 		"input": jsonString(inst.Input), "next_seq": int64(2), "created_at": now, "updated_at": now,
+		incarnationField:    newIncarnation(),
 		"search_attributes": searchAttrsDoc(inst.SearchAttributes),
 		"memo":              searchAttrsDoc(inst.Memo),
 	}
@@ -281,6 +282,7 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	// sends must not strip them); purge reaps all leftovers.
 	var dedupeSnapshot []string
 	var createdAt time.Time
+	var incarnation string
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		s, err := tx.Get(b.ref("wf_instances", id))
 		if isNotFound(err) {
@@ -296,8 +298,11 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		// fence (see sweepTerminateDocs): created_at is written once by
 		// CreateInstance and never updated, so a doc carrying a different
 		// value after a purge is a replacement whose documents the sweep
-		// must never touch.
+		// must never touch. The incarnation token pins the same identity
+		// against clock rollback, VM restore, and precision truncation,
+		// which can all reproduce the same created_at (see newIncarnation).
 		createdAt = timestamp(s.Data(), "created_at")
+		incarnation = str(s.Data(), incarnationField)
 		ids, err := listSignalDedupeIDsTx(tx, b.col("wf_signal_dedupe"), id)
 		if err != nil {
 			return err
@@ -318,7 +323,7 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	// The status flip above already committed, so subscribers must wake even
 	// when the sweep fails: GetInstance permanently reports terminated while
 	// a skipped notifyTerminal would leave waiters asleep until a retry.
-	if err := b.sweepTerminateDocs(ctx, id, createdAt, dedupeSnapshot); err != nil {
+	if err := b.sweepTerminateDocs(ctx, purgeVictim{id: id, createdAt: createdAt, incarnation: incarnation}, dedupeSnapshot); err != nil {
 		b.notifyTerminal(id)
 		return err
 	}
@@ -833,6 +838,10 @@ type advancementPrep struct {
 	// re-validates it on every page so a purge plus ID reuse interleaved
 	// with the sweep aborts instead of deleting the replacement's guard.
 	createdAt time.Time
+	// incarnation is the instance's unique per-incarnation token captured
+	// alongside createdAt (see newIncarnation). Fences compare it exactly;
+	// createdAt stays as the legacy fallback for rows predating the field.
+	incarnation string
 	// dedupeSnapshot holds the terminal advancement's dedupe keys as read
 	// inside the commit transaction (see readAdvancementTx). The post-commit
 	// sweep deletes exactly these IDs.
@@ -842,8 +851,9 @@ type advancementPrep struct {
 // terminalSweep carries one terminal advancement's post-commit sweep: the
 // pre-commit incarnation fencing it plus the exact dedupe keys to remove.
 type terminalSweep struct {
-	createdAt time.Time
-	dedupeIDs []string
+	createdAt   time.Time
+	incarnation string
+	dedupeIDs   []string
 }
 
 func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
@@ -888,7 +898,7 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			if _, ok := snapshots[adv.InstanceID]; ok {
 				continue
 			}
-			snapshots[adv.InstanceID] = terminalSweep{createdAt: preps[i].createdAt, dedupeIDs: preps[i].dedupeSnapshot}
+			snapshots[adv.InstanceID] = terminalSweep{createdAt: preps[i].createdAt, incarnation: preps[i].incarnation, dedupeIDs: preps[i].dedupeSnapshot}
 		}
 		return b.flushInboxSeqs(tx, alloc)
 	})
@@ -944,7 +954,7 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			// so a stuck store delays only this cleanup, never the caller.
 			cctx, cancel := context.WithTimeout(context.Background(), signalDedupeSweepTimeout)
 			sw := snapshots[adv.InstanceID]
-			_ = b.sweepSignalDedupeIDs(cctx, purgeFence{victim: purgeVictim{id: adv.InstanceID, createdAt: sw.createdAt}}, sw.dedupeIDs)
+			_ = b.sweepSignalDedupeIDs(cctx, purgeFence{victim: purgeVictim{id: adv.InstanceID, createdAt: sw.createdAt, incarnation: sw.incarnation}}, sw.dedupeIDs)
 			cancel()
 		}
 	}
@@ -1030,6 +1040,7 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 	inboxIter.Stop()
 	prep := advancementPrep{instRef: instSnap.Ref, taskRef: taskRef, inst: inst, hasInbox: hasInbox}
 	prep.createdAt = timestamp(instSnap.Data(), "created_at")
+	prep.incarnation = str(instSnap.Data(), incarnationField)
 	if adv.Terminal != nil {
 		// Snapshot the dedupe keys inside the commit transaction (still the
 		// read phase: no writes have been buffered yet). A SendToInbox

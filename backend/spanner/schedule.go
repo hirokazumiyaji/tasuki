@@ -151,6 +151,7 @@ func (b *Backend) ClaimDueSchedules(ctx context.Context, limit int) ([]backend.D
 					"id": instID, "name": r.workflow, "queue": r.queue, "status": "running",
 					"input": jsonVal(inputBytes), "next_seq": int64(2),
 					"created_at": now, "updated_at": now,
+					incarnationColumn: newIncarnation(),
 				}),
 			})
 			if isAlreadyExists(err) {

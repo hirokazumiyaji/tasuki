@@ -13,7 +13,15 @@ CREATE TABLE wf_instances (
   memo JSON,
   created_at TIMESTAMP NOT NULL,
   updated_at TIMESTAMP NOT NULL,
-  completed_at TIMESTAMP
+  completed_at TIMESTAMP,
+  -- incarnation is the unique per-incarnation identity token (Codex
+  -- round-21 P1 on #296): 128 crypto-random bits hex-encoded, written once
+  -- by CreateInstance and never updated. Terminal sweep and purge fences
+  -- compare it exactly instead of created_at, which clock rollback, VM
+  -- restore, or precision truncation can reproduce for a replacement
+  -- incarnation. NULL on rows predating the field; fences fall back to
+  -- created_at comparison for those (see victimMatches in purge.go).
+  incarnation STRING(32)
 ) PRIMARY KEY (id);
 
 CREATE INDEX wf_instances_visibility_idx ON wf_instances(status, name, created_at);
@@ -101,7 +109,12 @@ CREATE INDEX wf_timers_fire_idx ON wf_timers(fire_at);
 CREATE TABLE wf_purge_markers (
   instance_id STRING(255) NOT NULL,
   created_at TIMESTAMP NOT NULL,
-  purged_at TIMESTAMP NOT NULL
+  purged_at TIMESTAMP NOT NULL,
+  -- incarnation pins the victim identity the marker was written for (see
+  -- wf_instances.incarnation): a later purge of a replacement incarnation
+  -- overwrites the row with its own token instead of colliding. NULL on
+  -- rows predating the field.
+  incarnation STRING(32)
 ) PRIMARY KEY (instance_id);
 
 CREATE TABLE wf_schedules (

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -25,6 +26,30 @@ func newID() int64 {
 		return 1
 	}
 	return id
+}
+
+// incarnationColumn is the wf_instances (and wf_purge_markers) column
+// carrying the per-incarnation identity token (see newIncarnation).
+const incarnationColumn = "incarnation"
+
+// newIncarnation mints the identity token for one instance incarnation
+// (Codex round-21 P1 on #296): 128 crypto-random bits, hex-encoded. Terminal
+// sweep and purge fences compare this token — not created_at — so a
+// recreated ID can never alias a prior incarnation through clock rollback,
+// VM restore, or timestamp precision truncation (all of which can reproduce
+// the same created_at). A 128-bit random collision is practically
+// impossible, unlike clock-derived equality. Legacy instance rows predate
+// the column and read NULL; fences fall back to created_at comparison for
+// them (see victimMatches) with that documented caveat.
+func newIncarnation() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return hex.EncodeToString(b[:])
+	}
+	// crypto/rand essentially never fails; the fallback keeps
+	// CreateInstance total (unique per call via nanotime plus process
+	// randomness) rather than failing instance creation.
+	return fmt.Sprintf("fallback-%d-%d", time.Now().UnixNano(), newID())
 }
 
 func isAlreadyExists(err error) bool {
