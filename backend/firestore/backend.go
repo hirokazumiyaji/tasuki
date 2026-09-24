@@ -817,8 +817,15 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		if adv.ParentNotify != nil {
 			inst, _ := b.GetInstance(ctx, adv.InstanceID)
 			if inst != nil && inst.ParentID != "" {
-				if err := b.ensureWorkflowTask(ctx, inst.ParentID); err != nil {
-					return err
+				// A transient parent ensure failure must not abort the
+				// remaining ensures (Codex round-26 P2 on #291, mirroring
+				// the DynamoDB round-19 continuation): the advancement
+				// already committed, so returning here leaves later
+				// parents dormant (retry conflicts on the consumed seq)
+				// and skips every notification below. Retain in the same
+				// accumulator and finish all ensures + notifications.
+				if err := b.ensureWorkflowTask(ctx, inst.ParentID); err != nil && cleanupErr == nil {
+					cleanupErr = err
 				}
 			}
 		}
@@ -831,13 +838,13 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			continue
 		}
 		if adv.EnsureWorkflowTask {
-			if err := b.ensureWorkflowTaskForced(ctx, adv.InstanceID); err != nil {
-				return err
+			if err := b.ensureWorkflowTaskForced(ctx, adv.InstanceID); err != nil && cleanupErr == nil {
+				cleanupErr = err
 			}
 			continue
 		}
-		if err := b.ensureWorkflowTask(ctx, adv.InstanceID); err != nil {
-			return err
+		if err := b.ensureWorkflowTask(ctx, adv.InstanceID); err != nil && cleanupErr == nil {
+			cleanupErr = err
 		}
 	}
 	b.notifyTasks()
@@ -846,8 +853,8 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			b.notifyTerminal(adv.InstanceID)
 		}
 	}
-	// A failed terminal sweep still surfaces, but only after every parent
-	// ensure above had its chance (see cleanupErr).
+	// The retained cleanup/ensure error surfaces only after every ensure
+	// above had its chance and every waiter was woken (see cleanupErr).
 	return cleanupErr
 }
 

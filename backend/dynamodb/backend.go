@@ -1663,15 +1663,23 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 			newSeq = e.Seq + 1
 		}
 	}
-	names := map[string]string(nil)
+	names := map[string]string{"#status": "status"}
 	if adv.Terminal != nil {
-		names = map[string]string{"#status": "status", "#result": "result"}
+		names["#result"] = "result"
 	}
 	saUpdate := backend.HasSearchAttributesUpdate(adv.NewEvents)
 	memoUpdate := backend.HasMemoUpdate(adv.NewEvents)
+	// Gate the advancement on the persisted running status IN the
+	// transaction (Codex round-26 P1 on #291): the GetInstance above is a
+	// pre-read only, so a TerminateInstance committing after LoadWorkflowHead
+	// and before this txn would otherwise commit activities/timers/journal/
+	// children post-termination on next_seq alone. The "#status = :running"
+	// condition aborts nonterminal (and stale terminal) advancements that
+	// race termination, mirroring the Spanner in-txn status gate (round-25
+	// P1 on #328). A missing row fails the check (terminal treatment).
 	items := []types.TransactWriteItem{{
 		Update: &types.Update{TableName: aws.String(b.table("wf_instances")), Key: map[string]types.AttributeValue{"id": avS(adv.InstanceID)},
-			UpdateExpression: aws.String(instanceAdvanceExpression(adv.Terminal, saUpdate, memoUpdate)), ConditionExpression: aws.String("next_seq = :expected"),
+			UpdateExpression: aws.String(instanceAdvanceExpression(adv.Terminal, saUpdate, memoUpdate)), ConditionExpression: aws.String("next_seq = :expected AND #status = :running"),
 			ExpressionAttributeNames: names, ExpressionAttributeValues: instanceAdvanceValues(newSeq, adv.ExpectedSeq, now, adv.Terminal, adv.NewEvents)}},
 	}
 	for _, e := range adv.NewEvents {
@@ -1756,7 +1764,7 @@ func instanceAdvanceExpression(t *backend.TerminalUpdate, withSearchAttrs, withM
 	return expr + ", #status = :status, #result = :result, failure = :failure, completed_at = :now"
 }
 func instanceAdvanceValues(next, expected int64, now time.Time, t *backend.TerminalUpdate, events []journal.Event) map[string]types.AttributeValue {
-	m := map[string]types.AttributeValue{":next": avN(next), ":expected": avN(expected), ":now": avN(timeToN(now))}
+	m := map[string]types.AttributeValue{":next": avN(next), ":expected": avN(expected), ":now": avN(timeToN(now)), ":running": avS("running")}
 	if backend.HasSearchAttributesUpdate(events) {
 		m[":sa"] = avJSON(backend.MarshalSearchAttributes(backend.LastSearchAttributesUpdate(events)))
 	}
@@ -1934,6 +1942,27 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 				continue
 			}
 			items = append(items, put(b.table("wf_inbox"), inboxItem(id, newID(), is, journal.Event{Type: journal.TypeTimerFired, RefSeq: seq}, now), "attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
+			// Fence the firing on the instance status IN the transaction
+			// (Codex round-26 P2 on #291): the GetInstance above is a
+			// pre-read only, and a termination committing before this txn
+			// would otherwise delete the timer and insert a TimerFired row
+			// that the stale-instance check counts as fired while the gated
+			// ensure creates no task — the post-transition inbox row then
+			// survives a passed sweep (or is preserved via cutoff).
+			// The ConditionCheck aborts the whole txn on a terminal flip
+			// (conditional → continue below, timer left for the terminal
+			// sweep), mirroring the Spanner/Firestore in-txn status reads.
+			items = append([]types.TransactWriteItem{{ConditionCheck: &types.ConditionCheck{
+				TableName:           aws.String(b.table("wf_instances")),
+				Key:                 map[string]types.AttributeValue{"id": avS(id)},
+				ConditionExpression: aws.String("#s = :running"),
+				ExpressionAttributeNames: map[string]string{
+					"#s": "status",
+				},
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":running": avS("running"),
+				},
+			}}}, items...)
 		}
 		_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 		if conditional(err) {
