@@ -228,18 +228,28 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	// instance status) until the retention purge reaps them.
 	cutoff, err := b.readTerminalCutoff(ctx, id)
 	if err != nil {
+		// The terminated status already committed above: wake
+		// cross-process Result waiters even when the post-commit sweep
+		// fails, before the error surfaces (Codex round-28 P2 on #291),
+		// mirroring the advancement path that notifies before returning
+		// the retained cleanup error and Firestore TerminateInstance.
+		b.notifyTerminal(id)
 		return err
 	}
 	if err := b.deleteTasksForInstanceFull(ctx, id, cutoff); err != nil {
+		b.notifyTerminal(id)
 		return err
 	}
 	if err := b.deleteTimersForInstance(ctx, id, cutoff); err != nil {
+		b.notifyTerminal(id)
 		return err
 	}
 	if err := b.deleteSignalDedupeForInstance(ctx, id, cutoff); err != nil {
+		b.notifyTerminal(id)
 		return err
 	}
 	if err := b.deleteInboxForInstance(ctx, id, cutoff); err != nil {
+		b.notifyTerminal(id)
 		return err
 	}
 	b.notifyTerminal(id)

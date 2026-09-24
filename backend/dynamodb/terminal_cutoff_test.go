@@ -361,3 +361,31 @@ func TestCommitAdvancements_NotifiesTerminalsDespiteCleanupError(t *testing.T) {
 	awaitTerminal(t, ch, idA)
 	awaitTerminal(t, ch, idB)
 }
+
+// TestTerminateInstance_NotifiesTerminalDespiteSweepError covers Codex
+// round-28 P2 on #291: TerminateInstance commits the terminated status via
+// UpdateItem before the post-commit sweep, so a sweep-step failure must
+// still wake terminal waiters before the error surfaces. Old code returned
+// the sweep error before notifyTerminal, leaving cross-process Result
+// waiters asleep until their polling interval — the same ordering the
+// advancement path (round-22, above) and Firestore TerminateInstance
+// already have.
+func TestTerminateInstance_NotifiesTerminalDespiteSweepError(t *testing.T) {
+	ctx := context.Background()
+	const id = "notify-terminate"
+	f, _, _ := cutoffFake(id, 1_700_000_000_000_000)
+	// The flip commits (default UpdateItem success); the cutoff read
+	// right after fails.
+	f.getItemFn = func(_ context.Context, in *dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error) {
+		return nil, errors.New("boom: throttled cutoff read")
+	}
+	b := newTestBackend(f)
+	ch, err := b.SubscribeTerminal(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.TerminateInstance(ctx, id); err == nil {
+		t.Fatal("TerminateInstance returned nil, want the retained sweep error")
+	}
+	awaitTerminal(t, ch, id)
+}
