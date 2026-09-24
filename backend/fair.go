@@ -439,6 +439,31 @@ func TrimFairCarryWithResume(pending, secured []FairTaskRef, limit, perInstance 
 	return kept, tail[0], true
 }
 
+// SeedFairAttempted records every secured ID in the attempted set so an
+// overflow requery resuming from an earlier keyset snapshot never re-offers
+// an already-secured row (issue #294 round-27 P2): the attempt log is only
+// appended on passes that overflow (or on requery passes), so a pass that
+// secured rows WITHOUT overflowing leaves them out; a later requery from a
+// pre-overflow snapshot then re-scans those rows, and the fair picker —
+// seeded only by per-instance COUNTS, not IDs — admits the same ID again
+// whenever its instance still has quota free (e.g. Limit=3/MaxPerInstance=2
+// over A1..A70,B1,C1 with A1..A69 locked: the requery from the A69 snapshot
+// re-scans A70,B1,C1, fills the picker with [A70,B1], and the claiming update
+// rejects the duplicate B1 while C1 starves). Seeding on every requery arm
+// closes the gap for rows secured before the first overflow; later passes
+// keep recording their own picks through the existing rule, and the requery
+// progress guard still observes growth because the seed lands before its
+// baseline is captured. Returns the (possibly newly allocated) set.
+func SeedFairAttempted(attempted map[int64]struct{}, secured []FairTaskRef) map[int64]struct{} {
+	if attempted == nil {
+		attempted = make(map[int64]struct{}, len(secured))
+	}
+	for _, r := range secured {
+		attempted[r.ID] = struct{}{}
+	}
+	return attempted
+}
+
 // NoteFairLoss records per-instance outstanding lock/lease losses from one
 // pass (issue #294 round-17 P2): picked refs that were not secured free quota
 // a later pass can reuse. Instances whose secured count is back at the cap

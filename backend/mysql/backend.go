@@ -441,6 +441,13 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 		if requeryPasses > 0 && len(attempted) <= requeryAttempted && len(accepted) <= requeryAccepted {
 			return false
 		}
+		// Seed the duplicate filter with every ID secured so far (Codex
+		// round-27 P2 on #294, see backend.SeedFairAttempted): passes that
+		// secured rows without overflowing never enter the attempt log, so
+		// without this the requery below re-offers an accepted row whose
+		// instance still has quota free, fills the picker with a duplicate
+		// the claiming UPDATE rejects, and starves the rows behind it.
+		attempted = backend.SeedFairAttempted(attempted, accepted)
 		requeryPasses++
 		requeryAttempted, requeryAccepted = len(attempted), len(accepted)
 		overflowSeen = false

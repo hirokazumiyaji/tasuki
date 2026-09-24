@@ -368,6 +368,15 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		if requeryPasses > 0 && len(attempted) <= requeryAttempted && len(out) <= requeryOut {
 			return false
 		}
+		// Seed the duplicate filter with every ID secured so far (Codex
+		// round-27 P2 on #294, see backend.SeedFairAttempted): passes that
+		// secured rows without overflowing never enter the attempt log, so
+		// without this the requery below re-offers an already-claimed row
+		// whose instance still has quota free and fills the picker with a
+		// duplicate (this backend leases eagerly per pass, so the window is
+		// narrower than mysql's — a zero-lease claim re-exposes instantly —
+		// but the same seed keeps both loops identical).
+		attempted = backend.SeedFairAttempted(attempted, claimed)
 		requeryPasses++
 		requeryAttempted, requeryOut = len(attempted), len(out)
 		overflowSeen = false
