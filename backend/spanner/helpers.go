@@ -320,10 +320,17 @@ const dedupeFallbackOwnerColumn = "fallback_owner"
 //     rule so its guard keeps deduping; only such rows retain the hash-reuse
 //     caveat.
 //   - Legacy rows were stored verbatim, so they belong to the requested ID
-//     iff the stored key IS the requested raw ID exactly. An escaped
-//     candidate hitting a legacy row is another ID's row and never matches
-//     (safe direction: the send inserts, possibly duplicating, but is never
-//     dropped).
+//     iff the row's STORED key IS the requested raw ID exactly (Codex
+//     round-19 on #296, same rule as Firestore). An escaped candidate
+//     hitting a legacy row is another ID's row and never matches (safe
+//     direction: the send inserts, possibly duplicating, but is never
+//     dropped). The stored comparison is load-bearing on Firestore, where a
+//     framing collision can land a probe on a foreign legacy row
+//     (frameDedupeDocID("3:3","x") is the legacy doc of ("3","3:3:x")); under
+//     Spanner's composite (instance_id, dedupe_id) keys such aliasing is
+//     structurally impossible — readDedupeRow reads by (instanceID, key), so
+//     the stored column always equals the probed key — and the stored form
+//     keeps both backends on the identical rule.
 //
 // Callers additionally gate every hit on the stored instance_id equaling the
 // probing instance (see readDedupeRow): a no-op by construction under
@@ -346,7 +353,7 @@ func matchDedupeRow(requestedRaw, candidateKey, storedDedupeID string, owner spa
 	if version.Valid && version.Int64 >= dedupeFormatVersion {
 		return storedDedupeID == escapeDedupeID(requestedRaw)
 	}
-	return candidateKey == requestedRaw
+	return storedDedupeID == requestedRaw
 }
 
 // dedupeKeyCandidates lists the stored user-key forms to probe on

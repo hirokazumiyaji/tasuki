@@ -342,10 +342,17 @@ func rawFallbackDedupeKey(dedupeID string) string {
 //     key itself), so a deliberately reused fallback hash cannot claim
 //     another ID's guard.
 //   - Legacy rows (no format_version) were stored verbatim, so they belong
-//     to the requested ID iff the stored key IS the requested raw ID
-//     exactly. An escaped candidate hitting a legacy row is another ID's
-//     row and never matches (safe direction: the send inserts, possibly
-//     duplicating, but is never dropped).
+//     to the requested ID iff the row's STORED key IS the requested raw ID
+//     exactly — not merely the probe candidate (Codex round-19 on #296). A
+//     framing collision lands the probe on a foreign legacy row whose doc ID
+//     aliases this key (frameDedupeDocID("3:3","x") is the legacy doc of
+//     ("3","3:3:x")): the candidate equals the requested ID by construction,
+//     so comparing the candidate mistakes that row for this ID's guard and
+//     drops a genuine first send. Comparing the stored dedupe_id instead
+//     keeps the send (safe direction: at worst a duplicate) while own-ID
+//     verbatim guards still match exactly. Ownership still gates first (see
+//     docInstanceMatches): a missing instance_id field (pre-field row) falls
+//     back to this key check.
 //
 // Callers additionally gate every hit on docInstanceMatches: under legacy
 // framing a document may hold another instance's row.
@@ -362,7 +369,7 @@ func matchDedupeRow(requestedRaw, candidateKey string, doc map[string]any) bool 
 	if version >= dedupeFormatVersion {
 		return str(doc, "dedupe_id") == escapeDedupeID(requestedRaw)
 	}
-	return candidateKey == requestedRaw
+	return str(doc, "dedupe_id") == requestedRaw
 }
 
 // dedupeKeyCandidates lists the stored user-key forms to probe on
