@@ -1043,16 +1043,55 @@ func (b *Backend) cleanupTerminalDocsWithRetry(ctx context.Context, id string) e
 // leave the terminal transition permanently uncommittable. They are swept
 // here instead, paginated across batches; the owned workflow task was
 // already deleted atomically in the transaction.
+//
+// Only rows predating the terminal transition are swept (Codex round-21 P2
+// on #291): the sweep runs post-commit on a detached context, so a
+// SendToInboxBatch that starts after the status commit can accept and insert
+// its dedupe marker plus inbox row mid-sweep. An unrestricted sweep deletes
+// the inbox row while the dedupe phase already passed — the marker survives,
+// the event is lost, and every later send under the same DedupeID is
+// discarded.
+//
+// The cutoff compares SERVER commit order, not client timestamps: each
+// candidate's document update time against the instance doc's update time
+// (the flip commit itself). Client entry times cannot serve here —
+// TerminateInstance stamps completed_at at API entry while the flip
+// serializes later, so a racing CompleteActivity that starts after that
+// entry but commits before the flip carries created_at > completed_at while
+// genuinely predating the transition (conformance TerminateCompleteRace:
+// sweeping it is required, preserving it fails the suite). Server update
+// times order the two commits exactly, with no entry-time skew and no
+// cross-process clock skew. A missing instance doc falls back to the
+// unbounded sweep (status quo, e.g. a concurrent purge owns the leftovers).
+// A second TerminateInstance on an already-terminal instance advances the
+// instance update time and sweeps rows predating THAT call — matching the
+// conformance expectation that re-terminating stays clean.
 func (b *Backend) cleanupTerminalDocs(ctx context.Context, id string) error {
+	var cutoff time.Time
+	if snap, err := b.ref("wf_instances", id).Get(ctx); err == nil && snap.Exists() {
+		cutoff = snap.UpdateTime
+	}
 	for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox"} {
-		if err := b.deleteTerminalColDocs(ctx, col, id); err != nil {
+		if err := b.deleteTerminalColDocs(ctx, col, id, cutoff); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (b *Backend) deleteTerminalColDocs(ctx context.Context, col, id string) error {
+// sweepKeepsRow reports whether a terminal-sweep candidate postdates the
+// terminal transition and must survive cleanup. rowUpdate is the candidate
+// document's server update time; flipUpdate is the instance doc's update
+// time at the terminal flip (zero when unknown, e.g. the instance doc is
+// gone). Pure for unit tests.
+func sweepKeepsRow(rowUpdate, flipUpdate time.Time) bool {
+	if flipUpdate.IsZero() {
+		return false
+	}
+	return rowUpdate.After(flipUpdate)
+}
+
+func (b *Backend) deleteTerminalColDocs(ctx context.Context, col, id string, cutoff time.Time) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -1069,6 +1108,12 @@ func (b *Backend) deleteTerminalColDocs(ctx context.Context, col, id string) err
 			if err != nil {
 				it.Stop()
 				return err
+			}
+			// Client-side cutoff (no composite index required): only
+			// rows committed at or before the terminal flip are deleted,
+			// so a racing post-commit send's rows survive the sweep.
+			if sweepKeepsRow(d.UpdateTime, cutoff) {
+				continue
 			}
 			refs = append(refs, d.Ref)
 		}

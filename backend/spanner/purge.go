@@ -234,12 +234,12 @@ func (b *Backend) deletePurgeBatch(ctx context.Context, id string) (int, error) 
 			muts = append(muts, page...)
 			remaining -= len(page)
 		}
-		dMuts, err := deleteSignalDedupe(ctx, txn, id, purgePageLimit(remaining))
+		dMuts, err := deleteSignalDedupe(ctx, txn, id, purgePageLimit(remaining), time.Time{}, false) // purge owns the instance: unbounded
 		if err != nil {
 			return err
 		}
 		take(dMuts)
-		tMuts, err := deleteTasksForInstance(ctx, txn, id, 0, purgePageLimit(remaining))
+		tMuts, err := deleteTasksForInstance(ctx, txn, id, 0, purgePageLimit(remaining), time.Time{}, false)
 		if err != nil {
 			return err
 		}
@@ -249,7 +249,7 @@ func (b *Backend) deletePurgeBatch(ctx context.Context, id string) (int, error) 
 			return err
 		}
 		take(tmMuts)
-		inMuts, err := deleteInboxForInstance(ctx, txn, id, purgePageLimit(remaining))
+		inMuts, err := deleteInboxForInstance(ctx, txn, id, purgePageLimit(remaining), time.Time{}, false)
 		if err != nil {
 			return err
 		}

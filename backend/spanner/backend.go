@@ -257,13 +257,13 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 			"completed_at": now,
 		}))
 		budget := terminalCleanupMutationBudget
-		dMuts, err := deleteSignalDedupe(ctx, txn, id, budget)
+		dMuts, err := deleteSignalDedupe(ctx, txn, id, budget, time.Time{}, false)
 		if err != nil {
 			return err
 		}
 		muts = append(muts, dMuts...)
 		budget = max(budget-len(dMuts), 0)
-		tMuts, err := deleteTasksForInstance(ctx, txn, id, 0, budget)
+		tMuts, err := deleteTasksForInstance(ctx, txn, id, 0, budget, time.Time{}, false)
 		if err != nil {
 			return err
 		}
@@ -275,7 +275,7 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		}
 		muts = append(muts, tmMuts...)
 		budget = max(budget-len(tmMuts), 0)
-		inMuts, err := deleteInboxForInstance(ctx, txn, id, budget)
+		inMuts, err := deleteInboxForInstance(ctx, txn, id, budget, time.Time{}, false)
 		if err != nil {
 			return err
 		}
@@ -773,11 +773,18 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	// removed here in bounded transactions. The sweep uses a detached
 	// context so parent cancellation cannot strand survivors, and a
 	// persistent failure is surfaced rather than leaving claimable rows
-	// behind.
+	// behind. A per-instance cleanup failure no longer aborts the batch
+	// (Codex round-21 P2 on #291, mirroring the DynamoDB/Firestore
+	// continuation fix from round-19): cleanup-retries-exhausted used to
+	// return immediately, skipping later instances' sweeps (residue with no
+	// recovery: the advancement already committed). The first error is
+	// retained while every committed instance is still swept; it is
+	// returned at the end, after notifications.
+	var cleanupErr error
 	for _, adv := range advs {
 		if adv.Terminal != nil {
-			if err := b.cleanupTerminalInstance(context.Background(), adv.InstanceID, true); err != nil {
-				return err
+			if err := terminalCleanupFunc(b, context.Background(), adv.InstanceID, true); err != nil && cleanupErr == nil {
+				cleanupErr = err
 			}
 		}
 	}
@@ -801,7 +808,9 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			b.notifyTerminal(adv.InstanceID)
 		}
 	}
-	return nil
+	// A failed terminal sweep still surfaces, but only after every later
+	// victim was swept and every notification above had its chance.
+	return cleanupErr
 }
 
 func (b *Backend) withRW(ctx context.Context, fn func(context.Context, *spanner.ReadWriteTransaction) error) error {
@@ -821,6 +830,13 @@ const terminalCleanupMutationBudget = 1000
 // post-commit sweep transaction (at most four batches per commit),
 // keeping every commit far below the mutation limit.
 const terminalCleanupSweepBatch = 500
+
+// terminalCleanupFunc sweeps an instance's residual docs after a terminal
+// advancement commits. It is a variable (not a direct method call) so tests
+// can fault-inject a cleanup failure and assert later victims are still
+// swept before the retained error surfaces (Codex round-21 P2 on #291);
+// production always uses cleanupTerminalInstance.
+var terminalCleanupFunc = (*Backend).cleanupTerminalInstance
 
 // cleanupTerminalInstance removes an instance's residual tasks, timers,
 // inbox entries and signal dedupe rows left outside the advancement commit
@@ -858,16 +874,39 @@ func (b *Backend) cleanupTerminalInstanceOnce(ctx context.Context, id string, in
 }
 
 // deleteTerminalBatch deletes up to terminalCleanupSweepBatch residual rows
-// per table in one transaction and reports how many rows were removed.
+// per table in one transaction and reports how many rows were removed. Only
+// rows predating the terminal transition are swept (Codex round-21 P2 on
+// #291): the sweep runs post-commit, so a SendToInboxBatch that starts after
+// the status commit can accept and insert its dedupe marker plus inbox row
+// mid-sweep, and an unrestricted sweep deletes the inbox row while the
+// dedupe phase already passed — the marker survives, the event is lost, and
+// every later send under the same DedupeID is discarded. The cutoff is the
+// instance's completed_at read in this same transaction (the terminal
+// commit's own timestamp): rows created after it are the racing sends and
+// must survive. A missing instance row or a NULL completed_at (legacy rows)
+// falls back to the unbounded sweep, and wf_timers has no created_at column
+// — timers can only be created by a non-terminal advancement, so no racing
+// send can add one post-commit and the unbounded timer sweep is exact.
+//
+// The in-commit budget deletes (commitAdvancementTxn, TerminateInstance)
+// stay unbounded: their reads are snapshot-isolated inside the status-flip
+// transaction, so they can only ever see pre-commit rows, and both sides of
+// a swept send (dedupe marker and inbox row) are removed atomically with the
+// flip — the marker-without-inbox split the cutoff guards against cannot
+// arise there.
 func (b *Backend) deleteTerminalBatch(ctx context.Context, id string, includeInbox bool) (int, error) {
 	var n int
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n = 0
-		dMuts, err := deleteSignalDedupe(ctx, txn, id, terminalCleanupSweepBatch)
+		cutoff, hasCutoff, err := readCompletedAt(ctx, txn, id)
 		if err != nil {
 			return err
 		}
-		tMuts, err := deleteTasksForInstance(ctx, txn, id, 0, terminalCleanupSweepBatch)
+		dMuts, err := deleteSignalDedupe(ctx, txn, id, terminalCleanupSweepBatch, cutoff, hasCutoff)
+		if err != nil {
+			return err
+		}
+		tMuts, err := deleteTasksForInstance(ctx, txn, id, 0, terminalCleanupSweepBatch, cutoff, hasCutoff)
 		if err != nil {
 			return err
 		}
@@ -877,7 +916,7 @@ func (b *Backend) deleteTerminalBatch(ctx context.Context, id string, includeInb
 		}
 		muts := append(append(dMuts, tMuts...), tmMuts...)
 		if includeInbox {
-			inMuts, err := deleteInboxForInstance(ctx, txn, id, terminalCleanupSweepBatch)
+			inMuts, err := deleteInboxForInstance(ctx, txn, id, terminalCleanupSweepBatch, cutoff, hasCutoff)
 			if err != nil {
 				return err
 			}
@@ -1043,13 +1082,13 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		// ClaimTasks refuses tasks of non-running instances, so leftovers
 		// are never executed in the meantime.
 		budget := terminalCleanupMutationBudget
-		dMuts, err := deleteSignalDedupe(ctx, txn, adv.InstanceID, budget)
+		dMuts, err := deleteSignalDedupe(ctx, txn, adv.InstanceID, budget, time.Time{}, false)
 		if err != nil {
 			return err
 		}
 		muts = append(muts, dMuts...)
 		budget = max(budget-len(dMuts), 0)
-		tMuts, err := deleteTasksForInstance(ctx, txn, adv.InstanceID, adv.TaskID, budget)
+		tMuts, err := deleteTasksForInstance(ctx, txn, adv.InstanceID, adv.TaskID, budget, time.Time{}, false)
 		if err != nil {
 			return err
 		}
@@ -1061,7 +1100,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		}
 		muts = append(muts, tmMuts...)
 		budget = max(budget-len(tmMuts), 0)
-		inMuts, err := deleteInboxForInstance(ctx, txn, adv.InstanceID, budget)
+		inMuts, err := deleteInboxForInstance(ctx, txn, adv.InstanceID, budget, time.Time{}, false)
 		if err != nil {
 			return err
 		}
@@ -1517,6 +1556,13 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	now := nowUTC()
 	var inserted int
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// now is stamped per attempt (not per call): the transaction
+		// retries on abort, and a send that loses to the terminal commit
+		// must stamp its rows with the retry time — after the terminal
+		// completed_at — so the post-commit terminal sweep's create-time
+		// cutoff preserves them instead of deleting the inbox row while
+		// its dedupe marker survives (Codex round-21 P2 on #291).
+		now = nowUTC()
 		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"status", "queue"})
 		if err != nil {
 			if isNotFound(err) {
@@ -1591,11 +1637,39 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	return nil
 }
 
-func deleteSignalDedupe(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string, limit int) ([]*spanner.Mutation, error) {
-	iter := txn.Query(ctx, spanner.Statement{
+// readCompletedAt returns the instance's terminal-transition time for the
+// post-commit sweep cutoff (Codex round-21 P2 on #291). ok=false when the
+// instance row is gone (a concurrent purge owns the leftovers) or
+// completed_at is NULL (legacy rows): the sweep then falls back to
+// unbounded, matching the pre-cutoff behavior so legacy residue converges.
+func readCompletedAt(ctx context.Context, txn *spanner.ReadWriteTransaction, id string) (cutoff time.Time, ok bool, err error) {
+	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"completed_at"})
+	if err != nil {
+		if isNotFound(err) {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, err
+	}
+	var completedAt spanner.NullTime
+	if err := row.Columns(&completedAt); err != nil {
+		return time.Time{}, false, err
+	}
+	if !completedAt.Valid {
+		return time.Time{}, false, nil
+	}
+	return completedAt.Time, true, nil
+}
+
+func deleteSignalDedupe(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string, limit int, cutoff time.Time, hasCutoff bool) ([]*spanner.Mutation, error) {
+	stmt := spanner.Statement{
 		SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id LIMIT @limit`,
 		Params: map[string]any{"id": instanceID, "limit": int64(limit)},
-	})
+	}
+	if hasCutoff {
+		stmt.SQL = `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id AND created_at <= @cutoff LIMIT @limit`
+		stmt.Params["cutoff"] = cutoff
+	}
+	iter := txn.Query(ctx, stmt)
 	defer iter.Stop()
 	var muts []*spanner.Mutation
 	for {
@@ -1621,12 +1695,19 @@ func deleteSignalDedupe(ctx context.Context, txn *spanner.ReadWriteTransaction, 
 // passes 0 to exclude nothing. The instance_id filter is served by
 // wf_tasks_instance_idx (see schema.sql and ensureTasksInstanceIndex), so
 // cleanup cost stays proportional to the instance's rows; ORDER BY id keeps
-// the paged sweep deterministic.
-func deleteTasksForInstance(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string, excludeTaskID int64, limit int) ([]*spanner.Mutation, error) {
-	iter := txn.Query(ctx, spanner.Statement{
+// the paged sweep deterministic. When hasCutoff holds, only rows with
+// created_at at or before the terminal transition are returned, so racing
+// post-commit sends survive the sweep (Codex round-21 P2 on #291).
+func deleteTasksForInstance(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string, excludeTaskID int64, limit int, cutoff time.Time, hasCutoff bool) ([]*spanner.Mutation, error) {
+	stmt := spanner.Statement{
 		SQL:    `SELECT id FROM wf_tasks WHERE instance_id = @id ORDER BY id LIMIT @limit`,
 		Params: map[string]any{"id": instanceID, "limit": int64(limit)},
-	})
+	}
+	if hasCutoff {
+		stmt.SQL = `SELECT id FROM wf_tasks WHERE instance_id = @id AND created_at <= @cutoff ORDER BY id LIMIT @limit`
+		stmt.Params["cutoff"] = cutoff
+	}
+	iter := txn.Query(ctx, stmt)
 	defer iter.Stop()
 	var muts []*spanner.Mutation
 	for {
@@ -1673,11 +1754,16 @@ func deleteTimersForInstance(ctx context.Context, txn *spanner.ReadWriteTransact
 	return muts, nil
 }
 
-func deleteInboxForInstance(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string, limit int) ([]*spanner.Mutation, error) {
-	iter := txn.Query(ctx, spanner.Statement{
+func deleteInboxForInstance(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string, limit int, cutoff time.Time, hasCutoff bool) ([]*spanner.Mutation, error) {
+	stmt := spanner.Statement{
 		SQL:    `SELECT id FROM wf_inbox WHERE instance_id = @id LIMIT @limit`,
 		Params: map[string]any{"id": instanceID, "limit": int64(limit)},
-	})
+	}
+	if hasCutoff {
+		stmt.SQL = `SELECT id FROM wf_inbox WHERE instance_id = @id AND created_at <= @cutoff LIMIT @limit`
+		stmt.Params["cutoff"] = cutoff
+	}
+	iter := txn.Query(ctx, stmt)
 	defer iter.Stop()
 	var muts []*spanner.Mutation
 	for {
