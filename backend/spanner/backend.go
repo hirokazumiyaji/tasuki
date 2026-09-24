@@ -957,6 +957,19 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	if err := row.Columns(&status, &nextSeq, &queue, &parentID, &parentSeq); err != nil {
 		return err
 	}
+	// Reject commits for instances that already left running (Codex round-25
+	// P1 on #328, mirroring #327's round-23 status gate): only part of the
+	// terminal cleanup rides in the TerminateInstance flip transaction
+	// (terminalCleanupMutationBudget), so the owned workflow task can survive
+	// the flip when dedupe rows exhaust the budget. A worker holding that
+	// task still matches ExpectedSeq/TaskID, and without this gate a
+	// nonterminal advancement commits during the post-commit sweep —
+	// post-sweep activities/children then survive/execute after termination.
+	// Reading the status in-txn also conflicts with a concurrent flip,
+	// serializing the commit against termination.
+	if status != "running" {
+		return backend.ErrConflict
+	}
 	if nextSeq != adv.ExpectedSeq {
 		return backend.ErrConflict
 	}
