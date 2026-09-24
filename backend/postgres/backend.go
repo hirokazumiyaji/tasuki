@@ -406,7 +406,34 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		// set to O(limit+margin); locked extras past the margin stay
 		// dropped for later polls.
 		if len(pending) > 0 {
-			pending = backend.TrimFairCarry(pending, claimed, req.Limit, req.MaxPerInstance)
+			trimmed, resume, dropped := backend.TrimFairCarryWithResume(pending, claimed, req.Limit, req.MaxPerInstance)
+			if dropped {
+				// Spill the dropped tail's resume cursor into the
+				// overflow-requery state (issue #294 round-19 P1): the
+				// fixed quota+margin window above permanently forgets
+				// rows past it (e.g. Limit=2/MaxPerInstance=1 over
+				// A1..A68/B1 with A1..A67 locked: the window keeps
+				// A2..A66 while A67,A68 are dropped before either is
+				// ever attempted, so every poll returns short while
+				// the head stays locked). The FIFO-next dropped row
+				// rides along in trimmed (the keyset requery below is
+				// exclusive), and the cursor arms the pre-overflow
+				// snapshot so a later underfilled pass re-issues a
+				// bounded requery FROM the dropped tail instead of
+				// rescanning the head. Keep the earliest snapshot:
+				// the dropped tail is FIFO-earlier than the scan
+				// cursor. Arming overflowSeen also records this
+				// pass's picks in attempted, so the requery skips
+				// already-attempted rows in favor of the dropped
+				// tail. No requery fires without freed quota (the
+				// lost/outstanding gates below still apply), so a
+				// fully successful batch pays nothing extra.
+				if !overflowSnapValid || backend.FairRefBefore(resume, backend.FairTaskRef{VisibleAt: overflowSnapVis, ID: overflowSnapID}) {
+					overflowSnapVis, overflowSnapID, overflowSnapValid = resume.VisibleAt, resume.ID, true
+				}
+				overflowSeen = true
+			}
+			pending = trimmed
 			if len(pending) == 0 {
 				// Everything retained is already over quota: nothing to
 				// probe or re-offer this pass; the scan below (or the

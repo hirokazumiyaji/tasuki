@@ -872,8 +872,16 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 			args = append(args, s)
 		}
 		args = append(args, cutoff, lim)
+		// INDEXED BY forces the (completed_at, id) partial victim index
+		// (issue #294 round-19 P2): without stat1 the planner prefers the
+		// status seek plus a TEMP B-TREE sort, which scales with every
+		// completed row. The ordered partial scan applies the status IN
+		// filter per row and stops at LIMIT, staying bounded because
+		// completed rows are overwhelmingly purge-eligible. The index
+		// always exists post-Migrate (000001 creates it, 000004 rebuilds
+		// the pre-fix shape).
 		rows, err := conn.QueryContext(ctx, `
-		SELECT id FROM wf_instances
+		SELECT id FROM wf_instances INDEXED BY wf_instances_completed_at_idx
 		WHERE status IN (`+inClause(len(sts))+`)
 		  AND completed_at IS NOT NULL AND completed_at <= ?
 		ORDER BY completed_at, id

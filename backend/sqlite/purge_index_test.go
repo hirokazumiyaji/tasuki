@@ -53,8 +53,61 @@ func TestPurgeCompletedAtIndex(t *testing.T) {
 	}
 }
 
+// TestPurgeIndexLeadsWithOrderingColumns guards the round-19 P2 index
+// shape: the victim index must lead with (completed_at, id) so the ordered
+// scan serves ORDER BY without a TEMP B-TREE sort, and the 000004 migration
+// must retrofit databases still carrying the pre-fix (status, completed_at)
+// shape (databases at version >= 3 never re-run 000003).
+func TestPurgeIndexLeadsWithOrderingColumns(t *testing.T) {
+	ctx := context.Background()
+	b, err := sqlite.New(filepath.Join(t.TempDir(), "purge_shape.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	indexSQL := func() string {
+		var sql string
+		if err := b.DB().QueryRowContext(ctx,
+			`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'wf_instances_completed_at_idx'`,
+		).Scan(&sql); err != nil {
+			t.Fatal(err)
+		}
+		return sql
+	}
+	if sql := indexSQL(); !strings.Contains(sql, "(completed_at, id)") {
+		t.Fatalf("victim index DDL = %q, want leading (completed_at, id)", sql)
+	}
+	// Simulate a pre-fix database: stale status-leading index with 000004
+	// unapplied, then re-Migrate must rebuild the ordering-leading shape.
+	if _, err := b.DB().ExecContext(ctx, `DROP INDEX wf_instances_completed_at_idx`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.DB().ExecContext(ctx,
+		`CREATE INDEX wf_instances_completed_at_idx ON wf_instances (status, completed_at) WHERE completed_at IS NOT NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.DB().ExecContext(ctx, `DELETE FROM tasuki_schema_migrations WHERE version = 4`); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if sql := indexSQL(); !strings.Contains(sql, "(completed_at, id)") {
+		t.Fatalf("retrofitted victim index DDL = %q, want leading (completed_at, id)", sql)
+	}
+}
+// through EXPLAIN QUERY PLAN and requires an index-backed search (issue #294).
+// Round-19 P2 additionally requires NO temp b-tree: the victim index leads
+// with (completed_at, id) and the query forces it, so the ordered scan
+// serves the ORDER BY directly instead of sorting.
 // TestPurgeVictimScanUsesIndex runs the exact PurgeInstances victim SELECT
 // through EXPLAIN QUERY PLAN and requires an index-backed search (issue #294).
+// Round-19 P2 additionally requires NO temp b-tree: the victim index leads
+// with (completed_at, id) and the query forces it, so the ordered scan
+// serves the ORDER BY directly instead of sorting.
 func TestPurgeVictimScanUsesIndex(t *testing.T) {
 	ctx := context.Background()
 	b, err := sqlite.New(filepath.Join(t.TempDir(), "purge_plan.db"))
@@ -68,7 +121,7 @@ func TestPurgeVictimScanUsesIndex(t *testing.T) {
 
 	rows, err := b.DB().QueryContext(ctx, `
 		EXPLAIN QUERY PLAN
-		SELECT id FROM wf_instances
+		SELECT id FROM wf_instances INDEXED BY wf_instances_completed_at_idx
 		WHERE status IN ('completed', 'failed', 'terminated')
 		  AND completed_at IS NOT NULL AND completed_at <= '2026-01-01T00:00:00.000000000Z'
 		ORDER BY completed_at, id
@@ -95,5 +148,8 @@ func TestPurgeVictimScanUsesIndex(t *testing.T) {
 	}
 	if !strings.Contains(joined, "SEARCH") {
 		t.Fatalf("purge victim scan is not a SEARCH:\n%s", joined)
+	}
+	if strings.Contains(joined, "TEMP B-TREE") {
+		t.Fatalf("purge victim scan sorts via TEMP B-TREE (index must lead with the ORDER BY columns):\n%s", joined)
 	}
 }

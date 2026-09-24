@@ -479,7 +479,28 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 		// set to O(limit+margin); locked extras past the margin stay
 		// dropped for later polls.
 		if len(pending) > 0 {
-			pending = backend.TrimFairCarry(pending, accepted, req.Limit, req.MaxPerInstance)
+			trimmed, resume, dropped := backend.TrimFairCarryWithResume(pending, accepted, req.Limit, req.MaxPerInstance)
+			if dropped {
+				// Spill the dropped tail's resume cursor into the
+				// overflow-requery state (issue #294 round-19 P1): the
+				// fixed quota+margin window above permanently forgets
+				// rows past it (see the postgres claim loop for the
+				// A1..A68/B1 scenario). The FIFO-next dropped row
+				// rides along in trimmed (the keyset requery below is
+				// exclusive), and the cursor arms the pre-overflow
+				// snapshot so a later underfilled pass re-issues a
+				// bounded requery FROM the dropped tail instead of
+				// rescanning the head. Keep the earliest snapshot and
+				// record this pass's picks (via overflowSeen) so the
+				// requery skips already-attempted rows. No requery
+				// fires without freed quota (the lost/outstanding
+				// gates below still apply).
+				if !overflowSnapValid || backend.FairRefBefore(resume, backend.FairTaskRef{VisibleAt: overflowSnapVis, ID: overflowSnapID}) {
+					overflowSnapVis, overflowSnapID, overflowSnapValid = resume.VisibleAt, resume.ID, true
+				}
+				overflowSeen = true
+			}
+			pending = trimmed
 			if len(pending) == 0 {
 				// Everything retained is already over quota: nothing to
 				// probe or re-offer this pass.

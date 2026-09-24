@@ -375,6 +375,62 @@ func TrimFairCarry(pending, secured []FairTaskRef, limit, perInstance int) []Fai
 	return kept
 }
 
+// FairRefBefore reports whether a sorts before b in FIFO (scan) order —
+// the same (VisibleAt, ID) key SortFairRefs sorts by. Claim loops use it to
+// keep the earliest overflow-requery snapshot when a trim spill races a
+// scan-phase snapshot (issue #294 round-19 P1).
+func FairRefBefore(a, b FairTaskRef) bool {
+	if a.VisibleAt.Equal(b.VisibleAt) {
+		return a.ID < b.ID
+	}
+	return a.VisibleAt.Before(b.VisibleAt)
+}
+
+// TrimFairCarryWithResume trims like TrimFairCarry and additionally spills a
+// resume cursor for the dropped tail (issue #294 round-19 P1): the fixed
+// quota+margin window permanently forgets rows past it — e.g.
+// Limit=2/MaxPerInstance=1 over A1..A68/B1 with A1..A67 locked: pass 1
+// secures B1, the carry holds A2..A68, and every trim keeps A2..A66 while
+// dropping A67,A68 before either is ever attempted, so every poll returns
+// short while the head stays locked and A68 (unlocked) starves.
+//
+// kept carries the quota fill, the fallback margin, AND the FIFO-next
+// dropped row (boundary). The boundary rides along because the overflow
+// keyset requery is exclusive (`>` the snapshot): resuming exactly at the
+// dropped minimum would skip it. resume is the FIFO-smallest row still
+// dropped — the cursor the caller arms its overflow-requery snapshot from —
+// and dropped reports whether any row remains dropped (false when the whole
+// carry fit, in which case no requery is needed). Retention stays
+// O(limit+margin+1): one cursor plus one boundary row, not O(carry).
+func TrimFairCarryWithResume(pending, secured []FairTaskRef, limit, perInstance int) (kept []FairTaskRef, resume FairTaskRef, dropped bool) {
+	kept = TrimFairCarry(pending, secured, limit, perInstance)
+	if len(pending) == 0 || limit <= 0 || perInstance <= 0 || len(kept) == 0 {
+		return kept, FairTaskRef{}, false
+	}
+	inKept := make(map[int64]struct{}, len(kept))
+	for _, r := range kept {
+		inKept[r.ID] = struct{}{}
+	}
+	sorted := append([]FairTaskRef(nil), pending...)
+	SortFairRefs(sorted)
+	var tail []FairTaskRef
+	for _, r := range sorted {
+		if _, ok := inKept[r.ID]; !ok {
+			tail = append(tail, r)
+		}
+	}
+	if len(tail) == 0 {
+		return kept, FairTaskRef{}, false
+	}
+	// The FIFO-head of the dropped tail rides along so the exclusive
+	// requery from resume cannot skip it; resume covers the rest.
+	kept = append(kept, tail[0])
+	if len(tail) == 1 {
+		return kept, FairTaskRef{}, false
+	}
+	return kept, tail[1], true
+}
+
 // NoteFairLoss records per-instance outstanding lock/lease losses from one
 // pass (issue #294 round-17 P2): picked refs that were not secured free quota
 // a later pass can reuse. Instances whose secured count is back at the cap

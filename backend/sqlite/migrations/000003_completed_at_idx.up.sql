@@ -1,7 +1,12 @@
 -- 000003_completed_at_idx: PurgeInstances victim-scan index.
 -- PurgeInstances victim scan: WHERE status IN (...) AND completed_at IS NOT NULL
--- AND completed_at <= ? ORDER BY completed_at, id. Leading status keeps the
--- equality filter seekable while the range + ordering stay index-backed.
+-- AND completed_at <= ? ORDER BY completed_at, id. The index leads with the
+-- ordering columns (completed_at, id): the default 4-status purge filter
+-- matches nearly every completed row, so a status-leading index cannot serve
+-- the ORDER BY and the scan falls back to a TEMP B-TREE sort. Leading with
+-- the range + ordering lets SQLite walk victims in order and stop at LIMIT;
+-- the status IN (...) filter applies per row off the ordered scan, which
+-- stays bounded because completed rows are overwhelmingly purge-eligible.
 -- A dedicated migration (rather than relying on 000001) so databases stamped
 -- as legacy version 1 — which skip the baseline DDL — still gain the index.
-CREATE INDEX IF NOT EXISTS wf_instances_completed_at_idx ON wf_instances (status, completed_at) WHERE completed_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS wf_instances_completed_at_idx ON wf_instances (completed_at, id) WHERE completed_at IS NOT NULL;
