@@ -364,7 +364,20 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 		})
 		bcancel()
 		if err != nil {
-			w.recordStoreError(ctx, "commit_workflow", err, "n", len(advs))
+			if errors.Is(err, errLeaseLost) {
+				// Fencing rejection, not a backend failure: the
+				// aggregate gate refused the batch before any store
+				// op ran (initial cover failure or guard expiry), so
+				// — like the per-item path above — it is
+				// debug-logged, not counted as a store failure.
+				// Recording it would raise false backend-error
+				// alerts on routine fencing. The per-item fallback
+				// below still re-gates and commits the live members.
+				w.opts.Logger.Debug("skipping workflow batch commit; lease lost before the store op",
+					"n", len(advs), "err", err)
+			} else {
+				w.recordStoreError(ctx, "commit_workflow", err, "n", len(advs))
+			}
 			// One conflict rolls back the whole batch transaction, so fall
 			// back to per-instance commits: healthy instances still advance
 			// in this tick, and failed items release their leases inside
@@ -491,25 +504,57 @@ func (w *Worker) guardedDetachedBatchCommit(gated []flushGuardedCommit, commitCa
 // async cover that has not run yet admits the commit below onto a lease
 // that a scheduling delay already let lapse — a slow CommitAdvancement
 // then applies stale while the late ID-only renewal only observes the
-// loss after the fact. Blocking here (bounded by the renewal's own
-// lease-duration timeout, entries in parallel) means no store op runs
-// until continuity is proven or the guard trips. Afterwards each covered
-// entry renews on a half-lease ticker via the detached-renewal path (see
-// renewOnceDetached): any failure trips the guard so the commit gate
-// aborts instead of writing stale, and the loops exit when the flush is
-// over (stop func) or their entry commits (flag cleared by the
-// committer). Entries whose initial renewal failed start no loop — the
-// gate already excludes them. The returned stop func joins every loop:
+// loss after the fact. Blocking here (bounded by the flush commit context
+// and the renewal's own lease-duration timeout, entries in parallel —
+// see round-25 P1) means no store op runs until continuity is proven or
+// the guard trips. Afterwards each covered entry renews on a half-lease
+// ticker via the detached-renewal path (see renewOnceDetached): any
+// failure trips the guard so the commit gate aborts instead of writing
+// stale, and the loops exit when the flush is over (stop func) or their
+// entry commits (flag cleared by the committer). Entries whose initial
+// renewal failed start no loop — the gate already excludes them. The
+// returned stop func joins every loop (bounded by the same flush context):
 // no renewal is in flight when the flush returns.
 func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit) func() {
 	if len(gated) == 0 {
 		return func() {}
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Round-25 P1: rebase every gated entry's cover context onto the flush
+	// (commit) context. beginDetachedCommit seeds coverCtx from
+	// context.Background so cover outlives execution cancellation, but the
+	// flush itself runs under a bounded commit context (see commitContext:
+	// CommitTimeout during normal operation) and its documented bound must
+	// hold for the whole flush — including cover. renewOnceDetached derives
+	// its store-call context via WithTimeout(coverCtx, leaseDuration), so a
+	// coverCtx that is a child of the flush ctx yields
+	// min(flush deadline, lease-based timeout) for every renewal: a
+	// context-aware backend aborts promptly on flush expiry, while a
+	// context-ignoring one is cut off by the bounded joins below instead
+	// of pinning the polling loop / PollOnce past CommitTimeout. The old
+	// background-derived cancel is fired on replacement; no renewal is in
+	// flight yet (Phase 1 has not started), so nothing is disturbed.
+	w.detMu.Lock()
+	for _, g := range gated {
+		if gd, ok := w.detGuard[g.task.ID]; ok && gd.epoch == g.p.tok.epoch && gd.seq == g.p.tok.seq {
+			oldCancel := gd.coverCancel
+			nctx, ncancel := context.WithCancel(ctx)
+			gd.coverCtx = nctx
+			gd.coverCancel = ncancel
+			w.detGuard[g.task.ID] = gd
+			if oldCancel != nil {
+				oldCancel()
+			}
+		}
+	}
+	w.detMu.Unlock()
 	// Phase 1: the initial renewal for every entry, in parallel, joined
 	// before admitting any write. A failure trips the guard (the
 	// backstop trip below covers errors that bypass the internal one)
 	// and starts no ticker loop; the commit gate then skips the entry.
-	covered := make([]bool, len(gated))
+	covered := make([]atomic.Bool, len(gated))
 	var initWg sync.WaitGroup
 	for i, g := range gated {
 		initWg.Add(1)
@@ -525,15 +570,38 @@ func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit
 				w.tripDetachedGuard(taskID, tok)
 				return
 			}
-			covered[i] = true
+			covered[i].Store(true)
 		}(i, g.task.ID, g.p.tok)
 	}
-	initWg.Wait()
+	// Bounded join (round-25 P1): the pre-fix initWg.Wait held the flush
+	// past CommitTimeout when ExtendLease stalled in a context-ignoring
+	// backend. Waiting on the flush context instead bounds the whole Phase
+	// 1 by the documented flush bound; with a Background flush ctx (no
+	// deadline, e.g. older tests) the Done channel is nil and the wait is
+	// effectively unbounded, as before. On give-up every still-unproven
+	// entry is tripped so its gate skips without touching the store —
+	// continuity was never proven — and a late renewal landing after the
+	// trip finds the missing guard and reports loss without refreshing
+	// (see renewOnceDetached), so it cannot resurrect the entry.
+	initDone := make(chan struct{})
+	go func() {
+		initWg.Wait()
+		close(initDone)
+	}()
+	select {
+	case <-initDone:
+	case <-ctx.Done():
+		for i, g := range gated {
+			if !covered[i].Load() {
+				w.tripDetachedGuard(g.task.ID, g.p.tok)
+			}
+		}
+	}
 	// Phase 2: periodic cover for the entries proven live above.
 	coverDone := make(chan struct{})
 	var coverWg sync.WaitGroup
 	for i, g := range gated {
-		if !covered[i] {
+		if !covered[i].Load() {
 			continue
 		}
 		coverWg.Add(1)
@@ -572,7 +640,20 @@ func (w *Worker) startFlushCover(ctx context.Context, gated []flushGuardedCommit
 	}
 	return func() {
 		close(coverDone)
-		coverWg.Wait()
+		// Bounded join (round-25 P1): a periodic cover renewal stalled
+		// in a context-ignoring backend must not hold the flush past
+		// its commit bound after the store ops already returned. With
+		// a Background flush ctx the Done channel is nil and the wait
+		// is effectively unbounded, as before.
+		joinDone := make(chan struct{})
+		go func() {
+			coverWg.Wait()
+			close(joinDone)
+		}()
+		select {
+		case <-joinDone:
+		case <-ctx.Done():
+		}
 		for _, g := range gated {
 			g.committing.Store(false)
 			// Backstop for entries whose commit never ran (batch
