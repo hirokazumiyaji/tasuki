@@ -1299,7 +1299,10 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	// row plus one inbox row (3 mutations) plus one inbox-seq mutation —
 	// 100*3+1=301 mutations, far below the 20,000-mutation commit limit, and
 	// composite (instance_id, dedupe_id) keys never alias across IDs, so no
-	// dual-write compat docs are needed.
+	// FRAMING dual-write is needed (cf. Firestore's framed/legacy doc IDs).
+	// The RAW-escape compat leg (rawCompatGuardKey, Codex round-26 P1 on
+	// #296, extended to the terminal path in round-27) IS written on both
+	// paths: old nodes probe the verbatim key.
 	var inserted int
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		// Stamp inside the transaction (per attempt): a transaction that
@@ -1406,6 +1409,8 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					}))
 					baseExists := false
 					canonicalOccupied := false
+					rawOccupied := false
+					canonKey := escapeDedupeID(it.DedupeID)
 					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
 						if isPostTerminalMarkerKey(bk) {
 							continue
@@ -1417,8 +1422,11 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						if !ok {
 							continue
 						}
-						if bk == escapeDedupeID(it.DedupeID) {
+						if bk == canonKey {
 							canonicalOccupied = true
+						}
+						if bk == it.DedupeID {
+							rawOccupied = true
 						}
 						if !owned {
 							continue
@@ -1428,13 +1436,35 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 							break
 						}
 					}
+					// Same-batch guard keys are invisible to the probes above
+					// (reads see committed rows only): a canonical key
+					// reserved by an earlier terminal item counts as occupied,
+					// so the second insert degrades to marker-only instead of
+					// failing the commit on a duplicate insert.
+					if reservedGuardKeys[canonKey] {
+						canonicalOccupied = true
+					}
 					if baseExists || canonicalOccupied {
 						created[it.DedupeID] = true
 					} else {
+						reservedGuardKeys[canonKey] = true
 						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-							"instance_id": instanceID, "dedupe_id": dedupeKey(it.DedupeID),
+							"instance_id": instanceID, "dedupe_id": canonKey,
 							dedupeFormatVersionColumn: dedupeFormatVersion, "created_at": now,
 						}))
+						// Rolling-upgrade compat, same as the running path
+						// below (Codex round-27 P1 on #296): the terminal base
+						// guard above is stored escaped, so without the raw
+						// legacy leg an old-node retry probing the verbatim
+						// key misses and duplicates. The round-26 fix covered
+						// only the running path; the terminal path wrote the
+						// escaped primary alone.
+						if raw, ok := rawCompatGuardKey(it.DedupeID, canonKey, rawOccupied, reservedGuardKeys); ok {
+							reservedGuardKeys[raw] = true
+							muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
+								"instance_id": instanceID, "dedupe_id": raw, "created_at": now,
+							}))
+						}
 						created[it.DedupeID] = true
 					}
 				} else {
