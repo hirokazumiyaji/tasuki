@@ -593,6 +593,10 @@ func (w *Worker) renewExit(taskID int64) {
 // hold predictable; a renewal settling within the cap still orders
 // correctly, and a join that gives up aborts the commit (errLeaseLost)
 // instead of running a write the stuck renewal could then overwrite.
+// The same cap also bounds the deferred teardown (see joinCommitStop):
+// the pre-commit abort does not unstick a context-ignoring backend
+// call, so the post-commit join must give up on its own or the slot
+// stays held despite this cap.
 const commitJoinCap = 5 * time.Second
 
 // joinOrdinaryRenewalsForCommit waits for admitted ordinary renewals
@@ -1171,7 +1175,7 @@ func (w *Worker) guardedDetachedCommit(taskID int64, tok claimToken, commitCtx c
 	return err
 }
 
-// joinCommitStop wraps a commit-scoped stop func from
+// joinCommitStop builds the commit-scoped teardown for a stop func from
 // ensureCommitRenewal so the deferred stop also terminates AND joins
 // the inherited renewal loop before the handler drops its guard
 // (round-10 P1a): it runs the scoped teardown, signals the inherited
@@ -1181,18 +1185,51 @@ func (w *Worker) guardedDetachedCommit(taskID int64, tok claimToken, commitCtx c
 // wrote (a RetryActivity delay, a nack's visible_at). The close and
 // the wait run exactly once, so double-deferred stops cannot panic on
 // a second channel close; a nil or already-closed renewDone (scoped
-// replacement case) makes the wait return immediately. Call it at
-// every commit site that defers a stop from ensureCommitRenewal.
+// replacement case) makes the wait return immediately.
+//
+// Callers must defer the CALL — `defer joinCommitStop(...)()` — not
+// the constructor: `defer joinCommitStop(...)` only defers building
+// the closure and discards it at return, so the loop is never joined
+// (round-18 P1a). A direct `stop := joinCommitStop(...); stop()`
+// (as in the round-10 test) invokes the closure itself and is unaffected.
+//
+// Both waits are bounded by commitJoinCap (round-18 P1b): a renewal
+// stuck in a context-ignoring backend holds renewDone open past the
+// pre-commit join cap (the ordinary ExtendLease runs on the execution
+// context, which such a backend ignores), and the pre-commit abort
+// does not stop it — so an unconditional post-commit wait would hold
+// the activity slot forever despite the cap. The same holds for the
+// scoped replacement stop, whose cover renewal can stall the same way.
+// Giving up releases the slot; the stuck renewal landing later is
+// harmless: ordinary renewals refresh only token-matching in-flight
+// entries (the commit transferred this one out, so the refresh is a
+// no-op), admission stays generation- and expiry-gated, and cover
+// renewals observe the dropped guard and exit without issuing.
 func joinCommitStop(stop func(), closeDone func(), renewDone <-chan struct{}) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			if stop != nil {
-				stop()
+				stopDone := make(chan struct{})
+				go func() {
+					defer close(stopDone)
+					stop()
+				}()
+				timer := time.NewTimer(commitJoinCap)
+				select {
+				case <-stopDone:
+					timer.Stop()
+				case <-timer.C:
+				}
 			}
 			closeDone()
 			if renewDone != nil {
-				<-renewDone
+				timer := time.NewTimer(commitJoinCap)
+				defer timer.Stop()
+				select {
+				case <-renewDone:
+				case <-timer.C:
+				}
 			}
 		})
 	}
@@ -2128,7 +2165,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 				w.exitDetachedCommit(ctx, renewDone, &committing)
 				return herr
 			}
-			defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)
+			defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)()
 			commitCtx, commitCancel := w.commitContext(ctx)
 			// Nack rewrites visible_at in place: serialize against
 			// cover renewals (round-11 P1b).
@@ -2147,7 +2184,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			w.exitDetachedCommit(ctx, renewDone, &committing)
 			return herr
 		}
-		defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)
+		defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)()
 		commitCtx, commitCancel := w.commitContext(ctx)
 		// failActivity deletes the task row: shared commit, so a
 		// renewal running during a blocked Complete can still cancel
@@ -2252,7 +2289,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 				w.exitDetachedCommit(ctx, renewDone, &committing)
 				return herr
 			}
-			defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)
+			defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)()
 			commitCtx, commitCancel := w.commitContext(ctx)
 			// failActivity deletes the task row: shared commit (see above).
 			rerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, false, func() error {
@@ -2280,7 +2317,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			w.exitDetachedCommit(ctx, renewDone, &committing)
 			return herr
 		}
-		defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)
+		defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)()
 		commitCtx, commitCancel := w.commitContext(ctx)
 		w.opts.Metrics.AddActivityRetry(commitCtx, 1)
 		// RetryActivity rewrites visible_at in place: serialize against
@@ -2306,7 +2343,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		w.exitDetachedCommit(ctx, renewDone, &committing)
 		return herr
 	}
-	defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)
+	defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)()
 	commitCtx, commitCancel := w.commitContext(ctx)
 	// CompleteActivity deletes the task row: shared commit (see above).
 	if cerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, false, func() error {
