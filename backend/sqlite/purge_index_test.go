@@ -153,3 +153,62 @@ func TestPurgeVictimScanUsesIndex(t *testing.T) {
 		t.Fatalf("purge victim scan sorts via TEMP B-TREE (index must lead with the ORDER BY columns):\n%s", joined)
 	}
 }
+
+// TestPurgeSelectiveScanAvoidsForcedOrdering covers the round-22 P2 on
+// #294: a selective purge (e.g. statuses=["continued"]) must NOT force the
+// (completed_at, id) ordering index. The forced scan walks unrelated old
+// completed rows on every call; the unhinted planner seeks the
+// (status, ...) visibility index and sorts only the few matches. The plan
+// below is the exact unhinted query PurgeInstances issues for a selective
+// status set (see purgeVictimQuery): it must be a visibility-index SEARCH
+// (never a full-table SCAN), must not touch the forced ordering index, and
+// the ORDER BY is served by a small TEMP B-TREE sort over the selective
+// matches rather than a full-order walk.
+func TestPurgeSelectiveScanAvoidsForcedOrdering(t *testing.T) {
+	ctx := context.Background()
+	b, err := sqlite.New(filepath.Join(t.TempDir(), "purge_selective_plan.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := b.DB().QueryContext(ctx, `
+		EXPLAIN QUERY PLAN
+		SELECT id FROM wf_instances
+		WHERE status IN ('continued')
+		  AND completed_at IS NOT NULL AND completed_at <= '2026-01-01T00:00:00.000000000Z'
+		ORDER BY completed_at, id
+		LIMIT 100`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(plan, "\n")
+	if !strings.Contains(joined, "SEARCH") {
+		t.Fatalf("selective purge victim scan is not a SEARCH:\n%s", joined)
+	}
+	if strings.Contains(joined, "SCAN wf_instances") {
+		t.Fatalf("selective purge victim scan walks the table instead of seeking an index:\n%s", joined)
+	}
+	if !strings.Contains(joined, "USING INDEX wf_instances_visibility_idx") {
+		t.Fatalf("selective purge victim scan does not seek the visibility index:\n%s", joined)
+	}
+	if strings.Contains(joined, "wf_instances_completed_at_idx") {
+		t.Fatalf("selective purge victim scan uses the forced ordering index (must run unhinted):\n%s", joined)
+	}
+}

@@ -856,6 +856,50 @@ func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Du
 	return nil
 }
 
+// purgeUsesOrderingHint reports whether the PurgeInstances victim SELECT
+// should force the (completed_at, id) partial ordering index (issue #294
+// round-22 P2). The forced ordered scan pays off for broad purges — the
+// default status set, where completed rows are overwhelmingly
+// purge-eligible, so the scan applies the status IN filter per row and
+// stops at LIMIT. For selective statuses (e.g. statuses=["continued"]) the
+// forced scan walks unrelated old completed rows on every call, while the
+// unhinted planner seeks the (status, ...) visibility index and sorts only
+// the few matches. sts is the normalized status set; broad means covering
+// every default purge status (nil/empty input normalizes to exactly that).
+func purgeUsesOrderingHint(sts []string) bool {
+	// Empty normalizes to the default status set upstream
+	// (ValidatePurgeArgs), which is broad by definition.
+	if len(sts) == 0 {
+		return true
+	}
+	have := make(map[string]struct{}, len(sts))
+	for _, s := range sts {
+		have[s] = struct{}{}
+	}
+	for _, s := range backend.DefaultPurgeStatuses {
+		if _, ok := have[s]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// purgeVictimQuery builds the PurgeInstances victim SELECT for len(sts)
+// statuses, forcing the ordering index only when purgeUsesOrderingHint
+// holds. Extracted so tests pin the hint decision without a database.
+func purgeVictimQuery(sts []string) string {
+	hint := ""
+	if purgeUsesOrderingHint(sts) {
+		hint = " INDEXED BY wf_instances_completed_at_idx"
+	}
+	return `
+		SELECT id FROM wf_instances` + hint + `
+		WHERE status IN (` + inClause(len(sts)) + `)
+		  AND completed_at IS NOT NULL AND completed_at <= ?
+		ORDER BY completed_at, id
+		LIMIT ?`
+}
+
 // PurgeInstances deletes terminal instances and their dependent rows inside a
 // single immediate transaction. Child-row deletes are chunked so the bound
 // parameter count stays well under SQLITE_MAX_VARIABLE_NUMBER.
@@ -872,20 +916,16 @@ func (b *Backend) PurgeInstances(ctx context.Context, olderThan time.Duration, s
 			args = append(args, s)
 		}
 		args = append(args, cutoff, lim)
-		// INDEXED BY forces the (completed_at, id) partial victim index
-		// (issue #294 round-19 P2): without stat1 the planner prefers the
-		// status seek plus a TEMP B-TREE sort, which scales with every
-		// completed row. The ordered partial scan applies the status IN
-		// filter per row and stops at LIMIT, staying bounded because
-		// completed rows are overwhelmingly purge-eligible. The index
-		// always exists post-Migrate (000001 creates it, 000004 rebuilds
-		// the pre-fix shape).
-		rows, err := conn.QueryContext(ctx, `
-		SELECT id FROM wf_instances INDEXED BY wf_instances_completed_at_idx
-		WHERE status IN (`+inClause(len(sts))+`)
-		  AND completed_at IS NOT NULL AND completed_at <= ?
-		ORDER BY completed_at, id
-		LIMIT ?`, args...)
+		// The ordering-index hint is conditional (see
+		// purgeUsesOrderingHint): forcing the (completed_at, id) partial
+		// victim index (issue #294 round-19 P2) keeps broad purges
+		// bounded — without stat1 the planner prefers the status seek
+		// plus a TEMP B-TREE sort, which scales with every completed
+		// row — but for selective statuses the forced scan would walk
+		// unrelated old completed rows repeatedly. The index always
+		// exists post-Migrate (000001 creates it, 000004 rebuilds the
+		// pre-fix shape).
+		rows, err := conn.QueryContext(ctx, purgeVictimQuery(sts), args...)
 		if err != nil {
 			return err
 		}
