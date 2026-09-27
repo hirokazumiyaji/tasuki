@@ -29,17 +29,27 @@ type Backend interface {
 	// CountClaimableTasks returns per-queue counts of tasks with visible_at <= store now
 	// for kind among queues. Queues with zero may be omitted.
 	CountClaimableTasks(ctx context.Context, kind string, queues []string) (map[string]int64, error)
-	ExtendLease(ctx context.Context, taskID int64, d time.Duration) error
+	// ExtendLease pushes a claimed task's visibility out by d (store clock).
+	// The task carries kind/instance routing: DynamoDB/Firestore store
+	// workflow tasks under WF#<instanceID>, not ACT#<id>, so renewing by
+	// numeric ID alone misses workflow tasks (ErrNotFound) and long replays
+	// lose their lease to a peer (duplicate execution). Callers pass the
+	// claimed task, mirroring NackTask.
+	ExtendLease(ctx context.Context, t Task, d time.Duration) error
 	// RecordHeartbeat extends the lease and stores details for GetHeartbeatDetails on later attempts.
 	RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error
 	// ReleaseLease makes a claimed task immediately reclaimable.
 	// The task carries the claim ownership token (ID, Kind, InstanceID,
 	// WorkerID, Attempt): backends route workflow tasks by
 	// (Kind, InstanceID) — DynamoDB/Firestore store them under WF#<instanceID>,
-	// not ACT#<id> — and release conditionally on the token so a stale
-	// worker never clears a newer worker's lease after a reclaim race.
-	// A mismatch (reclaimed, refreshed, or already committed task) reports
-	// ErrNotFound, which callers ignore as best-effort. A zero WorkerID
+	// not ACT#<id>, so releasing by numeric ID alone misses workflow tasks
+	// (ErrNotFound) and a shutdown abandon stalls peers until lease expiry.
+	// Callers pass the claimed task, mirroring ExtendLease/NackTask.
+	//
+	// Releases are fenced to the claimed generation (worker_id + attempt):
+	// when the lease moved on (peer reclaim after a delayed renewal, or a
+	// successor turn), the release has no effect and reports ErrNotFound.
+	// Workers treat that as already-released, not an error. A zero WorkerID
 	// falls back to unconditional release by ID for legacy callers.
 	ReleaseLease(ctx context.Context, t Task) error
 	// NackTask clears the lease and defers visibility by delay (store clock).
@@ -58,6 +68,14 @@ type Backend interface {
 	CommitAdvancement(ctx context.Context, adv Advancement) error
 	CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error
 	// RetryActivity clears the lease and defers activity visibility by delay (store clock).
+	// It addresses the task by ID alone (no worker/attempt fencing):
+	// the worker-side lease-loss abandon (see handleActivity) is the
+	// primary defense — a stale worker whose lease moved on skips the
+	// call instead of touching a peer's task. A post-return race (loss
+	// after the result but before the store op) can still reach the
+	// store; release/nack/renewal are fenced on the claim token, while
+	// Complete/Retry stay ID-only on every backend (changing them would
+	// break the store contract) and rely on that abandon check.
 	RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error
 	FireDueTimers(ctx context.Context, limit int) (int, error)
 

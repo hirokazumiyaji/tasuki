@@ -63,7 +63,7 @@ func TestSQLite_LeaseHeartbeatReleaseRetry(t *testing.T) {
 		t.Fatalf("act claim: %v %#v", err, acts)
 	}
 	aid := acts[0].ID
-	if err := b.ExtendLease(ctx, aid, 2*time.Second); err != nil {
+	if err := b.ExtendLease(ctx, acts[0], 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.RecordHeartbeat(ctx, aid, 2*time.Second, []byte(`{"n":1}`)); err != nil {

@@ -465,12 +465,14 @@ func scanTask(row *spanner.Row) (backend.Task, error) {
 	return t, nil
 }
 
-func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	// Fenced to the claimed generation (worker_id + attempt): a renewal
+	// delayed past the lease (or racing a peer reclaim after a nack)
+	// must not overwrite the successor's visible_at. Zero rows means the
+	// lease moved on; report ErrNotFound so the worker treats the renewal
+	// as stale.
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		n, err := txn.Update(ctx, spanner.Statement{
-			SQL:    `UPDATE wf_tasks SET visible_at = @v WHERE id = @id`,
-			Params: map[string]any{"v": nowUTC().Add(d), "id": taskID},
-		})
+		n, err := txn.Update(ctx, extendLeaseStatement(nowUTC().Add(d), t))
 		if err != nil {
 			return err
 		}
@@ -480,6 +482,18 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 		return nil
 	})
 	return err
+}
+
+// extendLeaseStatement builds the conditional renewal DML for the claimed
+// task generation. Like fencedReleaseStatement, the attempt bind must be
+// INT64 (Go int64): the Spanner client rejects a native Go int for an
+// INT64 column, which would fail the renewal and leave the task to
+// expire instead of being renewed.
+func extendLeaseStatement(v time.Time, t backend.Task) spanner.Statement {
+	return spanner.Statement{
+		SQL:    `UPDATE wf_tasks SET visible_at = @v WHERE id = @id AND worker_id = @w AND attempt = @a`,
+		Params: map[string]any{"v": v, "id": t.ID, "w": t.WorkerID, "a": int64(t.Attempt)},
+	}
 }
 
 func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
@@ -710,7 +724,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	}
 	now := nowUTC()
 
-	taskRow, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{adv.TaskID}, []string{"kind", "instance_id"})
+	taskRow, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{adv.TaskID}, []string{"kind", "instance_id", "worker_id", "attempt"})
 	if err != nil {
 		if isNotFound(err) {
 			return backend.ErrConflict
@@ -718,11 +732,24 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		return err
 	}
 	var kind, taskInst string
-	if err := taskRow.Columns(&kind, &taskInst); err != nil {
+	var worker spanner.NullString
+	var attempt int64
+	if err := taskRow.Columns(&kind, &taskInst, &worker, &attempt); err != nil {
 		return err
 	}
 	if kind != "workflow" || taskInst != adv.InstanceID {
 		return backend.ErrConflict
+	}
+	// Fence to the claimed generation (see Advancement): stale commits
+	// after a release + peer reclaim must fail without touching the peer.
+	if adv.WorkerID != "" {
+		got := ""
+		if worker.Valid {
+			got = worker.StringVal
+		}
+		if got != adv.WorkerID || int(attempt) != adv.Attempt {
+			return backend.ErrConflict
+		}
 	}
 
 	var muts []*spanner.Mutation

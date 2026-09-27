@@ -124,9 +124,15 @@ func (w *Worker) commitWorkflow(ctx context.Context, task backend.Task, baseJour
 	if instanceID == "" {
 		instanceID = adv.InstanceID
 	}
+	// Stamp the claim generation for legacy/test paths that built adv
+	// without it (see Advancement): production handleWorkflow already
+	// stamps, but taskForCommit callers may carry only adv. A fenced commit
+	// that lost its lease reports ErrConflict/ErrNotFound and must not be
+	// retried — the worker treats it as lost (see requeueWorkflowTask).
+	adv = w.advForCommit(task, adv)
 	err := w.backend.CommitAdvancement(ctx, adv)
 	if err != nil {
-		if errors.Is(err, backend.ErrConflict) {
+		if errors.Is(err, backend.ErrConflict) || errors.Is(err, backend.ErrNotFound) {
 			w.dropSticky(instanceID)
 		}
 		// Contention releases immediately for fast replay; other commit
@@ -142,12 +148,21 @@ func (w *Worker) commitWorkflow(ctx context.Context, task backend.Task, baseJour
 
 // trackWfClaim records the local wall-clock claim time of a workflow task.
 func (w *Worker) trackWfClaim(taskID int64) {
+	w.trackWfClaimAt(taskID, time.Now())
+}
+
+// trackWfClaimAt records the local claim time of a workflow task stamped
+// from at, the instant BEFORE the ClaimTasks call that produced it
+// (round-23 P2a, see tickWorkflows). Backends stamp the visible lease
+// during the claim, so measuring from after the call returns stretches
+// the local estimate past the actual lease by the call latency.
+func (w *Worker) trackWfClaimAt(taskID int64, at time.Time) {
 	w.wfClaimMu.Lock()
 	defer w.wfClaimMu.Unlock()
 	if w.wfClaim == nil {
 		w.wfClaim = map[int64]time.Time{}
 	}
-	w.wfClaim[taskID] = time.Now()
+	w.wfClaim[taskID] = at
 }
 
 // clearWfClaims drops local claim records after the tick's flush.
@@ -156,6 +171,23 @@ func (w *Worker) clearWfClaims(tasks []backend.Task) {
 	defer w.wfClaimMu.Unlock()
 	for _, t := range tasks {
 		delete(w.wfClaim, t.ID)
+	}
+}
+
+// refreshWfClaim moves a workflow task's local claim time forward after a
+// successful lease renewal (see extendLeaseLoop), so the delayed nack in
+// requeueWorkflowTask measures staleness against the renewed lease — not
+// the original claim. Unknown IDs are ignored: activity turns share the
+// renewal loop but never enter wfClaim, and flushed claims were already
+// dropped by clearWfClaims. Without the refresh, a turn renewed past its
+// original claim time that then fails non-contentiously skips its nack
+// (the precheck sees the original time as expired) and stays hidden
+// until lease expiry instead of backing off for a retry delay.
+func (w *Worker) refreshWfClaim(taskID int64) {
+	w.wfClaimMu.Lock()
+	defer w.wfClaimMu.Unlock()
+	if _, ok := w.wfClaim[taskID]; ok {
+		w.wfClaim[taskID] = time.Now()
 	}
 }
 
@@ -197,7 +229,12 @@ func (w *Worker) wfLeaseExpired(taskID int64) bool {
 // skips the nack and expiry reclaims naturally. Nack failures share the
 // release_lease store-error op label to keep the op vocabulary bounded.
 func (w *Worker) requeueWorkflowTask(ctx context.Context, t backend.Task, herr error) {
-	if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {
+	// A fenced commit that lost its lease reports ErrConflict (generation
+	// mismatch) or ErrNotFound (task gone): the turn is lost, release
+	// immediately for fast replay (fenced, so a peer's fresh lease is
+	// untouched) and never retry the commit. Other failures back off via
+	// delayed nack.
+	if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) || errors.Is(herr, backend.ErrNotFound) {
 		if rerr := w.backend.ReleaseLease(ctx, t); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
 			w.recordStoreError(ctx, "release_lease", rerr, "task_id", t.ID)
 		}
@@ -217,45 +254,145 @@ type pendingWorkflowCommit struct {
 	instanceID  string
 	baseJournal []journal.Event
 	adv         backend.Advancement
-	// task is the claimed workflow task (ownership token for fenced lease
-	// release on commit failure). Older call sites may leave it zero; the
-	// release then falls back to adv-derived routing without fencing.
+	// task is the claimed task awaiting commit (ownership token for fenced
+	// lease release on commit failure). The commit stays tracked under its
+	// ID until flush succeeds (see tickWorkflows); failures return in the
+	// failed subset so the caller can untrack or release. Older call sites
+	// may leave it zero; taskForCommit then falls back to adv-derived
+	// routing without fencing.
 	task backend.Task
 }
 
-func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWorkflowCommit) {
+// flushWorkflowCommits commits pending advancements and returns the subset
+// whose commit did not succeed. Successful commits are untracked: the task
+// is deleted by the commit and must no longer be visible to
+// releaseInFlight. Failed commits stay tracked for the caller to dispose
+// (release when the flush context was canceled, untrack otherwise).
+//
+// Entries that lost in-flight ownership before the flush (see
+// ownsWorkflowCommit) are skipped without touching the store and returned
+// in the failed subset: Shutdown's releaseInFlight may have released a
+// finished pending turn mid-flush and a peer may have re-claimed it, and
+// backends validate the advancement by task ID alone, so committing it
+// would delete the peer's active task after duplicate execution. The
+// caller's disposal is ownership-gated (see claimWorkflowRelease), so a
+// skipped entry is never released twice.
+//
+// Cancellation is re-checked immediately before EACH store call
+// (round-18 P1): tickWorkflows checks ctx.Err() before the flush, but
+// Shutdown can cancel in the check-to-flush window — or while the flush
+// is blocked between two commits — and context-insensitive backends
+// (memory and similar) would then persist the advancement instead of
+// abandoning it. The per-call check narrows that window to the backend
+// call itself: a cancel observed before a store call skips it (returned
+// as failed so the caller releases the lease for a peer retry), and
+// ownership is re-verified at the same point so a Shutdown release that
+// landed between the preflight and this commit is never followed by a
+// stale write. Residual: a cancel landing after the final pre-call
+// check — inside the backend call — can still persist on a
+// context-insensitive backend. That commit carries the claim generation
+// (see advForCommit), so a backend enforcing the fence rejects it when
+// the lease moved on, and the caller still releases failures observed
+// under a canceled tick for a prompt peer retry.
+func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWorkflowCommit) []pendingWorkflowCommit {
 	if len(pending) == 0 {
-		return
+		return nil
 	}
-	if batcher, ok := w.backend.(backend.AdvancementBatcher); ok && len(pending) > 1 {
-		advs := make([]backend.Advancement, len(pending))
-		for i, p := range pending {
-			advs[i] = p.adv
+	owned, skipped := pending[:0:0], pending[:0:0]
+	for _, p := range pending {
+		if w.ownsWorkflowCommit(p.task) {
+			owned = append(owned, p)
+		} else {
+			w.opts.Logger.Debug("skipping stale workflow commit; lease already released",
+				"instance_id", p.instanceID, "task_id", p.adv.TaskID)
+			skipped = append(skipped, p)
+		}
+	}
+	failed := append([]pendingWorkflowCommit(nil), skipped...)
+	untrack := func(p pendingWorkflowCommit) {
+		w.untrackPending(p)
+	}
+	// Canceled before any store call: skip the flush outright (see
+	// above). The caller disposes the failed subset.
+	if ctx.Err() != nil {
+		w.opts.Logger.Debug("skipping workflow flush; tick canceled",
+			"n", len(owned))
+		return append(failed, owned...)
+	}
+	if batcher, ok := w.backend.(backend.AdvancementBatcher); ok && len(owned) > 1 {
+		advs := make([]backend.Advancement, len(owned))
+		for i, p := range owned {
+			advs[i] = w.advForCommit(w.taskForCommit(p), p.adv)
 		}
 		if err := batcher.CommitAdvancements(ctx, advs); err != nil {
-			w.recordStoreError(ctx, "commit_workflow", err, "n", len(pending))
+			w.recordStoreError(ctx, "commit_workflow", err, "n", len(owned))
 			// One conflict rolls back the whole batch transaction, so fall
-			// back to per-instance commits: healthy instances still advance
-			// in this tick, and failed items release their leases inside
-			// commitWorkflow for immediate re-visibility (independent of
-			// LeaseDuration).
-			for _, p := range pending {
+			// back to per-instance commits over the owned subset only:
+			// healthy instances still advance in this tick, and each
+			// commit disposes its own failure inside commitWorkflow
+			// (sticky drop on conflict, fenced release/nack via
+			// requeueWorkflowTask for immediate re-visibility). Failures
+			// still return below so the caller untracks them — or issues
+			// an ownership-gated detached release when the tick is
+			// canceled (the in-commit requeue may have run on a canceled
+			// context and been rejected before touching the store).
+			// Skipped (stale) entries never reach the store (see above).
+			for _, p := range owned {
+				if fp, skip := w.skipCanceledCommit(ctx, p); skip {
+					failed = append(failed, fp)
+					continue
+				}
 				if cerr := w.commitWorkflow(ctx, w.taskForCommit(p), p.baseJournal, p.adv); cerr != nil {
 					w.recordStoreError(ctx, "commit_workflow", cerr, "instance_id", p.instanceID)
+					failed = append(failed, p)
+					continue
 				}
+				untrack(p)
 			}
-			return
+			return failed
 		}
-		for _, p := range pending {
+		for _, p := range owned {
 			w.applyStickyAfterCommit(p.instanceID, p.baseJournal, p.adv)
+			untrack(p)
 		}
-		return
+		return failed
 	}
-	for _, p := range pending {
+	for _, p := range owned {
+		if fp, skip := w.skipCanceledCommit(ctx, p); skip {
+			failed = append(failed, fp)
+			continue
+		}
 		if err := w.commitWorkflow(ctx, w.taskForCommit(p), p.baseJournal, p.adv); err != nil {
 			w.recordStoreError(ctx, "commit_workflow", err, "instance_id", p.instanceID)
+			failed = append(failed, p)
+			continue
 		}
+		untrack(p)
 	}
+	return failed
+}
+
+// skipCanceledCommit enforces the round-18 P1 per-store-call gate: when
+// the tick context was canceled after the flush preflight (or while an
+// earlier commit in the same flush was blocked), the pending commit must
+// not reach the store — a context-insensitive backend would persist the
+// advancement instead of abandoning it. Ownership is re-verified for the
+// same reason: Shutdown's releaseInFlight may have released this entry
+// since the preflight. A skipped entry reports true so the caller routes
+// it to its canceled-tick disposal (ownership-gated release for a prompt
+// peer retry) instead of committing it.
+func (w *Worker) skipCanceledCommit(ctx context.Context, p pendingWorkflowCommit) (pendingWorkflowCommit, bool) {
+	if ctx.Err() != nil {
+		w.opts.Logger.Debug("skipping workflow commit; tick canceled before the store call",
+			"instance_id", p.instanceID, "task_id", p.adv.TaskID)
+		return p, true
+	}
+	if !w.ownsWorkflowCommit(p.task) {
+		w.opts.Logger.Debug("skipping stale workflow commit; lease released during the flush",
+			"instance_id", p.instanceID, "task_id", p.adv.TaskID)
+		return p, true
+	}
+	return p, false
 }
 
 // taskForCommit resolves the fenced release token for a pending commit.
@@ -271,6 +408,22 @@ func (w *Worker) taskForCommit(p pendingWorkflowCommit) backend.Task {
 		Kind:       "workflow",
 		InstanceID: p.instanceID,
 	}
+}
+
+// advForCommit resolves the fenced commit advancement for a pending commit:
+// the claim generation (worker + attempt) travels in the Advancement itself
+// so the backend can condition the transactional commit on it (see
+// Advancement). Production handleWorkflow already stamps; legacy/test
+// advancements built without generation inherit the pending task's token
+// here, keeping the worker preflight as fast path and the backend fence as
+// the atomic check-to-commit guard. A zero WorkerID stays unfenced for
+// older callers.
+func (w *Worker) advForCommit(task backend.Task, adv backend.Advancement) backend.Advancement {
+	if adv.WorkerID == "" && task.WorkerID != "" {
+		adv.WorkerID = task.WorkerID
+		adv.Attempt = task.Attempt
+	}
+	return adv
 }
 
 func (w *Worker) applyStickyAfterCommit(instanceID string, baseJournal []journal.Event, adv backend.Advancement) {

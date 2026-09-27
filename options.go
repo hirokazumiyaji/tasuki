@@ -43,6 +43,13 @@ type WorkerOptions struct {
 	// Unreleased leases expire via lease timeout and are reclaimed by peers.
 	// <=0 defaults to 5s.
 	ShutdownReleaseTimeout time.Duration
+	// LocalActivityTimeout bounds a single ExecuteLocal invocation. The bound
+	// is enforced outside the activity call, so even an activity that ignores
+	// cancellation returns a deadline error on time (its late result is
+	// discarded; the underlying call keeps running until it returns).
+	// <=0 disables the limit (default).
+	// Shutdown always cancels the context regardless of this setting.
+	LocalActivityTimeout time.Duration
 	// BacklogSampleInterval throttles backlog gauge sampling (2x
 	// CountClaimableTasks per sample when Metrics is set). 0 defaults to
 	// 10s (coarser than the 1s PollInterval default); negative disables

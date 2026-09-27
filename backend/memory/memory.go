@@ -233,11 +233,20 @@ func (b *Backend) TerminateInstance(_ context.Context, id string) error {
 	return nil
 }
 
-func (b *Backend) ExtendLease(_ context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(_ context.Context, task backend.Task, d time.Duration) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	t, ok := b.tasks[taskID]
+	t, ok := b.tasks[task.ID]
 	if !ok {
+		return backend.ErrNotFound
+	}
+	// Fence the renewal to the claimed generation (worker + attempt): a
+	// renewal delayed past the lease (or racing a peer reclaim after a
+	// nack) must not overwrite the successor's visible_at, or the peer's
+	// retry stays hidden and a third worker executes concurrently with
+	// it. A mismatch means the lease moved on; report ErrNotFound so the
+	// worker treats the renewal as stale.
+	if t.workerID != task.WorkerID || t.attempt != task.Attempt {
 		return backend.ErrNotFound
 	}
 	t.visibleAt = b.now.Add(d)
@@ -273,9 +282,13 @@ func (b *Backend) ReleaseLease(_ context.Context, t backend.Task) error {
 		b.mu.Unlock()
 		return backend.ErrNotFound
 	}
-	// Fence against a newer claim: after a lease expiry another worker
-	// reclaims the same task with a new worker/attempt, so a stale release
-	// must not clear the fresh lease (duplicate execution).
+	// Fence the release to the claimed generation (worker_id + attempt):
+	// a renewal delayed past the lease (or a shutdown release racing a
+	// peer reclaim) must not clear a successor's lease, or a third worker
+	// would execute concurrently with the peer. A mismatch means the lease
+	// moved on; report ErrNotFound so the worker treats it as
+	// already-released. A zero WorkerID falls back to unconditional
+	// release for legacy callers.
 	if t.WorkerID != "" && (task.workerID != t.WorkerID || task.attempt != t.Attempt) {
 		b.mu.Unlock()
 		return backend.ErrNotFound
@@ -530,6 +543,15 @@ func (b *Backend) preflightAdvancementLocked(adv backend.Advancement) error {
 	if !ok || own.instanceID != adv.InstanceID || own.kind != "workflow" {
 		return backend.ErrConflict
 	}
+	// Fence the commit to the claimed generation (worker + attempt), like
+	// the renewal/release fences: a stale worker whose task was reclaimed
+	// (new worker/attempt) must not delete the peer's active task. A
+	// mismatch means the lease moved on; report ErrConflict so the worker
+	// treats the turn as lost without retrying the commit. Zero WorkerID
+	// stays unfenced for legacy callers.
+	if adv.WorkerID != "" && (own.workerID != adv.WorkerID || own.attempt != adv.Attempt) {
+		return backend.ErrConflict
+	}
 	// Child IDs must be free now: createInstanceLocked is the only remaining
 	// fallible step in the commit loop, and preflighting it here keeps the
 	// batch all-or-nothing.
@@ -551,6 +573,9 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 	}
 	own, ok := b.tasks[adv.TaskID]
 	if !ok || own.instanceID != adv.InstanceID || own.kind != "workflow" {
+		return backend.ErrConflict
+	}
+	if adv.WorkerID != "" && (own.workerID != adv.WorkerID || own.attempt != adv.Attempt) {
 		return backend.ErrConflict
 	}
 

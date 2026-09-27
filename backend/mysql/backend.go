@@ -399,9 +399,14 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 	return ids, nil
 }
 
-func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	// Fenced to the claimed generation (worker_id + attempt): a renewal
+	// delayed past the lease (or racing a peer reclaim after a nack)
+	// must not overwrite the successor's visible_at. Zero rows means the
+	// lease moved on; report ErrNotFound so the worker treats the renewal
+	// as stale.
 	res, err := b.db.ExecContext(ctx, `
-		UPDATE wf_tasks SET visible_at = ? WHERE id = ?`, nowUTC().Add(d), taskID)
+		UPDATE wf_tasks SET visible_at = ? WHERE id = ? AND worker_id = ? AND attempt = ?`, nowUTC().Add(d), t.ID, t.WorkerID, t.Attempt)
 	if err != nil {
 		return err
 	}
@@ -433,6 +438,12 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 }
 
 func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
+	// Fenced to the claimed generation (worker_id + attempt): a renewal
+	// delayed past the lease (or a shutdown release racing a peer
+	// reclaim) must not clear a successor's lease. Zero rows means the
+	// lease moved on; report ErrNotFound so the worker treats it as
+	// already-released. A zero WorkerID falls back to unconditional
+	// release for legacy callers.
 	var res sql.Result
 	var err error
 	if t.WorkerID != "" {
@@ -622,8 +633,10 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 	}
 
 	var kind string
-	err = conn.QueryRowContext(ctx, `SELECT kind FROM wf_tasks WHERE id = ? AND instance_id = ?`,
-		adv.TaskID, adv.InstanceID).Scan(&kind)
+	var workerID sql.NullString
+	var attempt int64
+	err = conn.QueryRowContext(ctx, `SELECT kind, worker_id, attempt FROM wf_tasks WHERE id = ? AND instance_id = ?`,
+		adv.TaskID, adv.InstanceID).Scan(&kind, &workerID, &attempt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return backend.ErrConflict
@@ -632,6 +645,15 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 	}
 	if kind != "workflow" {
 		return backend.ErrConflict
+	}
+	if adv.WorkerID != "" {
+		got := ""
+		if workerID.Valid {
+			got = workerID.String
+		}
+		if got != adv.WorkerID || int(attempt) != adv.Attempt {
+			return backend.ErrConflict
+		}
 	}
 
 	for _, ev := range adv.NewEvents {
@@ -788,9 +810,20 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 			}
 		}
 	}
-	_, err = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE id = ?`, adv.TaskID)
+	var delRes sql.Result
+	if adv.WorkerID != "" {
+		delRes, err = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE id = ? AND worker_id = ? AND attempt = ?`, adv.TaskID, adv.WorkerID, adv.Attempt)
+	} else {
+		delRes, err = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE id = ?`, adv.TaskID)
+	}
 	if err != nil {
 		return err
+	}
+	// A terminal advancement bulk-deletes every task of the instance above
+	// (including its own) after the generation preflight passed; only
+	// non-terminal commits require a deleted row here.
+	if n, derr := delRes.RowsAffected(); derr == nil && n == 0 && adv.WorkerID != "" && adv.Terminal == nil {
+		return backend.ErrConflict
 	}
 	if err := ensureWorkflowTaskIfInbox(ctx, conn, adv.InstanceID); err != nil {
 		return err

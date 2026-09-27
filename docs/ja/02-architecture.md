@@ -491,7 +491,7 @@ type Backend interface {
 
     // Worker 系
     ClaimTasks(ctx context.Context, req ClaimRequest) ([]Task, error)
-    ExtendLease(ctx context.Context, taskID int64, d time.Duration) error
+    ExtendLease(ctx context.Context, t Task, d time.Duration) error
     LoadWorkflow(ctx context.Context, instanceID string) (*WorkflowState, error) // ジャーナル + inbox + next_seq + 現在時刻
     CommitAdvancement(ctx context.Context, adv Advancement) error               // 状態遷移Tx。競合時 ErrConflict
     CompleteActivity(ctx context.Context, taskID int64, ev Event) error         // 完了Tx。タスク消失時 ErrSuperseded
