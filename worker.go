@@ -2487,13 +2487,16 @@ func (w *Worker) attachEffects(adv *backend.Advancement, queue string, cmds []jo
 // inbox deletes + 3 per child + parent inbox + 1 task delete.
 // It mirrors backend/dynamodb buildAdvancementItems counting so workers can
 // stay within backend.Capabilities.MaxAdvancementEffects atomically.
-//
-// Signal-dedupe cleanup is deliberately excluded: Firestore/Spanner/DynamoDB
-// sweep wf_signal_dedupe outside the committing transaction in paged
-// post-commit batches (purge reaps leftovers), so terminal commits never scale
-// with accumulated dedupe rows. See docs/09-limits.md.
-func advancementOps(adv *backend.Advancement) int {
-	n := 2 + len(adv.NewEvents) + len(adv.ActivityTasks) + len(adv.Timers) + len(adv.DrainedInbox) + 3*len(adv.Children)
+// Terminal advancements skip activity and timer effects, so the estimate mirrors
+// those skips. Swept inbox rows and signal-dedupe cleanup happen outside the
+// committing transaction and do not count toward its operation budget.
+func advancementOps(adv *backend.Advancement, caps backend.Capabilities) int {
+	n := 2 + len(adv.NewEvents) + 3*len(adv.Children)
+	if adv.Terminal == nil {
+		n += len(adv.ActivityTasks) + len(adv.Timers) + len(adv.DrainedInbox)
+	} else if !caps.SweepsTerminalInbox {
+		n += len(adv.DrainedInbox)
+	}
 	if adv.ParentNotify != nil {
 		n++
 	}
@@ -2512,7 +2515,7 @@ func advancementBudget(b backend.Backend) int {
 // oversized single terminal advancement is a diagnostic error (the backend
 // would reject the transaction anyway).
 func (w *Worker) checkTerminalBudget(adv *backend.Advancement) error {
-	if ops, budget := advancementOps(adv), advancementBudget(w.backend); ops > budget {
+	if ops, budget := advancementOps(adv, w.backend.Capabilities()), advancementBudget(w.backend); ops > budget {
 		return fmt.Errorf("tasuki: terminal advancement needs %d ops, budget %d: split fanout across ticks or child workflows (see docs/09-limits.md)",
 			ops, budget)
 	}
@@ -2527,12 +2530,12 @@ func (w *Worker) checkTerminalBudget(adv *backend.Advancement) error {
 // return a diagnostic error.
 func (w *Worker) fitAdvancementToBudget(adv *backend.Advancement, commands []journal.Event, queue string) error {
 	budget := advancementBudget(w.backend)
-	if advancementOps(adv) <= budget {
+	if advancementOps(adv, w.backend.Capabilities()) <= budget {
 		return nil
 	}
 	if adv.Terminal != nil {
 		return fmt.Errorf("tasuki: advancement needs %d ops, budget %d: single terminal advancement does not fit (reduce fanout per tick)",
-			advancementOps(adv), budget)
+			advancementOps(adv, w.backend.Capabilities()), budget)
 	}
 	ingestedLen := len(adv.DrainedInbox)
 	if ingestedLen > len(adv.NewEvents) {

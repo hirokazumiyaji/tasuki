@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"cloud.google.com/go/spanner"
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
@@ -32,35 +31,26 @@ func commitTerminateTestBackend(t *testing.T) (*Backend, context.Context, string
 	return b, ctx, dsn
 }
 
-// flipStatusWithoutSweep commits the terminate status flip but skips the
-// task sweep, deterministically modeling the race window between the status
-// commit and the later sweep: the leased task row still exists, so only the
-// in-transaction running-status gate can reject the commit.
-func flipStatusWithoutSweep(t *testing.T, b *Backend, ctx context.Context, id string) {
-	t.Helper()
-	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		return txn.BufferWrite([]*spanner.Mutation{
-			spanner.UpdateMap("wf_instances", map[string]any{
-				"id":           id,
-				"status":       "terminated",
-				"updated_at":   nowUTC(),
-				"completed_at": nowUTC(),
-			}),
-		})
-	})
+// A workflow advancement racing TerminateInstance must be rejected: the
+// leased task still matches ExpectedSeq/TaskID inside the post-flip
+// pre-sweep window, so without the running-status gate a nonterminal commit
+// lands during the sweep (and a terminal one overwrites terminated).
+func TestCommitAfterTerminateConflicts(t *testing.T) {
+	dsn := emulatorDSNOrSkip(t)
+	ctx := context.Background()
+	if err := RecreateDatabase(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
+	b, err := New(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-}
+	t.Cleanup(func() { _ = b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
 
-// A workflow commit racing termination must be rejected: the leased task
-// still matches ExpectedSeq/TaskID inside the race window, so without the
-// running-status gate a terminal advancement overwrites terminated →
-// completed (and a suspended one appends journal/children post-termination).
-func TestCommitAfterTerminateConflicts(t *testing.T) {
-	b, ctx, _ := commitTerminateTestBackend(t)
-
-	const id = "commit-after-terminate"
+	const id = "commit-after-terminate-291"
 	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +67,6 @@ func TestCommitAfterTerminateConflicts(t *testing.T) {
 	}
 	flipStatusWithoutSweep(t, b, ctx, id)
 
-	// Terminal overwrite attempt must conflict, leaving terminated intact.
 	err = b.CommitAdvancement(ctx, backend.Advancement{
 		InstanceID: id, TaskID: tasks[0].ID, ExpectedSeq: st.NextSeq,
 		Terminal: &backend.TerminalUpdate{Status: "completed", Result: []byte(`"ok"`)},
@@ -93,15 +82,13 @@ func TestCommitAfterTerminateConflicts(t *testing.T) {
 		t.Fatalf("status=%q, want terminated (terminal commit must not overwrite)", inst.Status)
 	}
 
-	// Suspended (non-terminal) advancement must also conflict, appending
-	// nothing post-termination.
 	before, err := b.GetJournal(ctx, id, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = b.CommitAdvancement(ctx, backend.Advancement{
 		InstanceID: id, TaskID: tasks[0].ID, ExpectedSeq: st.NextSeq,
-		NewEvents:  []journal.Event{{Seq: st.NextSeq, Type: journal.TypeActivityScheduled, Name: "a"}},
+		NewEvents: []journal.Event{{Seq: st.NextSeq, Type: journal.TypeActivityScheduled, Name: "a"}},
 	})
 	if !errors.Is(err, backend.ErrConflict) {
 		t.Fatalf("suspended commit after terminate: err=%v, want ErrConflict", err)

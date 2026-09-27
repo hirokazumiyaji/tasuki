@@ -10,6 +10,8 @@ migrations/
 ├── 000001_init.down.sql          DROP all tables
 ├── 000002_vacuum_tuning.up.sql   autovacuum / fillfactor tuning
 ├── 000002_vacuum_tuning.down.sql Reset tuning settings
+├── 000005_tasks_instance_idx.up.sql   index terminal task cleanup by instance
+├── 000005_tasks_instance_idx.down.sql Drop the instance index
 ├── 000003_purge_search_indexes.up.sql   purge (completed_at, id) + search_attributes GIN indexes
 ├── 000003_purge_search_indexes.down.sql Drop those indexes
 ├── 000004_fix_purge_index_order.up.sql   rebuild the purge index leading with (completed_at, id)

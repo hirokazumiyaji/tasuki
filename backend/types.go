@@ -12,6 +12,25 @@ type Capabilities struct {
 	// Backends without support ignore the cap (FIFO) and the conformance
 	// fair-dispatch test skips them explicitly.
 	FairDispatch bool
+	// CleansTerminalState reports whether terminal transitions fully clean
+	// up: TerminateInstance and terminal CommitAdvancement remove pending
+	// tasks, timers, and inbox rows, and FireDueTimers never creates inbox
+	// rows or workflow tasks for non-running instances (see #290 #291).
+	CleansTerminalState bool
+	// SupportsBulkCleanup reports whether TerminateInstance and
+	// PurgeInstances handle instances with more child rows (inbox, dedupe,
+	// tasks, timers) than a single backend write transaction allows
+	// (Firestore ~500 writes, Spanner mutation limits) by chunking the
+	// deletes (see #299).
+	SupportsBulkCleanup bool
+	// SweepsTerminalInbox reports whether terminal CommitAdvancement omits
+	// per-row DrainedInbox deletes from the commit transaction, sweeping
+	// inbox rows post-commit (Firestore, Spanner) or via a single
+	// whole-inbox purge (SQL, memory) instead. Backends that report false
+	// (DynamoDB) delete each drained inbox row inside the terminal
+	// transaction, so the worker budget must keep charging one op per
+	// drained row for them (see #291).
+	SweepsTerminalInbox bool
 }
 
 // InstanceFilter selects instances for ListInstances.

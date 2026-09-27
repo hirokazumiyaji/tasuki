@@ -3,10 +3,12 @@ package dynamodb
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/hirokazumiyaji/tasuki/backend"
 )
 
 // fakeRecoverStore stubs the DynamoDB subset used by orphan recovery. Scan
@@ -19,6 +21,10 @@ type fakeRecoverStore struct {
 	pageSize   int // 0 = single page
 	scanStarts []string
 	puts       int
+	// instanceStatus overrides the live status returned by the pre-put
+	// re-check (default "running"). Set to "terminated" to model a terminal
+	// commit landing between the scan and the put.
+	instanceStatus string
 }
 
 func (f *fakeRecoverStore) Scan(_ context.Context, in *dynamodb.ScanInput, _ ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
@@ -65,7 +71,25 @@ func (f *fakeRecoverStore) Query(_ context.Context, _ *dynamodb.QueryInput, _ ..
 	}}, nil
 }
 
-func (f *fakeRecoverStore) GetItem(_ context.Context, _ *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+func (f *fakeRecoverStore) GetItem(_ context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	// recoverPutIfRunning re-reads the instance row immediately before the
+	// Put (round-17 P2 on #291): serve a live running instance for the
+	// wf_instances table, and no workflow task for wf_tasks (every checked
+	// instance is an orphan).
+	if in.TableName != nil && len(*in.TableName) >= len("wf_instances") &&
+		(*in.TableName)[len(*in.TableName)-len("wf_instances"):] == "wf_instances" {
+		id := ""
+		if v, ok := in.Key["id"]; ok {
+			id = fromS(v)
+		}
+		status := f.instanceStatus
+		if status == "" {
+			status = "running"
+		}
+		return &dynamodb.GetItemOutput{Item: map[string]types.AttributeValue{
+			"id": avS(id), "status": avS(status), "queue": avS("default"),
+		}}, nil
+	}
 	return &dynamodb.GetItemOutput{}, nil
 }
 
@@ -185,5 +209,104 @@ func TestRecoverOrphanedPass_FallsBackToPageStartAtPageBoundary(t *testing.T) {
 	}
 	if rec2 != 2 || !exhausted2 {
 		t.Fatalf("pass2 recovered=%d exhausted=%v want 2/true", rec2, exhausted2)
+	}
+}
+
+// TestRecoverOrphanedPass_SkipsTerminalInstance covers issue #291 round-17
+// P2(b): the scan image may predate a terminal commit whose sweep already
+// finished, and a bare PutItem would then recreate the workflow task after
+// the cleanup. The gated put re-checks the live instance status immediately
+// before the Put and skips a terminal instance.
+func TestRecoverOrphanedPass_SkipsTerminalInstance(t *testing.T) {
+	ctx := context.Background()
+	ids := recoverIDs("term", 3)
+	f := &fakeRecoverStore{ids: ids, instanceStatus: "terminated"}
+	b := &Backend{prefix: "tasuki_"}
+
+	rec, _, exhausted, err := b.recoverOrphanedPass(ctx, f, nil, recoverBound)
+	if err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	if rec != 0 {
+		t.Fatalf("recovered=%d want 0 (terminal instances must not be recreated)", rec)
+	}
+	if !exhausted {
+		t.Fatal("exhausted=false want true")
+	}
+	if f.puts != 0 {
+		t.Fatalf("puts=%d want 0 (no bare PutItem after a terminal sweep)", f.puts)
+	}
+}
+
+// transactRecoverStore extends fakeRecoverStore with TransactWriteItems so
+// the atomic status-conditioned path of recoverPutIfRunning is exercised:
+// the transaction commits only while the instance is running.
+type transactRecoverStore struct {
+	fakeRecoverStore
+	transacts int
+	status    string
+}
+
+func (f *transactRecoverStore) TransactWriteItems(_ context.Context, in *dynamodb.TransactWriteItemsInput, _ ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
+	f.transacts++
+	if f.status != "" && f.status != "running" {
+		return nil, &types.TransactionCanceledException{
+			CancellationReasons: []types.CancellationReason{{Code: recoverStrPtr("ConditionalCheckFailed")}},
+		}
+	}
+	f.puts++
+	return &dynamodb.TransactWriteItemsOutput{}, nil
+}
+
+func recoverStrPtr(s string) *string { return &s }
+
+// TestRecoverPutIfRunning_UsesTransactGate covers the atomic path of issue
+// #291 round-17 P2(b): when the store supports transactions the recovery put
+// rides the same ConditionCheck(status=running)+Put transaction as
+// putWorkflowTaskIfRunning, so a terminal instance aborts instead of
+// recreating the row.
+func TestRecoverPutIfRunning_UsesTransactGate(t *testing.T) {
+	ctx := context.Background()
+	b := &Backend{prefix: "tasuki_"}
+
+	running := &transactRecoverStore{status: "running"}
+	ok, err := b.recoverPutIfRunning(ctx, running, "inst-run", "default")
+	if err != nil || !ok {
+		t.Fatalf("running put ok=%v err=%v, want true/nil", ok, err)
+	}
+	if running.transacts != 1 {
+		t.Fatalf("transacts=%d want 1 (atomic gate, not bare PutItem)", running.transacts)
+	}
+
+	terminal := &transactRecoverStore{status: "terminated"}
+	ok, err = b.recoverPutIfRunning(ctx, terminal, "inst-term", "default")
+	if err != nil || ok {
+		t.Fatalf("terminal put ok=%v err=%v, want false/nil (gate aborts)", ok, err)
+	}
+	if terminal.transacts != 1 {
+		t.Fatalf("transacts=%d want 1 (gate attempted, then aborted)", terminal.transacts)
+	}
+	if terminal.puts != 0 {
+		t.Fatalf("puts=%d want 0 (terminal row must not be recreated)", terminal.puts)
+	}
+}
+
+// TestReleaseClaimedLeases_ReleasesBatchOnStatusReadFailure covers issue #291
+// round-17 P2(a) at the helper level: a throttled post-claim status read must
+// not abandon already-committed leases for a full lease duration. Releases
+// are fenced on the claim token, so only the claimed generation matches.
+func TestReleaseClaimedLeases_ReleasesBatchOnStatusReadFailure(t *testing.T) {
+	f := &fakeDynamo{}
+	b := newTestBackend(f)
+	tasks := []backend.Task{
+		{ID: 11, Kind: "activity", WorkerID: "w1", Attempt: 3},
+		{ID: 12, Kind: "activity", WorkerID: "w1", Attempt: 4},
+	}
+	b.releaseClaimedLeases(context.Background(), tasks)
+	if got := atomic.LoadInt64(&f.updateCalls); got != int64(len(tasks)) {
+		t.Fatalf("UpdateItem calls = %d, want %d (one fenced release per claimed task)", got, len(tasks))
+	}
+	if got := atomic.LoadInt64(&f.updateCalls); got == 0 {
+		t.Fatal("no releases issued; failed claims would hide the batch for a full lease")
 	}
 }

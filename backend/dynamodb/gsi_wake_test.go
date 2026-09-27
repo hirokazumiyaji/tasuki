@@ -26,10 +26,19 @@ type fakeDynamo struct {
 
 	lastQueryIndex string
 
+	// lastScan records the most recent Scan input so tests can pin the
+	// bounded verification page (single Limit + consistent read) rather
+	// than an unbounded fleet-wide Scan.
+	lastScanLimit      int32
+	lastScanConsistent bool
+
 	queryItems []map[string]types.AttributeValue
 	queryErr   error
 	scanItems  []map[string]types.AttributeValue
 	scanErr    error
+	// scanFn, when set, runs instead of the canned scanItems response so a
+	// test can script multi-page Scans via LastEvaluatedKey.
+	scanFn func(ctx context.Context, in *dynamodb.ScanInput, call int64) (*dynamodb.ScanOutput, error)
 
 	deleted []string
 
@@ -48,6 +57,16 @@ type fakeDynamo struct {
 	// is reported: a test hook to stall or record specific wake writes.
 	// It must honor ctx like the real client.
 	updateItemHook func(ctx context.Context, in *dynamodb.UpdateItemInput)
+
+	// Scripted-operation hooks for fault-injection tests (nil = legacy
+	// canned behavior above). Each runs instead of the canned response
+	// when set, so one test can route per-table/per-instance traffic
+	// (e.g. fail only one victim's cleanup deletes).
+	getItemFn    func(ctx context.Context, in *dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error)
+	queryFn      func(ctx context.Context, in *dynamodb.QueryInput) (*dynamodb.QueryOutput, error)
+	deleteItemFn func(ctx context.Context, in *dynamodb.DeleteItemInput) (*dynamodb.DeleteItemOutput, error)
+	updateItemFn func(ctx context.Context, in *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error)
+	transactFn   func(ctx context.Context, in *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error)
 }
 
 func (f *fakeDynamo) DescribeTable(ctx context.Context, in *dynamodb.DescribeTableInput, _ ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error) {
@@ -77,7 +96,19 @@ func (f *fakeDynamo) UpdateTable(ctx context.Context, in *dynamodb.UpdateTableIn
 	return &dynamodb.UpdateTableOutput{}, nil
 }
 func (f *fakeDynamo) Scan(ctx context.Context, in *dynamodb.ScanInput, _ ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
-	atomic.AddInt64(&f.scanCalls, 1)
+	call := atomic.AddInt64(&f.scanCalls, 1)
+	f.mu.Lock()
+	if in.Limit != nil {
+		f.lastScanLimit = aws.ToInt32(in.Limit)
+	} else {
+		f.lastScanLimit = 0
+	}
+	f.lastScanConsistent = aws.ToBool(in.ConsistentRead)
+	fn := f.scanFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, in, call)
+	}
 	if f.scanErr != nil {
 		return nil, f.scanErr
 	}
@@ -91,9 +122,15 @@ func (f *fakeDynamo) Query(ctx context.Context, in *dynamodb.QueryInput, _ ...fu
 	if f.queryErr != nil {
 		return nil, f.queryErr
 	}
+	if f.queryFn != nil {
+		return f.queryFn(ctx, in)
+	}
 	return &dynamodb.QueryOutput{Items: f.queryItems}, nil
 }
 func (f *fakeDynamo) GetItem(ctx context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	if f.getItemFn != nil {
+		return f.getItemFn(ctx, in)
+	}
 	return &dynamodb.GetItemOutput{}, nil
 }
 func (f *fakeDynamo) PutItem(ctx context.Context, in *dynamodb.PutItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
@@ -101,6 +138,9 @@ func (f *fakeDynamo) PutItem(ctx context.Context, in *dynamodb.PutItemInput, _ .
 }
 func (f *fakeDynamo) DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error) {
 	atomic.AddInt64(&f.deleteCalls, 1)
+	if f.deleteItemFn != nil {
+		return f.deleteItemFn(ctx, in)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if pk, ok := in.Key["task_pk"]; ok {
@@ -110,6 +150,9 @@ func (f *fakeDynamo) DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInpu
 }
 func (f *fakeDynamo) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
 	atomic.AddInt64(&f.updateCalls, 1)
+	if f.updateItemFn != nil {
+		return f.updateItemFn(ctx, in)
+	}
 	if f.updateGate != nil {
 		// Honor ctx like the real client: a stalled write unblocks when
 		// the caller's context times out instead of hanging forever.
@@ -124,6 +167,9 @@ func (f *fakeDynamo) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInpu
 	return &dynamodb.UpdateItemOutput{}, nil
 }
 func (f *fakeDynamo) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, _ ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
+	if f.transactFn != nil {
+		return f.transactFn(ctx, in)
+	}
 	return &dynamodb.TransactWriteItemsOutput{}, nil
 }
 
@@ -132,6 +178,15 @@ func newTestBackend(f *fakeDynamo) *Backend {
 }
 
 func TestDeleteTasksForInstance_UsesQueryNotScan(t *testing.T) {
+	// MERGE (issue-291 into main): the hot path still deletes via the
+	// instance_gsi Query, but follows it with a bounded
+	// strongly-consistent verification Scan run
+	// (verifyTasksBoundedScan, Limit gsiVerifyScanLimit, up to
+	// gsiVerifyScanMaxPages pages) to reap rows
+	// the eventually-consistent index has not caught up with yet. The pin
+	// below therefore allows that bounded run (one page here: the stubbed
+	// Scan ends the table) while still forbidding unbounded fleet-wide
+	// Scans.
 	f := &fakeDynamo{
 		queryItems: []map[string]types.AttributeValue{
 			{"task_pk": avS("WF#inst-1"), "instance_id": avS("inst-1")},
@@ -139,23 +194,94 @@ func TestDeleteTasksForInstance_UsesQueryNotScan(t *testing.T) {
 		},
 	}
 	b := newTestBackend(f)
-	if err := b.deleteTasksForInstance(context.Background(), "inst-1"); err != nil {
+	if err := b.deleteTasksForInstance(context.Background(), "inst-1", terminalSweepCutoff{}); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if got := atomic.LoadInt64(&f.queryCalls); got != 1 {
 		t.Fatalf("Query calls = %d, want 1", got)
 	}
-	if got := atomic.LoadInt64(&f.scanCalls); got != 0 {
-		t.Fatalf("Scan calls = %d, want 0 (Terminate must not Scan wf_tasks)", got)
+	if got := atomic.LoadInt64(&f.scanCalls); got != 1 {
+		t.Fatalf("Scan calls = %d, want 1 (bounded run ends at the table end)", got)
 	}
 	if got := atomic.LoadInt64(&f.deleteCalls); got != 2 {
 		t.Fatalf("Delete calls = %d, want 2", got)
 	}
 	f.mu.Lock()
 	idx := f.lastQueryIndex
+	scanLimit := f.lastScanLimit
+	scanConsistent := f.lastScanConsistent
 	f.mu.Unlock()
 	if idx != instanceGSIName {
 		t.Fatalf("Query IndexName = %q, want %q", idx, instanceGSIName)
+	}
+	if scanLimit != gsiVerifyScanLimit {
+		t.Fatalf("Scan Limit = %d, want %d (bounded verification page)", scanLimit, gsiVerifyScanLimit)
+	}
+	if !scanConsistent {
+		t.Fatal("verification Scan must use a consistent read")
+	}
+}
+
+// TestVerifyTasksBoundedScan_ReapsLaggingRowsAcrossPages covers Codex
+// round-23 P2 (b) on #291: a lagging task invisible to the GSI but sitting
+// past the first Scan page must still be reaped by the bounded
+// verification run. Without pagination (the single-page round-10 shape) the
+// row on page 2 survives as residue.
+func TestVerifyTasksBoundedScan_ReapsLaggingRowsAcrossPages(t *testing.T) {
+	more := map[string]types.AttributeValue{"task_pk": avS("more")}
+	lag1 := map[string]types.AttributeValue{"task_pk": avS("ACT#lag1"), "instance_id": avS("inst-lag")}
+	lag2 := map[string]types.AttributeValue{"task_pk": avS("ACT#lag2"), "instance_id": avS("inst-lag")}
+	other := map[string]types.AttributeValue{"task_pk": avS("ACT#other"), "instance_id": avS("other")}
+	f := &fakeDynamo{}
+	f.scanFn = func(_ context.Context, _ *dynamodb.ScanInput, call int64) (*dynamodb.ScanOutput, error) {
+		if call == 1 {
+			return &dynamodb.ScanOutput{Items: []map[string]types.AttributeValue{other, lag1}, LastEvaluatedKey: more}, nil
+		}
+		return &dynamodb.ScanOutput{Items: []map[string]types.AttributeValue{lag2}}, nil
+	}
+	b := newTestBackend(f)
+	// Unbounded cutoff: every instance row here predates the transition.
+	if err := b.verifyTasksBoundedScan(context.Background(), "inst-lag", terminalSweepCutoff{}); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if got := atomic.LoadInt64(&f.scanCalls); got != 2 {
+		t.Fatalf("Scan calls = %d, want 2 (lagging row past the first page)", got)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := map[string]bool{"ACT#lag1": true, "ACT#lag2": true}
+	if len(f.deleted) != len(want) {
+		t.Fatalf("deleted = %v, want %v (never the unrelated row)", f.deleted, want)
+	}
+	for _, k := range f.deleted {
+		if !want[k] {
+			t.Fatalf("deleted = %v, want %v (never the unrelated row)", f.deleted, want)
+		}
+	}
+}
+
+// TestVerifyTasksBoundedScan_StopsAtPageBound pins the cost ceiling from the
+// other side: a table that never ends still costs at most
+// gsiVerifyScanMaxPages verification pages per terminal advancement; rows
+// past the bound wait for the TerminateInstance/PurgeInstances backstops.
+func TestVerifyTasksBoundedScan_StopsAtPageBound(t *testing.T) {
+	more := map[string]types.AttributeValue{"task_pk": avS("more")}
+	f := &fakeDynamo{}
+	f.scanFn = func(_ context.Context, _ *dynamodb.ScanInput, _ int64) (*dynamodb.ScanOutput, error) {
+		return &dynamodb.ScanOutput{
+			Items:            []map[string]types.AttributeValue{{"task_pk": avS("ACT#live"), "instance_id": avS("live")}},
+			LastEvaluatedKey: more,
+		}, nil
+	}
+	b := newTestBackend(f)
+	if err := b.verifyTasksBoundedScan(context.Background(), "inst-lag", terminalSweepCutoff{}); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if got := atomic.LoadInt64(&f.scanCalls); got != gsiVerifyScanMaxPages {
+		t.Fatalf("Scan calls = %d, want %d (bounded run stops at the page bound)", got, gsiVerifyScanMaxPages)
+	}
+	if got := atomic.LoadInt64(&f.deleteCalls); got != 0 {
+		t.Fatalf("Delete calls = %d, want 0 (no rows belong to the instance)", got)
 	}
 }
 
@@ -208,7 +334,7 @@ func TestDeleteTasksForInstance_FallsBackToScanWhenGSIMissing(t *testing.T) {
 		},
 	}
 	b := newTestBackend(f)
-	if err := b.deleteTasksForInstance(context.Background(), "inst-9"); err != nil {
+	if err := b.deleteTasksForInstance(context.Background(), "inst-9", terminalSweepCutoff{}); err != nil {
 		t.Fatalf("delete with fallback: %v", err)
 	}
 	if got := atomic.LoadInt64(&f.queryCalls); got != 1 {
@@ -240,7 +366,7 @@ func TestDeleteTasksForInstance_AccessDeniedDoesNotFallBack(t *testing.T) {
 		},
 	}
 	b := newTestBackend(f)
-	if err := b.deleteTasksForInstance(context.Background(), "inst-9"); err == nil {
+	if err := b.deleteTasksForInstance(context.Background(), "inst-9", terminalSweepCutoff{}); err == nil {
 		t.Fatal("delete with IAM denial = nil, want the access error (no Scan fallback)")
 	}
 	if got := atomic.LoadInt64(&f.queryCalls); got != 1 {
@@ -279,7 +405,7 @@ func TestDeleteTasksForInstance_TypedMissingIndexFallsBack(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &fakeDynamo{queryErr: tc.queryErr, scanItems: scanItems}
 			b := newTestBackend(f)
-			err := b.deleteTasksForInstance(context.Background(), "inst-9")
+			err := b.deleteTasksForInstance(context.Background(), "inst-9", terminalSweepCutoff{})
 			if tc.fallback {
 				if err != nil {
 					t.Fatalf("delete = %v, want nil (Scan fallback)", err)

@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS wf_tasks (
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS wf_tasks_claim_idx ON wf_tasks (kind, queue, visible_at);
+CREATE INDEX IF NOT EXISTS wf_tasks_instance_idx ON wf_tasks (instance_id);
 CREATE UNIQUE INDEX IF NOT EXISTS wf_tasks_wf_singleton ON wf_tasks (instance_id) WHERE kind = 'workflow';
 
 CREATE TABLE IF NOT EXISTS wf_timers (

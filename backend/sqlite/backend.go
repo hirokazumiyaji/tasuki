@@ -13,7 +13,12 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{FairDispatch: true}
+	return backend.Capabilities{
+		FairDispatch:        true,
+		CleansTerminalState: true,
+		SupportsBulkCleanup: true,
+		SweepsTerminalInbox: true,
+	}
 }
 
 var _ backend.SchemaValidator = (*Backend)(nil)
@@ -904,6 +909,7 @@ var defaultPurgeIndexStatuses = []string{"completed", "failed", "terminated", "c
 //     selective: the unhinted planner seeks the (status, ...) visibility
 //     index and sorts only the few matches instead of walking every
 //     default-status row.
+//
 // sts is the normalized status set; empty normalizes to the default status
 // set upstream (ValidatePurgeArgs). The hint fires only when that set equals
 // the FIXED index predicate above — a customized backend.DefaultPurgeStatuses

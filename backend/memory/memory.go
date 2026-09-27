@@ -95,7 +95,12 @@ func New() *Backend {
 func (b *Backend) Migrate(context.Context) error { return nil }
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{FairDispatch: true}
+	return backend.Capabilities{
+		FairDispatch:        true,
+		CleansTerminalState: true,
+		SupportsBulkCleanup: true,
+		SweepsTerminalInbox: true,
+	}
 }
 
 func (b *Backend) SetNow(t time.Time) {

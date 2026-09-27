@@ -3,6 +3,7 @@ package firestore
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"sort"
 	"time"
@@ -17,7 +18,7 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{MaxAdvancementEffects: 400, FairDispatch: true}
+	return backend.Capabilities{MaxAdvancementEffects: 400, FairDispatch: true, SweepsTerminalInbox: true, CleansTerminalState: true, SupportsBulkCleanup: true}
 }
 func (b *Backend) col(name string) *gcf.CollectionRef  { return b.client.Collection(name) }
 func (b *Backend) ref(col, id string) *gcf.DocumentRef { return b.col(col).Doc(id) }
@@ -458,21 +459,19 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 						return backend.ErrConflict
 					}
 					m := s.Data()
-					// Fence against TerminateInstance: never lease a task whose
-					// instance already left running. Reading the instance doc
-					// inside the claim transaction also conflicts with a
-					// concurrent status flip, restoring the exclusion the
-					// pre-chunk single-transaction terminate had. A stale
-					// terminal task is removed in the same transaction so
-					// later polls (and the refill pass below) reach live
-					// tasks; a commit conflict drops the delete and the next
-					// poll retries.
-					instID := str(m, "instance_id")
-					isnap, e := tx.Get(b.ref("wf_instances", instID))
+					// The terminal transaction commits the instance update
+					// before its residual rows are swept, so a poll landing in
+					// that window can observe a task whose workflow already
+					// completed. Handing it out would execute user code after
+					// completion (the later sweep cannot recall it), so verify
+					// the owning instance is still running inside the same
+					// transaction. A residual task of a terminal instance is
+					// deleted here; the post-commit sweep removes the rest.
+					instSnap, e := tx.Get(b.ref("wf_instances", str(m, "instance_id")))
 					if e != nil && !isNotFound(e) {
 						return e
 					}
-					if e == nil && isnap.Exists() && str(isnap.Data(), "status") == "running" {
+					if e == nil && instSnap.Exists() && str(instSnap.Data(), "status") == "running" {
 						claimed = decodeTask(m)
 						claimed.Attempt++
 						claimed.VisibleAt = now.Add(req.Lease)
@@ -504,13 +503,11 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 					// so Full does not stop later candidates and queues
 					// from filling the batch, then re-query this queue
 					// for a replacement (the loop above) instead of
-					// moving on. The refill flag is set even without a picker
-					// (Codex round 8 on #327): deleting a stale task must loop
-					// until Limit is filled or candidates are exhausted.
+					// moving on.
 					if picker != nil {
 						picker.Release(backend.FairTaskRef{ID: id, InstanceID: str(m, "instance_id")})
+						released = true
 					}
-					released = true
 					continue
 				}
 				out = append(out, claimed)
@@ -1006,33 +1003,59 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if err != nil {
 		return err
 	}
-	// Wake terminal subscribers immediately after the successful commit,
-	// before the fallible ensureWorkflowTask loop below: the terminal
-	// status already committed, and a transient ensure error returns early
-	// while the advancement only retries on conflict. Notification must
-	// never be skipped because post-commit cleanup errored.
+	// Terminal sweeps run before any wake hint and before terminal success
+	// is reported: accumulated rows are unbounded (the 400-effect budget
+	// only caps new effects per turn), so they are removed in paginated
+	// batches below instead of inside the 500-operation transaction. A
+	// persistent failure is surfaced rather than leaving claimable rows
+	// behind. The sweep uses a detached context so parent cancellation
+	// cannot strand survivors.
+	// A terminal child also owes its parent a workflow task (ParentNotify):
+	// the inbox row rode the transaction, so the parent ensure below must
+	// run DESPITE a cleanup failure (Codex round-18 P2 on #291) — returning
+	// before it leaves the retry conflicting (task/seq consumed) with the
+	// parent dormant until the orphan scan. Stash the first cleanup error,
+	// run every ensure, then surface it.
+	var cleanupErr error
 	for _, adv := range advs {
 		if adv.Terminal != nil {
-			b.notifyTerminal(adv.InstanceID)
+			if err := terminalCleanupFunc(b, context.Background(), adv.InstanceID); err != nil && cleanupErr == nil {
+				cleanupErr = err
+			}
 		}
 	}
 	for _, adv := range advs {
 		if adv.ParentNotify != nil {
 			inst, _ := b.GetInstance(ctx, adv.InstanceID)
 			if inst != nil && inst.ParentID != "" {
-				if err := b.ensureWorkflowTask(ctx, inst.ParentID); err != nil {
-					return err
+				// A transient parent ensure failure must not abort the
+				// remaining ensures (Codex round-26 P2 on #291, mirroring
+				// the DynamoDB round-19 continuation): the advancement
+				// already committed, so returning here leaves later
+				// parents dormant (retry conflicts on the consumed seq)
+				// and skips every notification below. Retain in the same
+				// accumulator and finish all ensures + notifications.
+				if err := b.ensureWorkflowTask(ctx, inst.ParentID); err != nil && cleanupErr == nil {
+					cleanupErr = err
 				}
 			}
 		}
+		if adv.Terminal != nil {
+			// The owned workflow task was deleted atomically in the
+			// transaction and a terminal instance takes no follow-up, so
+			// both ensures below would be no-op status-gated reads. Skip
+			// the fallible RPCs instead of risking terminal success on a
+			// transient failure after cleanup already ran.
+			continue
+		}
 		if adv.EnsureWorkflowTask {
-			if err := b.ensureWorkflowTaskForced(ctx, adv.InstanceID); err != nil {
-				return err
+			if err := b.ensureWorkflowTaskForced(ctx, adv.InstanceID); err != nil && cleanupErr == nil {
+				cleanupErr = err
 			}
 			continue
 		}
-		if err := b.ensureWorkflowTask(ctx, adv.InstanceID); err != nil {
-			return err
+		if err := b.ensureWorkflowTask(ctx, adv.InstanceID); err != nil && cleanupErr == nil {
+			cleanupErr = err
 		}
 	}
 	b.notifyTasks()
@@ -1059,7 +1082,9 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			cancel()
 		}
 	}
-	return nil
+	// The retained cleanup/ensure error surfaces only after every ensure
+	// above had its chance and every waiter was woken (see cleanupErr).
+	return cleanupErr
 }
 
 func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement, alloc *inboxSeqAlloc) (advancementPrep, error) {
@@ -1195,19 +1220,27 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 		}
 	}
 	for _, at := range adv.ActivityTasks {
+		if adv.Terminal != nil {
+			break
+		}
 		id := newID()
 		if err := tx.Create(b.ref("wf_tasks", actTaskID(id)), activityTaskDoc(at, id, now)); err != nil {
 			return err
 		}
 	}
 	for _, tm := range adv.Timers {
+		if adv.Terminal != nil {
+			break
+		}
 		if err := tx.Create(b.ref("wf_timers", journalID(adv.InstanceID, tm.Seq)), map[string]any{"instance_id": adv.InstanceID, "seq": tm.Seq, "fire_at": tm.FireAt.UTC(), "created_at": now}); err != nil {
 			return err
 		}
 	}
-	for _, id := range adv.DrainedInbox {
-		if err := tx.Delete(b.ref("wf_inbox", inboxID(adv.InstanceID, id))); err != nil {
-			return err
+	if adv.Terminal == nil {
+		for _, id := range adv.DrainedInbox {
+			if err := tx.Delete(b.ref("wf_inbox", inboxID(adv.InstanceID, id))); err != nil {
+				return err
+			}
 		}
 	}
 	for _, ch := range adv.Children {
@@ -1245,6 +1278,194 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 	return tx.Delete(prep.taskRef)
 }
 
+// terminalCleanupBatchSize bounds post-commit terminal sweeps below
+// Firestore's 500-write transaction/batch limit.
+const terminalCleanupBatchSize = 400
+
+// terminalCleanupFunc sweeps an instance's residual docs after a terminal
+// advancement commits. It is a variable (not a direct method call) so tests
+// can fault-inject a cleanup failure and assert the parent ensure still runs
+// before the error surfaces (Codex round-18 P2 on #291); production always
+// uses cleanupTerminalDocsWithRetry.
+var terminalCleanupFunc = (*Backend).cleanupTerminalDocsWithRetry
+
+// cleanupTerminalDocsWithRetry removes an instance's residual rows after a
+// terminal advancement commits, retrying transient failures (cleanup query
+// or batch.Commit errors) before terminal success is reported. The terminal
+// transaction already committed, so a failure here cannot be recovered by
+// retrying the advancement (its sequence was consumed and there is no later
+// sweep) — the idempotent sweep itself is retried instead, mirroring the
+// DynamoDB implementation.
+func (b *Backend) cleanupTerminalDocsWithRetry(ctx context.Context, id string) error {
+	const attempts = 5
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = b.cleanupTerminalDocs(ctx, id); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		time.Sleep(time.Duration(100*(1<<i)) * time.Millisecond)
+	}
+	return fmt.Errorf("firestore: terminal cleanup for %s failed after %d attempts: %w", id, attempts, err)
+}
+
+// cleanupTerminalDocs removes an instance's residual tasks, timers, inbox
+// entries and signal dedupe rows after a terminal advancement commits.
+// Accumulated rows are unbounded (the 400-effect advancement budget only
+// caps newly generated effects per turn), so deleting them inside the
+// advancement transaction can exceed Firestore's 500-operation limit and
+// leave the terminal transition permanently uncommittable. They are swept
+// here instead, paginated across batches; the owned workflow task was
+// already deleted atomically in the transaction.
+//
+// Only rows predating the terminal transition are swept (Codex round-21 P2
+// on #291): the sweep runs post-commit on a detached context, so a
+// SendToInboxBatch that starts after the status commit can accept and insert
+// its dedupe marker plus inbox row mid-sweep. An unrestricted sweep deletes
+// the inbox row while the dedupe phase already passed — the marker survives,
+// the event is lost, and every later send under the same DedupeID is
+// discarded.
+//
+// The cutoff compares SERVER commit order, not client timestamps: each
+// candidate's document update time against the instance doc's update time
+// (the flip commit itself). Client entry times cannot serve here —
+// TerminateInstance stamps completed_at at API entry while the flip
+// serializes later, so a racing CompleteActivity that starts after that
+// entry but commits before the flip carries created_at > completed_at while
+// genuinely predating the transition (conformance TerminateCompleteRace:
+// sweeping it is required, preserving it fails the suite). Server update
+// times order the two commits exactly, with no entry-time skew and no
+// cross-process clock skew. A missing instance doc falls back to the
+// unbounded sweep (status quo, e.g. a concurrent purge owns the leftovers);
+// any other instance-doc read error propagates (retried by
+// cleanupTerminalDocsWithRetry) instead of silently zeroing the cutoff and
+// sweeping unbounded (Codex round-22 P2 on #291). A second TerminateInstance
+// on an already-terminal instance advances the instance update time and
+// sweeps rows predating THAT call — matching the conformance expectation
+// that re-terminating stays clean.
+
+// snapTime returns a document snapshot's server update time (zero when the
+// snapshot is nil, e.g. a failed Get).
+func snapTime(snap *gcf.DocumentSnapshot) time.Time {
+	if snap == nil {
+		return time.Time{}
+	}
+	return snap.UpdateTime
+}
+
+// resolveSweepCutoff maps an instance-doc read onto the terminal-sweep
+// cutoff (Codex round-22 P2 on #291). NotFound (or a missing doc) means the
+// instance is gone — a concurrent purge owns the leftovers — so the sweep
+// falls back to unbounded with no error. Any other read error propagates so
+// the caller retries instead of sweeping unbounded: a transient Get failure
+// that silently zeroed the cutoff would delete an accepted post-commit send
+// and report success. Pure for unit tests.
+func resolveSweepCutoff(exists bool, err error, updateTime time.Time) (time.Time, error) {
+	if err != nil {
+		if isNotFound(err) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+	if !exists {
+		return time.Time{}, nil
+	}
+	return updateTime, nil
+}
+
+func (b *Backend) cleanupTerminalDocs(ctx context.Context, id string) error {
+	snap, err := b.ref("wf_instances", id).Get(ctx)
+	cutoff, err := resolveSweepCutoff(snap != nil && snap.Exists(), err, snapTime(snap))
+	if err != nil {
+		return err
+	}
+	for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox"} {
+		if err := b.deleteTerminalColDocs(ctx, col, id, cutoff); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sweepKeepsRow reports whether a terminal-sweep candidate postdates the
+// terminal transition and must survive cleanup. rowUpdate is the candidate
+// document's server update time; flipUpdate is the instance doc's update
+// time at the terminal flip (zero when unknown, e.g. the instance doc is
+// gone). Pure for unit tests.
+func sweepKeepsRow(rowUpdate, flipUpdate time.Time) bool {
+	if flipUpdate.IsZero() {
+		return false
+	}
+	return rowUpdate.After(flipUpdate)
+}
+
+func (b *Backend) deleteTerminalColDocs(ctx context.Context, col, id string, cutoff time.Time) error {
+	// Paginate with a document-ID cursor and stop only when a page yields
+	// zero ROWS — not zero deletions (Codex round-22 P2 on #291). Retained
+	// post-transition rows survive the client-side cutoff below, so a page
+	// can fill entirely with survivors (400+ of them) while older deletable
+	// rows wait behind it: returning on an empty deletion set would declare
+	// completion and shield those rows permanently. The cursor advances
+	// past every row seen (deleted or retained), so each page makes
+	// progress and the loop always terminates.
+	//
+	// The OrderBy(__name__) + StartAfter cursor needs a composite index on
+	// (instance_id, __name__) per swept collection in production; the
+	// emulator serves it without one.
+	var cursor string
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		q := b.col(col).Where("instance_id", "==", id).OrderBy(gcf.DocumentID, gcf.Asc).Limit(terminalCleanupBatchSize)
+		if cursor != "" {
+			q = q.StartAfter(cursor)
+		}
+		it := q.Documents(ctx)
+		var refs []*gcf.DocumentRef
+		rows := 0
+		for {
+			d, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				it.Stop()
+				return err
+			}
+			rows++
+			cursor = d.Ref.ID
+			// Client-side cutoff (no composite index on update time
+			// required): only rows committed at or before the terminal
+			// flip are deleted, so a racing post-commit send's rows
+			// survive the sweep.
+			if sweepKeepsRow(d.UpdateTime, cutoff) {
+				continue
+			}
+			refs = append(refs, d.Ref)
+		}
+		it.Stop()
+		if len(refs) > 0 {
+			batch := b.client.Batch()
+			for _, r := range refs {
+				batch.Delete(r)
+			}
+			if _, err := batch.Commit(ctx); err != nil {
+				return err
+			}
+		}
+		if rows < terminalCleanupBatchSize {
+			return nil
+		}
+	}
+}
+
 func (b *Backend) ensureWorkflowTask(ctx context.Context, instanceID string) error {
 	return b.ensureWorkflowTaskWithForce(ctx, instanceID, false)
 }
@@ -1253,6 +1474,10 @@ func (b *Backend) ensureWorkflowTaskForced(ctx context.Context, instanceID strin
 	return b.ensureWorkflowTaskWithForce(ctx, instanceID, true)
 }
 
+// ensureWorkflowTaskWithForce creates the singleton workflow task while the
+// instance is still running. The status read and inbox probe below are
+// pre-checks only; the authoritative gate is createWorkflowTaskIfRunning,
+// which re-checks the status inside the creation transaction.
 func (b *Backend) ensureWorkflowTaskWithForce(ctx context.Context, instanceID string, force bool) error {
 	inst, err := b.GetInstance(ctx, instanceID)
 	if err != nil {
@@ -1275,7 +1500,40 @@ func (b *Backend) ensureWorkflowTaskWithForce(ctx context.Context, instanceID st
 			return err
 		}
 	}
-	_, err = b.ref("wf_tasks", wfTaskID(instanceID)).Create(ctx, workflowTaskDoc(instanceID, inst.Queue, newID(), nowUTC()))
+	return b.createWorkflowTaskIfRunning(ctx, instanceID)
+}
+
+// createWorkflowTaskIfRunning creates the singleton workflow task only while
+// the instance is still running, in ONE transaction: the instance row is
+// re-read and the Create aborts unless status is still "running", mirroring
+// DynamoDB's putWorkflowTaskIfRunning (ConditionCheck status=running + Put).
+//
+// This closes the recreate-after-cleanup race: CompleteActivity/FireDueTimers
+// commit the inbox and read the instance as running, then a terminal
+// transition can commit (and its sweep delete every task) before the Create
+// below executes. A bare Create has no status condition and would recreate
+// the workflow task after the cleanup — the claim gate still prevents
+// execution, but the row lingers and the cleanup already reported success
+// with residue. A concurrent terminal commit touching the instance row aborts
+// the transaction (retried internally, then re-read as terminal), so a
+// terminal sweep is never undone by a stale ensure.
+//
+// A missing instance or a non-running status is success (the terminal sweep
+// owns cleanup now), as is AlreadyExists from a concurrent ensure.
+func (b *Backend) createWorkflowTaskIfRunning(ctx context.Context, instanceID string) error {
+	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		snap, gerr := tx.Get(b.ref("wf_instances", instanceID))
+		if isNotFound(gerr) {
+			return nil
+		}
+		if gerr != nil {
+			return gerr
+		}
+		if str(snap.Data(), "status") != "running" {
+			return nil
+		}
+		return tx.Create(b.ref("wf_tasks", wfTaskID(instanceID)), workflowTaskDoc(instanceID, str(snap.Data(), "queue"), newID(), nowUTC()))
+	})
 	if status.Code(err) == codes.AlreadyExists {
 		return nil
 	}
@@ -1831,8 +2089,9 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 		m := d.Data()
 		id := str(m, "instance_id")
 		seq := i64(m, "seq")
-		claimed := false
+		fired := false
 		err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+			fired = false
 			alloc := newInboxSeqAlloc()
 			s, e := tx.Get(d.Ref)
 			if isNotFound(e) {
@@ -1867,7 +2126,11 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			if e = tx.Create(b.ref("wf_inbox", inboxID(id, inbox)), inboxDoc(id, inbox, next, journal.Event{Type: journal.TypeTimerFired, RefSeq: seq}, nowUTC())); e != nil {
 				return e
 			}
-			return b.flushInboxSeqs(tx, alloc)
+			if e = b.flushInboxSeqs(tx, alloc); e != nil {
+				return e
+			}
+			fired = true
+			return nil
 		})
 		if err == backend.ErrConflict {
 			continue
@@ -1875,8 +2138,7 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 		if err != nil {
 			return n, err
 		}
-		claimed = true
-		if claimed {
+		if fired {
 			n++
 			if err = b.ensureWorkflowTask(ctx, id); err != nil {
 				return n, err

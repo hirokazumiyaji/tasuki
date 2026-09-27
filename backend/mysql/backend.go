@@ -13,7 +13,12 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{FairDispatch: true}
+	return backend.Capabilities{
+		FairDispatch:        true,
+		CleansTerminalState: true,
+		SupportsBulkCleanup: true,
+		SweepsTerminalInbox: true,
+	}
 }
 
 var _ backend.SchemaValidator = (*Backend)(nil)
@@ -761,7 +766,7 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 	}
 	if len(accepted) == 0 {
 		return nil, nil
-	}	// Restore FIFO (scan) order: refill passes secure later rows before
+	} // Restore FIFO (scan) order: refill passes secure later rows before
 	// earlier ones (e.g. B1 on pass 1, A2 on the refill), so lock order is
 	// not queue order. Sort by the refs' captured scan keys.
 	backend.SortFairRefs(accepted)

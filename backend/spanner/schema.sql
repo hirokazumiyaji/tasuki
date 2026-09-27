@@ -14,13 +14,7 @@ CREATE TABLE wf_instances (
   created_at TIMESTAMP NOT NULL,
   updated_at TIMESTAMP NOT NULL,
   completed_at TIMESTAMP,
-  -- incarnation is the unique per-incarnation identity token (Codex
-  -- round-21 P1 on #296): 128 crypto-random bits hex-encoded, written once
-  -- by CreateInstance and never updated. Terminal sweep and purge fences
-  -- compare it exactly instead of created_at, which clock rollback, VM
-  -- restore, or precision truncation can reproduce for a replacement
-  -- incarnation. NULL on rows predating the field; fences fall back to
-  -- created_at comparison for those (see victimMatches in purge.go).
+  sweep_commit_ts TIMESTAMP OPTIONS (allow_commit_timestamp=true),
   incarnation STRING(32)
 ) PRIMARY KEY (id);
 
@@ -43,7 +37,7 @@ CREATE TABLE wf_inbox (
   type STRING(64) NOT NULL,
   ref_seq INT64,
   payload JSON,
-  created_at TIMESTAMP NOT NULL
+  created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true)
 ) PRIMARY KEY (id);
 
 CREATE INDEX wf_inbox_instance_idx ON wf_inbox(instance_id, id);
@@ -56,7 +50,7 @@ CREATE TABLE wf_inbox_seq (
 CREATE TABLE wf_signal_dedupe (
   instance_id STRING(255) NOT NULL,
   dedupe_id STRING(255) NOT NULL,
-  created_at TIMESTAMP NOT NULL,
+  created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
   format_version INT64,
   fallback_owner STRING(255)
 ) PRIMARY KEY (instance_id, dedupe_id);
@@ -84,13 +78,15 @@ CREATE TABLE wf_tasks (
   visible_at TIMESTAMP NOT NULL,
   worker_id STRING(255),
   heartbeat BYTES(MAX),
-  created_at TIMESTAMP NOT NULL,
+  created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
   wf_singleton STRING(255) AS (IF(kind = 'workflow', instance_id, NULL)) STORED
 ) PRIMARY KEY (id);
 
 CREATE UNIQUE NULL_FILTERED INDEX wf_tasks_wf_singleton ON wf_tasks(wf_singleton);
 
 CREATE INDEX wf_tasks_claim_idx ON wf_tasks(kind, queue, visible_at);
+
+CREATE INDEX wf_tasks_instance_idx ON wf_tasks(instance_id);
 
 CREATE TABLE wf_timers (
   instance_id STRING(255) NOT NULL,

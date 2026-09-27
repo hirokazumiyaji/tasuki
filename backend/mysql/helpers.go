@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -36,6 +37,19 @@ func isUniqueViolation(err error) bool {
 func isDuplicateIndexError(err error) bool {
 	var mysqlErr *mysql.MySQLError
 	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1061
+}
+
+// execIndexBackfill runs an idempotent CREATE INDEX backfill for databases
+// created before the index existed in schema.sql. A duplicate-index error
+// (1061, second and later Migrates) is ignored; every other failure is
+// returned so a half-migrated schema never passes silently.
+func execIndexBackfill(ctx context.Context, q queryExecer, stmt string) error {
+	if _, err := q.ExecContext(ctx, stmt); err != nil {
+		if !isDuplicateIndexError(err) {
+			return fmt.Errorf("mysql migrate: %w\nstmt: %s", err, stmt)
+		}
+	}
+	return nil
 }
 
 // isMissingIndexError reports MySQL error 1091 (ER_CANT_DROP_FIELD_OR_KEY):
@@ -135,10 +149,10 @@ func sortedSearchAttributeKeys(m map[string]string) []string {
 }
 
 type activityPayload struct {
-	Name                    string          `json:"name"`
-	Input                   json.RawMessage `json:"input"`
-	Retry                   retryJSON       `json:"retry"`
-	StartToCloseTimeoutMs   int64           `json:"start_to_close_timeout_ms,omitempty"`
+	Name                  string          `json:"name"`
+	Input                 json.RawMessage `json:"input"`
+	Retry                 retryJSON       `json:"retry"`
+	StartToCloseTimeoutMs int64           `json:"start_to_close_timeout_ms,omitempty"`
 }
 
 type retryJSON struct {

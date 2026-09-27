@@ -10,6 +10,40 @@ import (
 	"google.golang.org/api/iterator"
 )
 
+// purgeChildBatchBudget and purgeChildBatchPage retain the transaction
+// budget contract used by the branch's purge sizing tests. Purge now commits
+// each sweep page independently, with the same page bound.
+const (
+	purgeChildBatchBudget      = 1000
+	purgeChildBatchPage        = spannerSweepBatchSize
+	purgeChildlessVerifyRounds = 5
+)
+
+var errPurgeWriteRace = errors.New("spanner: purge raced concurrent writers; parent left intact for retry")
+
+func purgePageLimit(remaining int) int {
+	if remaining < purgeChildBatchPage {
+		return remaining
+	}
+	return purgeChildBatchPage
+}
+
+func purgeVictimRounds(sweep func() error, verify func() (bool, error), rounds int) error {
+	for i := 0; i < rounds; i++ {
+		if err := sweep(); err != nil {
+			return err
+		}
+		childless, err := verify()
+		if err != nil {
+			return err
+		}
+		if childless {
+			return nil
+		}
+	}
+	return errPurgeWriteRace
+}
+
 // errPurgeSuperseded aborts a purge that no longer owns its victim: a
 // concurrent purge already deleted the instance row, or the ID was recreated
 // after the delete. It is translated to (false, nil) — the instance is either

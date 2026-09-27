@@ -3,6 +3,7 @@ package spanner
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -11,7 +12,9 @@ import (
 	"google.golang.org/api/iterator"
 )
 
-func (b *Backend) Capabilities() backend.Capabilities { return backend.Capabilities{} }
+func (b *Backend) Capabilities() backend.Capabilities {
+	return backend.Capabilities{SweepsTerminalInbox: true, CleansTerminalState: true, SupportsBulkCleanup: true}
+}
 
 // readInboxSeq returns the instance's inbox counter (0, false when unset).
 // The counter lives in wf_inbox_seq, kept off wf_instances so signal appends
@@ -112,7 +115,7 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 				"instance_id": inst.ID,
 				"attempt":     int64(0),
 				"visible_at":  now,
-				"created_at":  now,
+				"created_at":  commitTimestamp(),
 			}),
 		}
 		return txn.BufferWrite(muts)
@@ -273,29 +276,60 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 			return err
 		}
 		dedupeSnapshot = ids
-		return txn.BufferWrite([]*spanner.Mutation{
-			spanner.UpdateMap("wf_instances", map[string]any{
-				"id":           id,
-				"status":       "terminated",
-				"updated_at":   now,
-				"completed_at": now,
-			}),
-		})
+		// Status flip plus a bounded in-transaction sweep of the full
+		// residual set (tasks, timers, signal dedupe, inbox). Residual
+		// rows are unbounded (they span many turns), and one delete
+		// mutation per row can exceed the per-commit mutation limit, so
+		// at most terminalCleanupMutationBudget deletions ride along;
+		// the remainder is swept post-commit in bounded transactions
+		// below (cleanupTerminalInstance).
+		var muts []*spanner.Mutation
+		muts = append(muts, spanner.UpdateMap("wf_instances", map[string]any{
+			"id":              id,
+			"status":          "terminated",
+			"updated_at":      now,
+			"completed_at":    now,
+			"sweep_commit_ts": commitTimestamp(),
+		}))
+		budget := terminalCleanupMutationBudget
+		dMuts, err := deleteSignalDedupe(ctx, txn, id, budget, time.Time{}, false)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, dMuts...)
+		budget = max(budget-len(dMuts), 0)
+		tMuts, err := deleteTasksForInstance(ctx, txn, id, 0, budget, time.Time{}, false)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, tMuts...)
+		budget = max(budget-len(tMuts), 0)
+		tmMuts, err := deleteTimersForInstance(ctx, txn, id, budget)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, tmMuts...)
+		budget = max(budget-len(tmMuts), 0)
+		inMuts, err := deleteInboxForInstance(ctx, txn, id, budget, time.Time{}, false)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, inMuts...)
+		return txn.BufferWrite(muts)
 	})
 	if err != nil {
 		return err
 	}
-	// Await the sweep before returning so previously seen DedupeIDs insert
-	// anew and claimed tasks observe no leftovers. Terminal instances are
-	// immutable, so the sweep cannot race with advancement commits — but it
-	// can race with a purge that deletes the instance and lets CreateInstance
-	// reuse the ID, which the incarnation fence aborts on (see
-	// sweepTerminateDocs); purge reaps anything left by a failed or fenced
-	// sweep.
-	// The status flip above already committed, so subscribers must wake even
-	// when the sweep fails: GetInstance permanently reports terminated while
-	// a skipped notifyTerminal would leave waiters asleep until a retry.
-	if err := b.sweepTerminateDocs(ctx, victim, dedupeSnapshot); err != nil {
+	// Post-commit bounded sweep for residuals beyond the in-transaction
+	// budget (or raced in concurrently). includeInbox=true keeps the full
+	// table set: TerminateInstance leaves no inbox rows behind. Claims
+	// refuse tasks of non-running instances, so leftovers are never
+	// executed in the meantime.
+	if err := b.sweepTerminateDocs(context.Background(), victim, dedupeSnapshot); err != nil {
+		b.notifyTerminal(id)
+		return err
+	}
+	if err := b.cleanupTerminalInstance(context.Background(), id, true); err != nil {
 		b.notifyTerminal(id)
 		return err
 	}
@@ -473,7 +507,122 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		}
 		return nil
 	})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	return b.fenceClaimedTasks(ctx, out)
+}
+
+// fenceClaimedTasks re-validates freshly claimed tasks before handing them
+// out (Codex round-18 P1 on #291, mirroring DynamoDB's round-17 post-claim
+// gate): the in-transaction status gate above covers a terminal commit
+// landing BEFORE the claim, but a terminal commit landing AFTER the claim
+// commit still leaves a live lease in the worker's hands, which would
+// invoke user code post-completion — the terminal sweep deletes the row
+// but cannot recall the in-memory task. Each claimed task whose instance
+// is no longer running is dropped and its residue deleted best-effort here
+// (the sweep owns whatever remains).
+//
+// RESIDUAL (Codex round-19 P1 on #291): this fence is itself a separate
+// status read, so a terminal commit landing between this read and the
+// worker's dispatch still dispatches post-completion. No backend-side read
+// can close that gap — fencing THROUGH the handoff requires the worker's
+// pre-invoke re-check immediately before invokeActivity, which lives on the
+// issue-296 branch (checkActivityFence, fail-closed) and is absent here.
+// Defense in depth across the two branches, narrowest window last:
+//  1. In-claim gate in the claim transaction (this backend: status read in
+//     the claim RW txn; DynamoDB: atomic ConditionCheck in
+//     claimTransactItems; Firestore: instance read in the claim txn) —
+//     covers terminals landing before the claim.
+//  2. This post-claim fence — narrows the window to fence-read→dispatch.
+//  3. Worker pre-invoke re-check (issue-296) — narrows it to ~0.
+//
+// A status-read failure releases every claimed lease best-effort — fenced
+// by the claim token, detached from cancellation — instead of abandoning
+// the batch hidden for a full lease.
+func (b *Backend) fenceClaimedTasks(ctx context.Context, tasks []backend.Task) ([]backend.Task, error) {
+	// Batch the status probe into ONE single-timestamp strong read over the
+	// distinct owning instances (Codex round-27 P1 on #291): the previous
+	// loop issued one full GetInstance RPC per task, so a batch spread its
+	// fence checks across N timestamps — later tasks were fenced strictly
+	// after earlier ones, widening each task's fence-read→dispatch window,
+	// besides reading whole rows (input/result/failure payloads) only to
+	// inspect the status. One key-set read of (id, status) at a single
+	// timestamp fences every task against the same snapshot in one round
+	// trip. Semantics are unchanged: a missing instance is terminal residue
+	// (the sweep owns it), and any read error releases every claimed lease
+	// instead of abandoning the batch hidden for a full lease.
+	ids := make([]string, 0, len(tasks))
+	seen := make(map[string]struct{}, len(tasks))
+	for _, t := range tasks {
+		if _, ok := seen[t.InstanceID]; !ok {
+			seen[t.InstanceID] = struct{}{}
+			ids = append(ids, t.InstanceID)
+		}
+	}
+	statuses := make(map[string]string, len(ids))
+	if len(ids) > 0 {
+		keys := make([]spanner.Key, 0, len(ids))
+		for _, id := range ids {
+			keys = append(keys, spanner.Key{id})
+		}
+		iter := b.client.Single().Read(ctx, "wf_instances", spanner.KeySetFromKeys(keys...), []string{"id", "status"})
+		defer iter.Stop()
+		for {
+			row, err := iter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				b.releaseClaimedLeases(ctx, tasks)
+				return nil, err
+			}
+			var id, status string
+			if err := row.Columns(&id, &status); err != nil {
+				b.releaseClaimedLeases(ctx, tasks)
+				return nil, err
+			}
+			statuses[id] = status
+		}
+	}
+	kept := make([]backend.Task, 0, len(tasks))
+	for _, t := range tasks {
+		if status, ok := statuses[t.InstanceID]; !ok || status != "running" {
+			b.deleteClaimedTask(ctx, t.ID)
+			continue
+		}
+		kept = append(kept, t)
+	}
+	return kept, nil
+}
+
+// releaseClaimedLeases best-effort releases durable leases acquired during a
+// ClaimTasks call that is about to fail. Without this, a throttled/transient
+// post-claim status read abandons every already-claimed task — each holds a
+// committed lease hiding it for the full lease duration. Releases are fenced
+// on the claim ownership token (see ReleaseLease), so a task reclaimed or
+// refreshed since the claim matches nothing and is left alone; release
+// errors are ignored because the original error is already being returned.
+// Detached from cancellation so a cancelled claim still frees what it
+// leased.
+func (b *Backend) releaseClaimedLeases(ctx context.Context, tasks []backend.Task) {
+	if len(tasks) == 0 {
+		return
+	}
+	rctx := context.WithoutCancel(ctx)
+	for _, t := range tasks {
+		_ = b.ReleaseLease(rctx, t)
+	}
+}
+
+// deleteClaimedTask best-effort deletes one claimed task row that turned out
+// to be terminal residue. Deleting a missing row is a no-op, so a concurrent
+// terminal sweep racing this delete is harmless; failures are ignored
+// because the sweep owns whatever remains.
+func (b *Backend) deleteClaimedTask(ctx context.Context, id int64) {
+	_ = b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		return txn.BufferWrite([]*spanner.Mutation{spanner.Delete("wf_tasks", spanner.Key{id})})
+	})
 }
 
 func scanTask(row *spanner.Row) (backend.Task, error) {
@@ -699,8 +848,10 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	// aborts it instead of deleting the replacement's recreated guard.
 	var snapshots map[string]terminalSweep
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		// Reset per attempt: the transaction function may run more than
-		// once, and only the committing attempt's reads classify the sweep.
+		// Fresh per attempt: the client retries the closure on abort, and
+		// buffered mutations are discarded, so read-your-writes state must
+		// reset with it.
+		st := newSpannerTxnState()
 		snapshots = make(map[string]terminalSweep, len(advs))
 		for _, adv := range advs {
 			if adv.Terminal != nil {
@@ -716,7 +867,7 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 					snapshots[adv.InstanceID] = terminalSweep{createdAt: victim.createdAt, incarnation: victim.incarnation, dedupeIDs: ids}
 				}
 			}
-			if err := b.commitAdvancementTxn(ctx, txn, adv); err != nil {
+			if err := b.commitAdvancementTxn(ctx, txn, st, adv); err != nil {
 				return err
 			}
 		}
@@ -725,20 +876,36 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if err != nil {
 		return err
 	}
-	// Wake terminal subscribers immediately after the successful commit,
-	// before the fallible ensureWorkflowTaskIfInbox loop below: the
-	// terminal status already committed, and a transient ensure error
-	// returns early while the advancement only retries on conflict.
-	// Notification must never be skipped because post-commit cleanup
-	// errored.
+	// Terminal sweeps run before any wake hint and before terminal success
+	// is reported: rows beyond the in-transaction mutation budget are
+	// removed here in bounded transactions. The sweep uses a detached
+	// context so parent cancellation cannot strand survivors, and a
+	// persistent failure is surfaced rather than leaving claimable rows
+	// behind. A per-instance cleanup failure no longer aborts the batch
+	// (Codex round-21 P2 on #291, mirroring the DynamoDB/Firestore
+	// continuation fix from round-19): cleanup-retries-exhausted used to
+	// return immediately, skipping later instances' sweeps (residue with no
+	// recovery: the advancement already committed). The first error is
+	// retained while every committed instance is still swept; it is
+	// returned at the end, after notifications.
+	var cleanupErr error
 	for _, adv := range advs {
 		if adv.Terminal != nil {
-			b.notifyTerminal(adv.InstanceID)
+			if err := terminalCleanupFunc(b, context.Background(), adv.InstanceID, true); err != nil && cleanupErr == nil {
+				cleanupErr = err
+			}
 		}
 	}
 	for _, adv := range advs {
+		if adv.Terminal != nil {
+			// Terminal instances take no follow-up task:
+			// ensureWorkflowTaskIfInbox is a no-op for non-running
+			// instances, so skip the fallible transaction instead of
+			// risking terminal success after cleanup already ran.
+			continue
+		}
 		if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-			return ensureWorkflowTaskIfInbox(ctx, txn, adv.InstanceID)
+			return ensureWorkflowTaskIfInbox(ctx, txn, nil, adv.InstanceID)
 		}); err != nil {
 			return err
 		}
@@ -771,7 +938,9 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			cancel()
 		}
 	}
-	return nil
+	// A failed terminal sweep still surfaces, but only after every later
+	// victim was swept and every notification above had its chance.
+	return cleanupErr
 }
 
 func (b *Backend) withRW(ctx context.Context, fn func(context.Context, *spanner.ReadWriteTransaction) error) error {
@@ -779,7 +948,128 @@ func (b *Backend) withRW(ctx context.Context, fn func(context.Context, *spanner.
 	return err
 }
 
-func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWriteTransaction, adv backend.Advancement) error {
+// terminalCleanupMutationBudget caps terminal-cleanup deletions buffered in
+// one advancement commit. Cloud Spanner allows 20,000 mutations per commit;
+// residual tasks, timers, inbox entries and dedupe rows accumulate over many
+// turns, so deleting them all in the terminal commit can exceed that limit
+// and leave the terminal transition permanently uncommittable. Cleanup
+// beyond the budget is swept post-commit (cleanupTerminalInstance).
+const terminalCleanupMutationBudget = 1000
+
+// terminalCleanupSweepBatch bounds the deletions per table of one
+// post-commit sweep transaction (at most four batches per commit),
+// keeping every commit far below the mutation limit.
+const terminalCleanupSweepBatch = 500
+
+// terminalCleanupFunc sweeps an instance's residual docs after a terminal
+// advancement commits. It is a variable (not a direct method call) so tests
+// can fault-inject a cleanup failure and assert later victims are still
+// swept before the retained error surfaces (Codex round-21 P2 on #291);
+// production always uses cleanupTerminalInstance.
+var terminalCleanupFunc = (*Backend).cleanupTerminalInstance
+
+// cleanupTerminalInstance removes an instance's residual tasks, timers,
+// inbox entries and signal dedupe rows left outside the advancement commit
+// by the mutation budget, retrying transient failures before terminal
+// success is reported. TerminateInstance passes includeInbox=false to
+// preserve its long-standing table set (tasks, timers, dedupe only),
+// matching the SQL backends.
+func (b *Backend) cleanupTerminalInstance(ctx context.Context, id string, includeInbox bool) error {
+	const attempts = 5
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = b.cleanupTerminalInstanceOnce(ctx, id, includeInbox); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		time.Sleep(time.Duration(100*(1<<i)) * time.Millisecond)
+	}
+	return fmt.Errorf("spanner: terminal cleanup for %s failed after %d attempts: %w", id, attempts, err)
+}
+
+func (b *Backend) cleanupTerminalInstanceOnce(ctx context.Context, id string, includeInbox bool) error {
+	for {
+		n, err := b.deleteTerminalBatch(ctx, id, includeInbox)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+	}
+}
+
+// deleteTerminalBatch deletes up to terminalCleanupSweepBatch residual rows
+// per table in one transaction and reports how many rows were removed. Only
+// rows predating the terminal transition are swept (Codex round-21 P2 on
+// #291): the sweep runs post-commit, so a SendToInboxBatch that starts after
+// the status commit can accept and insert its dedupe marker plus inbox row
+// mid-sweep, and an unrestricted sweep deletes the inbox row while the
+// dedupe phase already passed — the marker survives, the event is lost, and
+// every later send under the same DedupeID is discarded. The cutoff is the
+// instance's sweep_commit_ts read in this same transaction: the terminal
+// commit's own commit timestamp (see commitTimestamp), and every swept
+// table's created_at is a commit timestamp too, so the comparison orders the
+// two commits exactly with no cross-process clock skew (Codex round-22 P2 on
+// #291). Rows created after it are the racing sends and must survive. A
+// missing instance row or ticks on neither column (legacy rows) falls back
+// to the unbounded sweep, and wf_timers has no created_at column — timers
+// can only be created by a non-terminal advancement, so no racing send can
+// add one post-commit and the unbounded timer sweep is exact.
+// Pre-commit-timestamp rows (created_at stamped by writer wall clocks
+// before the migration, or swept under a NULL sweep_commit_ts via the
+// completed_at fallback in readCompletedAt) still compare by wall time
+// against the cutoff — the same approximation as before, converging as old
+// rows age out.
+//
+// The in-commit budget deletes (commitAdvancementTxn, TerminateInstance)
+// stay unbounded: their reads are snapshot-isolated inside the status-flip
+// transaction, so they can only ever see pre-commit rows, and both sides of
+// a swept send (dedupe marker and inbox row) are removed atomically with the
+// flip — the marker-without-inbox split the cutoff guards against cannot
+// arise there.
+func (b *Backend) deleteTerminalBatch(ctx context.Context, id string, includeInbox bool) (int, error) {
+	var n int
+	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		n = 0
+		cutoff, hasCutoff, err := readCompletedAt(ctx, txn, id)
+		if err != nil {
+			return err
+		}
+		dMuts, err := deleteSignalDedupe(ctx, txn, id, terminalCleanupSweepBatch, cutoff, hasCutoff)
+		if err != nil {
+			return err
+		}
+		tMuts, err := deleteTasksForInstance(ctx, txn, id, 0, terminalCleanupSweepBatch, cutoff, hasCutoff)
+		if err != nil {
+			return err
+		}
+		tmMuts, err := deleteTimersForInstance(ctx, txn, id, terminalCleanupSweepBatch)
+		if err != nil {
+			return err
+		}
+		muts := append(append(dMuts, tMuts...), tmMuts...)
+		if includeInbox {
+			inMuts, err := deleteInboxForInstance(ctx, txn, id, terminalCleanupSweepBatch, cutoff, hasCutoff)
+			if err != nil {
+				return err
+			}
+			muts = append(muts, inMuts...)
+		}
+		n = len(muts)
+		return txn.BufferWrite(muts)
+	})
+	return n, err
+}
+
+func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWriteTransaction, st *spannerTxnState, adv backend.Advancement) error {
+	if st == nil {
+		st = newSpannerTxnState()
+	}
 	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{adv.InstanceID},
 		[]string{"status", "next_seq", "queue", "parent_id", "parent_seq"})
 	if err != nil {
@@ -796,11 +1086,16 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	if err := row.Columns(&status, &nextSeq, &queue, &parentID, &parentSeq); err != nil {
 		return err
 	}
-	// Reject commits for instances that already left running (see firestore
-	// readAdvancementTx): a task leased before TerminateInstance still
-	// matches, and without this gate a terminal advancement would overwrite
-	// terminated → completed/failed while a suspended one appends
-	// journal/children post-termination.
+	// Reject commits for instances that already left running (Codex round-25
+	// P1 on #328, mirroring #327's round-23 status gate): only part of the
+	// terminal cleanup rides in the TerminateInstance flip transaction
+	// (terminalCleanupMutationBudget), so the owned workflow task can survive
+	// the flip when dedupe rows exhaust the budget. A worker holding that
+	// task still matches ExpectedSeq/TaskID, and without this gate a
+	// nonterminal advancement commits during the post-commit sweep —
+	// post-sweep activities/children then survive/execute after termination.
+	// Reading the status in-txn also conflicts with a concurrent flip,
+	// serializing the commit against termination.
 	if status != "running" {
 		return backend.ErrConflict
 	}
@@ -831,13 +1126,17 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	if kind != "workflow" || taskInst != adv.InstanceID {
 		return backend.ErrConflict
 	}
-	if adv.WorkerID != "" {
-		got := ""
-		if worker.Valid {
-			got = worker.StringVal
-		}
-		if got != adv.WorkerID || int(attempt) != adv.Attempt {
-			return backend.ErrConflict
+	// Read-your-writes: Spanner buffers mutations client-side until commit,
+	// so queries below do not see them. The owned workflow task is deleted
+	// later in this commit; record it before any existence check, otherwise
+	// the check sees the stale row and skips the follow-up insert, leaving
+	// no claimable task (TerminalCleanup "claim wf for terminal" empty).
+	st.wfDeleted[adv.TaskID] = true
+	if adv.Terminal != nil {
+		st.terminal[adv.InstanceID] = true
+	} else {
+		for _, inboxID := range adv.DrainedInbox {
+			st.inboxDeleted[inboxID] = true
 		}
 	}
 
@@ -873,6 +1172,9 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		}))
 	}
 	for _, at := range adv.ActivityTasks {
+		if adv.Terminal != nil {
+			break
+		}
 		payload, _ := json.Marshal(activityPayload{
 			Name:  at.Name,
 			Input: at.Input,
@@ -897,7 +1199,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 			"payload":     jsonVal(payload),
 			"attempt":     int64(0),
 			"visible_at":  now,
-			"created_at":  now,
+			"created_at":  commitTimestamp(),
 		}
 		if at.MaxAttempts > 0 {
 			m["max_attempts"] = int64(at.MaxAttempts)
@@ -905,6 +1207,9 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		muts = append(muts, spanner.InsertMap("wf_tasks", m))
 	}
 	for _, tm := range adv.Timers {
+		if adv.Terminal != nil {
+			break
+		}
 		muts = append(muts, spanner.InsertMap("wf_timers", map[string]any{
 			"instance_id": adv.InstanceID,
 			"seq":         tm.Seq,
@@ -913,19 +1218,55 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	}
 	if adv.Terminal != nil {
 		m := map[string]any{
-			"id":           adv.InstanceID,
-			"status":       adv.Terminal.Status,
-			"result":       jsonVal(adv.Terminal.Result),
-			"failure":      jsonVal(adv.Terminal.Failure),
-			"updated_at":   now,
-			"completed_at": now,
+			"id":              adv.InstanceID,
+			"status":          adv.Terminal.Status,
+			"result":          jsonVal(adv.Terminal.Result),
+			"failure":         jsonVal(adv.Terminal.Failure),
+			"updated_at":      now,
+			"completed_at":    now,
+			"sweep_commit_ts": commitTimestamp(),
 		}
 		muts = append(muts, spanner.UpdateMap("wf_instances", m))
-		// Dedupe keys are swept after commit (see CommitAdvancements): buffering
-		// one mutation per accumulated key would blow the commit mutation limit.
+		// Terminal cleanup cannot ride along unbounded: tasks, timers,
+		// inbox entries and dedupe rows accumulate across turns, and one
+		// delete mutation per row can exceed Cloud Spanner's per-commit
+		// mutation limit, wedging the terminal transition permanently.
+		// Buffer at most the budget below; the remainder is swept
+		// post-commit in bounded transactions (cleanupTerminalInstance).
+		// ClaimTasks refuses tasks of non-running instances, so leftovers
+		// are never executed in the meantime.
+		budget := terminalCleanupMutationBudget
+		dMuts, err := deleteSignalDedupe(ctx, txn, adv.InstanceID, budget, time.Time{}, false)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, dMuts...)
+		budget = max(budget-len(dMuts), 0)
+		tMuts, err := deleteTasksForInstance(ctx, txn, adv.InstanceID, adv.TaskID, budget, time.Time{}, false)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, tMuts...)
+		budget = max(budget-len(tMuts), 0)
+		tmMuts, err := deleteTimersForInstance(ctx, txn, adv.InstanceID, budget)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, tmMuts...)
+		budget = max(budget-len(tmMuts), 0)
+		inMuts, err := deleteInboxForInstance(ctx, txn, adv.InstanceID, budget, time.Time{}, false)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, inMuts...)
 	}
-	for _, inboxID := range adv.DrainedInbox {
-		muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{inboxID}))
+	if adv.Terminal != nil {
+		// Full inbox sweep above already removed every row; the drained
+		// deletes would be duplicates.
+	} else {
+		for _, inboxID := range adv.DrainedInbox {
+			muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{inboxID}))
+		}
 	}
 	// Fence child creation on purge markers (Codex round 12 on #296): only
 	// direct CreateInstance checked the marker, so a child — or a
@@ -963,7 +1304,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 			}),
 			spanner.InsertMap("wf_tasks", map[string]any{
 				"id": newID(), "kind": "workflow", "queue": q, "instance_id": ch.ID,
-				"attempt": int64(0), "visible_at": now, "created_at": now,
+				"attempt": int64(0), "visible_at": now, "created_at": commitTimestamp(),
 			}),
 		)
 	}
@@ -995,13 +1336,14 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 			spanner.InsertMap("wf_inbox", map[string]any{
 				"id": inboxID, "instance_id": parentID.StringVal,
 				"seq": pseq, "type": string(ev.Type), "ref_seq": nullInt(ev.RefSeq),
-				"payload": jsonVal(ev.Payload), "created_at": now,
+				"payload": jsonVal(ev.Payload), "created_at": commitTimestamp(),
 			}))
 		if err := txn.BufferWrite(muts); err != nil {
 			return err
 		}
+		st.inboxAdded[parentID.StringVal]++
 		if parentStatus == "running" {
-			if err := enqueueWorkflowTask(ctx, txn, parentID.StringVal, parentQueue, now); err != nil {
+			if err := enqueueWorkflowTask(ctx, txn, st, parentID.StringVal, parentQueue, now); err != nil {
 				return err
 			}
 		}
@@ -1012,7 +1354,13 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	}); err != nil {
 		return err
 	}
-	if err := ensureWorkflowTaskIfInbox(ctx, txn, adv.InstanceID); err != nil {
+	if adv.Terminal != nil {
+		// Terminal instances take no follow-up task. The status flip is
+		// only buffered, so the running check below would still see the
+		// stale pre-commit row; skip explicitly instead.
+		return nil
+	}
+	if err := ensureWorkflowTaskIfInbox(ctx, txn, st, adv.InstanceID); err != nil {
 		return err
 	}
 	if adv.EnsureWorkflowTask {
@@ -1021,12 +1369,53 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		// the instance row itself, so no separate pre-read is needed, and
 		// its error must fail the advancement: without the follow-up task
 		// the uncommitted remainder could never be reached.
-		return enqueueWorkflowTask(ctx, txn, adv.InstanceID, "", nowUTC())
+		return enqueueWorkflowTask(ctx, txn, st, adv.InstanceID, "", nowUTC())
 	}
 	return nil
 }
 
-func enqueueWorkflowTask(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID, queue string, now time.Time) error {
+// spannerTxnState tracks buffered writes within one Spanner read-write
+// transaction for read-your-writes. Spanner buffers mutations client-side
+// until commit: queries in the same transaction do NOT see them, so the
+// check-then-insert workflow-task helpers consult this state to observe
+// post-commit state.
+type spannerTxnState struct {
+	// wfEnqueued marks instances with a workflow-task insert buffered in
+	// this transaction (dedupes repeat enqueues, which would otherwise
+	// violate the wf_tasks_wf_singleton unique index at commit).
+	wfEnqueued map[string]bool
+	// wfDeleted marks task IDs with a delete buffered in this transaction
+	// (the owned workflow task being committed, terminal sweep victims).
+	wfDeleted map[int64]bool
+	// terminal marks instances known terminal in this transaction (the
+	// status flip is only buffered, so status reads still see running).
+	terminal map[string]bool
+	// inboxDeleted marks inbox IDs with a delete buffered in this
+	// transaction (drained rows); inboxAdded counts inbox inserts buffered
+	// per instance.
+	inboxDeleted map[int64]bool
+	inboxAdded   map[string]int
+}
+
+func newSpannerTxnState() *spannerTxnState {
+	return &spannerTxnState{
+		wfEnqueued:   map[string]bool{},
+		wfDeleted:    map[int64]bool{},
+		terminal:     map[string]bool{},
+		inboxDeleted: map[int64]bool{},
+		inboxAdded:   map[string]int{},
+	}
+}
+
+func enqueueWorkflowTask(ctx context.Context, txn *spanner.ReadWriteTransaction, st *spannerTxnState, instanceID, queue string, now time.Time) error {
+	if st != nil {
+		if st.terminal[instanceID] {
+			return nil
+		}
+		if st.wfEnqueued[instanceID] {
+			return nil
+		}
+	}
 	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"queue", "status"})
 	if err != nil {
 		return err
@@ -1043,27 +1432,59 @@ func enqueueWorkflowTask(ctx context.Context, txn *spanner.ReadWriteTransaction,
 		queue = q
 	}
 	// Spanner reports unique violations at commit; check first (insert-or-ignore).
-	exist := txn.Query(ctx, spanner.Statement{
-		SQL:    `SELECT id FROM wf_tasks WHERE kind = 'workflow' AND instance_id = @id LIMIT 1`,
+	// The check must ignore tasks deleted earlier in this transaction: the
+	// owned workflow task's delete is only buffered, so the pre-commit row
+	// is still returned and would wrongly suppress the follow-up insert.
+	iter := txn.Query(ctx, spanner.Statement{
+		SQL:    `SELECT id FROM wf_tasks WHERE kind = 'workflow' AND instance_id = @id`,
 		Params: map[string]any{"id": instanceID},
 	})
-	_, err = exist.Next()
-	exist.Stop()
-	if err == nil {
+	live := false
+	for {
+		r, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			iter.Stop()
+			return err
+		}
+		var tid int64
+		if err := r.Columns(&tid); err != nil {
+			iter.Stop()
+			return err
+		}
+		if st != nil && st.wfDeleted[tid] {
+			continue
+		}
+		live = true
+		break
+	}
+	iter.Stop()
+	if live {
+		if st != nil {
+			st.wfEnqueued[instanceID] = true
+		}
 		return nil
 	}
-	if err != iterator.Done {
-		return err
-	}
-	return txn.BufferWrite([]*spanner.Mutation{
+	if err := txn.BufferWrite([]*spanner.Mutation{
 		spanner.InsertMap("wf_tasks", map[string]any{
 			"id": newID(), "kind": "workflow", "queue": queue, "instance_id": instanceID,
-			"attempt": int64(0), "visible_at": now, "created_at": now,
+			"attempt": int64(0), "visible_at": now, "created_at": commitTimestamp(),
 		}),
-	})
+	}); err != nil {
+		return err
+	}
+	if st != nil {
+		st.wfEnqueued[instanceID] = true
+	}
+	return nil
 }
 
-func ensureWorkflowTaskIfInbox(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string) error {
+func ensureWorkflowTaskIfInbox(ctx context.Context, txn *spanner.ReadWriteTransaction, st *spannerTxnState, instanceID string) error {
+	if st != nil && st.terminal[instanceID] {
+		return nil
+	}
 	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"status", "queue"})
 	if err != nil {
 		if isNotFound(err) {
@@ -1078,19 +1499,37 @@ func ensureWorkflowTaskIfInbox(ctx context.Context, txn *spanner.ReadWriteTransa
 	if status != "running" {
 		return nil
 	}
+	if st != nil && st.inboxAdded[instanceID] > 0 {
+		return enqueueWorkflowTask(ctx, txn, st, instanceID, queue, nowUTC())
+	}
+	// The inbox check must ignore rows drained earlier in this transaction:
+	// their deletes are only buffered, so drained rows still read back and
+	// would otherwise cause a spurious follow-up task.
 	iter := txn.Query(ctx, spanner.Statement{
-		SQL:    `SELECT 1 FROM wf_inbox WHERE instance_id = @id LIMIT 1`,
+		SQL:    `SELECT id FROM wf_inbox WHERE instance_id = @id`,
 		Params: map[string]any{"id": instanceID},
 	})
-	_, err = iter.Next()
-	iter.Stop()
-	if err == iterator.Done {
-		return nil
+	for {
+		r, err := iter.Next()
+		if err == iterator.Done {
+			iter.Stop()
+			return nil
+		}
+		if err != nil {
+			iter.Stop()
+			return err
+		}
+		var inboxID int64
+		if err := r.Columns(&inboxID); err != nil {
+			iter.Stop()
+			return err
+		}
+		if st != nil && st.inboxDeleted[inboxID] {
+			continue
+		}
+		iter.Stop()
+		return enqueueWorkflowTask(ctx, txn, st, instanceID, queue, nowUTC())
 	}
-	if err != nil {
-		return err
-	}
-	return enqueueWorkflowTask(ctx, txn, instanceID, queue, nowUTC())
 }
 
 func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
@@ -1142,12 +1581,12 @@ func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev j
 		if err := txn.BufferWrite(append(inboxSeqMuts(instanceID, seq, existed),
 			spanner.InsertMap("wf_inbox", map[string]any{
 				"id": newID(), "instance_id": instanceID, "seq": seq, "type": string(ev.Type),
-				"ref_seq": nullInt(ev.RefSeq), "payload": jsonVal(ev.Payload), "created_at": now,
+				"ref_seq": nullInt(ev.RefSeq), "payload": jsonVal(ev.Payload), "created_at": commitTimestamp(),
 			}))); err != nil {
 			return err
 		}
 		wake = true
-		return enqueueWorkflowTask(ctx, txn, instanceID, queue, now)
+		return enqueueWorkflowTask(ctx, txn, nil, instanceID, queue, now)
 	})
 	if err != nil {
 		return err
@@ -1184,6 +1623,10 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n = 0
 		now := nowUTC()
+		// Shared across dues in this transaction: repeat fires for the same
+		// instance must not buffer duplicate workflow-task inserts (reads
+		// do not see the first insert; the unique index would fail commit).
+		st := newSpannerTxnState()
 		iter := txn.Query(ctx, spanner.Statement{
 			SQL: `SELECT instance_id, seq FROM wf_timers
 				WHERE fire_at <= @now ORDER BY fire_at, instance_id, seq LIMIT @limit`,
@@ -1222,25 +1665,15 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			if delN == 0 {
 				continue
 			}
-			n++
-			// Fence event creation on the instance still running (Codex
-			// round-23 P1 on #296, Firestore parity): a timer due after a
-			// status-only terminal commit but before the sweep deletes it
-			// must be discarded without recording. enqueueWorkflowTask
-			// below already gates task creation on running, but without
-			// this check the TimerFired inbox insert stands
-			// unconditionally, leaving a post-terminal event behind.
-			row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{d.instanceID}, []string{"status"})
+			instRow, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{d.instanceID}, []string{"status"})
 			if err != nil {
 				if isNotFound(err) {
-					// Instance purged: the timer is already deleted
-					// above; nothing to record.
 					continue
 				}
 				return err
 			}
 			var status string
-			if err := row.Columns(&status); err != nil {
+			if err := instRow.Columns(&status); err != nil {
 				return err
 			}
 			if status != "running" {
@@ -1254,12 +1687,12 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			muts := append(inboxSeqMuts(d.instanceID, seq, existed),
 				spanner.InsertMap("wf_inbox", map[string]any{
 					"id": newID(), "instance_id": d.instanceID, "seq": seq,
-					"type": string(journal.TypeTimerFired), "ref_seq": d.seq, "created_at": now,
+					"type": string(journal.TypeTimerFired), "ref_seq": d.seq, "created_at": commitTimestamp(),
 				}))
 			if err := txn.BufferWrite(muts); err != nil {
 				return err
 			}
-			if err := enqueueWorkflowTask(ctx, txn, d.instanceID, "", now); err != nil {
+			if err := enqueueWorkflowTask(ctx, txn, st, d.instanceID, "", now); err != nil {
 				return err
 			}
 		}
@@ -1325,11 +1758,13 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	// duplicated the sole guard or exceeded the key budget).
 	var inserted int
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		// Stamp inside the transaction (per attempt): a transaction that
-		// loses a race and retries must not commit with a created_at
-		// captured before the conflicting commit.
+		// Row creation order comes from commit timestamps, not this clock
+		// (see commitTimestamp): dedupe and inbox rows stamp the
+		// transaction's commit time, so a send that loses to the terminal
+		// commit and retries is ordered after the terminal completed_at no
+		// matter how skewed this worker's clock is. now is still refreshed
+		// per attempt for visible_at below.
 		now := nowUTC()
-		inserted = 0
 		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"status", "queue"})
 		if err != nil {
 			if isNotFound(err) {
@@ -1633,12 +2068,19 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					}
 					created[it.DedupeID] = true
 				}
+				if !isNotFound(err) {
+					return err
+				}
+				muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
+					"instance_id": instanceID, "dedupe_id": it.DedupeID, "created_at": commitTimestamp(),
+				}))
+				created[it.DedupeID] = true
 			}
 			payload := inboxPayload(it.Event)
 			seq++
 			muts = append(muts, spanner.InsertMap("wf_inbox", map[string]any{
 				"id": newID(), "instance_id": instanceID, "seq": seq, "type": string(it.Event.Type),
-				"ref_seq": nullInt(it.Event.RefSeq), "payload": jsonVal(payload), "created_at": now,
+				"ref_seq": nullInt(it.Event.RefSeq), "payload": jsonVal(payload), "created_at": commitTimestamp(),
 			}))
 			inserted++
 		}
@@ -1651,7 +2093,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 			}
 		}
 		if inserted > 0 && status == "running" {
-			return enqueueWorkflowTask(ctx, txn, instanceID, queue, now)
+			return enqueueWorkflowTask(ctx, txn, nil, instanceID, queue, now)
 		}
 		return nil
 	})
@@ -1662,10 +2104,167 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		return nil
 	}
 	if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		return ensureWorkflowTaskIfInbox(ctx, txn, instanceID)
+		return ensureWorkflowTaskIfInbox(ctx, txn, nil, instanceID)
 	}); err != nil {
 		return err
 	}
 	b.notifyTasks()
 	return nil
+}
+
+// readCompletedAt returns the instance's terminal-transition time for the
+// post-commit sweep cutoff (Codex round-21 P2 on #291): the status commit's
+// own commit timestamp recorded in sweep_commit_ts (see commitTimestamp),
+// so comparing it against the commit-timestamp created_at of swept rows
+// orders the commits exactly (Codex round-22 P2 on #291). Rows created
+// after it are the racing sends and must survive. ok=false when the
+// instance row is gone (a concurrent purge owns the leftovers) or neither
+// tick is set (legacy rows predate both columns): the sweep then falls back
+// to unbounded, matching the pre-cutoff behavior so legacy residue
+// converges. A set completed_at with a NULL sweep_commit_ts (rows written
+// between the flip and a crashed migration, or by an older binary) falls
+// back to the client-time completed_at — the pre-round-22 skew
+// approximation, converging as those rows age out.
+func readCompletedAt(ctx context.Context, txn *spanner.ReadWriteTransaction, id string) (cutoff time.Time, ok bool, err error) {
+	row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"sweep_commit_ts", "completed_at"})
+	if err != nil {
+		if isNotFound(err) {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, err
+	}
+	var sweepTs, completedAt spanner.NullTime
+	if err := row.Columns(&sweepTs, &completedAt); err != nil {
+		return time.Time{}, false, err
+	}
+	if sweepTs.Valid {
+		return sweepTs.Time, true, nil
+	}
+	if completedAt.Valid {
+		return completedAt.Time, true, nil
+	}
+	return time.Time{}, false, nil
+}
+
+func deleteSignalDedupe(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string, limit int, cutoff time.Time, hasCutoff bool) ([]*spanner.Mutation, error) {
+	stmt := spanner.Statement{
+		SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id LIMIT @limit`,
+		Params: map[string]any{"id": instanceID, "limit": int64(limit)},
+	}
+	if hasCutoff {
+		stmt.SQL = `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id AND created_at <= @cutoff LIMIT @limit`
+		stmt.Params["cutoff"] = cutoff
+	}
+	iter := txn.Query(ctx, stmt)
+	defer iter.Stop()
+	var muts []*spanner.Mutation
+	for {
+		r, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		var dedupeID string
+		if err := r.Columns(&dedupeID); err != nil {
+			return nil, err
+		}
+		muts = append(muts, spanner.Delete("wf_signal_dedupe", spanner.Key{instanceID, dedupeID}))
+	}
+	return muts, nil
+}
+
+// deleteTasksForInstance returns deletions for up to limit tasks of the
+// instance except excludeTaskID (the owned workflow task, removed
+// separately). newID never returns 0, so a sweep outside the advancement
+// passes 0 to exclude nothing. The instance_id filter is served by
+// wf_tasks_instance_idx (see schema.sql and ensureTasksInstanceIndex), so
+// cleanup cost stays proportional to the instance's rows; ORDER BY id keeps
+// the paged sweep deterministic. When hasCutoff holds, only rows with
+// created_at at or before the terminal transition are returned, so racing
+// post-commit sends survive the sweep (Codex round-21 P2 on #291).
+func deleteTasksForInstance(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string, excludeTaskID int64, limit int, cutoff time.Time, hasCutoff bool) ([]*spanner.Mutation, error) {
+	stmt := spanner.Statement{
+		SQL:    `SELECT id FROM wf_tasks WHERE instance_id = @id ORDER BY id LIMIT @limit`,
+		Params: map[string]any{"id": instanceID, "limit": int64(limit)},
+	}
+	if hasCutoff {
+		stmt.SQL = `SELECT id FROM wf_tasks WHERE instance_id = @id AND created_at <= @cutoff ORDER BY id LIMIT @limit`
+		stmt.Params["cutoff"] = cutoff
+	}
+	iter := txn.Query(ctx, stmt)
+	defer iter.Stop()
+	var muts []*spanner.Mutation
+	for {
+		r, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		var tid int64
+		if err := r.Columns(&tid); err != nil {
+			return nil, err
+		}
+		if tid == excludeTaskID {
+			continue
+		}
+		muts = append(muts, spanner.Delete("wf_tasks", spanner.Key{tid}))
+	}
+	return muts, nil
+}
+
+func deleteTimersForInstance(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string, limit int) ([]*spanner.Mutation, error) {
+	iter := txn.Query(ctx, spanner.Statement{
+		SQL:    `SELECT seq FROM wf_timers WHERE instance_id = @id LIMIT @limit`,
+		Params: map[string]any{"id": instanceID, "limit": int64(limit)},
+	})
+	defer iter.Stop()
+	var muts []*spanner.Mutation
+	for {
+		r, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		var seq int64
+		if err := r.Columns(&seq); err != nil {
+			return nil, err
+		}
+		muts = append(muts, spanner.Delete("wf_timers", spanner.Key{instanceID, seq}))
+	}
+	return muts, nil
+}
+
+func deleteInboxForInstance(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string, limit int, cutoff time.Time, hasCutoff bool) ([]*spanner.Mutation, error) {
+	stmt := spanner.Statement{
+		SQL:    `SELECT id FROM wf_inbox WHERE instance_id = @id LIMIT @limit`,
+		Params: map[string]any{"id": instanceID, "limit": int64(limit)},
+	}
+	if hasCutoff {
+		stmt.SQL = `SELECT id FROM wf_inbox WHERE instance_id = @id AND created_at <= @cutoff LIMIT @limit`
+		stmt.Params["cutoff"] = cutoff
+	}
+	iter := txn.Query(ctx, stmt)
+	defer iter.Stop()
+	var muts []*spanner.Mutation
+	for {
+		r, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		var inboxID int64
+		if err := r.Columns(&inboxID); err != nil {
+			return nil, err
+		}
+		muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{inboxID}))
+	}
+	return muts, nil
 }

@@ -18,6 +18,28 @@ import (
 
 func nowUTC() time.Time { return time.Now().UTC() }
 
+// commitTimestamp stamps swept-table ordering columns (sweep_commit_ts on
+// wf_instances; created_at on wf_signal_dedupe, wf_tasks and wf_inbox) with
+// the committing transaction's Spanner commit timestamp instead of the
+// writer's wall clock (Codex round-22 P2 on #291). Client entry times cannot
+// order the terminal cutoff: completed_at and row created_at stamped with
+// nowUTC() on different workers skew, so a post-transition signal from a
+// slow-clocked sender carries created_at at or below completed_at and the
+// sweep deletes it, while a fast-clocked pre-transition row survives. Commit
+// timestamps order the two commits exactly, with no cross-process clock
+// skew. Columns accept the placeholder only with
+// OPTIONS (allow_commit_timestamp=true) — see schema.sql and
+// ensureCommitTimestampOptions. Explicit timestamps (tests, backfills,
+// legacy rows) remain writable; they compare by wall time as before.
+//
+// completed_at deliberately stays a client-wall-clock timestamp (NOT a
+// commit tick): retention purges compare it against the purger's own clock,
+// and a commit tick can postdate that clock (TrueTime uncertainty; the
+// emulator's clock runs ~150ms ahead of clients), which would make
+// zero-window purges miss fresh victims. Sweep ordering and retention
+// ordering use separate ticks so each compares within one time domain.
+func commitTimestamp() time.Time { return spanner.CommitTimestamp }
+
 func newID() int64 {
 	var b [8]byte
 	_, _ = rand.Read(b[:])

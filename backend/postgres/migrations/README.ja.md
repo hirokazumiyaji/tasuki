@@ -10,6 +10,8 @@ migrations/
 ├── 000001_init.down.sql          全テーブルの DROP
 ├── 000002_vacuum_tuning.up.sql   autovacuum / fillfactor 設定
 ├── 000002_vacuum_tuning.down.sql 設定のリセット
+├── 000005_tasks_instance_idx.up.sql   終端タスク削除用の instance インデックス
+├── 000005_tasks_instance_idx.down.sql instance インデックスの削除
 ├── 000003_purge_search_indexes.up.sql   purge 用 (completed_at, id) + search_attributes 用 GIN インデックス
 ├── 000003_purge_search_indexes.down.sql 上記インデックスの削除
 ├── 000004_fix_purge_index_order.up.sql   purge インデックスを (completed_at, id) 先頭に作り直し

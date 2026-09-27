@@ -17,13 +17,28 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{MaxAdvancementEffects: 80, FairDispatch: true}
+	return backend.Capabilities{MaxAdvancementEffects: 80, FairDispatch: true, CleansTerminalState: true, SupportsBulkCleanup: true}
 }
 
 const dynamoTxnItemLimit = 100
 
+// advancementItemCount predicts the TransactWriteItems operations
+// buildAdvancementItems will emit for adv: 1 instance CAS + journal/activity/
+// timer puts + inbox deletes + 3 per child + 1 parent inbox when the instance
+// has a parent + 1 task delete/refresh. It must stay in lockstep with
+// buildAdvancementItems — the combined-batch preflight in CommitAdvancements
+// relies on the count being exact (a drift that undercounts would push the
+// overflow into the defensive in-loop guard; a drift that overcounts only
+// rejects a batch that would have fit).
+//
+// Terminal advancements skip activity and timer effects (buildAdvancementItems
+// breaks out of both loops when adv.Terminal != nil), so the count mirrors
+// those skips: terminal counts exclude ActivityTasks and Timers.
 func advancementItemCount(adv backend.Advancement, hasParent bool) int {
-	n := 2 + len(adv.NewEvents) + len(adv.ActivityTasks) + len(adv.Timers) + len(adv.DrainedInbox) + 3*len(adv.Children)
+	n := 2 + len(adv.NewEvents) + len(adv.DrainedInbox) + 3*len(adv.Children)
+	if adv.Terminal == nil {
+		n += len(adv.ActivityTasks) + len(adv.Timers)
+	}
 	if adv.ParentNotify != nil && hasParent {
 		n++
 	}
@@ -200,40 +215,258 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if err := b.deleteTasksForInstance(ctx, id); err != nil {
+	// Terminate always runs the full task cleanup (not the bounded
+	// hot-path sweep): an explicit termination must leave no claimable
+	// rows behind for the terminated ID. Every delete below still honors
+	// the terminal-transition cutoff (see terminalSweepCutoff): a
+	// SendToInboxBatch racing this synchronous sweep is accepted after
+	// the flip above, and only pre-transition rows are removed — the
+	// racing send's rows survive (inert: ClaimTasks gates execution on
+	// instance status) until the retention purge reaps them.
+	cutoff, err := b.readTerminalCutoff(ctx, id)
+	if err != nil {
+		// The terminated status already committed above: wake
+		// cross-process Result waiters even when the post-commit sweep
+		// fails, before the error surfaces (Codex round-28 P2 on #291),
+		// mirroring the advancement path that notifies before returning
+		// the retained cleanup error and Firestore TerminateInstance.
+		b.notifyTerminal(id)
 		return err
 	}
-	if err := b.deleteTimersForInstance(ctx, id); err != nil {
+	if err := b.deleteTasksForInstanceFull(ctx, id, cutoff); err != nil {
+		b.notifyTerminal(id)
 		return err
 	}
-	if err := b.deleteSignalDedupeForInstance(ctx, id); err != nil {
+	if err := b.deleteTimersForInstance(ctx, id, cutoff); err != nil {
+		b.notifyTerminal(id)
 		return err
 	}
-	if err := b.deleteInboxForInstance(ctx, id); err != nil {
+	if err := b.deleteSignalDedupeForInstance(ctx, id, cutoff); err != nil {
+		b.notifyTerminal(id)
+		return err
+	}
+	if err := b.deleteInboxForInstance(ctx, id, cutoff); err != nil {
+		b.notifyTerminal(id)
 		return err
 	}
 	b.notifyTerminal(id)
 	return nil
 }
 
-func (b *Backend) deleteTasksForInstance(ctx context.Context, id string) error {
-	if err := b.deleteTasksForInstanceByGSI(ctx, id); err == nil {
-		return nil
-	} else if !isMissingIndexError(err) {
-		return err
-	} else {
-		// Backward compat: tables created before instance_gsi existed
-		// (Migrate adds it lazily) fall back to a full-table Scan.
-		if scanErr := b.deleteTasksForInstanceByScan(ctx, id); scanErr != nil {
-			return scanErr
+func (b *Backend) deleteTasksForInstance(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
+	if err := b.deleteTasksForInstanceByGSI(ctx, id, cutoff); err != nil {
+		if !isMissingIndexError(err) {
+			return err
 		}
+		// Backward compat: tables created before instance_gsi existed (or
+		// still backfilling it) fall back to a strongly-consistent
+		// full-table Scan; Migrate backfills the index on existing tables.
+		return b.deleteTasksForInstanceByScan(ctx, id, cutoff)
+	}
+	// The GSI is eventually consistent: a sweep can report a partial match
+	// while lagging rows are still invisible to the index. Confirm with a
+	// bounded strongly-consistent Scan run (see
+	// verifyTasksBoundedScan): the common case stays cheap and lagging
+	// rows in the pages are reaped synchronously.
+	return b.verifyTasksBoundedScan(ctx, id, cutoff)
+}
+
+// deleteTasksForInstanceFull removes one instance's tasks with no bound on
+// verification cost: the GSI sweep first, then a fully-paginated
+// strongly-consistent Scan that reaps every lagging row anywhere in the
+// table. Only the rare single-instance path that must leave nothing behind
+// uses it — TerminateInstance — never the per-completion hot path (see
+// deleteTasksForInstance for why the hot path stays bounded) and never a
+// batch purge (see deleteTasksForInstancesFull for why the purge shares one
+// scan across all its victims instead of paying one per instance).
+func (b *Backend) deleteTasksForInstanceFull(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
+	if err := b.deleteTasksForInstanceByGSI(ctx, id, cutoff); err != nil {
+		if !isMissingIndexError(err) {
+			return err
+		}
+		// Without a queryable index the Scan below is the whole cleanup.
+	}
+	return b.deleteTasksForInstanceByScan(ctx, id, cutoff)
+}
+
+// deleteTasksForInstancesFull removes the task rows of every listed instance
+// with ONE shared fleet scan: a per-instance GSI sweep first (cheap,
+// instance-keyed, no fleet read), then a single fully-paginated
+// strongly-consistent Scan attributing rows to their instances (see
+// deleteTasksForInstancesByScan).
+//
+// COST MODEL (Codex round 10 on #328): the previous purge loop ran the
+// single-instance full cleanup per victim, so every victim paid its own
+// fully-paginated Scan — a purge batch of K instances cost up to K fleet
+// scans (O(K × table)). Sharing one scan per PurgeInstances CALL costs
+// O(instance rows + table) regardless of victim count: K GSI sweeps plus
+// exactly one Scan. TerminateInstance keeps the single-instance variant for
+// the common one-ID path.
+func (b *Backend) deleteTasksForInstancesFull(ctx context.Context, ids []string, cutoff terminalSweepCutoff) error {
+	if len(ids) == 0 {
 		return nil
+	}
+	for _, id := range ids {
+		if err := b.deleteTasksForInstanceByGSI(ctx, id, cutoff); err != nil {
+			if !isMissingIndexError(err) {
+				return err
+			}
+			// The index is table-wide, so a missing index fails identically
+			// for every ID: stop probing (further Queries fail the same way)
+			// and let the shared Scan below perform the whole cleanup.
+			break
+		}
+	}
+	return b.deleteTasksForInstancesByScan(ctx, ids, cutoff)
+}
+
+// deleteTasksForInstancesByScan performs one fully-paginated
+// strongly-consistent Scan over wf_tasks, deleting every row whose
+// instance_id belongs to ids. A single scan covers the whole purge batch no
+// matter how many victims it holds; rows of live instances are never
+// touched (see purgeTaskKeyForTargets).
+func (b *Backend) deleteTasksForInstancesByScan(ctx context.Context, ids []string, cutoff terminalSweepCutoff) error {
+	targets := purgeTaskTargets(ids)
+	var start map[string]types.AttributeValue
+	for {
+		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(b.table("wf_tasks")), ConsistentRead: aws.Bool(true), ExclusiveStartKey: start})
+		if err != nil {
+			return err
+		}
+		for _, m := range out.Items {
+			pk, ok := purgeTaskKeyForTargets(m, targets)
+			if !ok {
+				continue
+			}
+			// Retention purges pass no cutoff (unbounded); terminal
+			// sweeps preserve rows created after the transition.
+			if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
+				continue
+			}
+			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
+				return err
+			}
+		}
+		if out.LastEvaluatedKey == nil {
+			return nil
+		}
+		start = out.LastEvaluatedKey
 	}
 }
 
+// purgeTaskTargets builds the membership set for one shared purge scan from
+// the victim IDs of a single PurgeInstances call.
+func purgeTaskTargets(ids []string) map[string]struct{} {
+	targets := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		targets[id] = struct{}{}
+	}
+	return targets
+}
+
+// purgeTaskKeyForTargets returns the task_pk of a scanned task row iff the
+// row belongs to one of the purge targets. Rows of live instances, rows
+// without an instance_id, and rows without a task_pk (undeletable by key —
+// every real task row carries its HASH key) report false and are skipped.
+func purgeTaskKeyForTargets(m map[string]types.AttributeValue, targets map[string]struct{}) (types.AttributeValue, bool) {
+	inst, ok := m["instance_id"]
+	if !ok {
+		return nil, false
+	}
+	if _, ok := targets[fromS(inst)]; !ok {
+		return nil, false
+	}
+	pk, ok := m["task_pk"]
+	if !ok || pk == nil {
+		return nil, false
+	}
+	return pk, true
+}
+
+// gsiVerifyScanLimit bounds each strongly-consistent verification Scan page
+// on the terminal hot path, and gsiVerifyScanMaxPages bounds the page count
+// (Codex round-23 P2 on #291): verification cost stays O(instance rows +
+// maxPages pages) instead of scaling with fleet work (see
+// verifyTasksBoundedScan). GSI-lag rows are rare, so a bounded multi-page
+// verify covers realistic lag while a lagging row past the bound still waits
+// for the TerminateInstance/PurgeInstances backstops.
+const gsiVerifyScanLimit = 1000
+
+// gsiVerifyScanMaxPages caps the hot-path verification pages per terminal
+// advancement: 5 pages of 1000 items bound the fleet read while covering
+// realistic GSI lag depth.
+const gsiVerifyScanMaxPages = 5
+
+// verifyTasksBoundedScan deletes the instance's tasks visible to a bounded
+// run of strongly-consistent Scan pages (up to gsiVerifyScanMaxPages,
+// stopping early at the end of the table).
+//
+// DESIGN (Codex round 7 on #328, extended round-23 on #291): the previous
+// fully-paginated verification Scan ran after every terminal advancement
+// and scaled with the fleet's queued work — every completion paid a full
+// strongly-consistent table Scan, and throttling mid-scan errored the
+// cleanup after the terminal status had already committed. Scoping the
+// verification to the instance is not directly possible — the base table's
+// partition key is the task ID, so no strongly-consistent instance-keyed
+// read exists — and the GSI rows already returned prove nothing about
+// lagging rows the index has not caught up with. The honest trade-off:
+//
+//   - The GSI sweep (instance-keyed Query, fully paginated over the
+//     instance's own rows) removes everything the index has observed, and
+//     these bounded strong pages reap lagging rows visible to consistent
+//     state near the head of the table.
+//   - Correctness never depends on the sweep: a lagging row that survives
+//     cannot execute — ClaimTasks gates the lease on instance status in
+//     the same transaction (claimTaskItem) plus a post-claim re-check, so
+//     residue is inert.
+//   - The leak lifetime is bounded by the paths that always run the full
+//     cleanup: TerminateInstance (deleteTasksForInstanceFull) and retention
+//     PurgeInstances, plus best-effort deletion when residue is met by a
+//     later claim.
+//
+// A lagging task beyond these pages therefore waits for one of those
+// backstops instead of forcing every completion to scan the fleet.
+func (b *Backend) verifyTasksBoundedScan(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
+	var start map[string]types.AttributeValue
+	for page := 0; page < gsiVerifyScanMaxPages; page++ {
+		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{
+			TableName:         aws.String(b.table("wf_tasks")),
+			Limit:             aws.Int32(gsiVerifyScanLimit),
+			ConsistentRead:    aws.Bool(true),
+			ExclusiveStartKey: start,
+		})
+		if err != nil {
+			return err
+		}
+		for _, m := range out.Items {
+			if fromS(m["instance_id"]) != id {
+				continue
+			}
+			// Preserve rows a racing post-commit send created after the
+			// terminal transition (see terminalSweepCutoff).
+			if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
+				continue
+			}
+			pk, ok := m["task_pk"]
+			if !ok {
+				continue
+			}
+			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
+				return err
+			}
+		}
+		if out.LastEvaluatedKey == nil {
+			return nil
+		}
+		start = out.LastEvaluatedKey
+	}
+	return nil
+}
+
 // deleteTasksForInstanceByGSI removes one instance's tasks via the
-// instance_gsi Query (no full-table Scan, no RCU on unrelated tasks).
-func (b *Backend) deleteTasksForInstanceByGSI(ctx context.Context, id string) error {
+// instance_gsi Query (no full-table Scan, no RCU on unrelated tasks). Rows
+// created after the terminal transition survive (see terminalSweepCutoff).
+func (b *Backend) deleteTasksForInstanceByGSI(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
 	var start map[string]types.AttributeValue
 	for {
 		out, err := b.client.Query(ctx, &dynamodb.QueryInput{
@@ -249,6 +482,9 @@ func (b *Backend) deleteTasksForInstanceByGSI(ctx context.Context, id string) er
 		for _, m := range out.Items {
 			pk, ok := m["task_pk"]
 			if !ok {
+				continue
+			}
+			if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
 				continue
 			}
 			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": pk}}); err != nil {
@@ -276,30 +512,52 @@ func isMissingIndexError(err error) bool {
 	if errors.As(err, &rnfe) {
 		return strings.Contains(err.Error(), instanceGSIName)
 	}
+	// Pre-typed (DynamoDB Local / branch-era) failures carry the
+	// missing-index phrasing without a ValidationException code. The index
+	// name must appear alongside so unrelated failures (e.g. an IAM denial
+	// quoting the index ARN) still surface instead of silently degrading to
+	// fleet-wide Scans.
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(err.Error(), instanceGSIName) {
+		if strings.Contains(lower, "unknown index") ||
+			strings.Contains(lower, "being created") ||
+			strings.Contains(lower, "is creating") ||
+			strings.Contains(lower, "not active") ||
+			strings.Contains(lower, "backfill") {
+			return true
+		}
+	}
 	// Anything else must carry an explicit missing-index code AND phrasing.
 	// In particular a bare index-name mention (e.g. an IAM AccessDenied
 	// quoting the index ARN) must NOT fall back: that would silently turn
 	// every Terminate into perpetual full scans while hiding the config
 	// error, so unrecognized failures return false and surface.
-	lower := strings.ToLower(err.Error())
 	if !strings.Contains(lower, "validationexception") && !strings.Contains(lower, "indexnotfoundexception") {
 		return false
 	}
 	return strings.Contains(lower, "specified index") ||
 		strings.Contains(lower, "no such index") ||
 		strings.Contains(lower, "unknown index") ||
-		strings.Contains(lower, "backfill")
+		strings.Contains(lower, "backfill") ||
+		strings.Contains(lower, "being created") ||
+		strings.Contains(lower, "is creating") ||
+		strings.Contains(lower, "not active")
 }
 
-func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string) error {
+func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
 	var start map[string]types.AttributeValue
 	for {
-		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(b.table("wf_tasks")), ExclusiveStartKey: start})
+		out, err := b.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(b.table("wf_tasks")), ConsistentRead: aws.Bool(true), ExclusiveStartKey: start})
 		if err != nil {
 			return err
 		}
 		for _, m := range out.Items {
 			if fromS(m["instance_id"]) == id {
+				// Preserve rows a racing post-commit send created after
+				// the terminal transition (see terminalSweepCutoff).
+				if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
+					continue
+				}
 				if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": m["task_pk"]}}); err != nil {
 					return err
 				}
@@ -314,14 +572,22 @@ func (b *Backend) deleteTasksForInstanceByScan(ctx context.Context, id string) e
 
 // deleteTimersForInstance pages through the instance's timers (Query results
 // larger than 1 MB arrive in pages via LastEvaluatedKey) and removes each one.
-func (b *Backend) deleteTimersForInstance(ctx context.Context, id string) error {
+// The read is strongly consistent so a timer committed just before the
+// terminal transition is not missed (same gap as the terminal inbox query).
+// Timers created after the terminal transition survive (see
+// terminalSweepCutoff): only non-terminal advancements create timers, so in
+// practice this preserves nothing, but the filter keeps the sweep uniform.
+func (b *Backend) deleteTimersForInstance(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
 	var start map[string]types.AttributeValue
 	for {
-		out, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_timers")), KeyConditionExpression: aws.String("instance_id = :id"), ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)}, ExclusiveStartKey: start})
+		out, err := b.client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(b.table("wf_timers")), KeyConditionExpression: aws.String("instance_id = :id"), ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)}, ConsistentRead: aws.Bool(true), ExclusiveStartKey: start})
 		if err != nil {
 			return err
 		}
 		for _, m := range out.Items {
+			if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
+				continue
+			}
 			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_timers")), Key: timerKey(id, fromN(m["seq"]))}); err != nil {
 				return err
 			}
@@ -412,6 +678,11 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		for len(result) < req.Limit && (picker == nil || !picker.Full()) && !exhausted {
 			cands, next, done, err := b.listClaimCandidates(ctx, req.Kind, queue, now, req.Limit-len(result), picker, skip, cursor)
 			if err != nil {
+				// The batch may already hold committed leases from earlier
+				// candidates/queues: release them best-effort (fenced by
+				// the claim token) instead of abandoning the whole batch
+				// hidden for a full lease (round-17 P2 on #291).
+				b.releaseClaimedLeases(ctx, result)
 				return nil, err
 			}
 			cursor, exhausted = next, done
@@ -435,25 +706,63 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				id := fromN(item["id"])
 				skip[id] = struct{}{}
 				old := fromN(item["visible_at"])
-				updated, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": item["task_pk"]},
-					UpdateExpression: aws.String("SET visible_at = :v, worker_id = :w ADD attempt :one"), ConditionExpression: aws.String("visible_at = :old"),
-					ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(visible)), ":w": avS(req.WorkerID), ":one": avN(1), ":old": avN(old)}, ReturnValues: types.ReturnValueAllNew})
-				if conditional(err) {
-					// Another worker leased this candidate first, or the GSI
-					// returned a stale entry: free its picker slot so Full
-					// below does not stop later candidates and queues from
-					// filling the batch, then re-query this queue for a
-					// replacement (the loop above) instead of moving on.
+				// The lease commits atomically with an instance-status
+				// gate (see claimTaskItem): a terminal commit landing
+				// between the GSI Query and the claim aborts the claim
+				// instead of delivering the task to the worker.
+				t, claimed, err := b.claimTaskItem(ctx, item, old, visible, req.WorkerID)
+				if err != nil {
+					// The transactional lease for THIS candidate did not
+					// commit (TransactWriteItems errors never leave a
+					// half-committed lease), but earlier candidates in
+					// result already hold committed leases: release them
+					// best-effort instead of hiding the batch for a full
+					// lease (round-17 P2 on #291).
+					b.releaseClaimedLeases(ctx, result)
+					return nil, err
+				}
+				if !claimed {
+					// Lost the lease race, or the instance already left
+					// running (terminal residue is deleted best-effort
+					// inside claimTaskItem): free its picker slot so Full
+					// below does not stop later candidates and queues
+					// from filling the batch, then re-query this queue
+					// for a replacement (the loop above) instead of
+					// moving on.
 					if picker != nil {
 						picker.Release(backend.FairTaskRef{ID: id, InstanceID: fromS(item["instance_id"])})
 						released = true
 					}
 					continue
 				}
+				// The terminal transition commits the instance update
+				// before its residual rows are swept, so a terminal commit
+				// landing after the gated claim still needs a fence:
+				// deleting the row afterwards cannot recall it
+				// (tickActivities invokes user code immediately), so
+				// verify the owning instance is still running before
+				// handing the task out. A residual task of a terminal
+				// instance is dropped best-effort here; the terminal sweep
+				// removes whatever remains. The transact gate in
+				// claimTaskItem already covers a terminal commit landing
+				// BEFORE the claim; this read fences one landing AFTER the
+				// claim commit, so it stays (round-17 P2 on #291) — but a
+				// throttled/transient failure here must not abandon the
+				// already-committed leases below.
+				running, err := b.instanceRunning(ctx, t.InstanceID)
 				if err != nil {
+					b.releaseClaimedLeases(ctx, append(append([]backend.Task(nil), result...), t))
 					return nil, err
 				}
-				result = append(result, decodeTask(updated.Attributes))
+				if !running {
+					_, _ = b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": item["task_pk"]}})
+					if picker != nil {
+						picker.Release(backend.FairTaskRef{ID: id, InstanceID: t.InstanceID})
+						released = true
+					}
+					continue
+				}
+				result = append(result, t)
 				if len(result) >= req.Limit {
 					break
 				}
@@ -464,6 +773,162 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 		}
 	}
 	return result, nil
+}
+
+// claimTaskItem leases one task row previously read from the claim GSI,
+// gating on the owning instance's status in the SAME transaction: the lease
+// Update and a ConditionCheck on the instance row (status = "running")
+// commit atomically, so a terminal commit landing between the GSI Query and
+// the claim aborts the claim instead of delivering the task to the worker.
+// It reports claimed=false when the claim lost — either a lease race with
+// another worker or a terminal (or vanished) instance — in which case the
+// task must never be handed out. Terminal residue is deleted best-effort;
+// the terminal sweep owns whatever remains.
+func (b *Backend) claimTaskItem(ctx context.Context, item map[string]types.AttributeValue, oldVisible int64, visible time.Time, workerID string) (backend.Task, bool, error) {
+	instanceID := fromS(item["instance_id"])
+	_, err := b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: claimTransactItems(b.table("wf_tasks"), b.table("wf_instances"), item["task_pk"], avS(instanceID), oldVisible, visible, workerID),
+	})
+	if err != nil {
+		if isTransactionUnsupported(err) {
+			// Stores without transaction support (some DynamoDB-compatible
+			// endpoints) fall back to the separate lease update; the
+			// post-claim status gate in ClaimTasks still fences terminal
+			// residue, only without atomicity.
+			return b.claimTaskItemLegacy(ctx, item, oldVisible, visible, workerID)
+		}
+		if conditional(err) {
+			// Either the lease moved (another worker won) or the instance
+			// left running (or was reaped). Neither case may deliver the
+			// task; the extra read only decides delete-vs-skip.
+			if running, rerr := b.instanceRunning(ctx, instanceID); rerr == nil && !running {
+				_, _ = b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": item["task_pk"]}})
+			}
+			return backend.Task{}, false, nil
+		}
+		return backend.Task{}, false, err
+	}
+	// TransactWriteItems returns no updated image, so apply the claimed
+	// lease to the queried row locally (visible_at/worker_id set verbatim,
+	// attempt incremented by the ADD :one update).
+	t := decodeTask(item)
+	t.VisibleAt = visible
+	t.WorkerID = workerID
+	t.Attempt++
+	return t, true, nil
+}
+
+// claimTransactItems builds the atomic claim transaction: a ConditionCheck
+// that the instance row still carries status "running" (a missing row fails
+// the check, matching instanceRunning's terminal treatment) plus the lease
+// Update guarded on the observed visible_at.
+func claimTransactItems(tasksTable, instancesTable string, taskPK, instanceID types.AttributeValue, oldVisible int64, visible time.Time, workerID string) []types.TransactWriteItem {
+	return []types.TransactWriteItem{
+		{ConditionCheck: &types.ConditionCheck{
+			TableName:           aws.String(instancesTable),
+			Key:                 map[string]types.AttributeValue{"id": instanceID},
+			ConditionExpression: aws.String("#s = :running"),
+			ExpressionAttributeNames: map[string]string{
+				"#s": "status",
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":running": avS("running"),
+			},
+		}},
+		{Update: &types.Update{
+			TableName:           aws.String(tasksTable),
+			Key:                 map[string]types.AttributeValue{"task_pk": taskPK},
+			UpdateExpression:    aws.String("SET visible_at = :v, worker_id = :w ADD attempt :one"),
+			ConditionExpression: aws.String("visible_at = :old"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":v":   avN(timeToN(visible)),
+				":w":   avS(workerID),
+				":one": avN(1),
+				":old": avN(oldVisible),
+			},
+		}},
+	}
+}
+
+// claimTaskItemLegacy performs the pre-transaction lease update for stores
+// without TransactWriteItems support. The caller still applies the
+// post-claim status gate as defense-in-depth.
+func (b *Backend) claimTaskItemLegacy(ctx context.Context, item map[string]types.AttributeValue, oldVisible int64, visible time.Time, workerID string) (backend.Task, bool, error) {
+	updated, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": item["task_pk"]},
+		UpdateExpression: aws.String("SET visible_at = :v, worker_id = :w ADD attempt :one"), ConditionExpression: aws.String("visible_at = :old"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(timeToN(visible)), ":w": avS(workerID), ":one": avN(1), ":old": avN(oldVisible)}, ReturnValues: types.ReturnValueAllNew})
+	if conditional(err) {
+		return backend.Task{}, false, nil
+	}
+	if err != nil {
+		return backend.Task{}, false, err
+	}
+	return decodeTask(updated.Attributes), true, nil
+}
+
+// isTransactionUnsupported reports whether err indicates the endpoint does
+// not implement TransactWriteItems at all (as opposed to a transaction that
+// executed and cancelled). Executed-then-cancelled errors must never take
+// the legacy path: they already decided the claim.
+func isTransactionUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	var cancelled *types.TransactionCanceledException
+	if errors.As(err, &cancelled) {
+		return false
+	}
+	var failed *types.ConditionalCheckFailedException
+	if errors.As(err, &failed) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"unknownoperationexception",
+		"invalidaction",
+		"unrecognized",
+		"unsupported",
+		"not supported",
+		"not implemented",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// instanceRunning reports whether the instance still accepts work (status
+// "running"). A missing instance is treated as terminal: its tasks are
+// residue the terminal sweep owns.
+func (b *Backend) instanceRunning(ctx context.Context, id string) (bool, error) {
+	inst, err := b.GetInstance(ctx, id)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return inst.Status == "running", nil
+}
+
+// releaseClaimedLeases best-effort releases durable leases acquired during a
+// ClaimTasks call that is about to fail (round-17 P2 on #291). Without this,
+// a throttled/transient post-claim status read abandons every already-claimed
+// candidate — each holds a committed lease hiding it for the full lease
+// duration. Releases are fenced on the claim ownership token (see
+// ReleaseLease), so a task reclaimed or refreshed since the claim matches
+// nothing and is left alone; release errors are ignored because the original
+// error is already being returned. Detached from cancellation so a cancelled
+// claim still frees what it leased.
+func (b *Backend) releaseClaimedLeases(ctx context.Context, tasks []backend.Task) {
+	if len(tasks) == 0 {
+		return
+	}
+	rctx := context.WithoutCancel(ctx)
+	for _, t := range tasks {
+		_ = b.ReleaseLease(rctx, t)
+	}
 }
 
 // listClaimCandidates returns FIFO-ordered claim_gsi items for one queue.
@@ -880,8 +1345,7 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		if err := b.commitAdvancementOnce(ctx, advs[0]); err != nil {
 			return err
 		}
-		b.notifyAfterAdvancements(advs)
-		return nil
+		return b.notifyAfterAdvancements(advs)
 	}
 	total := 0
 	for _, adv := range advs {
@@ -928,9 +1392,31 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if err != nil {
 		return err
 	}
+	// Sweep terminal residue before any fallible post-commit work: the
+	// terminal status already committed, so a throttled ensure below would
+	// otherwise skip cleanup with no recovery (retrying the advancement
+	// conflicts on the consumed sequence and no later pass removes the
+	// rows). Terminal instances take no follow-up task, so they are also
+	// excluded from the ensure loop below: ensureWorkflowTask would be a
+	// no-op status-gated read for them, and a transient failure must not
+	// fail terminal success after the rows are already gone.
+	// A per-instance cleanup failure no longer aborts the batch (Codex
+	// round-19 P2 on #291): cleanup-retries-exhausted used to return
+	// immediately, skipping later instances' sweeps (residue with no
+	// recovery: the advancement already committed) and every parent ensure
+	// (dormant parents till the orphan scan). The first error is retained
+	// while every committed instance is still swept and ensured; it is
+	// returned at the end, after notifications.
+	cleanupErr := b.cleanupTerminalAdvancements(context.Background(), advs)
+	terminal := make(map[string]bool, len(advs))
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			terminal[adv.InstanceID] = true
+		}
+	}
 	for _, id := range parentEnsures {
-		if err := b.ensureWorkflowTask(ctx, id); err != nil {
-			return err
+		if err := b.ensureWorkflowTask(ctx, id); err != nil && cleanupErr == nil {
+			cleanupErr = err
 		}
 	}
 	for _, id := range ensures {
@@ -939,22 +1425,193 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		if refreshed[id] {
 			continue
 		}
-		if err := b.ensureWorkflowTask(ctx, id); err != nil {
-			return err
+		if terminal[id] {
+			continue
+		}
+		if err := b.ensureWorkflowTask(ctx, id); err != nil && cleanupErr == nil {
+			cleanupErr = err
 		}
 	}
-	b.notifyAfterAdvancements(advs)
-	return nil
+	if cleanupErr != nil {
+		// Surface the retained cleanup error only after every waiter is
+		// woken: the terminal status already committed, so cross-process
+		// Result waiters must observe the terminal wake even when the
+		// post-commit sweep exhausted its retries (Codex round-22 P2 on
+		// #291), mirroring the Spanner/Firestore paths that notify before
+		// returning the retained error. notifyAfterAdvancements only fires
+		// wake hints and always returns nil.
+		_ = b.notifyAfterAdvancements(advs)
+		return cleanupErr
+	}
+	return b.notifyAfterAdvancements(advs)
 }
 
-func (b *Backend) notifyAfterAdvancements(advs []backend.Advancement) {
+func (b *Backend) notifyAfterAdvancements(advs []backend.Advancement) error {
+	// Terminal residue was swept before the fallible post-commit ensures
+	// (see commitAdvancementOnce and CommitAdvancements), so only wake
+	// hints remain here: task waiters first, then terminal watchers.
 	b.notifyTasks()
 	for _, adv := range advs {
 		if adv.Terminal != nil {
-			_ = b.deleteSignalDedupeForInstance(context.Background(), adv.InstanceID)
 			b.notifyTerminal(adv.InstanceID)
 		}
 	}
+	return nil
+}
+
+// terminalSweepCutoff bounds a post-commit terminal sweep to rows predating
+// the terminal transition (Codex round-22 P2 on #291). The sweep runs on a
+// detached context after the status commit, so a SendToInboxBatch that starts
+// after the commit can accept and insert its dedupe marker plus inbox row
+// mid-sweep; an unrestricted sweep deletes the inbox row while the dedupe
+// phase already passed — the marker survives, the event is lost, and every
+// later send under the same DedupeID is discarded. Only rows with created_at
+// at or before the transition are deleted, so racing post-commit sends
+// survive, mirroring the Firestore/Spanner sweeps.
+//
+// The cutoff is the instance row's completed_at (micros since epoch, the
+// same timeToN domain as every created_at), read with a consistent read at
+// sweep time. hasCutoff is false when the instance row is gone (a concurrent
+// purge owns the leftovers) or completed_at is missing/zero (legacy rows):
+// the sweep then falls back to unbounded, matching the pre-cutoff behavior.
+//
+// ORDERING (Codex round-23 P2 on #291): the comparison above is exact —
+// same-tick rows sweep — because the conformance suite pins synchronous
+// exact cleanup (a pre-commit signal sent under the same clock must be
+// gone after the terminal commit; TerminateInstance must leave an empty
+// inbox). A positive skew margin here would preserve those rows and break
+// the advertised CleansTerminalState contract, so skew safety comes from
+// the writer side instead: SendToInboxBatch clamps its stamps after an
+// OBSERVED terminal transition (see clampSendNow), making a post-flip send
+// provably post-transition however skewed its clock. (Firestore/Spanner
+// need neither: their sweeps are ordered by server update time / commit
+// timestamp — verified, not redone here.)
+//
+// LIMITATION (honest): DynamoDB exposes no server commit timestamp, so the
+// residual race is a send that observes the instance RUNNING (pre-flip,
+// hence unclamped) but whose transaction commits post-flip under a slow
+// clock: its created_at lands at or below completed_at and the sweep
+// deletes it. SendToInboxBatch narrows this by re-stamping now per attempt
+// right before its transaction, but no client-time cutoff can close a skew
+// window it cannot see. Skew errs the safe way in the other direction: a
+// fast-clock pre-transition row (created_at above the cutoff) survives as
+// inert residue (ClaimTasks gates execution on instance status) until the
+// retention purge reaps it.
+type terminalSweepCutoff struct {
+	cutoff    int64
+	hasCutoff bool
+}
+
+// sweepKeepsRow reports whether a terminal-sweep candidate postdates the
+// terminal transition and must survive cleanup. Pure for unit tests.
+func sweepKeepsRow(createdAtN int64, c terminalSweepCutoff) bool {
+	if !c.hasCutoff {
+		return false
+	}
+	return createdAtN > c.cutoff
+}
+
+// clampSendNow orders a send after an observed terminal transition (Codex
+// round-23 P2 on #291): when SendToInboxBatch observes the instance already
+// terminal, its stamps must land strictly after completed_at however skewed
+// the sender's clock, or the exact terminal-sweep cutoff classifies the
+// accepted send pre-transition and deletes it. sendFloorN is
+// completed_at+1 micros, or 0 when the instance was observed running (no
+// floor: the send may genuinely predate the transition). Pure for unit
+// tests.
+func clampSendNow(now time.Time, sendFloorN int64) time.Time {
+	if sendFloorN > 0 && timeToN(now) < sendFloorN {
+		return nToTime(sendFloorN)
+	}
+	return now
+}
+
+// readTerminalCutoff returns the instance's terminal-transition time for the
+// post-commit sweep cutoff. A read error is returned (never silently
+// downgraded to unbounded: a transient GetItem failure must retry through
+// the caller's attempts loop, not sweep unbounded and delete an accepted
+// post-commit send while reporting success).
+func (b *Backend) readTerminalCutoff(ctx context.Context, id string) (terminalSweepCutoff, error) {
+	out, err := b.client.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(b.table("wf_instances")), Key: map[string]types.AttributeValue{"id": avS(id)}, ConsistentRead: aws.Bool(true)})
+	if err != nil {
+		return terminalSweepCutoff{}, err
+	}
+	if len(out.Item) == 0 {
+		return terminalSweepCutoff{}, nil
+	}
+	av, ok := out.Item["completed_at"]
+	if !ok || av == nil {
+		return terminalSweepCutoff{}, nil
+	}
+	cutoff := fromN(av)
+	if cutoff == 0 {
+		return terminalSweepCutoff{}, nil
+	}
+	return terminalSweepCutoff{cutoff: cutoff, hasCutoff: true}, nil
+}
+
+// cleanupTerminalAdvancements sweeps residual rows for every terminal
+// advancement. Callers run it immediately after the commit and before any
+// fallible post-commit work, so a throttled ensure cannot strand claimable
+// rows behind. Per-instance failures do not abort the sweep (Codex round-19
+// P2 on #291): every committed instance is still swept and the first error
+// is returned, so one victim's exhausted cleanup retries never strand later
+// instances' residue (unrecoverable once the advancement committed) while
+// the caller still continues parent/self ensures before surfacing it.
+func (b *Backend) cleanupTerminalAdvancements(ctx context.Context, advs []backend.Advancement) error {
+	var first error
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			if err := b.cleanupTerminalInstance(ctx, adv.InstanceID); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	return first
+}
+
+// cleanupTerminalInstance removes residual tasks, timers, inbox entries and
+// signal dedupe rows for a terminal instance, retrying transient failures
+// (throttling, timeouts) before terminal success is reported.
+func (b *Backend) cleanupTerminalInstance(ctx context.Context, id string) error {
+	const attempts = 5
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = b.cleanupTerminalInstanceOnce(ctx, id); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		time.Sleep(time.Duration(100*(1<<i)) * time.Millisecond)
+	}
+	return fmt.Errorf("dynamodb: terminal cleanup for %s failed after %d attempts: %w", id, attempts, err)
+}
+
+func (b *Backend) cleanupTerminalInstanceOnce(ctx context.Context, id string) error {
+	// Read the transition cutoff first: every delete below preserves rows
+	// created after the terminal flip (see terminalSweepCutoff). A cutoff
+	// read failure aborts the attempt (retried by the caller) instead of
+	// sweeping unbounded.
+	cutoff, err := b.readTerminalCutoff(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := b.deleteSignalDedupeForInstance(ctx, id, cutoff); err != nil {
+		return err
+	}
+	if err := b.deleteTasksForInstance(ctx, id, cutoff); err != nil {
+		return err
+	}
+	if err := b.deleteTimersForInstance(ctx, id, cutoff); err != nil {
+		return err
+	}
+	if err := b.deleteInboxForInstance(ctx, id, cutoff); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advancement) error {
@@ -972,17 +1629,52 @@ func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advance
 	if err != nil {
 		return err
 	}
+	// Sweep terminal residue before the fallible ensures below: the
+	// terminal status already committed, so a throttled GetItem here would
+	// otherwise skip cleanup with no recovery (retrying the advancement
+	// conflicts on the consumed sequence and no later pass removes the
+	// rows). A cleanup failure is retained — not returned immediately — so
+	// the parent ensure below still runs (Codex round-19 P2 on #291, same
+	// shape as the batch path: an early return would leave a dormant
+	// parent till the orphan scan).
+	var cleanupErr error
+	if adv.Terminal != nil {
+		cleanupErr = b.cleanupTerminalInstance(context.Background(), adv.InstanceID)
+	}
 	if parentID != "" {
-		if err := b.ensureWorkflowTask(ctx, parentID); err != nil {
-			return err
+		if err := b.ensureWorkflowTask(ctx, parentID); err != nil && cleanupErr == nil {
+			cleanupErr = err
 		}
+	}
+	if cleanupErr != nil {
+		// The terminal status already committed: wake task and terminal
+		// waiters before surfacing the post-commit error (Codex round-22
+		// P2 on #291, same shape as the batch path above — a
+		// cleanup-retries-exhausted return must not skip the terminal
+		// wake for cross-process Result waiters).
+		_ = b.notifyAfterAdvancements([]backend.Advancement{adv})
+		return cleanupErr
+	}
+	if adv.Terminal != nil {
+		// The owned workflow task was deleted atomically in the
+		// transaction and a terminal instance takes no follow-up, so the
+		// self-ensure would be a no-op status-gated read. Skip the
+		// fallible RPC instead of risking terminal success on throttling.
+		// notifyAfterAdvancements (caller) still fires task wake hints.
+		return nil
 	}
 	if adv.EnsureWorkflowTask {
 		// Follow-up task was refreshed atomically inside the transaction;
 		// notifyAfterAdvancements (caller) still fires task wake hints.
 		return nil
 	}
-	return b.ensureWorkflowTask(ctx, adv.InstanceID)
+	// Post-commit ensure: the advancement already committed, so a failure
+	// here wakes waiters before surfacing, like the cleanup path above.
+	if err := b.ensureWorkflowTask(ctx, adv.InstanceID); err != nil {
+		_ = b.notifyAfterAdvancements([]backend.Advancement{adv})
+		return err
+	}
+	return nil
 }
 
 func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advancement) ([]types.TransactWriteItem, string, error) {
@@ -997,24 +1689,38 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 			newSeq = e.Seq + 1
 		}
 	}
-	names := map[string]string(nil)
+	names := map[string]string{"#status": "status"}
 	if adv.Terminal != nil {
-		names = map[string]string{"#status": "status", "#result": "result"}
+		names["#result"] = "result"
 	}
 	saUpdate := backend.HasSearchAttributesUpdate(adv.NewEvents)
 	memoUpdate := backend.HasMemoUpdate(adv.NewEvents)
+	// Gate the advancement on the persisted running status IN the
+	// transaction (Codex round-26 P1 on #291): the GetInstance above is a
+	// pre-read only, so a TerminateInstance committing after LoadWorkflowHead
+	// and before this txn would otherwise commit activities/timers/journal/
+	// children post-termination on next_seq alone. The "#status = :running"
+	// condition aborts nonterminal (and stale terminal) advancements that
+	// race termination, mirroring the Spanner in-txn status gate (round-25
+	// P1 on #328). A missing row fails the check (terminal treatment).
 	items := []types.TransactWriteItem{{
 		Update: &types.Update{TableName: aws.String(b.table("wf_instances")), Key: map[string]types.AttributeValue{"id": avS(adv.InstanceID)},
-			UpdateExpression: aws.String(instanceAdvanceExpression(adv.Terminal, saUpdate, memoUpdate)), ConditionExpression: aws.String("next_seq = :expected"),
+			UpdateExpression: aws.String(instanceAdvanceExpression(adv.Terminal, saUpdate, memoUpdate)), ConditionExpression: aws.String("next_seq = :expected AND #status = :running"),
 			ExpressionAttributeNames: names, ExpressionAttributeValues: instanceAdvanceValues(newSeq, adv.ExpectedSeq, now, adv.Terminal, adv.NewEvents)}},
 	}
 	for _, e := range adv.NewEvents {
 		items = append(items, put(b.table("wf_journal"), journalItem(adv.InstanceID, e.Seq, e, now), "attribute_not_exists(instance_id) AND attribute_not_exists(seq)"))
 	}
 	for _, at := range adv.ActivityTasks {
+		if adv.Terminal != nil {
+			break
+		}
 		items = append(items, put(b.table("wf_tasks"), activityTaskItem(at, now), "attribute_not_exists(task_pk)"))
 	}
 	for _, tm := range adv.Timers {
+		if adv.Terminal != nil {
+			break
+		}
 		items = append(items, put(b.table("wf_timers"), timerItem(adv.InstanceID, tm, now), "attribute_not_exists(instance_id) AND attribute_not_exists(seq)"))
 	}
 	for _, id := range adv.DrainedInbox {
@@ -1040,7 +1746,7 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 		items = append(items, put(b.table("wf_inbox"), inboxItem(inst.ParentID, newID(), seq, ev, now), "attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
 		parentID = inst.ParentID
 	}
-	if adv.EnsureWorkflowTask {
+	if adv.EnsureWorkflowTask && adv.Terminal == nil {
 		// Truncated fanout: keep the singleton workflow task alive with an
 		// in-place refresh instead of delete + post-commit ensure. The
 		// follow-up is then part of the same atomic transaction, so no
@@ -1098,7 +1804,7 @@ func instanceAdvanceExpression(t *backend.TerminalUpdate, withSearchAttrs, withM
 	return expr + ", #status = :status, #result = :result, failure = :failure, completed_at = :now"
 }
 func instanceAdvanceValues(next, expected int64, now time.Time, t *backend.TerminalUpdate, events []journal.Event) map[string]types.AttributeValue {
-	m := map[string]types.AttributeValue{":next": avN(next), ":expected": avN(expected), ":now": avN(timeToN(now))}
+	m := map[string]types.AttributeValue{":next": avN(next), ":expected": avN(expected), ":now": avN(timeToN(now)), ":running": avS("running")}
 	if backend.HasSearchAttributesUpdate(events) {
 		m[":sa"] = avJSON(backend.MarshalSearchAttributes(backend.LastSearchAttributesUpdate(events)))
 	}
@@ -1139,7 +1845,76 @@ func (b *Backend) ensureWorkflowTask(ctx context.Context, instanceID string) err
 	if err != nil || len(inbox.Items) == 0 {
 		return err
 	}
-	_, err = b.client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(b.table("wf_tasks")), Item: workflowTaskItem(instanceID, inst.Queue, newID(), nowUTC()), ConditionExpression: aws.String("attribute_not_exists(task_pk)")})
+	item := workflowTaskItem(instanceID, inst.Queue, newID(), nowUTC())
+	if terr := b.putWorkflowTaskIfRunning(ctx, instanceID, item); terr != nil {
+		if isTransactionUnsupported(terr) {
+			// Stores without TransactWriteItems support fall back to a
+			// status re-check immediately before the Put (see
+			// putWorkflowTaskLegacy): narrower race, documented residual.
+			return b.putWorkflowTaskLegacy(ctx, instanceID, item)
+		}
+		return terr
+	}
+	return nil
+}
+
+// putWorkflowTaskIfRunning creates the singleton workflow task only while
+// the instance is still running, in ONE transaction: a ConditionCheck on
+// the instance row (status = "running"; a missing row fails the check,
+// matching instanceRunning's terminal treatment) plus the Put guarded on
+// attribute_not_exists(task_pk).
+//
+// This closes the recreate-after-cleanup race: CompleteActivity's inbox
+// commit and the status read above can both serialize before a terminal
+// transition whose sweep then finishes before the task Put executes. A
+// bare PutItem has no status condition and would recreate the workflow
+// task after the cleanup — the row lingers (the claim gate still prevents
+// execution, but nothing reaps it). The transactional Put aborts instead,
+// so a terminal sweep is never undone by a stale ensure.
+//
+// A conditional failure (instance left running, or the singleton already
+// exists) is success: either the terminal sweep owns the task now or
+// another ensure already created it.
+func (b *Backend) putWorkflowTaskIfRunning(ctx context.Context, instanceID string, item map[string]types.AttributeValue) error {
+	_, err := b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{ConditionCheck: &types.ConditionCheck{
+			TableName:           aws.String(b.table("wf_instances")),
+			Key:                 map[string]types.AttributeValue{"id": avS(instanceID)},
+			ConditionExpression: aws.String("#s = :running"),
+			ExpressionAttributeNames: map[string]string{
+				"#s": "status",
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":running": avS("running"),
+			},
+		}},
+		{Put: &types.Put{
+			TableName:           aws.String(b.table("wf_tasks")),
+			Item:                item,
+			ConditionExpression: aws.String("attribute_not_exists(task_pk)"),
+		}},
+	}})
+	if conditional(err) {
+		return nil
+	}
+	return err
+}
+
+// putWorkflowTaskLegacy is the ensure fallback for stores without
+// TransactWriteItems support: it re-reads the instance status immediately
+// before the Put and skips a terminal instance, narrowing the
+// read-then-Put gap to the minimum a bare PutItem allows. A residual race
+// remains — a termination committing between the re-read and the Put still
+// recreates the row — and is documented rather than hidden: the lingered
+// row cannot execute (claimTaskItem's atomic status ConditionCheck plus
+// the post-claim instanceRunning gate fence it) and is reaped by the next
+// TerminateInstance full cleanup or retention purge.
+func (b *Backend) putWorkflowTaskLegacy(ctx context.Context, instanceID string, item map[string]types.AttributeValue) error {
+	running, err := b.instanceRunning(ctx, instanceID)
+	if err != nil || !running {
+		return err
+	}
+	_, err = b.client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(b.table("wf_tasks")), Item: item, ConditionExpression: aws.String("attribute_not_exists(task_pk)")})
 	if conditional(err) {
 		return nil
 	}
@@ -1209,6 +1984,27 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 				continue
 			}
 			items = append(items, put(b.table("wf_inbox"), inboxItem(id, newID(), is, journal.Event{Type: journal.TypeTimerFired, RefSeq: seq}, now), "attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
+			// Fence the firing on the instance status IN the transaction
+			// (Codex round-26 P2 on #291): the GetInstance above is a
+			// pre-read only, and a termination committing before this txn
+			// would otherwise delete the timer and insert a TimerFired row
+			// that the stale-instance check counts as fired while the gated
+			// ensure creates no task — the post-transition inbox row then
+			// survives a passed sweep (or is preserved via cutoff).
+			// The ConditionCheck aborts the whole txn on a terminal flip
+			// (conditional → continue below, timer left for the terminal
+			// sweep), mirroring the Spanner/Firestore in-txn status reads.
+			items = append([]types.TransactWriteItem{{ConditionCheck: &types.ConditionCheck{
+				TableName:           aws.String(b.table("wf_instances")),
+				Key:                 map[string]types.AttributeValue{"id": avS(id)},
+				ConditionExpression: aws.String("#s = :running"),
+				ExpressionAttributeNames: map[string]string{
+					"#s": "status",
+				},
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":running": avS("running"),
+				},
+			}}}, items...)
 		}
 		_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 		if conditional(err) {
@@ -1217,11 +2013,12 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 		if err != nil {
 			return count, err
 		}
+		if inst.Status != "running" {
+			continue
+		}
 		count++
-		if inst.Status == "running" {
-			if err := b.ensureWorkflowTask(ctx, id); err != nil {
-				return count, err
-			}
+		if err := b.ensureWorkflowTask(ctx, id); err != nil {
+			return count, err
 		}
 	}
 	if count > 0 {
@@ -1245,14 +2042,41 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	if err != nil {
 		return err
 	}
+	// Order this send after an observed terminal transition (see
+	// clampSendNow): a send that starts after the flip must stamp strictly
+	// past completed_at, or the exact terminal-sweep cutoff classifies it
+	// pre-transition on skewed hosts and deletes the accepted event. One
+	// extra consistent read, and only for sends that already observe a
+	// non-running instance — the running hot path is untouched. A terminal
+	// read failure fails the send (retryable) rather than risk a
+	// misordered stamp; a send that observes running takes no floor and
+	// keeps the documented residual race.
+	var sendFloorN int64
+	if inst.Status != "running" {
+		cutoff, err := b.readTerminalCutoff(ctx, instanceID)
+		if err != nil {
+			return err
+		}
+		if cutoff.hasCutoff {
+			sendFloorN = cutoff.cutoff + 1
+		}
+	}
 	pending := append([]backend.InboxItem(nil), items...)
 	wrote := false
 	for len(pending) > 0 {
-		now := nowUTC()
 		top, err := b.allocInboxSeqs(ctx, instanceID, int64(len(pending)))
 		if err != nil {
 			return err
 		}
+		// Stamp now as late as possible, right before the transaction
+		// below: the terminal sweep preserves only rows with created_at
+		// past the flip (see terminalSweepCutoff), so a flip landing
+		// between the stamp and the commit would sweep this send despite
+		// it postdating the transition. Per-attempt re-stamping (not one
+		// stamp per call) keeps retries past the flip ordered after it,
+		// within client-clock skew; the floor above covers observed
+		// terminal state regardless of skew.
+		now := clampSendNow(nowUTC(), sendFloorN)
 		var twi []types.TransactWriteItem
 		type meta struct {
 			pidx   int
@@ -1376,6 +2200,97 @@ type recoverStore interface {
 	PutItem(ctx context.Context, params *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
 }
 
+// recoverTransactStore is the optional transact-capable extension of
+// recoverStore: the production client implements TransactWriteItems, so
+// orphan recovery can route its put through the same atomic
+// status-conditioned transaction as ensureWorkflowTask (see
+// putWorkflowTaskIfRunning). Test fakes that lack it fall back to a
+// status re-check immediately before the Put (see recoverPutIfRunning).
+type recoverTransactStore interface {
+	recoverStore
+	TransactWriteItems(ctx context.Context, params *dynamodb.TransactWriteItemsInput, optFns ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
+}
+
+// recoverPutIfRunning recreates one orphaned workflow task only while its
+// instance is still running (round-17 P2 on #291). The scan image may be
+// stale — a terminal commit plus sweep can land between the scan and the put
+// — and a bare PutItem would then recreate the workflow task after the
+// cleanup, leaving a row that lingers unpolled (the claim gate still prevents
+// execution, but nothing reaps it). When the store supports transactions the
+// put rides the same atomic status-conditioned transaction as
+// putWorkflowTaskIfRunning (a ConditionCheck on status="running" plus the Put
+// guarded on attribute_not_exists); a terminal instance (or an existing
+// singleton) aborts as success. Stores without transaction support re-read
+// the instance status immediately before the Put and skip a terminal
+// instance, narrowing the read-then-Put gap to the minimum a bare PutItem
+// allows (same documented residual as putWorkflowTaskLegacy). It reports
+// true when the put committed.
+func (b *Backend) recoverPutIfRunning(ctx context.Context, store recoverStore, instanceID, queue string) (bool, error) {
+	item := workflowTaskItem(instanceID, queue, newID(), nowUTC())
+	if ts, ok := store.(recoverTransactStore); ok {
+		_, err := ts.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+			{ConditionCheck: &types.ConditionCheck{
+				TableName:           aws.String(b.table("wf_instances")),
+				Key:                 map[string]types.AttributeValue{"id": avS(instanceID)},
+				ConditionExpression: aws.String("#s = :running"),
+				ExpressionAttributeNames: map[string]string{
+					"#s": "status",
+				},
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":running": avS("running"),
+				},
+			}},
+			{Put: &types.Put{
+				TableName:           aws.String(b.table("wf_tasks")),
+				Item:                item,
+				ConditionExpression: aws.String("attribute_not_exists(task_pk)"),
+			}},
+		}})
+		if err == nil {
+			return true, nil
+		}
+		if conditional(err) {
+			return false, nil
+		}
+		if !isTransactionUnsupported(err) {
+			return false, err
+		}
+		// Stores without TransactWriteItems support fall through to the
+		// status re-check + Put below.
+	}
+	// Re-check the instance status immediately before the Put: the scan row
+	// above may predate a terminal transition whose sweep already finished.
+	// A missing instance reads as terminal (same as instanceRunning).
+	got, err := store.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      aws.String(b.table("wf_instances")),
+		Key:            map[string]types.AttributeValue{"id": avS(instanceID)},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return false, err
+	}
+	if len(got.Item) == 0 || fromS(got.Item["status"]) != "running" {
+		return false, nil
+	}
+	if q := fromS(got.Item["queue"]); q != "" && q != queue {
+		// Prefer the fresh queue for the recreated task over the
+		// potentially stale scan image.
+		item = workflowTaskItem(instanceID, q, newID(), nowUTC())
+	}
+	_, err = store.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:           aws.String(b.table("wf_tasks")),
+		Item:                item,
+		ConditionExpression: aws.String("attribute_not_exists(task_pk)"),
+	})
+	if err != nil {
+		if conditional(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // recoverOrphanedPass checks up to bound running instances starting from start
 // and reports where the next pass should resume. exhausted is true only when
 // the full table was visited (caller resets the cursor to nil).
@@ -1437,12 +2352,21 @@ func (b *Backend) recoverOrphanedPass(ctx context.Context, store recoverStore, s
 				continue
 			}
 			inst := decodeInstance(m)
-			_, err = store.PutItem(ctx, &dynamodb.PutItemInput{
-				TableName:           aws.String(b.table("wf_tasks")),
-				Item:                workflowTaskItem(id, inst.Queue, newID(), nowUTC()),
-				ConditionExpression: aws.String("attribute_not_exists(task_pk)"),
-			})
-			if err == nil {
+			// Gate the recreate on the live instance status (round-17 P2
+			// on #291): the scan row above may predate a terminal commit
+			// whose sweep already finished, and a bare PutItem would then
+			// recreate the workflow task after the cleanup. The gated put
+			// aborts on a terminal instance (or an existing singleton) as
+			// success; only a committed put counts as recovered.
+			ok, err := b.recoverPutIfRunning(ctx, store, id, inst.Queue)
+			if err != nil {
+				// A failed status re-read (throttling, transient) must not
+				// fail the whole pass: skip this instance like the inbox
+				// and task reads above do. It stays orphaned for the next
+				// pass instead of aborting recovery for the fleet.
+				continue
+			}
+			if ok {
 				recovered++
 			}
 		}
@@ -1455,20 +2379,28 @@ func (b *Backend) recoverOrphanedPass(ctx context.Context, store recoverStore, s
 
 // deleteSignalDedupeForInstance pages through the instance's dedupe entries
 // (Query results larger than 1 MB arrive in pages via LastEvaluatedKey) and
-// removes each one.
-func (b *Backend) deleteSignalDedupeForInstance(ctx context.Context, id string) error {
+// removes each one. The read is strongly consistent so a dedupe key committed
+// just before the terminal transition is not missed (same gap as the
+// terminal inbox query). Markers created after the terminal transition
+// survive (see terminalSweepCutoff): the sweep deletes the marker and its
+// inbox row only as a pre-transition pair, never a lone marker.
+func (b *Backend) deleteSignalDedupeForInstance(ctx context.Context, id string, cutoff terminalSweepCutoff) error {
 	var start map[string]types.AttributeValue
 	for {
 		out, err := b.client.Query(ctx, &dynamodb.QueryInput{
 			TableName:                 aws.String(b.table("wf_signal_dedupe")),
 			KeyConditionExpression:    aws.String("instance_id = :id"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{":id": avS(id)},
+			ConsistentRead:            aws.Bool(true),
 			ExclusiveStartKey:         start,
 		})
 		if err != nil {
 			return err
 		}
 		for _, m := range out.Items {
+			if sweepKeepsRow(fromN(m["created_at"]), cutoff) {
+				continue
+			}
 			if _, err := b.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 				TableName: aws.String(b.table("wf_signal_dedupe")),
 				Key: map[string]types.AttributeValue{

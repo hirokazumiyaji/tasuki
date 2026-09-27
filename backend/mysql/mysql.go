@@ -399,6 +399,15 @@ func applyMigration(ctx context.Context, q migrationQueryer, m migration) error 
 		return nil // already applied
 	}
 	for _, stmt := range splitSQL(m.up) {
+		if isCreateIndex(stmt) {
+			// Standalone CREATE INDEX backfills (e.g. 000003): tolerate
+			// only duplicate-index errors (the index is already there);
+			// every other failure aborts instead of passing silently.
+			if err := execIndexBackfill(ctx, q, stmt); err != nil {
+				return err
+			}
+			continue
+		}
 		if _, err := q.ExecContext(ctx, stmt); err != nil {
 			if isAddColumn(stmt) && isDuplicateColumnError(err) {
 				continue // already backfilled; keep going
