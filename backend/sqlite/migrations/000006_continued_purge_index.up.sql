@@ -1,0 +1,13 @@
+-- 000006_continued_purge_index: ordered path for continued purges (issue #294 round-24 P2).
+-- 000005 restricted wf_instances_completed_at_idx to the default purge
+-- statuses, so continued rows left every purge-order index: explicit
+-- statuses=["continued"] purges sort via visibility_idx + TEMP B-TREE. The
+-- partial index below covers exactly the continued purge filter, so the
+-- continued victim SELECT walks victims in (completed_at, id) order and
+-- stops at LIMIT. The default index is untouched (see
+-- purgeOrderingHint, which forces one index per filter: the default set
+-- forces wf_instances_completed_at_idx, continued-only forces this one;
+-- every other filter runs unhinted against the visibility index). DROP +
+-- CREATE is idempotent (fresh databases, which gain the definition from
+-- 000001, rebuild a no-op equivalent).
+CREATE INDEX IF NOT EXISTS wf_instances_continued_purge_idx ON wf_instances (completed_at, id) WHERE completed_at IS NOT NULL AND status = 'continued';

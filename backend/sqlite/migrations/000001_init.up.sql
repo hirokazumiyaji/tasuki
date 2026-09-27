@@ -20,6 +20,33 @@ CREATE TABLE IF NOT EXISTS wf_instances (
     completed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS wf_instances_visibility_idx ON wf_instances (status, name, created_at);
+-- PurgeInstances victim scan: WHERE status IN (...) AND completed_at IS NOT NULL
+-- AND completed_at <= ? ORDER BY completed_at, id. The index leads with the
+-- ordering columns (completed_at, id): the default 4-status purge filter
+-- matches nearly every completed row, so a status-leading index cannot serve
+-- the ORDER BY and the scan falls back to a TEMP B-TREE sort. Leading with
+-- the range + ordering lets SQLite walk victims in order and stop at LIMIT;
+-- the status IN (...) filter applies per row off the ordered scan, which
+-- stays bounded because completed rows are overwhelmingly purge-eligible.
+-- The partial predicate covers exactly the default purge status set
+-- (backend.DefaultPurgeStatuses): `continued` instances are never deleted by
+-- a default purge, so admitting them (round-23 P2 on #294) would make the
+-- forced ordered scan walk old continued rows on every batch. Purges whose
+-- filter is not exactly the default set run unhinted (see
+-- purgeUsesOrderingHint) and never need this index.
+-- Kept here for fresh databases; pre-existing databases gain it through
+-- migrations 000003 (legacy-stamped version-1 databases skip the baseline),
+-- 000004 (ordering shape) and 000005 (default-status predicate).
+CREATE INDEX IF NOT EXISTS wf_instances_completed_at_idx ON wf_instances (completed_at, id) WHERE completed_at IS NOT NULL AND status IN ('completed', 'failed', 'terminated', 'canceled');
+-- Continued-purge victim scan (issue #294 round-24 P2): explicit
+-- statuses=["continued"] purges filter status = 'continued' AND
+-- completed_at IS NOT NULL AND completed_at <= ? ORDER BY completed_at, id.
+-- The default partial index above excludes continued rows, so without this
+-- index continued purges sort via visibility_idx + TEMP B-TREE. This index
+-- covers exactly the continued filter (see purgeOrderingHint, which forces
+-- it only for continued-only purges). Fresh databases gain it here;
+-- pre-existing databases through migration 000006.
+CREATE INDEX IF NOT EXISTS wf_instances_continued_purge_idx ON wf_instances (completed_at, id) WHERE completed_at IS NOT NULL AND status = 'continued';
 
 CREATE TABLE IF NOT EXISTS wf_journal (
     instance_id TEXT    NOT NULL,
