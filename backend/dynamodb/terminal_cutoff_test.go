@@ -267,7 +267,7 @@ func TestCleanupTerminalInstance_CutoffReadErrorRetries(t *testing.T) {
 // notifyTerminalSweepBackend returns a backend whose terminal cleanup always
 // fails (task delete errors) while the commit itself succeeds, plus a
 // subscribed terminal channel observing wake hints.
-func notifyTerminalSweepBackend(id string) (*Backend, <-chan string) {
+func notifyTerminalSweepBackend(id string) (*Backend, <-chan string, *fakeDynamo) {
 	f, _, _ := cutoffFake(id, 1_700_000_000_000_000)
 	f.deleteItemFn = func(_ context.Context, in *dynamodb.DeleteItemInput) (*dynamodb.DeleteItemOutput, error) {
 		if _, ok := in.Key["task_pk"]; ok {
@@ -297,7 +297,7 @@ func notifyTerminalSweepBackend(id string) (*Backend, <-chan string) {
 	if err != nil {
 		panic(err)
 	}
-	return b, ch
+	return b, ch, f
 }
 
 func awaitTerminal(t *testing.T, ch <-chan string, want string) {
@@ -320,7 +320,7 @@ func awaitTerminal(t *testing.T, ch <-chan string, want string) {
 func TestCommitAdvancement_NotifiesTerminalDespiteCleanupError(t *testing.T) {
 	ctx := context.Background()
 	const id = "notify-single"
-	b, ch := notifyTerminalSweepBackend(id)
+	b, ch, _ := notifyTerminalSweepBackend(id)
 	result := []byte(`"ok"`)
 	err := b.CommitAdvancement(ctx, backend.Advancement{
 		InstanceID: id, TaskID: 7, ExpectedSeq: 2,
@@ -339,7 +339,13 @@ func TestCommitAdvancements_NotifiesTerminalsDespiteCleanupError(t *testing.T) {
 	ctx := context.Background()
 	const idA = "notify-batch-a"
 	const idB = "notify-batch-b"
-	b, ch := notifyTerminalSweepBackend(idB)
+	b, ch, f := notifyTerminalSweepBackend(idB)
+	wakeWrites := make(chan string, 2)
+	f.updateItemHook = func(_ context.Context, in *dynamodb.UpdateItemInput) {
+		if fromS(in.Key["pk"]) == wakePKTerminal {
+			wakeWrites <- fromS(in.ExpressionAttributeValues[":id"])
+		}
+	}
 	// notifyTerminalSweepBackend answers every instance read with the same
 	// running-instance shape, so idA's preflight/build reads succeed too;
 	// only its TaskID differs, and every task delete fails.
@@ -352,14 +358,34 @@ func TestCommitAdvancements_NotifiesTerminalsDespiteCleanupError(t *testing.T) {
 		}
 	}
 	// Two terminal victims: the combined commit succeeds, every per-victim
-	// cleanup fails on the task delete, and both terminal wakes must still
-	// fire before the retained error surfaces.
+	// cleanup fails on the task delete, and each shared wake write must still
+	// be scheduled before the retained error surfaces. The in-process
+	// subscriber is deliberately coalescing, so one hint must prompt a
+	// database recheck while the fake records both shared wake writes.
 	err := b.CommitAdvancements(ctx, []backend.Advancement{mkAdv(idA, 11), mkAdv(idB, 22)})
 	if err == nil {
 		t.Fatal("CommitAdvancements returned nil, want the retained cleanup error")
 	}
-	awaitTerminal(t, ch, idA)
-	awaitTerminal(t, ch, idB)
+	written := map[string]bool{}
+	for range 2 {
+		select {
+		case id := <-wakeWrites:
+			written[id] = true
+		case <-time.After(5 * time.Second):
+			t.Fatalf("terminal wake writes = %v, want writes for %q and %q", written, idA, idB)
+		}
+	}
+	if !written[idA] || !written[idB] {
+		t.Fatalf("terminal wake writes = %v, want writes for %q and %q", written, idA, idB)
+	}
+	select {
+	case id := <-ch:
+		if id != idA && id != idB {
+			t.Fatalf("terminal hint = %q, want %q or %q", id, idA, idB)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no terminal hint delivered")
+	}
 }
 
 // TestTerminateInstance_NotifiesTerminalDespiteSweepError covers Codex
