@@ -213,6 +213,7 @@ func (b *Backend) TerminateInstance(_ context.Context, id string) error {
 	inst.status = "terminated"
 	inst.completedAt = b.now
 	delete(b.signalDedupe, id)
+	delete(b.inbox, id)
 	for tid, t := range b.tasks {
 		if t.instanceID == id {
 			delete(b.tasks, tid)
@@ -228,22 +229,28 @@ func (b *Backend) TerminateInstance(_ context.Context, id string) error {
 	return nil
 }
 
-func (b *Backend) ExtendLease(_ context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(_ context.Context, task backend.Task, d time.Duration) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	t, ok := b.tasks[taskID]
+	t, ok := b.tasks[task.ID]
 	if !ok {
+		return backend.ErrNotFound
+	}
+	if t.workerID != task.WorkerID || t.attempt != task.Attempt {
 		return backend.ErrNotFound
 	}
 	t.visibleAt = b.now.Add(d)
 	return nil
 }
 
-func (b *Backend) RecordHeartbeat(_ context.Context, taskID int64, lease time.Duration, details []byte) error {
+func (b *Backend) RecordHeartbeat(_ context.Context, task backend.Task, lease time.Duration, details []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	t, ok := b.tasks[taskID]
+	t, ok := b.tasks[task.ID]
 	if !ok {
+		return backend.ErrNotFound
+	}
+	if t.workerID != task.WorkerID || t.attempt != task.Attempt {
 		return backend.ErrNotFound
 	}
 	t.visibleAt = b.now.Add(lease)
@@ -311,15 +318,15 @@ func (b *Backend) NackTask(_ context.Context, task backend.Task, delay time.Dura
 	return nil
 }
 
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
 	b.mu.Lock()
-	t, ok := b.tasks[taskID]
-	if !ok || t.kind != "activity" {
+	t, ok := b.tasks[claim.ID]
+	if !ok || t.kind != "activity" || t.workerID != claim.WorkerID || t.attempt != claim.Attempt {
 		b.mu.Unlock()
-		return backend.ErrNotFound
+		return backend.ErrSuperseded
 	}
 	b.mu.Unlock()
-	return b.NackTask(ctx, backend.Task{ID: taskID, Kind: "activity"}, delay)
+	return b.NackTask(ctx, claim, delay)
 }
 
 func (b *Backend) LoadWorkflowHead(_ context.Context, instanceID string) (*backend.WorkflowState, error) {
@@ -504,6 +511,9 @@ func (b *Backend) preflightAdvancementLocked(adv backend.Advancement) error {
 	if !ok || own.instanceID != adv.InstanceID || own.kind != "workflow" {
 		return backend.ErrConflict
 	}
+	if adv.WorkerID != "" && (own.workerID != adv.WorkerID || own.attempt != adv.Attempt) {
+		return backend.ErrConflict
+	}
 	return nil
 }
 
@@ -517,6 +527,9 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 	}
 	own, ok := b.tasks[adv.TaskID]
 	if !ok || own.instanceID != adv.InstanceID || own.kind != "workflow" {
+		return backend.ErrConflict
+	}
+	if adv.WorkerID != "" && (own.workerID != adv.WorkerID || own.attempt != adv.Attempt) {
 		return backend.ErrConflict
 	}
 
@@ -609,10 +622,10 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 	return nil
 }
 
-func (b *Backend) CompleteActivity(_ context.Context, taskID int64, ev journal.Event) error {
+func (b *Backend) CompleteActivity(_ context.Context, claim backend.Task, ev journal.Event) error {
 	b.mu.Lock()
-	t, ok := b.tasks[taskID]
-	if !ok || t.kind != "activity" {
+	t, ok := b.tasks[claim.ID]
+	if !ok || t.kind != "activity" || t.workerID != claim.WorkerID || t.attempt != claim.Attempt {
 		b.mu.Unlock()
 		return backend.ErrSuperseded
 	}
@@ -621,7 +634,7 @@ func (b *Backend) CompleteActivity(_ context.Context, taskID int64, ev journal.E
 		b.mu.Unlock()
 		return backend.ErrNotFound
 	}
-	delete(b.tasks, taskID)
+	delete(b.tasks, claim.ID)
 	if inst.status != "running" {
 		// Terminated/completed instances ignore late completions.
 		b.mu.Unlock()
@@ -671,6 +684,10 @@ func (b *Backend) FireDueTimers(_ context.Context, limit int) (int, error) {
 			continue
 		}
 		delete(b.timers, d.key)
+		if inst.status != "running" {
+			n++
+			continue
+		}
 		b.nextInbox++
 		b.inbox[d.tm.instanceID] = append(b.inbox[d.tm.instanceID], &inboxItem{
 			id: b.nextInbox,
@@ -679,9 +696,7 @@ func (b *Backend) FireDueTimers(_ context.Context, limit int) (int, error) {
 				RefSeq: d.tm.seq,
 			},
 		})
-		if inst.status == "running" {
-			b.enqueueWorkflowTaskLocked(d.tm.instanceID, inst.queue)
-		}
+		b.enqueueWorkflowTaskLocked(d.tm.instanceID, inst.queue)
 		n++
 	}
 	b.mu.Unlock()

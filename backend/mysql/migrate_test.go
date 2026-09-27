@@ -376,3 +376,72 @@ func TestValidateSchemaMissingColumns(t *testing.T) {
 		}
 	}
 }
+
+// TestMigrateRetryAfterDropBeforeCreate covers the Codex round-21 P1 on
+// #294: MySQL DDL autocommits per statement, so a crash after 000004's DROP
+// succeeds leaves version 4 unrecorded with the index already absent, and a
+// retry must not fail on the DROP of the nonexistent index (error 1091).
+// The setup simulates exactly that crash state (DROP applied, version row
+// missing); the retry must tolerate the missing index, recreate it with the
+// fixed (completed_at, id) definition, and record version 4. Old code
+// aborted the retry with error 1091, requiring manual repair.
+func TestMigrateRetryAfterDropBeforeCreate(t *testing.T) {
+	dsn := dsnOrSkip(t)
+	ctx := context.Background()
+	b, err := mysql.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the crash: DROP committed, version row never recorded.
+	if _, err := b.DB().ExecContext(ctx,
+		`ALTER TABLE wf_instances DROP INDEX wf_instances_completed_at_idx`); err != nil {
+		t.Fatalf("setup DROP: %v", err)
+	}
+	if _, err := b.DB().ExecContext(ctx,
+		`DELETE FROM tasuki_schema_migrations WHERE version = 4`); err != nil {
+		t.Fatalf("setup unrecord version 4: %v", err)
+	}
+	// The retry must succeed instead of failing on the missing index.
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatalf("retry Migrate after DROP-without-version: %v", err)
+	}
+	rows, err := b.DB().QueryContext(ctx,
+		`SELECT column_name FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'wf_instances' AND index_name = 'wf_instances_completed_at_idx' ORDER BY seq_in_index`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			t.Fatal(err)
+		}
+		cols = append(cols, c)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cols) != 2 || cols[0] != "completed_at" || cols[1] != "id" {
+		t.Fatalf("rebuilt index columns = %v, want [completed_at id]", cols)
+	}
+	var version int64
+	if err := b.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM tasuki_schema_migrations WHERE version = 4`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 1 {
+		t.Fatalf("version 4 recorded %d times, want 1", version)
+	}
+	// A further Migrate stays a no-op (duplicate CREATE tolerated as before).
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatalf("second Migrate: %v", err)
+	}
+	if err := b.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

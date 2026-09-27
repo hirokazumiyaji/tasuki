@@ -9,7 +9,11 @@ migrations/
 ├── 000001_init.up.sql            基本テーブルとインデックス
 ├── 000001_init.down.sql          全テーブルの DROP
 ├── 000002_vacuum_tuning.up.sql   autovacuum / fillfactor 設定
-└── 000002_vacuum_tuning.down.sql 設定のリセット
+├── 000002_vacuum_tuning.down.sql 設定のリセット
+├── 000003_purge_search_indexes.up.sql   purge 用 (completed_at, id) + search_attributes 用 GIN インデックス
+├── 000003_purge_search_indexes.down.sql 上記インデックスの削除
+├── 000004_fix_purge_index_order.up.sql   purge インデックスを (completed_at, id) 先頭に作り直し
+└── 000004_fix_purge_index_order.down.sql 単一カラムの purge インデックスに戻す
 ```
 
 命名規則は `<6桁バージョン>_<名前>.up.sql` / `.down.sql`。ファイル名は辞書順 = 適用順になる。
@@ -65,6 +69,6 @@ atlas migrate apply --dir file://backend/postgres/migrations \
 
 ## 新しいマイグレーションの追加
 
-1. `000003_<名前>.up.sql` / `.down.sql` を追加する。バージョンは必ず増分。
+1. `000005_<名前>.up.sql` / `.down.sql` を追加する。バージョンは必ず増分。
 2. `.up.sql` は idempotent に書かなくてよい（適用は 1 回きり、失敗時はトランザクションでロールバックされる）。ただし `CREATE TABLE IF NOT EXISTS` のような冪等 DDL にしておくと、旧 schema.sql から移行したデータベースとの差異が吸収しやすい。
 3. テストは実 PostgreSQL に対して `go test ./...`（`TASUKI_POSTGRES_DSN` 必須）で検証する。

@@ -29,9 +29,12 @@ type Backend interface {
 	// CountClaimableTasks returns per-queue counts of tasks with visible_at <= store now
 	// for kind among queues. Queues with zero may be omitted.
 	CountClaimableTasks(ctx context.Context, kind string, queues []string) (map[string]int64, error)
-	ExtendLease(ctx context.Context, taskID int64, d time.Duration) error
-	// RecordHeartbeat extends the lease and stores details for GetHeartbeatDetails on later attempts.
-	RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error
+	// ExtendLease conditionally extends the task's lease only while its exact
+	// worker and attempt claim still own it. A mismatch returns ErrNotFound.
+	ExtendLease(ctx context.Context, task Task, d time.Duration) error
+	// RecordHeartbeat extends the lease and stores details for later attempts
+	// only while the task's worker and attempt claim still match.
+	RecordHeartbeat(ctx context.Context, task Task, lease time.Duration, details []byte) error
 	// ReleaseLease makes a claimed task immediately reclaimable.
 	// The task carries the claim ownership token (ID, Kind, InstanceID,
 	// WorkerID, Attempt): backends route workflow tasks by
@@ -56,9 +59,11 @@ type Backend interface {
 	// LoadWorkflowHead returns instance metadata, inbox, next_seq, and store Now without journal.
 	LoadWorkflowHead(ctx context.Context, instanceID string) (*WorkflowState, error)
 	CommitAdvancement(ctx context.Context, adv Advancement) error
-	CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error
+	CompleteActivity(ctx context.Context, task Task, ev journal.Event) error
 	// RetryActivity clears the lease and defers activity visibility by delay (store clock).
-	RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error
+	// It is conditional on the claimed worker and attempt so stale workers cannot
+	// clear a successor's lease.
+	RetryActivity(ctx context.Context, task Task, delay time.Duration) error
 	FireDueTimers(ctx context.Context, limit int) (int, error)
 
 	UpsertSchedule(ctx context.Context, s NewSchedule) error

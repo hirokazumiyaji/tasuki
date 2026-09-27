@@ -38,10 +38,10 @@ func TestMemory_RecordHeartbeatAndTimerHelpers(t *testing.T) {
 		t.Fatalf("claim: %v %#v", err, tasks)
 	}
 
-	if err := b.RecordHeartbeat(ctx, tasks[0].ID, 5*time.Second, []byte(`{"n":1}`)); err != nil {
+	if err := b.RecordHeartbeat(ctx, tasks[0], 5*time.Second, []byte(`{"n":1}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.RecordHeartbeat(ctx, 99999, time.Second, nil); !errors.Is(err, backend.ErrNotFound) {
+	if err := b.RecordHeartbeat(ctx, backend.Task{ID: 99999}, time.Second, nil); !errors.Is(err, backend.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 

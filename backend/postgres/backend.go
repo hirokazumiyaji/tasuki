@@ -171,6 +171,10 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	_, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE instance_id = $1`, id)
+	if err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
@@ -249,6 +253,22 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 // instance is still found, then claims each survivor with a visibility
 // re-check: concurrent claimants lose the race on already-leased rows (their
 // visible_at moved to the future) and simply skip.
+//
+// Rows the picker accepts but a concurrent claimer locks first are dropped
+// and refilled from later candidates, so a claim never returns empty while
+// claimable tasks remain behind contended head rows. Claimed rows seed each
+// refill pass, keeping the per-instance cap across passes. Candidates the
+// picker rejects are carried forward as well: a rejected row can become
+// eligible once the pick that blocked it is lost (e.g. FIFO A1,A2,B1 with
+// Limit=2 and MaxPerInstance=1 picks A1,B1 and rejects A2; losing both picks
+// to concurrent locks must revisit A2 instead of resuming after B1).
+//
+// Candidate paging runs as plain SELECTs so rows the picker rejects are
+// never locked: only picker-accepted IDs are locked (SELECT ... FOR UPDATE
+// SKIP LOCKED with a visibility re-check) before the claiming UPDATEs.
+// Locking every scanned row instead would let one batch hold the whole ready
+// queue while claiming a single task, starving concurrent claimers that skip
+// locked rows (issue #294).
 func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
@@ -257,72 +277,456 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 	defer tx.Rollback(ctx)
 
 	pageSize := backend.FairOverfetch(req.Limit)
-	picker := backend.NewFairPicker(req.Limit, req.MaxPerInstance)
 	first := true
 	var lastVis time.Time
 	var lastID int64
-	for !picker.Full() {
-		q := `
-			SELECT id, instance_id, visible_at FROM wf_tasks
-			WHERE kind = $1 AND queue = ANY($2) AND visible_at <= now()`
-		args := []any{req.Kind, req.Queues}
-		if !first {
-			q += ` AND (visible_at, id) > ($3, $4)`
-			args = append(args, lastVis, lastID)
+	var (
+		out     []backend.Task
+		claimed []backend.FairTaskRef
+		pending []backend.FairTaskRef
+	)
+	// Ordering for the secured batch travels on the refs themselves: each
+	// scanned candidate captures its (visible_at, id) scan key, so the
+	// batch can be restored to FIFO (scan) order before returning without
+	// retaining every scanned candidate in a rank map (issue #294 round-12
+	// P2). Refill passes secure later rows first (e.g. pass 1 locks B1
+	// while the FIFO-earlier A2 is only secured on a refill after the pick
+	// that blocked it is lost), and returning lock order would emit [B1
+	// A2]. Re-offered pending rows keep the key captured on their original
+	// scan pass. Only picked and retained/rejected-carry refs (bounded by
+	// limit+cap) ever reach the sort; the scan itself stays streaming.
+	// Overflow-requery state (issue #294 follow-up): when scan-phase rejected
+	// retention overflows FairRejectedCap, rows past the cap are dropped while
+	// the SQL cursor advances past them. If every retained candidate is then
+	// lost to concurrent locks, the dropped tail would stay unclaimed for this
+	// claim even though it may hold eligible rows (e.g. Limit=2,
+	// MaxPerInstance=1 over A1..A2002 with A1..A2001 locked: A2002 is dropped
+	// by the cap and never revisited). Remember the pre-overflow keyset
+	// position and the IDs already attempted, so the claim can re-issue
+	// bounded requery passes from the snapshot instead of returning
+	// underfilled. A requery pass that itself overflows arms the next pass
+	// from its own fresher snapshot (successive segments), so multi-cap
+	// floods (A1..A4003, all locked, or A18010 needing ~9 segments) are
+	// walked through segment by segment while each segment makes progress
+	// (newly attempts or secures a row). Passes stop when the batch fills,
+	// when a pass makes no progress, when a pass proves no unattempted
+	// candidates remain (no overflow), or — as a backstop only — at
+	// MaxOverflowRequeryPasses (64) additional segments. Worst case per claim
+	// is 64 extra bounded segment scans; each segment advances past up to
+	// FairRejectedCap dropped rows. Rows still dropped afterwards stay
+	// claimable for a later poll, which restarts from the head.
+	var (
+		overflowSnapValid bool
+		overflowSnapVis   time.Time
+		overflowSnapID    int64
+		overflowSeen      bool
+		requeryPasses     int
+		requeryAttempted  int
+		requeryOut        int
+		attempted         map[int64]struct{}
+		// outstanding tracks per-instance OUTSTANDING lock/lease losses:
+		// picks lost to concurrent locks that no later pass has refilled
+		// back to the per-instance cap (round-17 P2 on #294, via
+		// backend.NoteFairLoss). A historical bool stays true after a
+		// refill replaces every lost pick (e.g. A1..A100000 with A1
+		// locked: the refill secures A2 and the next zero-pick carry pass
+		// rescans the suffix though no A row is admissible), causing a
+		// wasteful rescan. Outstanding quota clears once the securing pass
+		// restores the instance to the cap, so requery gates fire only
+		// while freed quota actually remains.
+		outstanding map[string]struct{}
+	)
+	// startOverflowRequery arms the next bounded requery pass from the
+	// pre-overflow snapshot when the batch would otherwise return
+	// underfilled after retention overflowed AND a lock loss actually freed
+	// quota. When every pick succeeded no slot was freed, so a requery would
+	// rescan the same dropped tail against the same per-instance caps and
+	// return an identical result — up to 2x the scan cost for nothing. The
+	// scan-exhausted call site therefore gates on its own pass lost>0 OR the
+	// cross-pass outstanding map (an earlier pass may have freed quota even
+	// when this pass secured all its picks), while
+	// the zero-pick call site gates on the cross-pass outstanding map: a pass
+	// that picks nothing loses nothing itself, but an earlier pass may have
+	// freed quota (round-13 P2 on #294). Call sites skip the requery (break)
+	// when no loss freed quota; the dropped rows stay claimable for a later
+	// poll starting from the head.
+	// It reports whether the caller
+	// should continue to the extra pass instead of breaking. At either break
+	// point the retained carry is exhausted (a pass that leaves un-offered
+	// pending rows behind either fills the picker or keeps scanning), so
+	// resetting the keyset cursor to the snapshot and dropping the empty
+	// carry loses nothing. The guard is underfilled (len(out) < Limit), not
+	// empty: pass 1 may secure B1 while the retained As drain on locks,
+	// leaving dropped A2002 eligible for slot 2 (Limit=2/MaxPerInstance=1
+	// over A1..A2002(locked)/B1 returns [B1] without this). Arming consumes
+	// the overflow flag and the snapshot, so the next pass takes a fresh
+	// snapshot further along (successive segments); passes beyond the first
+	// additionally require progress (a newly attempted or secured row) since
+	// the previous arm — progress is the primary stop condition — and the
+	// total is backstopped by MaxOverflowRequeryPasses (64).
+	startOverflowRequery := func() bool {
+		if len(out) >= req.Limit || !overflowSeen || !overflowSnapValid ||
+			requeryPasses >= backend.MaxOverflowRequeryPasses {
+			return false
 		}
-		q += fmt.Sprintf(` ORDER BY visible_at, id LIMIT $%d`, len(args)+1)
-		args = append(args, pageSize)
-		rows, err := tx.Query(ctx, q, args...)
-		if err != nil {
-			return nil, err
+		if requeryPasses > 0 && len(attempted) <= requeryAttempted && len(out) <= requeryOut {
+			return false
 		}
-		full := false
-		page := 0
-		for rows.Next() {
-			var r backend.FairTaskRef
-			var vis time.Time
-			if err := rows.Scan(&r.ID, &r.InstanceID, &vis); err != nil {
+		// Seed the duplicate filter with every ID secured so far (Codex
+		// round-27 P2 on #294, see backend.SeedFairAttempted): passes that
+		// secured rows without overflowing never enter the attempt log, so
+		// without this the requery below re-offers an already-claimed row
+		// whose instance still has quota free and fills the picker with a
+		// duplicate (this backend leases eagerly per pass, so the window is
+		// narrower than mysql's — a zero-lease claim re-exposes instantly —
+		// but the same seed keeps both loops identical).
+		attempted = backend.SeedFairAttempted(attempted, claimed)
+		requeryPasses++
+		requeryAttempted, requeryOut = len(attempted), len(out)
+		overflowSeen = false
+		first = false
+		lastVis, lastID = overflowSnapVis, overflowSnapID
+		overflowSnapValid = false
+		pending = nil
+		return true
+	}
+	for len(out) < req.Limit {
+		picker := backend.NewFairPicker(req.Limit-len(out), req.MaxPerInstance).TrackRejected()
+		picker.Seed(claimed)
+		// Batch-probe the retained carry in one lock-free query before
+		// re-offering it (issue #294 round-15 P2, round-16 fix): re-offering
+		// a large carry one pick per pass costs a lock query per pass plus
+		// quadratic re-offers when every pick is lost (a retained run over
+		// one invisible instance drains a single row per pass, so
+		// A1..A2002 with A1..A2001 leased needs ~2001 lock queries in one
+		// long txn). The probe drops rows leased since the scan in one
+		// plain SELECT — taking no locks, so concurrent claimers never skip
+		// claimable work held by this claim — and only visible survivors
+		// are re-offered, in FIFO order, so fair-cap semantics are
+		// unchanged. Rows locked between the probe and the pick are skipped
+		// by the picker's lock step below (which locks only accepted rows)
+		// and refilled as lost picks, exactly as before the batch probe
+		// existed. Probe-dropped rows do NOT create outstanding quota (they
+		// were rejected carry that turned invisible — no picker slot was
+		// freed, so a requery would face identical caps). Only lock/lease
+		// losses below free quota (see backend.NoteFairLoss).
+		// Trim the carry to the rows that can actually be picked (round-17
+		// P2 on #294, round-18 fallback margin) BEFORE probing: the plain
+		// visibility probe cannot see locks, so it would retain the entire
+		// locked carry and the picker would admit one retained row per pass.
+		// Trimming to the unfilled per-instance quota plus a bounded
+		// fallback margin (see backend.FairCarryMargin) bounds the probe
+		// set to O(limit+margin); locked extras past the margin stay
+		// dropped for later polls.
+		if len(pending) > 0 {
+			trimmed, resume, dropped := backend.TrimFairCarryWithResume(pending, claimed, req.Limit, req.MaxPerInstance)
+			if dropped {
+				// Spill the dropped tail's resume cursor into the
+				// overflow-requery state (issue #294 round-19 P1): the
+				// fixed quota+margin window above permanently forgets
+				// rows past it (e.g. Limit=2/MaxPerInstance=1 over
+				// A1..A68/B1 with A1..A67 locked: the window keeps
+				// A2..A66 while A67,A68 are dropped before either is
+				// ever attempted, so every poll returns short while
+				// the head stays locked). The FIFO-next dropped row
+				// rides along in trimmed as the retained boundary, and
+				// the cursor IS that boundary (issue #294 round-20 P1:
+				// the keyset requery below is exclusive, so a cursor
+				// at the first dropped row would skip it — resuming
+				// strictly after the retained boundary re-fetches the
+				// dropped tail instead). The cursor arms the
+				// pre-overflow snapshot so a later underfilled pass
+				// re-issues a bounded requery FROM the dropped tail
+				// instead of rescanning the head. Keep the earliest snapshot:
+				// the dropped tail is FIFO-earlier than the scan
+				// cursor. Arming overflowSeen also records this
+				// pass's picks in attempted, so the requery skips
+				// already-attempted rows in favor of the dropped
+				// tail. No requery fires without freed quota (the
+				// lost/outstanding gates below still apply), so a
+				// fully successful batch pays nothing extra.
+				if !overflowSnapValid || backend.FairRefBefore(resume, backend.FairTaskRef{VisibleAt: overflowSnapVis, ID: overflowSnapID}) {
+					overflowSnapVis, overflowSnapID, overflowSnapValid = resume.VisibleAt, resume.ID, true
+				}
+				overflowSeen = true
+			}
+			pending = trimmed
+			if len(pending) == 0 {
+				// Everything retained is already over quota: nothing to
+				// probe or re-offer this pass; the scan below (or the
+				// requery gates) decides what happens next.
+			} else {
+				kept, _, err := b.probeRetainedCarry(ctx, tx, req, pending)
+				if err != nil {
+					return nil, err
+				}
+				pending = kept
+			}
+		}
+		// Reconsider candidates rejected by an earlier pass first: they are
+		// FIFO-earlier than the scan cursor and may now fit under the cap
+		// once the picks that blocked them were lost to concurrent locks.
+		offered := 0
+		for _, r := range pending {
+			if picker.Full() {
+				break
+			}
+			picker.Offer(r)
+			offered++
+		}
+		// The scan runs to the end of the queue (or a full batch) even when
+		// rejected retention overflows FairRejectedCap: the cap bounds the
+		// carry list, not the scan. Stopping at the cap would strand the
+		// unscanned tail: the next refill re-offers the retained rows,
+		// rejections fill the fresh carry to the cap with no picks, and the
+		// pass exits empty while later polls restart at the head, so rows
+		// past the flood (B) starve and batches underfill. Offer drops
+		// rejections beyond the cap, so scanning on stays O(cap) in memory
+		// while still reaching victims past the flood; dropped rows stay
+		// claimable for later polls.
+		if !picker.Full() {
+			for !picker.Full() {
+				q := `
+				SELECT id, instance_id, visible_at FROM wf_tasks
+				WHERE kind = $1 AND queue = ANY($2) AND visible_at <= now()`
+				args := []any{req.Kind, req.Queues}
+				if !first {
+					q += ` AND (visible_at, id) > ($3, $4)`
+					args = append(args, lastVis, lastID)
+				}
+				q += fmt.Sprintf(` ORDER BY visible_at, id LIMIT $%d`, len(args)+1)
+				args = append(args, pageSize)
+				rows, err := tx.Query(ctx, q, args...)
+				if err != nil {
+					return nil, err
+				}
+				full := false
+				page := 0
+				for rows.Next() {
+					var r backend.FairTaskRef
+					if err := rows.Scan(&r.ID, &r.InstanceID, &r.VisibleAt); err != nil {
+						rows.Close()
+						return nil, err
+					}
+					vis := r.VisibleAt
+					page++
+					// Snapshot the pre-row cursor while retention is intact, so
+					// an overflow-triggered requery can resume from the last
+					// retained position. First snapshot per pass wins: it covers
+					// the largest dropped tail. Arming a requery consumes the
+					// overflow flag and the snapshot, so each successive
+					// segment takes its own snapshot further along. Only SQL
+					// scan rows reach here;
+					// pending-phase re-offers never advance the cursor, and the
+					// pending carry is bounded by FairRejectedCap so it cannot
+					// overflow on its own.
+					if !overflowSeen && !picker.RejectedCapped() {
+						overflowSnapVis, overflowSnapID, overflowSnapValid = lastVis, lastID, !first
+					}
+					first = false
+					lastVis, lastID = vis, r.ID
+					// No rank map: r carries its (visible_at, id) scan key
+					// (see above), so ordering needs no per-candidate retention.
+					// Overflow-requery passes skip IDs already put through the
+					// lock step this claim, so never-attempted dropped rows
+					// get priority in each bounded segment.
+					if _, dup := attempted[r.ID]; !(requeryPasses > 0 && dup) {
+						offerFull := picker.Offer(r)
+						if picker.RejectedCapped() {
+							overflowSeen = true
+						}
+						if offerFull {
+							full = true
+							break
+						}
+					}
+				}
+				if err := rows.Err(); err != nil {
+					rows.Close()
+					return nil, err
+				}
 				rows.Close()
+				if full || page < pageSize {
+					break
+				}
+			}
+		}
+		// The paging loop only stops short of a full picker at the end of
+		// the queue; a full picker may still have unscanned rows behind it.
+		scanExhausted := !picker.Full()
+		picked := picker.Picked()
+		iterRejected := picker.Rejected()
+		// Record pick attempts only while an overflow requery may need them
+		// (round-13 P2 on #294): the set is consulted solely by requery
+		// passes (to skip already-attempted IDs in favor of never-attempted
+		// dropped rows), so recording every pick on claims that never
+		// overflow grows O(queue) on lock-heavy claims for nothing.
+		// Overflow passes record their picks; requery passes keep recording
+		// theirs for the progress guard and successive segments.
+		if overflowSeen || requeryPasses > 0 {
+			for _, r := range picked {
+				if attempted == nil {
+					attempted = make(map[int64]struct{})
+				}
+				attempted[r.ID] = struct{}{}
+			}
+		}
+		if len(picked) == 0 {
+			// No picks means this pass lost nothing (lost==0 by
+			// definition): without prior OUTSTANDING loss an overflow
+			// requery would re-offer the dropped tail against identical
+			// caps and return the same empty pick, so skip it and break.
+			// But when an earlier pass lost picks to locks and no later
+			// pass refilled those instances back to the cap
+			// (len(outstanding) > 0), quota was freed that can admit a
+			// previously dropped row (e.g. Limit=3/
+			// MaxPerInstance=1 over A1,B1,B2..B2001,A2 with A1 locked:
+			// pass 1 secures B1 and drops A2 past the cap, pass 2
+			// re-rejects the carry and picks nothing — only a requery from
+			// the pre-overflow snapshot revisits A2). Dropped rows stay
+			// claimable for later polls.
+			if len(outstanding) > 0 && startOverflowRequery() {
+				continue
+			}
+			break
+		}
+
+		// Lock only the accepted IDs. Rows locked by a concurrent claimant are
+		// skipped here and refilled above, and rows leased since the scan fail
+		// the visibility re-check here and again at UPDATE time.
+		locked := make(map[int64]bool, len(picked))
+		{
+			ids := make([]int64, 0, len(picked))
+			for _, r := range picked {
+				ids = append(ids, r.ID)
+			}
+			lrows, err := tx.Query(ctx, `
+				SELECT id FROM wf_tasks
+				WHERE id = ANY($1) AND visible_at <= now()
+				FOR UPDATE SKIP LOCKED`, ids)
+			if err != nil {
 				return nil, err
 			}
-			page++
-			first = false
-			lastVis, lastID = vis, r.ID
-			if picker.Offer(r) {
-				full = true
+			for lrows.Next() {
+				var id int64
+				if err := lrows.Scan(&id); err != nil {
+					lrows.Close()
+					return nil, err
+				}
+				locked[id] = true
+			}
+			if err := lrows.Err(); err != nil {
+				lrows.Close()
+				return nil, err
+			}
+			lrows.Close()
+		}
+
+		prevOut := len(out)
+		prevClaimed := len(claimed)
+		for _, r := range picked {
+			if !locked[r.ID] {
+				continue // locked or leased concurrently; refilled above
+			}
+			row := tx.QueryRow(ctx, `
+				UPDATE wf_tasks
+				SET visible_at = now() + $2::interval, attempt = attempt + 1, worker_id = $3
+				WHERE id = $1 AND visible_at <= now()
+				RETURNING id, kind, queue, instance_id, ref_seq, payload, attempt, visible_at, worker_id, heartbeat`,
+				r.ID, interval(req.Lease), req.WorkerID)
+			t, payload, err := scanClaimedTask(row)
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue // claimed concurrently between select and update
+			}
+			if err != nil {
+				return nil, err
+			}
+			if t.Kind == "activity" {
+				decodeActivityTask(&t, payload)
+			}
+			out = append(out, t)
+			claimed = append(claimed, r)
+		}
+		// Picks lost to concurrent locks (or to a concurrent claim between
+		// select and update) free quota a later pass can reuse; record
+		// OUTSTANDING losses for the requery gates (round-13 P2, refined to
+		// outstanding-only in round-17 P2 on #294). Instances refilled back
+		// to the cap resolve (see backend.NoteFairLoss), so a refill that
+		// replaces every lost pick clears the flag instead of triggering a
+		// wasteful rescan.
+		{
+			securedIDs := make(map[int64]bool, len(claimed)-prevClaimed)
+			for _, r := range claimed[prevClaimed:] {
+				securedIDs[r.ID] = true
+			}
+			if outstanding == nil {
+				outstanding = make(map[string]struct{})
+			}
+			backend.NoteFairLoss(outstanding, picked, securedIDs, claimed, req.MaxPerInstance)
+		}
+		if len(out) >= req.Limit {
+			break
+		}
+		if scanExhausted {
+			// No unscanned rows remain, so the only way to make progress is
+			// to revisit rejected candidates freed by lost picks. When no
+			// pick was lost on this pass (lost==0) AND no earlier pass holds
+			// OUTSTANDING freed quota (len(outstanding)==0), every pick
+			// succeeded and no quota was freed: the dropped overflow tail
+			// would face the same caps and reproduce the same pick, so skip
+			// the wasteful full rescan (up to 2x) and return underfilled. A
+			// current OR outstanding prior loss frees a slot that can admit
+			// a previously rejected/dropped row (e.g.
+			// Limit=4/MaxPerInstance=1 over A1,C1,B1,C2,B2..B2001,A2 with
+			// A1,C1 locked: pass 1 secures B1 and drops A2 past the cap,
+			// the carry pass secures C2 with lost==0 — only the outstanding
+			// prior loss still admits A2 via requery).
+			lost := len(picked) - (len(out) - prevOut)
+			if lost == 0 && len(outstanding) == 0 {
+				break
+			}
+			if len(iterRejected) == 0 {
+				// Overflow may have dropped eligible rows past the cursor
+				// (see above): with the batch still underfilled, re-issue a
+				// bounded scan from the pre-overflow snapshot instead of
+				// returning short. A requery segment that itself overflows
+				// arms the next segment; rows still dropped after the pass
+				// bound stay claimable for a later poll.
+				if startOverflowRequery() {
+					continue
+				}
 				break
 			}
 		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		rows.Close()
-		if full || page < pageSize {
-			break
+		// Preserve the unvisited tail of pending alongside this pass's
+		// rejected rows. When an offered pending candidate fills the batch
+		// the offer loop above breaks, leaving later pending rows unoffered;
+		// they are FIFO-earlier than the scan cursor and never rescanned, so
+		// keeping only iterRejected would drop claimable tasks (e.g. FIFO
+		// A1,A2,A3,B1 with Limit=2 and MaxPerInstance=1 picks A1,B1 and
+		// rejects A2,A3; claiming B1 then losing A2 to a concurrent lock
+		// must still revisit the unvisited A3).
+		pending = append(iterRejected, pending[offered:]...)
+		if len(pending) > backend.FairRejectedCap {
+			// Bound the cross-pass carry as well: each pass contributes up
+			// to FairRejectedCap rows. Overflow rows stay claimable and
+			// resurface on a later poll, which restarts from the head.
+			pending = pending[:backend.FairRejectedCap]
 		}
 	}
-	picked := picker.Picked()
-
-	var out []backend.Task
-	for _, r := range picked {
-		row := tx.QueryRow(ctx, `
-			UPDATE wf_tasks
-			SET visible_at = now() + $2::interval, attempt = attempt + 1, worker_id = $3
-			WHERE id = $1 AND visible_at <= now()
-			RETURNING id, kind, queue, instance_id, ref_seq, payload, attempt, visible_at, worker_id, heartbeat`,
-			r.ID, interval(req.Lease), req.WorkerID)
-		t, payload, err := scanClaimedTask(row)
-		if errors.Is(err, pgx.ErrNoRows) {
-			continue // claimed concurrently between select and update
+	// Restore FIFO (scan) order: refill passes secure later rows before
+	// earlier ones (e.g. B1 on pass 1, A2 on the refill), so lock order is
+	// not queue order. out[i] corresponds to claimed[i]; reorder both by
+	// the refs' captured scan keys.
+	if len(out) > 1 {
+		backend.SortFairRefs(claimed)
+		byID := make(map[int64]backend.Task, len(out))
+		for _, t := range out {
+			byID[t.ID] = t
 		}
-		if err != nil {
-			return nil, err
+		for i, r := range claimed {
+			out[i] = byID[r.ID]
 		}
-		if t.Kind == "activity" {
-			decodeActivityTask(&t, payload)
-		}
-		out = append(out, t)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -331,6 +735,47 @@ func (b *Backend) claimTasksFair(ctx context.Context, req backend.ClaimRequest) 
 		b.notifyTasks(ctx)
 	}
 	return out, nil
+}
+
+// probeRetainedCarry batch-filters a retained carry to its visible rows
+// with a single plain SELECT over the carry IDs (see the call site in
+// claimTasksFair). The probe takes NO row locks: probing with SELECT ...
+// FOR UPDATE SKIP LOCKED over every unlocked carry row held up to ~2000
+// locks until commit though the picker accepts only a few, so concurrent
+// claimers skipped claimable work (Codex round-16 on #294). Only the
+// picker's lock step below takes locks, and only on accepted rows. Rows
+// locked between the probe and the pick are skipped there (counted as lost
+// for the overflow-requery gate, same as before the batch probe existed),
+// and rows leased since the scan fail the visibility re-check here and
+// again at UPDATE time — so probe staleness in either direction is covered
+// without retaining locks. Re-offered survivors stay in FIFO (visible_at,
+// id) order, preserving fair-cap semantics while invisible rows are dropped
+// in one query instead of one lost pick each.
+func (b *Backend) probeRetainedCarry(ctx context.Context, tx pgx.Tx, req backend.ClaimRequest, pending []backend.FairTaskRef) ([]backend.FairTaskRef, bool, error) {
+	ids := make([]int64, 0, len(pending))
+	for _, r := range pending {
+		ids = append(ids, r.ID)
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT id, instance_id, visible_at FROM wf_tasks
+		WHERE id = ANY($1) AND kind = $2 AND visible_at <= now()
+		ORDER BY visible_at, id`, ids, req.Kind)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	kept := make([]backend.FairTaskRef, 0, len(pending))
+	for rows.Next() {
+		var r backend.FairTaskRef
+		if err := rows.Scan(&r.ID, &r.InstanceID, &r.VisibleAt); err != nil {
+			return nil, false, err
+		}
+		kept = append(kept, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	return kept, len(kept) < len(pending), nil
 }
 
 // scanClaimedTask scans the shared claim RETURNING column list and returns
@@ -364,9 +809,9 @@ func decodeActivityTask(t *backend.Task, payload []byte) {
 	t.StartToCloseTimeout = time.Duration(p.StartToCloseTimeoutMs) * time.Millisecond
 }
 
-func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
 	tag, err := b.pool.Exec(ctx, `
-		UPDATE wf_tasks SET visible_at = now() + $2::interval WHERE id = $1`, taskID, interval(d))
+		UPDATE wf_tasks SET visible_at = now() + $2::interval WHERE id = $1 AND worker_id = $3 AND attempt = $4`, t.ID, interval(d), t.WorkerID, t.Attempt)
 	if err != nil {
 		return err
 	}
@@ -376,10 +821,10 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 	return nil
 }
 
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
 	tag, err := b.pool.Exec(ctx, `
-		UPDATE wf_tasks SET visible_at = now() + $2::interval, heartbeat = $3 WHERE id = $1`,
-		taskID, interval(lease), details)
+		UPDATE wf_tasks SET visible_at = now() + $2::interval, heartbeat = $3 WHERE id = $1 AND worker_id = $4 AND attempt = $5`,
+		task.ID, interval(lease), details, task.WorkerID, task.Attempt)
 	if err != nil {
 		return err
 	}
@@ -553,10 +998,12 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 		return backend.ErrConflict
 	}
 
-	// Verify own task exists
+	// Verify own task exists and still belongs to the claimed generation.
 	var kind string
-	err = tx.QueryRow(ctx, `SELECT kind FROM wf_tasks WHERE id = $1 AND instance_id = $2`,
-		adv.TaskID, adv.InstanceID).Scan(&kind)
+	var workerID *string
+	var attempt int
+	err = tx.QueryRow(ctx, `SELECT kind, worker_id, attempt FROM wf_tasks WHERE id = $1 AND instance_id = $2`,
+		adv.TaskID, adv.InstanceID).Scan(&kind, &workerID, &attempt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return backend.ErrConflict
@@ -565,6 +1012,15 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 	}
 	if kind != "workflow" {
 		return backend.ErrConflict
+	}
+	if adv.WorkerID != "" {
+		got := ""
+		if workerID != nil {
+			got = *workerID
+		}
+		if got != adv.WorkerID || attempt != adv.Attempt {
+			return backend.ErrConflict
+		}
 	}
 
 	for _, ev := range adv.NewEvents {
@@ -707,9 +1163,17 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 			}
 		}
 	}
-	_, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE id = $1`, adv.TaskID)
+	var delTag pgconn.CommandTag
+	if adv.WorkerID != "" {
+		delTag, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE id = $1 AND worker_id = $2 AND attempt = $3`, adv.TaskID, adv.WorkerID, adv.Attempt)
+	} else {
+		delTag, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE id = $1`, adv.TaskID)
+	}
 	if err != nil {
 		return err
+	}
+	if adv.WorkerID != "" && delTag.RowsAffected() == 0 {
+		return backend.ErrConflict
 	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO wf_tasks (kind, instance_id, queue)
@@ -737,7 +1201,7 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 	return nil
 }
 
-func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -747,8 +1211,8 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	var instanceID string
 	var refSeq int64
 	err = tx.QueryRow(ctx, `
-		DELETE FROM wf_tasks WHERE id = $1 AND kind = 'activity'
-		RETURNING instance_id, COALESCE(ref_seq, 0)`, taskID).Scan(&instanceID, &refSeq)
+		DELETE FROM wf_tasks WHERE id = $1 AND kind = 'activity' AND worker_id = $2 AND attempt = $3
+		RETURNING instance_id, COALESCE(ref_seq, 0)`, claim.ID, claim.WorkerID, claim.Attempt).Scan(&instanceID, &refSeq)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return backend.ErrSuperseded
@@ -786,16 +1250,16 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	return nil
 }
 
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
 	tag, err := b.pool.Exec(ctx, `
 		UPDATE wf_tasks SET visible_at = now() + $2::interval, worker_id = NULL
-		WHERE id = $1 AND kind = 'activity'`,
-		taskID, interval(delay))
+		WHERE id = $1 AND kind = 'activity' AND worker_id = $3 AND attempt = $4`,
+		claim.ID, interval(delay), claim.WorkerID, claim.Attempt)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return backend.ErrNotFound
+		return backend.ErrSuperseded
 	}
 	return nil
 }
@@ -911,7 +1375,6 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	return n, nil
 }
 
-
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
 	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
 }
@@ -978,10 +1441,10 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 }
 
 type activityPayload struct {
-	Name                    string          `json:"name"`
-	Input                   json.RawMessage `json:"input"`
-	Retry                   retryJSON       `json:"retry"`
-	StartToCloseTimeoutMs   int64           `json:"start_to_close_timeout_ms,omitempty"`
+	Name                  string          `json:"name"`
+	Input                 json.RawMessage `json:"input"`
+	Retry                 retryJSON       `json:"retry"`
+	StartToCloseTimeoutMs int64           `json:"start_to_close_timeout_ms,omitempty"`
 }
 
 type retryJSON struct {
@@ -990,7 +1453,6 @@ type retryJSON struct {
 	MaxIntervalMs      int64   `json:"max_interval_ms"`
 	MaxAttempts        int     `json:"max_attempts"`
 }
-
 
 type inboxEnv struct {
 	Name string          `json:"_name,omitempty"`

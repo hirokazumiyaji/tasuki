@@ -424,11 +424,11 @@ type Backend interface {
 
     // Worker operations
     ClaimTasks(ctx context.Context, req ClaimRequest) ([]Task, error)
-    ExtendLease(ctx context.Context, taskID int64, d time.Duration) error
+    ExtendLease(ctx context.Context, task Task, d time.Duration) error
     LoadWorkflow(ctx context.Context, instanceID string) (*WorkflowState, error)
     CommitAdvancement(ctx context.Context, adv Advancement) error
-    CompleteActivity(ctx context.Context, taskID int64, ev Event) error
-    RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error
+    CompleteActivity(ctx context.Context, task Task, ev Event) error
+    RetryActivity(ctx context.Context, task Task, delay time.Duration) error
     NackTask(ctx context.Context, t Task, delay time.Duration) error
     FireDueTimers(ctx context.Context, limit int) (int, error)
     ClaimDueSchedules(ctx context.Context, limit int) ([]Schedule, error)

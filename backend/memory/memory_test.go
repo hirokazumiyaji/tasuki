@@ -141,14 +141,14 @@ func TestMemory_CompleteActivity(t *testing.T) {
 	if err != nil || len(atasks) != 1 {
 		t.Fatalf("activity claim: %v %#v", err, atasks)
 	}
-	err = b.CompleteActivity(ctx, atasks[0].ID, journal.Event{
+	err = b.CompleteActivity(ctx, atasks[0], journal.Event{
 		Type: journal.TypeActivityCompleted, RefSeq: seq, Payload: []byte(`"y"`),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Second complete should be superseded
-	err = b.CompleteActivity(ctx, atasks[0].ID, journal.Event{
+	err = b.CompleteActivity(ctx, atasks[0], journal.Event{
 		Type: journal.TypeActivityCompleted, RefSeq: seq, Payload: []byte(`"z"`),
 	})
 	if !errors.Is(err, backend.ErrSuperseded) {

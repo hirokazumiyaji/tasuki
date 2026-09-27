@@ -3,10 +3,12 @@ package firestore
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"sort"
 	"time"
 
 	gcf "cloud.google.com/go/firestore"
+	firestorepb "cloud.google.com/go/firestore/apiv1/firestorepb"
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/journal"
 	"google.golang.org/api/iterator"
@@ -294,13 +296,7 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		if !s.Exists() {
 			return backend.ErrNotFound
 		}
-		// Capture the pre-termination incarnation for the post-commit sweep
-		// fence (see sweepTerminateDocs): created_at is written once by
-		// CreateInstance and never updated, so a doc carrying a different
-		// value after a purge is a replacement whose documents the sweep
-		// must never touch. The incarnation token pins the same identity
-		// against clock rollback, VM restore, and precision truncation,
-		// which can all reproduce the same created_at (see newIncarnation).
+		// Pin the post-commit sweep to this instance incarnation.
 		createdAt = timestamp(s.Data(), "created_at")
 		incarnation = str(s.Data(), incarnationField)
 		ids, err := listSignalDedupeIDsTx(tx, b.col("wf_signal_dedupe"), id)
@@ -338,11 +334,27 @@ func (b *Backend) CountClaimableTasks(ctx context.Context, kind string, queues [
 	now := nowUTC()
 	out := map[string]int64{}
 	for _, q := range queues {
-		it := b.col("wf_tasks").
+		query := b.col("wf_tasks").
 			Where("kind", "==", kind).
 			Where("queue", "==", q).
-			Where("visible_at", "<=", now).
-			Documents(ctx)
+			Where("visible_at", "<=", now)
+		res, err := query.NewAggregationQuery().WithCount("n").Get(ctx)
+		if err == nil {
+			var n int64
+			if v, ok := res["n"]; ok {
+				if count, ok := v.(*firestorepb.Value); ok {
+					n = count.GetIntegerValue()
+				}
+			}
+			if n > 0 {
+				out[q] = n
+			}
+			continue
+		}
+		if os.Getenv("FIRESTORE_EMULATOR_HOST") == "" {
+			return nil, err
+		}
+		it := query.Documents(ctx)
 		var n int64
 		for {
 			_, err := it.Next()
@@ -689,16 +701,82 @@ func (b *Backend) updateTask(ctx context.Context, id int64, activity bool, field
 		return tx.Update(r, fields)
 	})
 }
-func (b *Backend) ExtendLease(ctx context.Context, id int64, d time.Duration) error {
-	return b.updateTask(ctx, id, false, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	// Workflow tasks live under WF#<instanceID>, not ACT#<id>.
+	if t.Kind == "workflow" && t.InstanceID != "" {
+		ref := b.ref("wf_tasks", wfTaskID(t.InstanceID))
+		return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+			s, err := tx.Get(ref)
+			if isNotFound(err) {
+				return backend.ErrNotFound
+			}
+			if err != nil {
+				return err
+			}
+			if !s.Exists() {
+				return backend.ErrNotFound
+			}
+			if err := checkWorkflowRenewalDoc(s.Data(), t); err != nil {
+				return err
+			}
+			return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
+		})
+	}
+	ref := b.ref("wf_tasks", actTaskID(t.ID))
+	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		s, err := tx.Get(ref)
+		if isNotFound(err) {
+			return backend.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if !s.Exists() {
+			return backend.ErrNotFound
+		}
+		if err := checkActivityRenewalDoc(s.Data(), t); err != nil {
+			return err
+		}
+		return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
+	})
 }
 
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+func checkActivityRenewalDoc(data map[string]any, t backend.Task) error {
+	if data == nil {
+		return backend.ErrNotFound
+	}
+	if str(data, "worker_id") != t.WorkerID || i64(data, "attempt") != int64(t.Attempt) {
+		return backend.ErrNotFound
+	}
+	return nil
+}
+
+func checkWorkflowRenewalDoc(data map[string]any, t backend.Task) error {
+	if data == nil || i64(data, "id") != t.ID || str(data, "worker_id") != t.WorkerID || i64(data, "attempt") != int64(t.Attempt) {
+		return backend.ErrNotFound
+	}
+	return nil
+}
+
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
 	fields := []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(lease)}}
 	if details != nil {
 		fields = append(fields, gcf.Update{Path: "heartbeat", Value: string(details)})
 	}
-	return b.updateTask(ctx, taskID, false, fields)
+	ref := b.ref("wf_tasks", actTaskID(task.ID))
+	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		s, err := tx.Get(ref)
+		if isNotFound(err) || (err == nil && !s.Exists()) {
+			return backend.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if err := checkActivityRenewalDoc(s.Data(), task); err != nil {
+			return err
+		}
+		return tx.Update(ref, fields)
+	})
 }
 func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
@@ -775,8 +853,31 @@ func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Durat
 	b.notifyTasks()
 	return nil
 }
-func (b *Backend) RetryActivity(ctx context.Context, id int64, delay time.Duration) error {
-	return b.updateTask(ctx, id, true, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(delay)}, {Path: "worker_id", Value: gcf.Delete}})
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
+	r := b.ref("wf_tasks", actTaskID(claim.ID))
+	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		task, err := tx.Get(r)
+		if isNotFound(err) {
+			return backend.ErrSuperseded
+		}
+		if err != nil {
+			return err
+		}
+		if !task.Exists() {
+			return backend.ErrSuperseded
+		}
+		m := task.Data()
+		workerID, hasWorkerID := m["worker_id"].(string)
+		if str(m, "kind") != "activity" || !hasWorkerID || workerID != claim.WorkerID || int(i64(m, "attempt")) != claim.Attempt {
+			return backend.ErrSuperseded
+		}
+		return tx.Update(r, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(delay)}, {Path: "worker_id", Value: gcf.Delete}})
+	})
+	if err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
 }
 func (b *Backend) LoadWorkflowHead(ctx context.Context, id string) (*backend.WorkflowState, error) {
 	inst, err := b.GetInstance(ctx, id)
@@ -983,6 +1084,12 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 	if !taskSnap.Exists() || i64(taskSnap.Data(), "id") != adv.TaskID {
 		return advancementPrep{}, backend.ErrConflict
 	}
+	if adv.WorkerID != "" {
+		m := taskSnap.Data()
+		if str(m, "worker_id") != adv.WorkerID || int(i64(m, "attempt")) != adv.Attempt {
+			return advancementPrep{}, backend.ErrConflict
+		}
+	}
 	inst := decodeInstance(instSnap.Data())
 	// Reject commits for instances that already left running: a task leased
 	// before TerminateInstance still carries a matching ExpectedSeq/TaskID,
@@ -1175,12 +1282,12 @@ func (b *Backend) ensureWorkflowTaskWithForce(ctx context.Context, instanceID st
 	return err
 }
 
-func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
 	now := nowUTC()
 	var instanceID string
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		alloc := newInboxSeqAlloc()
-		r := b.ref("wf_tasks", actTaskID(taskID))
+		r := b.ref("wf_tasks", actTaskID(claim.ID))
 		task, err := tx.Get(r)
 		if isNotFound(err) {
 			return backend.ErrSuperseded
@@ -1188,10 +1295,14 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 		if err != nil {
 			return err
 		}
-		if !task.Exists() || str(task.Data(), "kind") != "activity" {
+		if !task.Exists() {
 			return backend.ErrSuperseded
 		}
 		m := task.Data()
+		workerID, hasWorkerID := m["worker_id"].(string)
+		if str(m, "kind") != "activity" || !hasWorkerID || workerID != claim.WorkerID || int(i64(m, "attempt")) != claim.Attempt {
+			return backend.ErrSuperseded
+		}
 		instanceID = str(m, "instance_id")
 		inst, err := tx.Get(b.ref("wf_instances", instanceID))
 		if isNotFound(err) {
@@ -1613,12 +1724,11 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	if err != nil {
 		return err
 	}
-	// Even on pure dedupe hits, ensure a task when inbox remains: a prior
-	// crash between commit and ensure must not stall the instance forever.
-	if inst.Status == "running" {
-		_ = b.ensureWorkflowTask(ctx, instanceID)
-	}
 	if inserted == 0 {
+		// A retry after commit but before task creation must not strand inbox rows.
+		if inst.Status == "running" {
+			_ = b.ensureWorkflowTask(ctx, instanceID)
+		}
 		return nil
 	}
 	if inst.Status == "running" {

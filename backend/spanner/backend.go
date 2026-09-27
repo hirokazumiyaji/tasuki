@@ -512,12 +512,9 @@ func scanTask(row *spanner.Row) (backend.Task, error) {
 	return t, nil
 }
 
-func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		n, err := txn.Update(ctx, spanner.Statement{
-			SQL:    `UPDATE wf_tasks SET visible_at = @v WHERE id = @id`,
-			Params: map[string]any{"v": nowUTC().Add(d), "id": taskID},
-		})
+		n, err := txn.Update(ctx, extendLeaseStatement(nowUTC().Add(d), t))
 		if err != nil {
 			return err
 		}
@@ -529,11 +526,18 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 	return err
 }
 
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+func extendLeaseStatement(v time.Time, t backend.Task) spanner.Statement {
+	return spanner.Statement{
+		SQL:    `UPDATE wf_tasks SET visible_at = @v WHERE id = @id AND worker_id = @w AND attempt = @a`,
+		Params: map[string]any{"v": v, "id": t.ID, "w": t.WorkerID, "a": int64(t.Attempt)},
+	}
+}
+
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
-			SQL:    `UPDATE wf_tasks SET visible_at = @v, heartbeat = @h WHERE id = @id`,
-			Params: map[string]any{"v": nowUTC().Add(lease), "h": details, "id": taskID},
+			SQL:    `UPDATE wf_tasks SET visible_at = @v, heartbeat = @h WHERE id = @id AND worker_id = @w AND attempt = @a`,
+			Params: map[string]any{"v": nowUTC().Add(lease), "h": details, "id": task.ID, "w": task.WorkerID, "a": int64(task.Attempt)},
 		})
 		if err != nil {
 			return err
@@ -811,7 +815,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	}
 	now := nowUTC()
 
-	taskRow, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{adv.TaskID}, []string{"kind", "instance_id"})
+	taskRow, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{adv.TaskID}, []string{"kind", "instance_id", "worker_id", "attempt"})
 	if err != nil {
 		if isNotFound(err) {
 			return backend.ErrConflict
@@ -819,11 +823,22 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		return err
 	}
 	var kind, taskInst string
-	if err := taskRow.Columns(&kind, &taskInst); err != nil {
+	var worker spanner.NullString
+	var attempt int64
+	if err := taskRow.Columns(&kind, &taskInst, &worker, &attempt); err != nil {
 		return err
 	}
 	if kind != "workflow" || taskInst != adv.InstanceID {
 		return backend.ErrConflict
+	}
+	if adv.WorkerID != "" {
+		got := ""
+		if worker.Valid {
+			got = worker.StringVal
+		}
+		if got != adv.WorkerID || int(attempt) != adv.Attempt {
+			return backend.ErrConflict
+		}
 	}
 
 	var muts []*spanner.Mutation
@@ -1078,12 +1093,12 @@ func ensureWorkflowTaskIfInbox(ctx context.Context, txn *spanner.ReadWriteTransa
 	return enqueueWorkflowTask(ctx, txn, instanceID, queue, nowUTC())
 }
 
-func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
 	now := nowUTC()
 	var wake bool
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{taskID},
-			[]string{"instance_id", "ref_seq", "kind"})
+		row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{claim.ID},
+			[]string{"instance_id", "ref_seq", "kind", "worker_id", "attempt"})
 		if err != nil {
 			if isNotFound(err) {
 				return backend.ErrSuperseded
@@ -1091,15 +1106,17 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 			return err
 		}
 		var instanceID, kind string
+		var workerID spanner.NullString
 		var refSeq spanner.NullInt64
-		if err := row.Columns(&instanceID, &refSeq, &kind); err != nil {
+		var attempt int64
+		if err := row.Columns(&instanceID, &refSeq, &kind, &workerID, &attempt); err != nil {
 			return err
 		}
-		if kind != "activity" {
+		if kind != "activity" || !workerID.Valid || workerID.StringVal != claim.WorkerID || attempt != int64(claim.Attempt) {
 			return backend.ErrSuperseded
 		}
 		if err := txn.BufferWrite([]*spanner.Mutation{
-			spanner.Delete("wf_tasks", spanner.Key{taskID}),
+			spanner.Delete("wf_tasks", spanner.Key{claim.ID}),
 		}); err != nil {
 			return err
 		}
@@ -1141,18 +1158,18 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	return nil
 }
 
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
 			SQL: `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL
-				WHERE id = @id AND kind = 'activity'`,
-			Params: map[string]any{"v": nowUTC().Add(delay), "id": taskID},
+				WHERE id = @id AND kind = 'activity' AND worker_id = @wid AND attempt = @attempt`,
+			Params: map[string]any{"v": nowUTC().Add(delay), "id": claim.ID, "wid": claim.WorkerID, "attempt": int64(claim.Attempt)},
 		})
 		if err != nil {
 			return err
 		}
 		if n == 0 {
-			return backend.ErrNotFound
+			return backend.ErrSuperseded
 		}
 		return nil
 	})

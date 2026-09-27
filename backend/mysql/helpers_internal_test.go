@@ -159,3 +159,43 @@ func TestMigrationProcessLockPerDatabase(t *testing.T) {
 		t.Fatal("canceled context must not acquire the lock")
 	}
 }
+
+// TestIsMissingIndexError pins the retryable purge-index rebuild (Codex
+// round-21 P1 on #294): only MySQL error 1091 (missing index on DROP) may be
+// tolerated for DROP INDEX statements. Every other failure (missing table
+// 1146, permissions 1142, syntax 1064, duplicate key 1061) must abort the
+// migration instead of being silently ignored.
+func TestIsMissingIndexError(t *testing.T) {
+	if isMissingIndexError(nil) {
+		t.Fatal("nil is not a missing-index error")
+	}
+	if !isMissingIndexError(&driver.MySQLError{Number: 1091, Message: "Can't DROP 'wf_instances_completed_at_idx'; check that column/key exists"}) {
+		t.Fatal("want error 1091 to be missing index")
+	}
+	for _, number := range []uint16{1146, 1142, 1064, 1061, 1060} {
+		if isMissingIndexError(&driver.MySQLError{Number: number, Message: "other failure"}) {
+			t.Fatalf("error %d must not be a missing-index error", number)
+		}
+	}
+}
+
+// TestIsDropIndex pins the DROP INDEX statement classifier: only DROP INDEX
+// statements earn missing-index tolerance, so a stray tolerance can never
+// mask a missing table/column elsewhere.
+func TestIsDropIndex(t *testing.T) {
+	if !isDropIndex(`ALTER TABLE wf_instances DROP INDEX wf_instances_completed_at_idx`) {
+		t.Fatal("want DROP INDEX statement detected")
+	}
+	if !isDropIndex("alter table wf_instances drop index x") {
+		t.Fatal("want case-insensitive DROP INDEX detection")
+	}
+	for _, stmt := range []string{
+		`CREATE INDEX wf_instances_completed_at_idx ON wf_instances (completed_at, id)`,
+		`ALTER TABLE wf_instances ADD COLUMN foo INT`,
+		`DROP TABLE wf_instances`,
+	} {
+		if isDropIndex(stmt) {
+			t.Fatalf("want %q to not be a DROP INDEX statement", stmt)
+		}
+	}
+}

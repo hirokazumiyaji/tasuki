@@ -84,13 +84,13 @@ func testWakeupRace(t *testing.T, newBackend Factory) {
 		var errA, errB error
 		go func() {
 			defer wg.Done()
-			errA = b.CompleteActivity(ctx, atasks[0].ID, journal.Event{
+			errA = b.CompleteActivity(ctx, atasks[0], journal.Event{
 				Type: journal.TypeActivityCompleted, RefSeq: seq, Payload: []byte(`"a"`),
 			})
 		}()
 		go func() {
 			defer wg.Done()
-			errB = b.CompleteActivity(ctx, atasks[0].ID, journal.Event{
+			errB = b.CompleteActivity(ctx, atasks[0], journal.Event{
 				Type: journal.TypeActivityCompleted, RefSeq: seq, Payload: []byte(`"b"`),
 			})
 		}()

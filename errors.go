@@ -8,6 +8,14 @@ var (
 	// ErrWorkerAlreadyRunning is returned by Worker.StartWithError when Start
 	// is called on a worker that is already running.
 	ErrWorkerAlreadyRunning = errors.New("tasuki: worker already running")
+	// ErrWorkerShuttingDown is returned by Worker.StartWithError when Start
+	// is called while a Shutdown is still in progress. Restarting in that
+	// window would install a new execution context that the in-flight
+	// Shutdown then cancels at grace expiry (while the old generation's
+	// context leaks live), so the restart is rejected until Shutdown
+	// returns.
+	ErrWorkerShuttingDown = errors.New("tasuki: worker shutting down")
+	errTurnAbandoned      = errors.New("tasuki: workflow turn abandoned")
 )
 
 type nonRetryable struct{ err error }

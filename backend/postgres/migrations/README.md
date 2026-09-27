@@ -9,7 +9,11 @@ migrations/
 ├── 000001_init.up.sql            Base tables and indexes
 ├── 000001_init.down.sql          DROP all tables
 ├── 000002_vacuum_tuning.up.sql   autovacuum / fillfactor tuning
-└── 000002_vacuum_tuning.down.sql Reset tuning settings
+├── 000002_vacuum_tuning.down.sql Reset tuning settings
+├── 000003_purge_search_indexes.up.sql   purge (completed_at, id) + search_attributes GIN indexes
+├── 000003_purge_search_indexes.down.sql Drop those indexes
+├── 000004_fix_purge_index_order.up.sql   rebuild the purge index leading with (completed_at, id)
+└── 000004_fix_purge_index_order.down.sql Restore the single-column purge index
 ```
 
 The naming convention is `<6-digit-version>_<name>.up.sql` / `.down.sql`. Lexicographical file name order determines application order.
@@ -65,6 +69,6 @@ atlas migrate apply --dir file://backend/postgres/migrations \
 
 ## Adding New Migrations
 
-1. Add `000003_<name>.up.sql` / `.down.sql`. Versions must always be monotonically incrementing.
+1. Add `000005_<name>.up.sql` / `.down.sql`. Versions must always be monotonically incrementing.
 2. `.up.sql` does not strictly need to be idempotent (it runs only once and rolls back on failure in a transaction), but using idempotent DDL like `CREATE TABLE IF NOT EXISTS` helps bridge differences with databases migrated from older setups.
 3. Validate against a real PostgreSQL instance with `go test ./...` (requires `TASUKI_POSTGRES_DSN`).
