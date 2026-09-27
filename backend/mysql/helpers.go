@@ -31,11 +31,10 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1062
 }
 
-// isDuplicateIndex reports MySQL error 1061 (ER_DUP_KEYNAME): the index
-// already exists. Used by Migrate to keep the wf_tasks_instance_idx backfill
-// idempotent while surfacing every other CREATE INDEX failure (bad column,
-// insufficient privilege, storage-engine limits) instead of swallowing it.
-func isDuplicateIndex(err error) bool {
+// isDuplicateIndexError reports MySQL error 1061 (ER_DUP_KEYNAME): the named
+// index already exists. Used to make conditional CREATE INDEX idempotent on
+// databases provisioned before the index was added to schema.sql.
+func isDuplicateIndexError(err error) bool {
 	var mysqlErr *mysql.MySQLError
 	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1061
 }
@@ -46,11 +45,23 @@ func isDuplicateIndex(err error) bool {
 // returned so a half-migrated schema never passes silently.
 func execIndexBackfill(ctx context.Context, q queryExecer, stmt string) error {
 	if _, err := q.ExecContext(ctx, stmt); err != nil {
-		if !isDuplicateIndex(err) {
+		if !isDuplicateIndexError(err) {
 			return fmt.Errorf("mysql migrate: %w\nstmt: %s", err, stmt)
 		}
 	}
 	return nil
+}
+
+// isMissingIndexError reports MySQL error 1091 (ER_CANT_DROP_FIELD_OR_KEY):
+// DROP INDEX named an index that does not exist. MySQL DDL autocommits per
+// statement, so a crash between this migration's DROP and CREATE leaves the
+// version unrecorded with the index already gone; the retry's DROP then hits
+// 1091. Only this class of DROP INDEX failure may be tolerated by Migrate
+// (the index is already gone, i.e. the DROP's effect holds); everything else
+// (permissions, missing table, syntax) must abort the migration.
+func isMissingIndexError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1091
 }
 
 // isDuplicateColumnError reports whether err is a duplicate-column error
@@ -138,10 +149,10 @@ func sortedSearchAttributeKeys(m map[string]string) []string {
 }
 
 type activityPayload struct {
-	Name                    string          `json:"name"`
-	Input                   json.RawMessage `json:"input"`
-	Retry                   retryJSON       `json:"retry"`
-	StartToCloseTimeoutMs   int64           `json:"start_to_close_timeout_ms,omitempty"`
+	Name                  string          `json:"name"`
+	Input                 json.RawMessage `json:"input"`
+	Retry                 retryJSON       `json:"retry"`
+	StartToCloseTimeoutMs int64           `json:"start_to_close_timeout_ms,omitempty"`
 }
 
 type retryJSON struct {

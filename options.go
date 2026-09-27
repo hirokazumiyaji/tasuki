@@ -43,6 +43,19 @@ type WorkerOptions struct {
 	// Unreleased leases expire via lease timeout and are reclaimed by peers.
 	// <=0 defaults to 5s.
 	ShutdownReleaseTimeout time.Duration
+	// CommitTimeout bounds detached result commits (CompleteActivity,
+	// RetryActivity, activity failure records, workflow advancement flush)
+	// during normal operation. It is independent of ShutdownReleaseTimeout
+	// so a short shutdown-only bound (e.g. 50ms) cannot cancel ordinary
+	// commits and force re-execution. Once Shutdown has begun, commits
+	// racing shutdown are instead bounded by ShutdownReleaseTimeout to keep
+	// shutdown predictable. <=0 defaults to 30s.
+	CommitTimeout time.Duration
+	// LocalActivityTimeout bounds one ExecuteLocal invocation. The activity
+	// runs with a cancellable context; a call that ignores cancellation may
+	// continue in its goroutine, but its result is discarded after the limit.
+	// <=0 disables the limit.
+	LocalActivityTimeout time.Duration
 	// BacklogSampleInterval throttles backlog gauge sampling (2x
 	// CountClaimableTasks per sample when Metrics is set). 0 defaults to
 	// 10s (coarser than the 1s PollInterval default); negative disables

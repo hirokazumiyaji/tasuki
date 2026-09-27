@@ -10,6 +10,27 @@ import (
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
+func commitTerminateTestBackend(t *testing.T) (*Backend, context.Context, string) {
+	t.Helper()
+	dsn := guardTestDSN(t)
+	ctx := context.Background()
+	if err := RecreateDatabase(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
+	b, err := New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if err := b.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return b, ctx, dsn
+}
+
 // A workflow advancement racing TerminateInstance must be rejected: the
 // leased task still matches ExpectedSeq/TaskID inside the post-flip
 // pre-sweep window, so without the running-status gate a nonterminal commit
@@ -67,7 +88,7 @@ func TestCommitAfterTerminateConflicts(t *testing.T) {
 	}
 	err = b.CommitAdvancement(ctx, backend.Advancement{
 		InstanceID: id, TaskID: tasks[0].ID, ExpectedSeq: st.NextSeq,
-		NewEvents:  []journal.Event{{Seq: st.NextSeq, Type: journal.TypeActivityScheduled, Name: "a"}},
+		NewEvents: []journal.Event{{Seq: st.NextSeq, Type: journal.TypeActivityScheduled, Name: "a"}},
 	})
 	if !errors.Is(err, backend.ErrConflict) {
 		t.Fatalf("suspended commit after terminate: err=%v, want ErrConflict", err)

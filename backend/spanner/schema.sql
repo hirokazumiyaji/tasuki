@@ -14,7 +14,8 @@ CREATE TABLE wf_instances (
   created_at TIMESTAMP NOT NULL,
   updated_at TIMESTAMP NOT NULL,
   completed_at TIMESTAMP,
-  sweep_commit_ts TIMESTAMP OPTIONS (allow_commit_timestamp=true)
+  sweep_commit_ts TIMESTAMP OPTIONS (allow_commit_timestamp=true),
+  incarnation STRING(32)
 ) PRIMARY KEY (id);
 
 CREATE INDEX wf_instances_visibility_idx ON wf_instances(status, name, created_at);
@@ -49,8 +50,21 @@ CREATE TABLE wf_inbox_seq (
 CREATE TABLE wf_signal_dedupe (
   instance_id STRING(255) NOT NULL,
   dedupe_id STRING(255) NOT NULL,
-  created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true)
+  created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+  format_version INT64,
+  fallback_owner STRING(255)
 ) PRIMARY KEY (instance_id, dedupe_id);
+
+-- Post-terminal retry markers live outside the dedupe keyspace (Codex round
+-- 11 on #296): one row per (instance, marker key). Swept with the victim's
+-- other children at purge; without this a purged instance's markers would
+-- survive and suppress the next incarnation's sends under the same
+-- DedupeIDs.
+CREATE TABLE wf_post_terminal_markers (
+  instance_id STRING(255) NOT NULL,
+  marker_key STRING(255) NOT NULL,
+  created_at TIMESTAMP NOT NULL
+) PRIMARY KEY (instance_id, marker_key);
 
 CREATE TABLE wf_tasks (
   id INT64 NOT NULL,
@@ -81,6 +95,23 @@ CREATE TABLE wf_timers (
 ) PRIMARY KEY (instance_id, seq);
 
 CREATE INDEX wf_timers_fire_idx ON wf_timers(fire_at);
+
+-- wf_purge_markers is the durable incarnation fence for purge victims (see
+-- purge.go): one row per victim whose instance row is already gone but whose
+-- trailing sweep/reap may not have finished. Written in the same transaction
+-- as the victim delete, cleared when cleanup completes, resumed by later
+-- purges after a crash. Keyed by victim ID so a later purge of a replacement
+-- incarnation overwrites the row instead of colliding.
+CREATE TABLE wf_purge_markers (
+  instance_id STRING(255) NOT NULL,
+  created_at TIMESTAMP NOT NULL,
+  purged_at TIMESTAMP NOT NULL,
+  -- incarnation pins the victim identity the marker was written for (see
+  -- wf_instances.incarnation): a later purge of a replacement incarnation
+  -- overwrites the row with its own token instead of colliding. NULL on
+  -- rows predating the field.
+  incarnation STRING(32)
+) PRIMARY KEY (instance_id);
 
 CREATE TABLE wf_schedules (
   id STRING(255) NOT NULL,

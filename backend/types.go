@@ -154,6 +154,8 @@ type Advancement struct {
 	ParentNotify  *journal.Event
 	Terminal      *TerminalUpdate
 	EnsureWorkflowTask bool // if true, enqueue workflow task after commit when inbox remains or always for M0 helpers
+	WorkerID      string
+	Attempt       int
 }
 
 // InboxItem is one event for SendToInboxBatch.

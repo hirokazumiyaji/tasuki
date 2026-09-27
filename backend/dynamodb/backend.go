@@ -20,9 +20,6 @@ func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{MaxAdvancementEffects: 80, FairDispatch: true, CleansTerminalState: true, SupportsBulkCleanup: true}
 }
 
-// dynamoTxnItemLimit is the DynamoDB TransactWriteItems item cap. A combined
-// CommitAdvancements batch must fit in a single transaction to stay atomic;
-// anything larger is rejected before applying (see CommitAdvancements).
 const dynamoTxnItemLimit = 100
 
 // advancementItemCount predicts the TransactWriteItems operations
@@ -1104,18 +1101,50 @@ func decodeTask(m map[string]types.AttributeValue) backend.Task {
 	return t
 }
 
-func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
-	return b.updateTask(ctx, taskID, "SET visible_at = :v", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(d)))}, "")
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	// Workflow tasks live under WF#<instanceID>, while activities live under ACT#<id>.
+	if t.Kind == "workflow" && t.InstanceID != "" {
+		cond, values := workflowRenewalFence(t, timeToN(nowUTC().Add(d)))
+		_, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:                 aws.String(b.table("wf_tasks")),
+			Key:                       map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(t.InstanceID))},
+			UpdateExpression:          aws.String("SET visible_at = :v"),
+			ConditionExpression:       aws.String(cond),
+			ExpressionAttributeValues: values,
+		})
+		if conditional(err) {
+			return backend.ErrNotFound
+		}
+		return err
+	}
+	return b.updateActivityLease(ctx, t, d)
 }
 
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
-	values := map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(lease)))}
+func (b *Backend) activityRenewalFence(t backend.Task, visible int64) (string, map[string]types.AttributeValue) {
+	return "kind = :kind AND worker_id = :w AND attempt = :a", map[string]types.AttributeValue{
+		":v": avN(visible), ":kind": avS(t.Kind), ":w": avS(t.WorkerID), ":a": avN(int64(t.Attempt)),
+	}
+}
+
+func (b *Backend) updateActivityLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	cond, values := b.activityRenewalFence(t, timeToN(nowUTC().Add(d)))
+	return b.updateTask(ctx, t.ID, "SET visible_at = :v", values, cond)
+}
+
+func workflowRenewalFence(t backend.Task, visible int64) (string, map[string]types.AttributeValue) {
+	return "attribute_exists(task_pk) AND id = :id AND worker_id = :w AND attempt = :a", map[string]types.AttributeValue{
+		":v": avN(visible), ":id": avN(t.ID), ":w": avS(t.WorkerID), ":a": avN(int64(t.Attempt)),
+	}
+}
+
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
+	cond, values := b.activityRenewalFence(task, timeToN(nowUTC().Add(lease)))
 	update := "SET visible_at = :v"
 	if details != nil {
 		update += ", heartbeat = :h"
 		values[":h"] = avJSON(details)
 	}
-	return b.updateTask(ctx, taskID, update, values, "")
+	return b.updateTask(ctx, task.ID, update, values, cond)
 }
 func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
@@ -1190,8 +1219,15 @@ func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Durat
 	b.notifyTasks()
 	return nil
 }
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
-	return b.updateTask(ctx, taskID, "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(delay)))}, "kind = :kind")
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
+	values := map[string]types.AttributeValue{
+		":v": avN(timeToN(nowUTC().Add(delay))), ":wid": avS(claim.WorkerID), ":attempt": avN(int64(claim.Attempt)),
+	}
+	err := b.updateTask(ctx, claim.ID, "SET visible_at = :v REMOVE worker_id", values, "kind = :kind AND worker_id = :wid AND attempt = :attempt")
+	if errors.Is(err, backend.ErrNotFound) {
+		return backend.ErrSuperseded
+	}
+	return err
 }
 func (b *Backend) updateTask(ctx context.Context, id int64, update string, values map[string]types.AttributeValue, condition string) error {
 	if condition != "" {
@@ -1298,12 +1334,6 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if len(advs) == 0 {
 		return nil
 	}
-	// Reject duplicate instances up front: the batch below builds one
-	// TransactWriteItems with operations from every advancement, and
-	// DynamoDB rejects multiple operations on the same item with a
-	// ValidationException (not mapped to ErrConflict by conditional).
-	// Preflight keeps the batch all-or-nothing with a conflict error
-	// (see backendtest CommitAdvancementsAtomic).
 	seen := make(map[string]struct{}, len(advs))
 	for _, adv := range advs {
 		if _, dup := seen[adv.InstanceID]; dup {
@@ -1317,16 +1347,6 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		}
 		return b.notifyAfterAdvancements(advs)
 	}
-	// Size the combined transaction BEFORE building anything: the batch
-	// below commits as one TransactWriteItems (limit 100 items), and falling
-	// back to sequential per-advancement commits when it overflows would
-	// break atomicity — earlier advancements would stay committed while a
-	// later stale ExpectedSeq returns ErrConflict (see backendtest
-	// CommitAdvancementsAtomic case C). Oversized combined batches are
-	// rejected with a sizing error while every instance is still untouched.
-	// The preflight is read-only (instance reads for the parent-notify term)
-	// so a rejection mutates nothing, not even inbox sequence counters
-	// (which buildAdvancementItems would bump as a side effect).
 	total := 0
 	for _, adv := range advs {
 		inst, err := b.GetInstance(ctx, adv.InstanceID)
@@ -1351,10 +1371,6 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			return err
 		}
 		if len(all)+len(items) > dynamoTxnItemLimit {
-			// Unreachable when the preflight above mirrors
-			// buildAdvancementItems exactly: fail closed with a sizing
-			// error rather than falling back to sequential commits that
-			// would apply the batch partially.
 			return fmt.Errorf("dynamodb: combined batch produces %d transaction operations (limit %d; split the batch or reduce fanout; see docs/09-limits.md)", len(all)+len(items), dynamoTxnItemLimit)
 		}
 		all = append(all, items...)
@@ -1736,9 +1752,16 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 		// follow-up is then part of the same atomic transaction, so no
 		// crash gap can stall the remaining replayed commands (recovery
 		// cannot detect them: they leave no inbox behind).
-		items = append(items, b.refreshWorkflowTask(adv.InstanceID, adv.TaskID, inst.Queue, now))
+		items = append(items, b.refreshWorkflowTask(adv, inst.Queue, now))
 	} else {
-		items = append(items, delWithValues(b.table("wf_tasks"), map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))}, "id = :taskid AND kind = :workflow", map[string]types.AttributeValue{":taskid": avN(adv.TaskID), ":workflow": avS("workflow")}))
+		cond := "id = :taskid AND kind = :workflow"
+		vals := map[string]types.AttributeValue{":taskid": avN(adv.TaskID), ":workflow": avS("workflow")}
+		if adv.WorkerID != "" {
+			cond += " AND worker_id = :wid AND attempt = :attempt"
+			vals[":wid"] = avS(adv.WorkerID)
+			vals[":attempt"] = avN(int64(adv.Attempt))
+		}
+		items = append(items, delWithValues(b.table("wf_tasks"), map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))}, cond, vals))
 	}
 	return items, parentID, nil
 }
@@ -1747,16 +1770,23 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 // truncated advancement: one Update on the same key instead of Delete +
 // post-commit Put. The fence (id/kind condition) is preserved so a zombie
 // task that lost its lease still fails the transaction.
-func (b *Backend) refreshWorkflowTask(instanceID string, taskID int64, queue string, now time.Time) types.TransactWriteItem {
+func (b *Backend) refreshWorkflowTask(adv backend.Advancement, queue string, now time.Time) types.TransactWriteItem {
+	cond := "id = :taskid AND kind = :workflow"
+	vals := map[string]types.AttributeValue{
+		":newid": avN(newID()), ":v": avN(timeToN(now)), ":zero": avN(0), ":now": avN(timeToN(now)),
+		":taskid": avN(adv.TaskID), ":workflow": avS("workflow"),
+	}
+	if adv.WorkerID != "" {
+		cond += " AND worker_id = :wid AND attempt = :attempt"
+		vals[":wid"] = avS(adv.WorkerID)
+		vals[":attempt"] = avN(int64(adv.Attempt))
+	}
 	return types.TransactWriteItem{Update: &types.Update{
-		TableName:           aws.String(b.table("wf_tasks")),
-		Key:                 map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(instanceID))},
-		UpdateExpression:    aws.String("SET id = :newid, visible_at = :v, attempt = :zero, created_at = :now REMOVE worker_id"),
-		ConditionExpression: aws.String("id = :taskid AND kind = :workflow"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":newid": avN(newID()), ":v": avN(timeToN(now)), ":zero": avN(0), ":now": avN(timeToN(now)),
-			":taskid": avN(taskID), ":workflow": avS("workflow"),
-		},
+		TableName:                 aws.String(b.table("wf_tasks")),
+		Key:                       map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))},
+		UpdateExpression:          aws.String("SET id = :newid, visible_at = :v, attempt = :zero, created_at = :now REMOVE worker_id"),
+		ConditionExpression:       aws.String(cond),
+		ExpressionAttributeValues: vals,
 	}}
 }
 
@@ -1891,8 +1921,8 @@ func (b *Backend) putWorkflowTaskLegacy(ctx context.Context, instanceID string, 
 	return err
 }
 
-func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
-	key := map[string]types.AttributeValue{"task_pk": avS(actTaskPK(taskID))}
+func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
+	key := map[string]types.AttributeValue{"task_pk": avS(actTaskPK(claim.ID))}
 	task, err := b.client.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(b.table("wf_tasks")), Key: key, ConsistentRead: aws.Bool(true)})
 	if err != nil || len(task.Item) == 0 || fromS(task.Item["kind"]) != "activity" {
 		return backend.ErrSuperseded
@@ -1905,7 +1935,9 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 		ev.RefSeq = fromN(task.Item["ref_seq"])
 	}
 	now := nowUTC()
-	items := []types.TransactWriteItem{del(b.table("wf_tasks"), key, "attribute_exists(task_pk)")}
+	items := []types.TransactWriteItem{delWithValues(b.table("wf_tasks"), key, "kind = :kind AND worker_id = :wid AND attempt = :attempt", map[string]types.AttributeValue{
+		":kind": avS("activity"), ":wid": avS(claim.WorkerID), ":attempt": avN(int64(claim.Attempt)),
+	})}
 	if inst.Status == "running" {
 		seq, err := b.allocInboxSeqs(ctx, inst.ID, 1)
 		if err != nil {
@@ -2073,7 +2105,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				"attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
 			metas = append(metas, meta{pi, false})
 		}
-		if len(twi) > dynamoTxnItemLimit {
+		if len(twi) > 100 {
 			return backend.ErrBatchTooLarge
 		}
 		_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: twi})

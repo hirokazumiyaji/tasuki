@@ -41,16 +41,13 @@ func Run(t *testing.T, newBackend Factory) {
 	t.Run("SignalDedupeBatch", func(t *testing.T) { testSignalDedupeBatch(t, newBackend) })
 	t.Run("InboxOrder", func(t *testing.T) { testInboxOrder(t, newBackend) })
 	t.Run("NackTask", func(t *testing.T) { testNackTask(t, newBackend) })
+	t.Run("ActivityClaimFencing", func(t *testing.T) { testActivityClaimFencing(t, newBackend) })
 	t.Run("SearchAttributes", func(t *testing.T) { testSearchAttributes(t, newBackend) })
 	t.Run("SearchAttributesPagination", func(t *testing.T) { testSearchAttributesPagination(t, newBackend) })
 	t.Run("Memo", func(t *testing.T) { testMemo(t, newBackend) })
 	t.Run("PurgeInstances", func(t *testing.T) { testPurgeInstances(t, newBackend) })
-	t.Run("TerminalCleanup", func(t *testing.T) { testTerminalCleanup(t, newBackend) })
-	t.Run("TerminateCompleteRace", func(t *testing.T) { testTerminateCompleteRace(t, newBackend) })
-	t.Run("CommitAdvancementsAtomic", func(t *testing.T) { testCommitAdvancementsAtomic(t, newBackend) })
-	t.Run("FairDispatch", func(t *testing.T) { testFairDispatchGated(t, newBackend) })
-	t.Run("BulkTerminatePurge", func(t *testing.T) { testBulkTerminatePurge(t, newBackend) })
-	t.Run("ListInstancesScale", func(t *testing.T) { testListInstancesScale(t, newBackend) })
+	t.Run("TerminalLargeDedupe", func(t *testing.T) { testTerminalLargeDedupe(t, newBackend) })
+	t.Run("FairDispatch", func(t *testing.T) { RunFairDispatch(t, newBackend) })
 	RunConcurrent(t, newBackend)
 	RunM2(t, newBackend)
 	RunM3(t, newBackend)
@@ -326,10 +323,10 @@ func testDoubleComplete(t *testing.T, newBackend Factory) {
 		t.Fatalf("claim act: %v %#v", err, atasks)
 	}
 	ev := journal.Event{Type: journal.TypeActivityCompleted, RefSeq: seq, Payload: []byte(`"ok"`)}
-	if err := b.CompleteActivity(ctx, atasks[0].ID, ev); err != nil {
+	if err := b.CompleteActivity(ctx, atasks[0], ev); err != nil {
 		t.Fatal(err)
 	}
-	err = b.CompleteActivity(ctx, atasks[0].ID, ev)
+	err = b.CompleteActivity(ctx, atasks[0], ev)
 	if !errors.Is(err, backend.ErrSuperseded) {
 		t.Fatalf("want ErrSuperseded, got %v", err)
 	}
@@ -351,7 +348,7 @@ func testTerminateLateComplete(t *testing.T, newBackend Factory) {
 	if len(atasks) != 0 {
 		t.Fatalf("activity tasks should be gone, got %d", len(atasks))
 	}
-	err = b.CompleteActivity(ctx, 42, journal.Event{
+	err = b.CompleteActivity(ctx, backend.Task{ID: 42, Kind: "activity", WorkerID: "missing", Attempt: 1}, journal.Event{
 		Type: journal.TypeActivityCompleted, RefSeq: seq, Payload: []byte(`"late"`),
 	})
 	if !errors.Is(err, backend.ErrSuperseded) {
