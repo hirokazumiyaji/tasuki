@@ -399,9 +399,9 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 	return ids, nil
 }
 
-func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
 	res, err := b.db.ExecContext(ctx, `
-		UPDATE wf_tasks SET visible_at = ? WHERE id = ?`, formatTime(nowUTC().Add(d)), taskID)
+		UPDATE wf_tasks SET visible_at = ? WHERE id = ? AND worker_id = ? AND attempt = ?`, formatTime(nowUTC().Add(d)), t.ID, t.WorkerID, t.Attempt)
 	if err != nil {
 		return err
 	}
@@ -415,14 +415,14 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 	return nil
 }
 
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
 	var hb any
 	if details != nil {
 		hb = string(details)
 	}
 	res, err := b.db.ExecContext(ctx, `
-		UPDATE wf_tasks SET visible_at = ?, heartbeat = ? WHERE id = ?`,
-		formatTime(nowUTC().Add(lease)), hb, taskID)
+		UPDATE wf_tasks SET visible_at = ?, heartbeat = ? WHERE id = ? AND worker_id = ? AND attempt = ?`,
+		formatTime(nowUTC().Add(lease)), hb, task.ID, task.WorkerID, task.Attempt)
 	if err != nil {
 		return err
 	}
@@ -610,8 +610,10 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 	}
 
 	var kind string
-	err = conn.QueryRowContext(ctx, `SELECT kind FROM wf_tasks WHERE id = ? AND instance_id = ?`,
-		adv.TaskID, adv.InstanceID).Scan(&kind)
+	var workerID sql.NullString
+	var attempt int64
+	err = conn.QueryRowContext(ctx, `SELECT kind, worker_id, attempt FROM wf_tasks WHERE id = ? AND instance_id = ?`,
+		adv.TaskID, adv.InstanceID).Scan(&kind, &workerID, &attempt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return backend.ErrConflict
@@ -620,6 +622,15 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 	}
 	if kind != "workflow" {
 		return backend.ErrConflict
+	}
+	if adv.WorkerID != "" {
+		gotWorker := ""
+		if workerID.Valid {
+			gotWorker = workerID.String
+		}
+		if gotWorker != adv.WorkerID || int(attempt) != adv.Attempt {
+			return backend.ErrConflict
+		}
 	}
 
 	for _, ev := range adv.NewEvents {
@@ -762,9 +773,17 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 			}
 		}
 	}
-	_, err = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE id = ?`, adv.TaskID)
+	var delRes sql.Result
+	if adv.WorkerID != "" {
+		delRes, err = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE id = ? AND worker_id = ? AND attempt = ?`, adv.TaskID, adv.WorkerID, adv.Attempt)
+	} else {
+		delRes, err = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE id = ?`, adv.TaskID)
+	}
 	if err != nil {
 		return err
+	}
+	if n, derr := delRes.RowsAffected(); derr == nil && n == 0 && adv.WorkerID != "" {
+		return backend.ErrConflict
 	}
 	if err := ensureWorkflowTaskIfInbox(ctx, conn, adv.InstanceID); err != nil {
 		return err

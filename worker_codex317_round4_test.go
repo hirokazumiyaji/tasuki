@@ -26,9 +26,9 @@ type extendCall struct {
 	live   bool
 }
 
-func (b *extendRecorder) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *extendRecorder) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	b.mu.Lock()
-	b.calls = append(b.calls, extendCall{taskID: taskID, live: ctx.Err() == nil})
+	b.calls = append(b.calls, extendCall{taskID: task.ID, live: ctx.Err() == nil})
 	b.mu.Unlock()
 	return nil
 }
@@ -60,10 +60,10 @@ func TestExtendLeaseLoopRenewsImmediatelyOnDetachedEntry(t *testing.T) {
 	// A detached commit is always entered via beginDetachedCommit, which
 	// also seeds the renewal continuity guard: mirror the production
 	// setup so the loop's cover renewal is owned (round-9 P1b).
-	tok := w.track(42)
+	tok := w.trackTaskAt(backend.Task{ID: 42, Kind: "activity", WorkerID: "w1", Attempt: 1}, time.Now())
 	defer w.untrack(42, tok)
 	defer w.dropDetachedGuard(42, tok)
-	if !w.beginDetachedCommit(42, tok, &committing) {
+	if !w.beginDetachedCommit(42, tok, &committing, context.Background()) {
 		t.Fatal("beginDetachedCommit failed on a tracked entry")
 	}
 	done := make(chan struct{})

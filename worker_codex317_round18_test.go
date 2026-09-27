@@ -29,13 +29,13 @@ type ignoreCtxStallExtendBackend struct {
 	release   chan struct{}
 }
 
-func (b *ignoreCtxStallExtendBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *ignoreCtxStallExtendBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	b.mu.Lock()
 	b.calls++
 	first := b.calls == 1
 	b.mu.Unlock()
 	if !first {
-		return b.Backend.ExtendLease(ctx, taskID, d)
+		return b.Backend.ExtendLease(ctx, task, d)
 	}
 	if b.enterOnce.CompareAndSwap(false, true) {
 		close(b.entered)
@@ -43,7 +43,7 @@ func (b *ignoreCtxStallExtendBackend) ExtendLease(ctx context.Context, taskID in
 	// Deliberately deaf to ctx: the stuck ordinary renewal from the
 	// finding stays blocked across the pre-commit abort and the commit.
 	<-b.release
-	err := b.Backend.ExtendLease(context.Background(), taskID, d)
+	err := b.Backend.ExtendLease(context.Background(), task, d)
 	b.mu.Lock()
 	b.landed++
 	b.mu.Unlock()

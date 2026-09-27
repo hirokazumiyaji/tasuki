@@ -117,7 +117,7 @@ func TestWorker_Round15_DeadlineExpiryCancelsCover(t *testing.T) {
 	defer w.untrack(task.ID, tok)
 	defer w.dropDetachedGuard(task.ID, tok)
 	var committing atomic.Bool
-	if !w.beginDetachedCommit(task.ID, tok, &committing) {
+	if !w.beginDetachedCommit(task.ID, tok, &committing, context.Background()) {
 		t.Fatal("beginDetachedCommit failed on a tracked entry")
 	}
 

@@ -1,6 +1,7 @@
 package tasuki
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -14,6 +15,29 @@ func (a *workflowActor) dispatch(fn func()) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	fn()
+}
+
+func (a *workflowActor) dispatchContext(ctx context.Context, fn func()) bool {
+	locked := make(chan struct{})
+	go func() {
+		a.mu.Lock()
+		close(locked)
+	}()
+	select {
+	case <-ctx.Done():
+		go func() {
+			<-locked
+			a.mu.Unlock()
+		}()
+		return false
+	case <-locked:
+		defer a.mu.Unlock()
+		if ctx.Err() != nil {
+			return false
+		}
+		fn()
+		return true
+	}
 }
 
 func (w *Worker) actorFor(instanceID string) *workflowActor {

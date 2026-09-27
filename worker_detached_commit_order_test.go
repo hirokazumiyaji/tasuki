@@ -75,11 +75,11 @@ type gateNackBackend struct {
 	extendCalls int
 }
 
-func (b *gateNackBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *gateNackBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	b.mu.Lock()
 	b.extendCalls++
 	b.mu.Unlock()
-	return b.Backend.ExtendLease(ctx, taskID, d)
+	return b.Backend.ExtendLease(ctx, task, d)
 }
 
 func (b *gateNackBackend) extendCount() int {

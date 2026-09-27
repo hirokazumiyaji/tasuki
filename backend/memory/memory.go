@@ -228,22 +228,28 @@ func (b *Backend) TerminateInstance(_ context.Context, id string) error {
 	return nil
 }
 
-func (b *Backend) ExtendLease(_ context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(_ context.Context, task backend.Task, d time.Duration) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	t, ok := b.tasks[taskID]
+	t, ok := b.tasks[task.ID]
 	if !ok {
+		return backend.ErrNotFound
+	}
+	if t.workerID != task.WorkerID || t.attempt != task.Attempt {
 		return backend.ErrNotFound
 	}
 	t.visibleAt = b.now.Add(d)
 	return nil
 }
 
-func (b *Backend) RecordHeartbeat(_ context.Context, taskID int64, lease time.Duration, details []byte) error {
+func (b *Backend) RecordHeartbeat(_ context.Context, task backend.Task, lease time.Duration, details []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	t, ok := b.tasks[taskID]
+	t, ok := b.tasks[task.ID]
 	if !ok {
+		return backend.ErrNotFound
+	}
+	if t.workerID != task.WorkerID || t.attempt != task.Attempt {
 		return backend.ErrNotFound
 	}
 	t.visibleAt = b.now.Add(lease)
@@ -504,6 +510,9 @@ func (b *Backend) preflightAdvancementLocked(adv backend.Advancement) error {
 	if !ok || own.instanceID != adv.InstanceID || own.kind != "workflow" {
 		return backend.ErrConflict
 	}
+	if adv.WorkerID != "" && (own.workerID != adv.WorkerID || own.attempt != adv.Attempt) {
+		return backend.ErrConflict
+	}
 	return nil
 }
 
@@ -517,6 +526,9 @@ func (b *Backend) commitAdvancementLocked(adv backend.Advancement) error {
 	}
 	own, ok := b.tasks[adv.TaskID]
 	if !ok || own.instanceID != adv.InstanceID || own.kind != "workflow" {
+		return backend.ErrConflict
+	}
+	if adv.WorkerID != "" && (own.workerID != adv.WorkerID || own.attempt != adv.Attempt) {
 		return backend.ErrConflict
 	}
 

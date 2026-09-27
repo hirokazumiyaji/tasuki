@@ -66,18 +66,18 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		muts := []*spanner.Mutation{
 			spanner.InsertMap("wf_instances", map[string]any{
-				"id":         inst.ID,
-				"name":       inst.Name,
-				"queue":      queue,
-				"status":     "running",
-				"input":      jsonVal(inst.Input),
-				"next_seq":   int64(2),
-				"parent_id":  nullStr(inst.ParentID),
-				"parent_seq": nullInt(inst.ParentSeq),
+				"id":                inst.ID,
+				"name":              inst.Name,
+				"queue":             queue,
+				"status":            "running",
+				"input":             jsonVal(inst.Input),
+				"next_seq":          int64(2),
+				"parent_id":         nullStr(inst.ParentID),
+				"parent_seq":        nullInt(inst.ParentSeq),
 				"search_attributes": jsonVal(backend.MarshalSearchAttributes(inst.SearchAttributes)),
 				"memo":              jsonVal(backend.MarshalSearchAttributes(inst.Memo)),
-				"created_at": now,
-				"updated_at": now,
+				"created_at":        now,
+				"updated_at":        now,
 			}),
 			spanner.InsertMap("wf_journal", map[string]any{
 				"instance_id": inst.ID,
@@ -441,12 +441,9 @@ func scanTask(row *spanner.Row) (backend.Task, error) {
 	return t, nil
 }
 
-func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		n, err := txn.Update(ctx, spanner.Statement{
-			SQL:    `UPDATE wf_tasks SET visible_at = @v WHERE id = @id`,
-			Params: map[string]any{"v": nowUTC().Add(d), "id": taskID},
-		})
+		n, err := txn.Update(ctx, extendLeaseStatement(nowUTC().Add(d), t))
 		if err != nil {
 			return err
 		}
@@ -458,11 +455,18 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 	return err
 }
 
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+func extendLeaseStatement(v time.Time, t backend.Task) spanner.Statement {
+	return spanner.Statement{
+		SQL:    `UPDATE wf_tasks SET visible_at = @v WHERE id = @id AND worker_id = @w AND attempt = @a`,
+		Params: map[string]any{"v": v, "id": t.ID, "w": t.WorkerID, "a": int64(t.Attempt)},
+	}
+}
+
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
-			SQL: `UPDATE wf_tasks SET visible_at = @v, heartbeat = @h WHERE id = @id`,
-			Params: map[string]any{"v": nowUTC().Add(lease), "h": details, "id": taskID},
+			SQL:    `UPDATE wf_tasks SET visible_at = @v, heartbeat = @h WHERE id = @id AND worker_id = @w AND attempt = @a`,
+			Params: map[string]any{"v": nowUTC().Add(lease), "h": details, "id": task.ID, "w": task.WorkerID, "a": int64(task.Attempt)},
 		})
 		if err != nil {
 			return err
@@ -672,7 +676,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	}
 	now := nowUTC()
 
-	taskRow, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{adv.TaskID}, []string{"kind", "instance_id"})
+	taskRow, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{adv.TaskID}, []string{"kind", "instance_id", "worker_id", "attempt"})
 	if err != nil {
 		if isNotFound(err) {
 			return backend.ErrConflict
@@ -680,11 +684,22 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 		return err
 	}
 	var kind, taskInst string
-	if err := taskRow.Columns(&kind, &taskInst); err != nil {
+	var worker spanner.NullString
+	var attempt int64
+	if err := taskRow.Columns(&kind, &taskInst, &worker, &attempt); err != nil {
 		return err
 	}
 	if kind != "workflow" || taskInst != adv.InstanceID {
 		return backend.ErrConflict
+	}
+	if adv.WorkerID != "" {
+		got := ""
+		if worker.Valid {
+			got = worker.StringVal
+		}
+		if got != adv.WorkerID || int(attempt) != adv.Attempt {
+			return backend.ErrConflict
+		}
 	}
 
 	var muts []*spanner.Mutation
@@ -788,7 +803,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 				"parent_id": ch.ParentID, "parent_seq": ch.ParentSeq,
 				"search_attributes": jsonVal(backend.MarshalSearchAttributes(ch.SearchAttributes)),
 				"memo":              jsonVal(backend.MarshalSearchAttributes(ch.Memo)),
-				"created_at": now, "updated_at": now,
+				"created_at":        now, "updated_at": now,
 			}),
 			spanner.InsertMap("wf_journal", map[string]any{
 				"instance_id": ch.ID, "seq": int64(1),

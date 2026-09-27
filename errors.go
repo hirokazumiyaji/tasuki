@@ -15,6 +15,7 @@ var (
 	// context leaks live), so the restart is rejected until Shutdown
 	// returns.
 	ErrWorkerShuttingDown = errors.New("tasuki: worker shutting down")
+	errTurnAbandoned      = errors.New("tasuki: workflow turn abandoned")
 )
 
 type nonRetryable struct{ err error }

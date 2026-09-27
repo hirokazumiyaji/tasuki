@@ -56,7 +56,7 @@ type round24GateExtendBackend struct {
 	commitEntered atomic.Bool
 }
 
-func (b *round24GateExtendBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *round24GateExtendBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	if b.extendOnce.CompareAndSwap(false, true) {
 		close(b.extendEntered)
 	}
@@ -65,7 +65,7 @@ func (b *round24GateExtendBackend) ExtendLease(ctx context.Context, taskID int64
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return b.Backend.ExtendLease(ctx, taskID, d)
+	return b.Backend.ExtendLease(ctx, task, d)
 }
 
 func (b *round24GateExtendBackend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {

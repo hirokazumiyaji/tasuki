@@ -24,7 +24,7 @@ type orderExtendBackend struct {
 	release   chan struct{}
 }
 
-func (b *orderExtendBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *orderExtendBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	b.mu.Lock()
 	b.calls++
 	n := b.calls
@@ -65,7 +65,7 @@ func TestWorker_Round13_DetachedGuardDeadlineMonotonic(t *testing.T) {
 	const taskID = int64(999)
 	tok := w.track(taskID)
 	var committing atomic.Bool
-	if !w.beginDetachedCommit(taskID, tok, &committing) {
+	if !w.beginDetachedCommit(taskID, tok, &committing, context.Background()) {
 		t.Fatal("beginDetachedCommit failed on a tracked entry")
 	}
 	defer w.dropDetachedGuard(taskID, tok)

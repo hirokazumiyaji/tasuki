@@ -51,6 +51,11 @@ type WorkerOptions struct {
 	// racing shutdown are instead bounded by ShutdownReleaseTimeout to keep
 	// shutdown predictable. <=0 defaults to 30s.
 	CommitTimeout time.Duration
+	// LocalActivityTimeout bounds one ExecuteLocal invocation. The activity
+	// runs with a cancellable context; a call that ignores cancellation may
+	// continue in its goroutine, but its result is discarded after the limit.
+	// <=0 disables the limit.
+	LocalActivityTimeout time.Duration
 	// BacklogSampleInterval throttles backlog gauge sampling (2x
 	// CountClaimableTasks per sample when Metrics is set). 0 defaults to
 	// 10s (coarser than the 1s PollInterval default); negative disables

@@ -160,13 +160,13 @@ type round26BlockExtendBackend struct {
 	commitCalls   atomic.Int32
 }
 
-func (b *round26BlockExtendBackend) ExtendLease(_ context.Context, id int64, d time.Duration) error {
+func (b *round26BlockExtendBackend) ExtendLease(_ context.Context, task backend.Task, d time.Duration) error {
 	if b.extendOnce.CompareAndSwap(false, true) {
 		close(b.extendEntered)
 	}
 	// Deliberately ignore ctx: block until the test releases, then land.
 	<-b.extendRelease
-	return b.Backend.ExtendLease(context.Background(), id, d)
+	return b.Backend.ExtendLease(context.Background(), task, d)
 }
 
 func (b *round26BlockExtendBackend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {

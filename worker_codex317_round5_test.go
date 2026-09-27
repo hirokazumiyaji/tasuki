@@ -30,18 +30,18 @@ func (b *joinOrderBackend) record(ev string) {
 	b.mu.Unlock()
 }
 
-func (b *joinOrderBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *joinOrderBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	if b.armBlock.Load() {
 		b.record("extend-enter")
 		if b.enterOnce.CompareAndSwap(false, true) {
 			close(b.extendEntered)
 		}
 		<-b.extendGate
-		err := b.Backend.ExtendLease(ctx, taskID, d)
+		err := b.Backend.ExtendLease(ctx, task, d)
 		b.record("extend-exit")
 		return err
 	}
-	return b.Backend.ExtendLease(ctx, taskID, d)
+	return b.Backend.ExtendLease(ctx, task, d)
 }
 
 func (b *joinOrderBackend) ReleaseLease(ctx context.Context, t backend.Task) error {

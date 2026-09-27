@@ -22,11 +22,11 @@ type transientArmExtendBackend struct {
 	armFail atomic.Bool
 }
 
-func (b *transientArmExtendBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *transientArmExtendBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	if b.armFail.Load() {
 		return errors.New("transient store timeout")
 	}
-	return b.Backend.ExtendLease(ctx, taskID, d)
+	return b.Backend.ExtendLease(ctx, task, d)
 }
 
 // TestWorker_Round11_TransientCoverFailureAbortsBlockedCommit is the
@@ -126,7 +126,7 @@ type stallExtendBackend struct {
 	release   chan struct{}
 }
 
-func (b *stallExtendBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *stallExtendBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	b.mu.Lock()
 	b.calls++
 	b.mu.Unlock()
@@ -150,7 +150,7 @@ func (b *stallExtendBackend) ExtendLease(ctx context.Context, taskID int64, d ti
 	b.mu.Lock()
 	b.landed++
 	b.mu.Unlock()
-	return b.Backend.ExtendLease(ctx, taskID, d)
+	return b.Backend.ExtendLease(ctx, task, d)
 }
 
 func (b *stallExtendBackend) callCount() int {
@@ -213,7 +213,7 @@ func TestWorker_Round11_ExclusiveCommitAbortsOnStuckCover(t *testing.T) {
 	defer w.untrack(task.ID, tok)
 	defer w.dropDetachedGuard(task.ID, tok)
 	var committing atomic.Bool
-	if !w.beginDetachedCommit(task.ID, tok, &committing) {
+	if !w.beginDetachedCommit(task.ID, tok, &committing, context.Background()) {
 		t.Fatal("beginDetachedCommit failed on a tracked entry")
 	}
 

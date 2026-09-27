@@ -123,7 +123,7 @@ type failExtendBackend struct {
 	completes atomic.Int32
 }
 
-func (b *failExtendBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *failExtendBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	b.extends.Add(1)
 	return errors.New("transient store timeout")
 }

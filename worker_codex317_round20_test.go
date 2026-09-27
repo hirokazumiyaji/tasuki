@@ -27,7 +27,7 @@ type stallExtendCountingBackend struct {
 	releases  atomic.Int32
 }
 
-func (b *stallExtendCountingBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *stallExtendCountingBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	b.mu.Lock()
 	b.calls++
 	call := b.calls
@@ -39,13 +39,13 @@ func (b *stallExtendCountingBackend) ExtendLease(ctx context.Context, taskID int
 		// Deliberately deaf to ctx: the stuck renewal stays blocked
 		// across grace expiry even though its context is canceled.
 		<-b.release
-		err := b.Backend.ExtendLease(context.Background(), taskID, d)
+		err := b.Backend.ExtendLease(context.Background(), task, d)
 		b.mu.Lock()
 		b.landed++
 		b.mu.Unlock()
 		return err
 	}
-	return b.Backend.ExtendLease(ctx, taskID, d)
+	return b.Backend.ExtendLease(ctx, task, d)
 }
 
 func (b *stallExtendCountingBackend) ReleaseLease(ctx context.Context, t backend.Task) error {
@@ -221,11 +221,11 @@ type gateRetryBackend struct {
 	retryRelease chan struct{}
 }
 
-func (b *gateRetryBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *gateRetryBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	b.mu.Lock()
 	b.extendCalls++
 	b.mu.Unlock()
-	return b.Backend.ExtendLease(ctx, taskID, d)
+	return b.Backend.ExtendLease(ctx, task, d)
 }
 
 func (b *gateRetryBackend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
@@ -360,7 +360,7 @@ func TestWorker_Round20_CoverJoinAbortsWriteOnTimeout(t *testing.T) {
 	defer w.dropDetachedGuard(task.ID, tok)
 
 	var committing atomic.Bool
-	if !w.beginDetachedCommit(task.ID, tok, &committing) {
+	if !w.beginDetachedCommit(task.ID, tok, &committing, context.Background()) {
 		t.Fatal("beginDetachedCommit refused a live tracked claim")
 	}
 	// Plant a cover renewal and wait until it is genuinely blocked in

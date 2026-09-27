@@ -52,7 +52,7 @@ func TestWorker_Round16_OrdinaryRenewalJoinedBeforeExclusiveCommit(t *testing.T)
 	})
 	task := setupClaimableActivityTask(t, ctx, mem, mem, setupW, "round16-ordinary-1", "hooked")
 
-	tok := w.track(task.ID)
+	tok := w.trackTaskAt(task, time.Now())
 	defer w.untrack(task.ID, tok)
 	defer w.dropDetachedGuard(task.ID, tok)
 
@@ -65,7 +65,7 @@ func TestWorker_Round16_OrdinaryRenewalJoinedBeforeExclusiveCommit(t *testing.T)
 	ordCh := make(chan error, 1)
 	go func() {
 		renewStart := time.Now()
-		rerr := store.ExtendLease(ctx, task.ID, 10*time.Second)
+		rerr := store.ExtendLease(ctx, task, 10*time.Second)
 		w.renewExit(task.ID)
 		if rerr == nil {
 			w.refreshLeaseAt(task.ID, tok, renewStart)
@@ -83,7 +83,7 @@ func TestWorker_Round16_OrdinaryRenewalJoinedBeforeExclusiveCommit(t *testing.T)
 	// blocked: committing flips, the guard seeds, and no new ordinary
 	// renewal for this task may start — but the admitted one is live.
 	var committing atomic.Bool
-	if !w.beginDetachedCommit(task.ID, tok, &committing) {
+	if !w.beginDetachedCommit(task.ID, tok, &committing, context.Background()) {
 		close(store.release)
 		t.Fatal("beginDetachedCommit failed on a tracked entry")
 	}

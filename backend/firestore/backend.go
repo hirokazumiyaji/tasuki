@@ -573,16 +573,82 @@ func (b *Backend) updateTask(ctx context.Context, id int64, activity bool, field
 		return tx.Update(r, fields)
 	})
 }
-func (b *Backend) ExtendLease(ctx context.Context, id int64, d time.Duration) error {
-	return b.updateTask(ctx, id, false, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	// Workflow tasks live under WF#<instanceID>, not ACT#<id>.
+	if t.Kind == "workflow" && t.InstanceID != "" {
+		ref := b.ref("wf_tasks", wfTaskID(t.InstanceID))
+		return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+			s, err := tx.Get(ref)
+			if isNotFound(err) {
+				return backend.ErrNotFound
+			}
+			if err != nil {
+				return err
+			}
+			if !s.Exists() {
+				return backend.ErrNotFound
+			}
+			if err := checkWorkflowRenewalDoc(s.Data(), t); err != nil {
+				return err
+			}
+			return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
+		})
+	}
+	ref := b.ref("wf_tasks", actTaskID(t.ID))
+	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		s, err := tx.Get(ref)
+		if isNotFound(err) {
+			return backend.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if !s.Exists() {
+			return backend.ErrNotFound
+		}
+		if err := checkActivityRenewalDoc(s.Data(), t); err != nil {
+			return err
+		}
+		return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
+	})
 }
 
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+func checkActivityRenewalDoc(data map[string]any, t backend.Task) error {
+	if data == nil {
+		return backend.ErrNotFound
+	}
+	if str(data, "worker_id") != t.WorkerID || i64(data, "attempt") != int64(t.Attempt) {
+		return backend.ErrNotFound
+	}
+	return nil
+}
+
+func checkWorkflowRenewalDoc(data map[string]any, t backend.Task) error {
+	if data == nil || i64(data, "id") != t.ID || str(data, "worker_id") != t.WorkerID || i64(data, "attempt") != int64(t.Attempt) {
+		return backend.ErrNotFound
+	}
+	return nil
+}
+
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
 	fields := []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(lease)}}
 	if details != nil {
 		fields = append(fields, gcf.Update{Path: "heartbeat", Value: string(details)})
 	}
-	return b.updateTask(ctx, taskID, false, fields)
+	ref := b.ref("wf_tasks", actTaskID(task.ID))
+	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		s, err := tx.Get(ref)
+		if isNotFound(err) || (err == nil && !s.Exists()) {
+			return backend.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if err := checkActivityRenewalDoc(s.Data(), task); err != nil {
+			return err
+		}
+		return tx.Update(ref, fields)
+	})
 }
 func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
@@ -795,6 +861,12 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 	}
 	if !taskSnap.Exists() || i64(taskSnap.Data(), "id") != adv.TaskID {
 		return advancementPrep{}, backend.ErrConflict
+	}
+	if adv.WorkerID != "" {
+		m := taskSnap.Data()
+		if str(m, "worker_id") != adv.WorkerID || int(i64(m, "attempt")) != adv.Attempt {
+			return advancementPrep{}, backend.ErrConflict
+		}
 	}
 	inst := decodeInstance(instSnap.Data())
 	if adv.ParentNotify != nil && inst.ParentID != "" {

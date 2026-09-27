@@ -29,9 +29,12 @@ type Backend interface {
 	// CountClaimableTasks returns per-queue counts of tasks with visible_at <= store now
 	// for kind among queues. Queues with zero may be omitted.
 	CountClaimableTasks(ctx context.Context, kind string, queues []string) (map[string]int64, error)
-	ExtendLease(ctx context.Context, taskID int64, d time.Duration) error
-	// RecordHeartbeat extends the lease and stores details for GetHeartbeatDetails on later attempts.
-	RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error
+	// ExtendLease conditionally extends the task's lease only while its exact
+	// worker and attempt claim still own it. A mismatch returns ErrNotFound.
+	ExtendLease(ctx context.Context, task Task, d time.Duration) error
+	// RecordHeartbeat extends the lease and stores details for later attempts
+	// only while the task's worker and attempt claim still match.
+	RecordHeartbeat(ctx context.Context, task Task, lease time.Duration, details []byte) error
 	// ReleaseLease makes a claimed task immediately reclaimable.
 	// The task carries the claim ownership token (ID, Kind, InstanceID,
 	// WorkerID, Attempt): backends route workflow tasks by

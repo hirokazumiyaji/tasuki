@@ -40,7 +40,7 @@ func newBlockExtendBackend(mem *memory.Backend, blockFirst bool, failRest error)
 	}
 }
 
-func (b *blockExtendBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *blockExtendBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	b.mu.Lock()
 	b.calls++
 	first := b.calls == 1
@@ -64,7 +64,7 @@ func (b *blockExtendBackend) ExtendLease(ctx context.Context, taskID int64, d ti
 		b.mu.Lock()
 		b.exits++
 		b.mu.Unlock()
-		return b.Backend.ExtendLease(ctx, taskID, d)
+		return b.Backend.ExtendLease(ctx, task, d)
 	}
 	if b.failRest != nil {
 		return b.failRest
@@ -72,7 +72,7 @@ func (b *blockExtendBackend) ExtendLease(ctx context.Context, taskID int64, d ti
 	b.mu.Lock()
 	b.exits++
 	b.mu.Unlock()
-	return b.Backend.ExtendLease(ctx, taskID, d)
+	return b.Backend.ExtendLease(ctx, task, d)
 }
 
 func (b *blockExtendBackend) callCount() int {
@@ -112,11 +112,11 @@ func TestWorker_Round10_RenewalCompletingPastDeadlineAbortsCommit(t *testing.T) 
 		IncompatibleRetryDelay: -1,
 	})
 
-	tok := w.track(task.ID)
+	tok := w.trackTaskAt(task, time.Now())
 	defer w.untrack(task.ID, tok)
 	defer w.dropDetachedGuard(task.ID, tok)
 	var committing atomic.Bool
-	if !w.beginDetachedCommit(task.ID, tok, &committing) {
+	if !w.beginDetachedCommit(task.ID, tok, &committing, context.Background()) {
 		t.Fatal("beginDetachedCommit failed on a tracked entry")
 	}
 	// Release the renewal 400ms in — well past the 200ms continuity
@@ -177,7 +177,7 @@ func TestWorker_Round10_ObservedLossAbortsInflightCommit(t *testing.T) {
 		return "ok", nil
 	}, WithName("hooked"))
 
-	tok := w.track(task.ID)
+	tok := w.trackTaskAt(task, time.Now())
 	defer w.untrack(task.ID, tok)
 	herrCh := make(chan error, 1)
 	go func() { herrCh <- w.handleActivity(ctx, task, tok) }()
@@ -255,7 +255,7 @@ func TestWorker_Round10_LossDuringBlockedCommitCancelsStoreOp(t *testing.T) {
 		return "ok", nil
 	}, WithName("hooked"))
 
-	tok := w.track(task.ID)
+	tok := w.trackTaskAt(task, time.Now())
 	defer w.untrack(task.ID, tok)
 	gated.armCommit.Store(true)
 	herrCh := make(chan error, 1)
@@ -333,11 +333,11 @@ type armableExtendBackend struct {
 	armFail atomic.Bool
 }
 
-func (b *armableExtendBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *armableExtendBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	if b.armFail.Load() {
 		return backend.ErrNotFound
 	}
-	return b.Backend.ExtendLease(ctx, taskID, d)
+	return b.Backend.ExtendLease(ctx, task, d)
 }
 
 // TestWorker_Round10_CommitStopJoinsInheritedLoop is the regression test

@@ -123,7 +123,16 @@ func (w *Worker) loadWorkflowState(ctx context.Context, instanceID string) (*bac
 }
 
 func (w *Worker) commitWorkflow(ctx context.Context, task backend.Task, baseJournal []journal.Event, adv backend.Advancement) error {
+	adv = w.advForCommit(task, adv)
 	return w.finishWorkflowCommit(ctx, task, baseJournal, adv, w.backend.CommitAdvancement(ctx, adv))
+}
+
+func (w *Worker) advForCommit(task backend.Task, adv backend.Advancement) backend.Advancement {
+	if adv.WorkerID == "" && task.WorkerID != "" {
+		adv.WorkerID = task.WorkerID
+		adv.Attempt = task.Attempt
+	}
+	return adv
 }
 
 // finishWorkflowCommit applies commitWorkflow's post-store handling for the
@@ -137,7 +146,7 @@ func (w *Worker) finishWorkflowCommit(ctx context.Context, task backend.Task, ba
 		instanceID = adv.InstanceID
 	}
 	if err != nil {
-		if errors.Is(err, backend.ErrConflict) {
+		if errors.Is(err, backend.ErrConflict) || errors.Is(err, backend.ErrNotFound) {
 			w.dropSticky(instanceID)
 		}
 		// Contention releases immediately for fast replay; other commit
@@ -153,12 +162,24 @@ func (w *Worker) finishWorkflowCommit(ctx context.Context, task backend.Task, ba
 
 // trackWfClaim records the local wall-clock claim time of a workflow task.
 func (w *Worker) trackWfClaim(taskID int64) {
+	w.trackWfClaimAt(taskID, time.Now())
+}
+
+func (w *Worker) trackWfClaimAt(taskID int64, at time.Time) {
 	w.wfClaimMu.Lock()
 	defer w.wfClaimMu.Unlock()
 	if w.wfClaim == nil {
 		w.wfClaim = map[int64]time.Time{}
 	}
-	w.wfClaim[taskID] = time.Now()
+	w.wfClaim[taskID] = at
+}
+
+func (w *Worker) refreshWfClaim(taskID int64) {
+	w.wfClaimMu.Lock()
+	defer w.wfClaimMu.Unlock()
+	if _, ok := w.wfClaim[taskID]; ok {
+		w.wfClaim[taskID] = time.Now()
+	}
 }
 
 // clearWfClaims drops local claim records after the tick's flush.
@@ -208,7 +229,7 @@ func (w *Worker) wfLeaseExpired(taskID int64) bool {
 // skips the nack and expiry reclaims naturally. Nack failures share the
 // release_lease store-error op label to keep the op vocabulary bounded.
 func (w *Worker) requeueWorkflowTask(ctx context.Context, t backend.Task, herr error) {
-	if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {
+	if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) || errors.Is(herr, backend.ErrNotFound) {
 		if rerr := w.backend.ReleaseLease(ctx, t); rerr != nil && !errors.Is(rerr, backend.ErrNotFound) {
 			w.recordStoreError(ctx, "release_lease", rerr, "task_id", t.ID)
 		}
@@ -289,12 +310,14 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 		}
 		t := w.taskForCommit(p)
 		if !w.ownsFresh(t.ID, p.tok) {
+			w.untrack(t.ID, p.tok)
 			w.opts.Logger.Debug("skipping stale workflow commit; lease expired or already released",
 				"instance_id", p.instanceID, "task_id", t.ID)
 			continue
 		}
 		flag := &atomic.Bool{}
-		if !w.beginDetachedCommit(t.ID, p.tok, flag) {
+		if !w.beginDetachedCommit(t.ID, p.tok, flag, ctx) {
+			w.untrack(t.ID, p.tok)
 			w.opts.Logger.Debug("skipping stale workflow commit; lease already released",
 				"instance_id", p.instanceID, "task_id", t.ID)
 			continue
@@ -327,7 +350,8 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 		// (one extend_lease store error on a slow commit); pausing
 		// cover instead would risk a stale write, which is worse.
 		err := w.guardedDetachedCommit(g.task.ID, g.p.tok, cctx, ccancel, false, func() error {
-			return w.backend.CommitAdvancement(cctx, g.p.adv)
+			adv := w.advForCommit(g.task, g.p.adv)
+			return w.backend.CommitAdvancement(cctx, adv)
 		})
 		if err != nil {
 			if errors.Is(err, errLeaseLost) {
@@ -369,7 +393,7 @@ func (w *Worker) flushWorkflowCommits(ctx context.Context, pending []pendingWork
 	if batcher, ok := w.backend.(backend.AdvancementBatcher); ok && len(gated)+len(legacy) > 1 {
 		advs := make([]backend.Advancement, 0, len(gated)+len(legacy))
 		for _, g := range gated {
-			advs = append(advs, g.p.adv)
+			advs = append(advs, w.advForCommit(g.task, g.p.adv))
 		}
 		for _, p := range legacy {
 			advs = append(advs, p.adv)

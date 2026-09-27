@@ -22,9 +22,9 @@ type countExtendBackend struct {
 	completes atomic.Int32
 }
 
-func (b *countExtendBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *countExtendBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	b.extends.Add(1)
-	return b.Backend.ExtendLease(ctx, taskID, d)
+	return b.Backend.ExtendLease(ctx, task, d)
 }
 
 func (b *countExtendBackend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
@@ -247,7 +247,7 @@ func TestWorker_Round9_DetachedRenewalSuccessAfterExpiryAbortsCommit(t *testing.
 	defer w.untrack(task.ID, tok)
 	defer w.dropDetachedGuard(task.ID, tok)
 	var committing atomic.Bool
-	if !w.beginDetachedCommit(task.ID, tok, &committing) {
+	if !w.beginDetachedCommit(task.ID, tok, &committing, context.Background()) {
 		t.Fatal("beginDetachedCommit failed on a tracked entry")
 	}
 	// Let the worker-side continuity deadline pass with no successful
@@ -299,7 +299,7 @@ func TestWorker_Round9_DetachedCoverStopsOnLeaseLoss(t *testing.T) {
 	defer w.untrack(task.ID, tok)
 	defer w.dropDetachedGuard(task.ID, tok)
 	var committing atomic.Bool
-	if !w.beginDetachedCommit(task.ID, tok, &committing) {
+	if !w.beginDetachedCommit(task.ID, tok, &committing, context.Background()) {
 		t.Fatal("beginDetachedCommit failed on a tracked entry")
 	}
 	time.Sleep(300 * time.Millisecond) // pass the continuity deadline

@@ -29,7 +29,7 @@ type round25IgnoreExtendBackend struct {
 	batchCalls    atomic.Int32
 }
 
-func (b *round25IgnoreExtendBackend) ExtendLease(_ context.Context, _ int64, _ time.Duration) error {
+func (b *round25IgnoreExtendBackend) ExtendLease(_ context.Context, _ backend.Task, _ time.Duration) error {
 	if b.extendOnce.CompareAndSwap(false, true) {
 		close(b.extendEntered)
 	}
@@ -139,11 +139,11 @@ type round25FailFirstExtendBackend struct {
 	singleCalls atomic.Int32
 }
 
-func (b *round25FailFirstExtendBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *round25FailFirstExtendBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	if b.extendCalls.Add(1) == 1 {
 		return errors.New("round25 injected cover failure")
 	}
-	return b.Backend.ExtendLease(ctx, taskID, d)
+	return b.Backend.ExtendLease(ctx, task, d)
 }
 
 func (b *round25FailFirstExtendBackend) CommitAdvancement(ctx context.Context, adv backend.Advancement) error {

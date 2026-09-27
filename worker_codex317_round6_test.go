@@ -206,7 +206,7 @@ func TestWorker_CommitOwnershipLossExitsDetachedMode(t *testing.T) {
 	tok := w.track(42)
 	defer w.untrack(42, tok)
 	defer w.dropDetachedGuard(42, tok)
-	if !w.beginDetachedCommit(42, tok, &committing) {
+	if !w.beginDetachedCommit(42, tok, &committing, context.Background()) {
 		t.Fatal("beginDetachedCommit failed on a tracked entry")
 	}
 	done := make(chan struct{})

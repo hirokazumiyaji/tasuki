@@ -26,8 +26,8 @@ type countResultBackend struct {
 	extends       atomic.Int32
 }
 
-func (b *countResultBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
-	err := b.Backend.ExtendLease(ctx, taskID, d)
+func (b *countResultBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
+	err := b.Backend.ExtendLease(ctx, task, d)
 	b.extends.Add(1)
 	return err
 }

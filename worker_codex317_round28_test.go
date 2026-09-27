@@ -27,7 +27,7 @@ type round28StallExtendBackend struct {
 	releases atomic.Int32
 }
 
-func (b *round28StallExtendBackend) ExtendLease(_ context.Context, _ int64, _ time.Duration) error {
+func (b *round28StallExtendBackend) ExtendLease(_ context.Context, _ backend.Task, _ time.Duration) error {
 	b.extends.Add(1)
 	if b.once.CompareAndSwap(false, true) {
 		close(b.entered)
@@ -124,8 +124,8 @@ type round28HookExtendBackend struct {
 	commits  atomic.Int32
 }
 
-func (b *round28HookExtendBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
-	return b.Backend.ExtendLease(ctx, taskID, d)
+func (b *round28HookExtendBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
+	return b.Backend.ExtendLease(ctx, task, d)
 }
 
 func (b *round28HookExtendBackend) ReleaseLease(ctx context.Context, t backend.Task) error {
@@ -251,11 +251,11 @@ type round28FailCommitStallCoverBackend struct {
 	once        atomic.Bool
 }
 
-func (b *round28FailCommitStallCoverBackend) ExtendLease(_ context.Context, taskID int64, d time.Duration) error {
+func (b *round28FailCommitStallCoverBackend) ExtendLease(_ context.Context, task backend.Task, d time.Duration) error {
 	n := b.extendCalls.Add(1)
 	if n == 1 {
 		// Initial renewal: succeed so the commit is admitted and fails.
-		return b.Backend.ExtendLease(context.Background(), taskID, d)
+		return b.Backend.ExtendLease(context.Background(), task, d)
 	}
 	// Periodic cover: block ignoring cancellation until the test ends.
 	if b.once.CompareAndSwap(false, true) {

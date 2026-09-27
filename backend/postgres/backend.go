@@ -364,9 +364,9 @@ func decodeActivityTask(t *backend.Task, payload []byte) {
 	t.StartToCloseTimeout = time.Duration(p.StartToCloseTimeoutMs) * time.Millisecond
 }
 
-func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
 	tag, err := b.pool.Exec(ctx, `
-		UPDATE wf_tasks SET visible_at = now() + $2::interval WHERE id = $1`, taskID, interval(d))
+		UPDATE wf_tasks SET visible_at = now() + $2::interval WHERE id = $1 AND worker_id = $3 AND attempt = $4`, t.ID, interval(d), t.WorkerID, t.Attempt)
 	if err != nil {
 		return err
 	}
@@ -376,10 +376,10 @@ func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration
 	return nil
 }
 
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
 	tag, err := b.pool.Exec(ctx, `
-		UPDATE wf_tasks SET visible_at = now() + $2::interval, heartbeat = $3 WHERE id = $1`,
-		taskID, interval(lease), details)
+		UPDATE wf_tasks SET visible_at = now() + $2::interval, heartbeat = $3 WHERE id = $1 AND worker_id = $4 AND attempt = $5`,
+		task.ID, interval(lease), details, task.WorkerID, task.Attempt)
 	if err != nil {
 		return err
 	}
@@ -553,10 +553,12 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 		return backend.ErrConflict
 	}
 
-	// Verify own task exists
+	// Verify own task exists and still belongs to the claimed generation.
 	var kind string
-	err = tx.QueryRow(ctx, `SELECT kind FROM wf_tasks WHERE id = $1 AND instance_id = $2`,
-		adv.TaskID, adv.InstanceID).Scan(&kind)
+	var workerID *string
+	var attempt int
+	err = tx.QueryRow(ctx, `SELECT kind, worker_id, attempt FROM wf_tasks WHERE id = $1 AND instance_id = $2`,
+		adv.TaskID, adv.InstanceID).Scan(&kind, &workerID, &attempt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return backend.ErrConflict
@@ -565,6 +567,15 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 	}
 	if kind != "workflow" {
 		return backend.ErrConflict
+	}
+	if adv.WorkerID != "" {
+		got := ""
+		if workerID != nil {
+			got = *workerID
+		}
+		if got != adv.WorkerID || attempt != adv.Attempt {
+			return backend.ErrConflict
+		}
 	}
 
 	for _, ev := range adv.NewEvents {
@@ -707,9 +718,17 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 			}
 		}
 	}
-	_, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE id = $1`, adv.TaskID)
+	var delTag pgconn.CommandTag
+	if adv.WorkerID != "" {
+		delTag, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE id = $1 AND worker_id = $2 AND attempt = $3`, adv.TaskID, adv.WorkerID, adv.Attempt)
+	} else {
+		delTag, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE id = $1`, adv.TaskID)
+	}
 	if err != nil {
 		return err
+	}
+	if adv.WorkerID != "" && delTag.RowsAffected() == 0 {
+		return backend.ErrConflict
 	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO wf_tasks (kind, instance_id, queue)
@@ -911,7 +930,6 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	return n, nil
 }
 
-
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
 	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
 }
@@ -978,10 +996,10 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 }
 
 type activityPayload struct {
-	Name                    string          `json:"name"`
-	Input                   json.RawMessage `json:"input"`
-	Retry                   retryJSON       `json:"retry"`
-	StartToCloseTimeoutMs   int64           `json:"start_to_close_timeout_ms,omitempty"`
+	Name                  string          `json:"name"`
+	Input                 json.RawMessage `json:"input"`
+	Retry                 retryJSON       `json:"retry"`
+	StartToCloseTimeoutMs int64           `json:"start_to_close_timeout_ms,omitempty"`
 }
 
 type retryJSON struct {
@@ -990,7 +1008,6 @@ type retryJSON struct {
 	MaxIntervalMs      int64   `json:"max_interval_ms"`
 	MaxAttempts        int     `json:"max_attempts"`
 }
-
 
 type inboxEnv struct {
 	Name string          `json:"_name,omitempty"`

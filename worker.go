@@ -32,6 +32,7 @@ type Worker struct {
 	// execCancel that Shutdown then captures and cancels at grace expiry
 	// (leaving the old execCtx live). Guarded by mu.
 	shuttingDown bool
+	shutdownDone chan struct{}
 	// inFlight tracks claimed task IDs with their local lease-expiry
 	// estimate (claim time + LeaseDuration, refreshed on each successful
 	// renewal) plus the claimed task itself. The local expiry is a fast
@@ -270,6 +271,7 @@ type claimToken struct {
 // trackAt/refreshLeaseAt), so a live lease always verifies: only a
 // genuine renewal gap trips the guard.
 type detachedGuard struct {
+	task     backend.Task
 	epoch    uint64
 	seq      uint64
 	deadline time.Time
@@ -422,10 +424,16 @@ func (w *Worker) tickSync(ctx context.Context) {
 func (w *Worker) Shutdown(ctx context.Context) error {
 	w.mu.Lock()
 	if w.shuttingDown {
-		// A concurrent Shutdown is already in progress; the in-flight
-		// call owns the grace, renewal join, and lease release.
+		// A concurrent Shutdown owns the grace, renewal join, and lease
+		// release; wait for that lifecycle transition to finish.
+		done := w.shutdownDone
 		w.mu.Unlock()
-		return nil
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	cancel := w.cancel
 	done := w.done
@@ -436,10 +444,14 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	w.shuttingDown = true
+	w.shutdownDone = make(chan struct{})
+	shutdownDone := w.shutdownDone
 	w.mu.Unlock()
 	defer func() {
 		w.mu.Lock()
 		w.shuttingDown = false
+		w.shutdownDone = nil
+		close(shutdownDone)
 		w.mu.Unlock()
 	}()
 	// Stop new detached activities first so the grace period only covers
@@ -1050,6 +1062,26 @@ func (w *Worker) owns(taskID int64, tok claimToken) bool {
 	return ok && e.epoch == tok.epoch && e.seq == tok.seq
 }
 
+func (w *Worker) trackedTask(taskID int64, tok claimToken) backend.Task {
+	w.mu.Lock()
+	e := w.inFlight[taskID]
+	w.mu.Unlock()
+	if e.epoch == tok.epoch && e.seq == tok.seq && e.task.ID != 0 {
+		return e.task
+	}
+	return backend.Task{ID: taskID}
+}
+
+func (w *Worker) bindTrackedTask(task backend.Task, tok claimToken) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	e, ok := w.inFlight[task.ID]
+	if ok && e.epoch == tok.epoch && e.seq == tok.seq {
+		e.task = task
+		w.inFlight[task.ID] = e
+	}
+}
+
 // ownsFresh reports whether tok still stamps the in-flight entry for
 // taskID AND the local lease estimate has not yet expired. The ordinary
 // renewal path must gate on both: past local expiry a peer may have
@@ -1121,7 +1153,7 @@ func (w *Worker) claimCommitOwnership(taskID int64, tok claimToken) bool {
 // must not stop renewal mid-commit either: with the flag set first, either
 // renewal stays alive through the commit or the shutdown check routes to
 // release — never a commit without renewal.
-func (w *Worker) beginDetachedCommit(taskID int64, tok claimToken, committing *atomic.Bool) bool {
+func (w *Worker) beginDetachedCommit(taskID int64, tok claimToken, committing *atomic.Bool, parent context.Context) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	e, ok := w.inFlight[taskID]
@@ -1142,14 +1174,18 @@ func (w *Worker) beginDetachedCommit(taskID int64, tok claimToken, committing *a
 	if w.detGuard == nil {
 		w.detGuard = map[int64]detachedGuard{}
 	}
+	task := e.task
+	if task.ID == 0 {
+		task.ID = taskID
+	}
 	// Cover renewals for this commit live on an independent cover
 	// context (see detachedGuard): it outlives execution cancellation
 	// like the commit context, but the commit cancels it the moment
 	// its store op completes so no renewal lands after the result
 	// write (round-11 P1b). The deferred guard drop at handler return
 	// cancels it on every path that never commits.
-	coverCtx, coverCancel := context.WithCancel(context.Background())
-	w.detGuard[taskID] = detachedGuard{epoch: tok.epoch, seq: tok.seq, deadline: e.expiry, coverCtx: coverCtx, coverCancel: coverCancel}
+	coverCtx, coverCancel := context.WithCancel(parent)
+	w.detGuard[taskID] = detachedGuard{task: task, epoch: tok.epoch, seq: tok.seq, deadline: e.expiry, coverCtx: coverCtx, coverCancel: coverCancel}
 	committing.Store(true)
 	delete(w.inFlight, taskID)
 	return true
@@ -1589,6 +1625,14 @@ func (w *Worker) releaseContext(ctx context.Context) (context.Context, context.C
 	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
 
+func (w *Worker) releaseWorkflowLease(task backend.Task) {
+	ctx, cancel := w.releaseContext(context.Background())
+	defer cancel()
+	if err := w.backend.ReleaseLease(ctx, task); err != nil && !errors.Is(err, backend.ErrNotFound) {
+		w.recordStoreError(ctx, "release_lease", err, "task_id", task.ID)
+	}
+}
+
 func (w *Worker) releaseInFlight(ctx context.Context) {
 	now := time.Now()
 	w.mu.Lock()
@@ -1759,6 +1803,9 @@ func (w *Worker) availableSlots(sem chan struct{}) int {
 }
 
 func (w *Worker) tickWorkflows(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	avail := w.availableSlots(w.wfSem)
 	if avail <= 0 {
 		return
@@ -1800,12 +1847,13 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 	// a reclaim race (see requeueWorkflowTask). Cleared after the flush
 	// below; entries are wall-clock only, never store time.
 	for _, t := range wtasks {
-		w.trackWfClaim(t.ID)
+		w.trackWfClaimAt(t.ID, claimStart)
 	}
 	defer w.clearWfClaims(wtasks)
 	var wg sync.WaitGroup
 	var pendingMu sync.Mutex
 	var pending []pendingWorkflowCommit
+	var renewalStops []func()
 	for _, t := range wtasks {
 		// Reserve a slot before dispatch so Claim never over-subscribes and
 		// lease extension starts without semaphore wait.
@@ -1822,41 +1870,55 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 			relCancel()
 			continue
 		}
+		tok, ok := w.trackTaskAtEpoch(t, claimStart, claimEpoch)
+		if !ok {
+			<-w.wfSem
+			w.dropStaleClaims(ctx, []backend.Task{t})
+			continue
+		}
+		leaseDone := make(chan struct{})
+		turnCtx, cancelTurn := context.WithCancel(ctx)
+		var leaseOnce sync.Once
+		var leaseWg sync.WaitGroup
+		leaseWg.Add(1)
+		go func(taskID int64, token claimToken) {
+			defer leaseWg.Done()
+			w.extendLeaseLoopWithLoss(context.WithoutCancel(ctx), taskID, token, leaseDone, nil, cancelTurn, claimStart)
+		}(t.ID, tok)
+		stopRenewal := func() {
+			leaseOnce.Do(func() { close(leaseDone) })
+			joined := make(chan struct{})
+			go func() { leaseWg.Wait(); close(joined) }()
+			bound := w.leaseDuration()
+			timer := time.NewTimer(bound)
+			defer timer.Stop()
+			select {
+			case <-joined:
+			case <-timer.C:
+			}
+		}
+		renewalStops = append(renewalStops, stopRenewal)
 		wg.Add(1)
-		go func(t backend.Task) {
+		go func(t backend.Task, tok claimToken, stopRenewal func()) {
 			defer wg.Done()
 			defer func() { <-w.wfSem }()
-			// Lease extension starts immediately after claim (extendLoop
-			// runs inside handleActivity; workflows are short so no
-			// extension needed here).
 			actor := w.actorFor(t.InstanceID)
-			actor.dispatch(func() {
+			if !actor.dispatchContext(turnCtx, func() {
 				w.opts.Metrics.AddWorkflowTask(ctx, 1)
 				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
-				// Generation-gated track (see trackTaskAtEpoch): the
-				// dispatch may run after a restart queued it behind a
-				// long turn, so the claim-time epoch — not the current
-				// one — decides ownership. A superseded claim is
-				// fenced-released, never executed: Shutdown already
-				// released it (or the new generation owns it now), and
-				// a ctx-ignoring backend would otherwise run it to a
-				// pending whose ungated flush deletes a peer's task.
-				tok, ok := w.trackTaskAtEpoch(t, claimStart, claimEpoch)
-				if !ok {
-					w.opts.Logger.Debug("dropping workflow claim from a superseded generation",
-						"instance_id", t.InstanceID, "task_id", t.ID)
-					relCtx, relCancel := w.releaseContext(ctx)
-					_ = w.backend.ReleaseLease(relCtx, t)
-					relCancel()
-					return
-				}
-				p, herr := w.handleWorkflow(ctx, t)
+				p, herr := w.handleWorkflow(turnCtx, t, stopRenewal)
 				if herr != nil {
-					w.untrack(t.ID, tok)
+					stopRenewal()
+					if errors.Is(herr, errTurnAbandoned) || ctx.Err() != nil || turnCtx.Err() != nil {
+						if w.claimReleaseOwnership(t.ID, tok) {
+							w.releaseWorkflowLease(t)
+						}
+						return
+					}
 					w.recordStoreError(ctx, "commit_workflow", herr,
 						"instance_id", t.InstanceID, "task_id", t.ID)
 					w.opts.Logger.Debug("workflow task error", "instance_id", t.InstanceID, "err", herr)
-					if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) {
+					if errors.Is(herr, backend.ErrConflict) || errors.Is(herr, backend.ErrSuperseded) || errors.Is(herr, backend.ErrNotFound) {
 						w.dropSticky(t.InstanceID)
 					}
 					// Contention releases immediately for fast replay;
@@ -1864,6 +1926,7 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					// persistently failing task does not spin the poll
 					// loop (see requeueWorkflowTask).
 					w.requeueWorkflowTask(ctx, t, herr)
+					w.untrack(t.ID, tok)
 					return
 				}
 				if p != nil {
@@ -1884,16 +1947,41 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 					pendingMu.Unlock()
 				} else {
 					w.untrack(t.ID, tok)
+					stopRenewal()
 				}
-			})
-		}(t)
+			}) {
+				stopRenewal()
+				if w.claimReleaseOwnership(t.ID, tok) {
+					w.releaseWorkflowLease(t)
+				}
+			}
+			cancelTurn()
+		}(t, tok, stopRenewal)
 	}
 	wg.Wait()
-	// Flush with a detached commit ctx so within-grace workflow results are
-	// not lost when the poll loop ctx was canceled by Shutdown.
+	if ctx.Err() != nil {
+		for _, stop := range renewalStops {
+			stop()
+		}
+		pendingMu.Lock()
+		abandoned := append([]pendingWorkflowCommit(nil), pending...)
+		pendingMu.Unlock()
+		for _, p := range abandoned {
+			if p.hasTok && w.claimReleaseOwnership(p.task.ID, p.tok) {
+				w.releaseWorkflowLease(p.task)
+			}
+		}
+		return
+	}
+	// Flush with a detached commit context after confirming the tick is live;
+	// canceled turns were disposed above so a context-insensitive backend
+	// cannot persist shutdown as a workflow advancement.
 	commitCtx, commitCancel := w.commitContext(ctx)
 	w.flushWorkflowCommits(commitCtx, pending)
 	commitCancel()
+	for _, stop := range renewalStops {
+		stop()
+	}
 	w.evictIdleInstanceLocks(time.Now())
 	w.evictIdleSticky(time.Now())
 }
@@ -2091,7 +2179,10 @@ func (w *Worker) tickActivitiesSync(ctx context.Context) {
 	wg.Wait()
 }
 
-func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWorkflowCommit, error) {
+func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task, stopRenewal func()) (*pendingWorkflowCommit, error) {
+	if ctx.Err() != nil {
+		return nil, errTurnAbandoned
+	}
 	state, err := w.loadWorkflowState(ctx, t.InstanceID)
 	if err != nil {
 		return nil, err
@@ -2103,6 +2194,7 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 	wf, err := w.reg.workflow(state.Instance.Name)
 	if err != nil {
 		if errors.Is(err, ErrWorkflowNotRegistered) {
+			stopRenewal()
 			return nil, w.nackIncompatible(ctx, t, "unregistered_workflow", err)
 		}
 		return nil, err
@@ -2159,7 +2251,7 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 		wctx.SetCodec(w.reg.codec)
 		wctx.SetSearchAttributes(state.Instance.SearchAttributes)
 		wctx.SetMemo(state.Instance.Memo)
-		w.attachLocalActivityRunner(wctx)
+		w.attachLocalActivityRunner(wctx, ctx)
 		out, err := wf.fn(wctx, state.Instance.Input)
 		if err != nil {
 			return nil, err
@@ -2186,10 +2278,15 @@ func (w *Worker) handleWorkflow(ctx context.Context, t backend.Task) (*pendingWo
 			}
 		}
 	}
+	if ctx.Err() != nil {
+		return nil, errTurnAbandoned
+	}
 
 	adv := backend.Advancement{
 		InstanceID:   t.InstanceID,
 		TaskID:       t.ID,
+		WorkerID:     t.WorkerID,
+		Attempt:      t.Attempt,
 		ExpectedSeq:  state.NextSeq,
 		DrainedInbox: drained,
 		NewEvents:    append([]journal.Event{}, ingested...),
@@ -2489,6 +2586,7 @@ func (w *Worker) fitAdvancementToBudget(adv *backend.Advancement, commands []jou
 }
 
 func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimToken) error {
+	w.bindTrackedTask(t, tok)
 	// Result commits use a bounded detached context created immediately
 	// before each result operation. Shutdown cancels the poll loop ctx
 	// immediately and the execution ctx after its grace; committing with
@@ -2553,14 +2651,12 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 	act, err := w.reg.activity(t.Name)
 	if err != nil {
 		if errors.Is(err, ErrActivityNotRegistered) {
-			if !w.beginDetachedCommit(t.ID, tok, &committing) {
+			commitCtx, commitCancel := w.commitContext(ctx)
+			if !w.beginDetachedCommit(t.ID, tok, &committing, commitCtx) {
+				commitCancel()
 				w.exitDetachedCommit(ctx, renewDone, &committing)
 				return ctx.Err()
 			}
-			// Round-28 P1a: create the bounded commit context FIRST so
-			// the handoff renewal is bounded by min(commit bound,
-			// lease logic) instead of blocking past CommitTimeout.
-			commitCtx, commitCancel := w.commitContext(ctx)
 			stopCommitRenewal, herr := w.ensureCommitRenewalWithCommitCtx(ctx, commitCtx, t.ID, tok, renewDone, detachedEntered)
 			if herr != nil {
 				commitCancel()
@@ -2576,12 +2672,12 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			commitCancel()
 			return rerr
 		}
-		if !w.beginDetachedCommit(t.ID, tok, &committing) {
+		commitCtx, commitCancel := w.commitContext(ctx)
+		if !w.beginDetachedCommit(t.ID, tok, &committing, commitCtx) {
+			commitCancel()
 			w.exitDetachedCommit(ctx, renewDone, &committing)
 			return ctx.Err()
 		}
-		// Round-28 P1a: bound the handoff by the pre-created commit ctx.
-		commitCtx, commitCancel := w.commitContext(ctx)
 		stopCommitRenewal, herr := w.ensureCommitRenewalWithCommitCtx(ctx, commitCtx, t.ID, tok, renewDone, detachedEntered)
 		if herr != nil {
 			commitCancel()
@@ -2625,7 +2721,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 			// Conservative lease base (see refreshLeaseAt): measure from
 			// before the heartbeat call, not after it succeeds.
 			hbStart := time.Now()
-			err := w.backend.RecordHeartbeat(ctx, t.ID, w.opts.LeaseDuration, details)
+			err := w.backend.RecordHeartbeat(ctx, t, w.opts.LeaseDuration, details)
 			if err == nil {
 				w.refreshLeaseAt(t.ID, tok, hbStart)
 			}
@@ -2700,7 +2796,9 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 	}
 	if err != nil {
 		if IsNonRetryable(err) || (t.MaxAttempts > 0 && t.Attempt >= t.MaxAttempts) {
-			if !w.beginDetachedCommit(t.ID, tok, &committing) {
+			commitCtx, commitCancel := w.commitContext(ctx)
+			if !w.beginDetachedCommit(t.ID, tok, &committing, commitCtx) {
+				commitCancel()
 				// Shutdown's release already handed this lease to a peer
 				// (or a new generation re-tracked it): leave detached
 				// mode and join renewal before returning so no detached
@@ -2708,8 +2806,6 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 				w.exitDetachedCommit(ctx, renewDone, &committing)
 				return ctx.Err()
 			}
-			// Round-28 P1a: bound the handoff by the pre-created commit ctx.
-			commitCtx, commitCancel := w.commitContext(ctx)
 			stopCommitRenewal, herr := w.ensureCommitRenewalWithCommitCtx(ctx, commitCtx, t.ID, tok, renewDone, detachedEntered)
 			if herr != nil {
 				commitCancel()
@@ -2732,14 +2828,14 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		}.Backoff(t.Attempt)
 		w.opts.Logger.Info("activity retry",
 			"instance_id", t.InstanceID, "activity", t.Name, "attempt", t.Attempt, "delay", delay)
-		if !w.beginDetachedCommit(t.ID, tok, &committing) {
+		commitCtx, commitCancel := w.commitContext(ctx)
+		if !w.beginDetachedCommit(t.ID, tok, &committing, commitCtx) {
+			commitCancel()
 			// See above: ownership lost between the live-ctx check and the
 			// commit transfer — stop renewal before returning.
 			w.exitDetachedCommit(ctx, renewDone, &committing)
 			return ctx.Err()
 		}
-		// Round-28 P1a: bound the handoff by the pre-created commit ctx.
-		commitCtx, commitCancel := w.commitContext(ctx)
 		stopCommitRenewal, herr := w.ensureCommitRenewalWithCommitCtx(ctx, commitCtx, t.ID, tok, renewDone, detachedEntered)
 		if herr != nil {
 			commitCancel()
@@ -2776,14 +2872,14 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		commitCancel()
 		return nil
 	}
-	if !w.beginDetachedCommit(t.ID, tok, &committing) {
+	commitCtx, commitCancel := w.commitContext(ctx)
+	if !w.beginDetachedCommit(t.ID, tok, &committing, commitCtx) {
+		commitCancel()
 		// See above: ownership lost between the live-ctx check and the
 		// commit transfer — stop renewal before returning.
 		w.exitDetachedCommit(ctx, renewDone, &committing)
 		return ctx.Err()
 	}
-	// Round-28 P1a: bound the handoff by the pre-created commit ctx.
-	commitCtx, commitCancel := w.commitContext(ctx)
 	stopCommitRenewal, herr := w.ensureCommitRenewalWithCommitCtx(ctx, commitCtx, t.ID, tok, renewDone, detachedEntered)
 	if herr != nil {
 		commitCancel()
@@ -2853,43 +2949,6 @@ func (w *Worker) exitDetachedCommit(ctx context.Context, renewDone <-chan struct
 	}
 }
 
-// rebaseDetachedCover re-parents taskID's detached-cover context onto parent
-// (round-28 P1a). beginDetachedCommit seeds coverCtx from
-// context.Background so cover outlives execution cancellation, but the
-// activity result commit runs under a bounded commit context (see
-// commitContext: CommitTimeout normally, ShutdownReleaseTimeout after
-// Shutdown begins) and its documented bound must hold for the whole
-// commit — including the pre-commit renewal. renewOnceDetached derives
-// its store-call context via WithTimeout(coverCtx, leaseDuration), so a
-// coverCtx that is a child of the commit context yields
-// min(commit deadline, lease-based timeout) for every renewal: a
-// context-aware backend aborts promptly on commit expiry, while a
-// context-ignoring one is cut off by the bounded handoff wait below
-// (see renewOnceDetachedBounded) instead of pinning the activity slot
-// past CommitTimeout. The old background-derived cancel fires on
-// replacement; no renewal is in flight yet at the call sites (the
-// handoff has not run), so nothing is disturbed. A missing or
-// superseded guard is a no-op.
-func (w *Worker) rebaseDetachedCover(taskID int64, tok claimToken, parent context.Context) {
-	if parent == nil {
-		parent = context.Background()
-	}
-	w.detMu.Lock()
-	defer w.detMu.Unlock()
-	gd, ok := w.detGuard[taskID]
-	if !ok || gd.epoch != tok.epoch || gd.seq != tok.seq {
-		return
-	}
-	oldCancel := gd.coverCancel
-	nctx, ncancel := context.WithCancel(parent)
-	gd.coverCtx = nctx
-	gd.coverCancel = ncancel
-	w.detGuard[taskID] = gd
-	if oldCancel != nil {
-		oldCancel()
-	}
-}
-
 // renewOnceDetachedBounded runs one detached pre-commit renewal bounded by
 // both the commit context and the lease duration (round-28 P1a): the
 // activity-result paths must not block past the advertised commit bound
@@ -2935,16 +2994,14 @@ func (w *Worker) renewOnceDetachedBounded(commitCtx context.Context, taskID int6
 }
 
 // ensureCommitRenewalWithCommitCtx is ensureCommitRenewal bounded by a
-// pre-created commit context (round-28 P1a). Callers create the bounded
-// commit context FIRST via commitContext, rebase the detached cover onto
-// it, then hand off: the synchronous pre-commit renewal runs bounded by
+// pre-created commit context. Callers seed the detached cover from the
+// bounded context before entering detached mode, so the pre-commit renewal runs bounded by
 // min(commit bound, lease logic) instead of blocking on the execution
 // context past CommitTimeout. execCtx drives the handoff-join liveness
 // check (canceled execution needs the fate join); commitCtx bounds the
 // renewal and — via the rebased cover — every renewal the scoped
 // replacement issues. See ensureCommitRenewal for the handoff itself.
 func (w *Worker) ensureCommitRenewalWithCommitCtx(execCtx, commitCtx context.Context, taskID int64, tok claimToken, renewDone <-chan struct{}, detachedEntered ...<-chan struct{}) (func(), error) {
-	w.rebaseDetachedCover(taskID, tok, commitCtx)
 	var detachedAck <-chan struct{}
 	if len(detachedEntered) > 0 {
 		detachedAck = detachedEntered[0]
@@ -3136,7 +3193,7 @@ func (w *Worker) recordStoreError(ctx context.Context, op string, err error, att
 	w.opts.Metrics.AddStoreError(ctx, op)
 }
 
-func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context) {
+func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context, runCtx context.Context) {
 	wctx.SetLocalActivityRunner(func(name string, input []byte) (out []byte, err error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -3150,7 +3207,50 @@ func (w *Worker) attachLocalActivityRunner(wctx *workflow.Context) {
 		if err != nil {
 			return nil, err
 		}
-		return act.fn(context.Background(), input)
+		if runCtx.Err() != nil {
+			return nil, runCtx.Err()
+		}
+		timeout := w.opts.LocalActivityTimeout
+		if timeout <= 0 {
+			out, err = act.fn(runCtx, input)
+			if runCtx.Err() != nil {
+				return nil, runCtx.Err()
+			}
+			return out, err
+		}
+		ctx, cancel := context.WithTimeout(runCtx, timeout)
+		defer cancel()
+		type localResult struct {
+			out []byte
+			err error
+			at  time.Time
+		}
+		done := make(chan localResult, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					done <- localResult{err: fmt.Errorf("activity panic: %v", r), at: time.Now()}
+				}
+			}()
+			o, e := act.fn(ctx, input)
+			done <- localResult{out: o, err: e, at: time.Now()}
+		}()
+		deadline, _ := ctx.Deadline()
+		select {
+		case result := <-done:
+			if runCtx.Err() != nil {
+				return nil, runCtx.Err()
+			}
+			if !result.at.Before(deadline) {
+				return nil, context.DeadlineExceeded
+			}
+			return result.out, result.err
+		case <-ctx.Done():
+			if runCtx.Err() != nil {
+				return nil, runCtx.Err()
+			}
+			return nil, context.DeadlineExceeded
+		}
 	})
 }
 
@@ -3168,6 +3268,10 @@ func (w *Worker) nackIncompatible(ctx context.Context, t backend.Task, reason st
 }
 
 func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, tok claimToken, done <-chan struct{}, committing *atomic.Bool, detachedEntered ...chan struct{}) {
+	w.extendLeaseLoopWithLoss(ctx, taskID, tok, done, committing, nil, time.Time{}, detachedEntered...)
+}
+
+func (w *Worker) extendLeaseLoopWithLoss(ctx context.Context, taskID int64, tok claimToken, done <-chan struct{}, committing *atomic.Bool, onLeaseLost func(), claimBase time.Time, detachedEntered ...chan struct{}) {
 	var detachedCh chan struct{}
 	if len(detachedEntered) > 0 {
 		detachedCh = detachedEntered[0]
@@ -3176,9 +3280,26 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, tok claimTok
 	if d <= 0 {
 		return
 	}
+	firstDelay := d
+	margin := w.leaseDuration() / 4
+	lastSuccess := claimBase
+	if !lastSuccess.IsZero() {
+		if remaining := time.Until(lastSuccess.Add(w.leaseDuration() - margin)); remaining < firstDelay {
+			firstDelay = max(remaining, 0)
+		}
+	} else {
+		lastSuccess = time.Now()
+	}
+	firstTimer := time.NewTimer(firstDelay)
+	defer firstTimer.Stop()
 	ticker := time.NewTicker(d)
 	defer ticker.Stop()
+	first := true
 	for {
+		tick := ticker.C
+		if first {
+			tick = firstTimer.C
+		}
 		select {
 		case <-done:
 			return
@@ -3208,7 +3329,8 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, tok claimTok
 			}
 			w.renewUntilDone(ctx, taskID, tok, done, ticker, committing)
 			return
-		case <-ticker.C:
+		case <-tick:
+			first = false
 			// A stale invocation whose entry was overwritten by a
 			// reclaim (new generation or new claim of the same task ID)
 			// must stop renewing: extending the new owner's lease
@@ -3242,12 +3364,33 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, taskID int64, tok claimTok
 				}
 				// Conservative lease base (see refreshLeaseAt).
 				renewStart := time.Now()
-				rerr := w.backend.ExtendLease(ctx, taskID, w.opts.LeaseDuration)
+				deadline := lastSuccess.Add(w.leaseDuration() - margin)
+				renewFor := time.Until(deadline)
+				if renewFor <= 0 {
+					w.renewExit(taskID)
+					if onLeaseLost != nil {
+						onLeaseLost()
+					}
+					return
+				}
+				renewCtx, renewCancel := context.WithTimeout(ctx, renewFor)
+				rerr := w.backend.ExtendLease(renewCtx, w.trackedTask(taskID, tok), w.opts.LeaseDuration)
+				renewCancel()
 				w.renewExit(taskID)
 				if rerr != nil {
-					w.recordStoreError(ctx, "extend_lease", rerr, "task_id", taskID)
+					if errors.Is(rerr, backend.ErrNotFound) {
+						w.opts.Logger.Debug("lease moved on; stopping renewal", "task_id", taskID)
+					} else {
+						w.recordStoreError(ctx, "extend_lease", rerr, "task_id", taskID)
+					}
+					if onLeaseLost != nil {
+						onLeaseLost()
+						return
+					}
 				} else {
 					w.refreshLeaseAt(taskID, tok, renewStart)
+					w.refreshWfClaim(taskID)
+					lastSuccess = renewStart
 				}
 				continue
 			}
@@ -3408,7 +3551,7 @@ func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimT
 		defer cancel()
 		// Conservative lease base (see refreshLeaseAt).
 		renewStart := time.Now()
-		if err := w.backend.ExtendLease(rctx, taskID, w.opts.LeaseDuration); err != nil {
+		if err := w.backend.ExtendLease(rctx, w.trackedTask(taskID, tok), w.opts.LeaseDuration); err != nil {
 			w.recordStoreError(rctx, "extend_lease", err, "task_id", taskID)
 			return err
 		}
@@ -3471,7 +3614,7 @@ func (w *Worker) renewOnceDetached(ctx context.Context, taskID int64, tok claimT
 	// Conservative lease base (see refreshLeaseAt).
 	renewStart := time.Now()
 	w.detMu.Unlock()
-	if err := w.backend.ExtendLease(rctx, taskID, w.opts.LeaseDuration); err != nil {
+	if err := w.backend.ExtendLease(rctx, g.task, w.opts.LeaseDuration); err != nil {
 		w.coverRenewExit(taskID)
 		// Our own commit ended first (result write completed, guard
 		// tripped by a concurrent loss): the cover context is

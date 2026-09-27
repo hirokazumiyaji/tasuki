@@ -57,7 +57,7 @@ func TestWorker_Round17_UnrelatedRenewalDoesNotBlockExclusiveCommit(t *testing.T
 	defer w.renewExit(unrelatedID)
 
 	var committing atomic.Bool
-	if !w.beginDetachedCommit(task.ID, tok, &committing) {
+	if !w.beginDetachedCommit(task.ID, tok, &committing, context.Background()) {
 		t.Fatal("beginDetachedCommit failed on a tracked entry")
 	}
 
@@ -133,7 +133,7 @@ func TestWorker_Round17_CommitJoinBoundedByCommitContext(t *testing.T) {
 	defer w.renewExit(task.ID)
 
 	var committing atomic.Bool
-	if !w.beginDetachedCommit(task.ID, tok, &committing) {
+	if !w.beginDetachedCommit(task.ID, tok, &committing, context.Background()) {
 		t.Fatal("beginDetachedCommit failed on a tracked entry")
 	}
 

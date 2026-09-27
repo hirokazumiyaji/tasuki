@@ -39,16 +39,16 @@ type round27RequeueOrderBackend struct {
 	nackOnce      atomic.Bool
 }
 
-func (b *round27RequeueOrderBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *round27RequeueOrderBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	if b.extendCalls.Add(1) == 1 {
-		return b.Backend.ExtendLease(ctx, taskID, d)
+		return b.Backend.ExtendLease(ctx, task, d)
 	}
 	if b.extendOnce.CompareAndSwap(false, true) {
 		close(b.extendEntered)
 	}
 	// Deliberately ignore ctx: block until the test releases, then land.
 	<-b.extendRelease
-	err := b.Backend.ExtendLease(context.Background(), taskID, d)
+	err := b.Backend.ExtendLease(context.Background(), task, d)
 	b.mu.Lock()
 	b.events = append(b.events, "extend-return")
 	b.mu.Unlock()

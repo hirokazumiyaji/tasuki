@@ -623,18 +623,50 @@ func decodeTask(m map[string]types.AttributeValue) backend.Task {
 	return t
 }
 
-func (b *Backend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
-	return b.updateTask(ctx, taskID, "SET visible_at = :v", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(d)))}, "")
+func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	// Workflow tasks live under WF#<instanceID>, while activities live under ACT#<id>.
+	if t.Kind == "workflow" && t.InstanceID != "" {
+		cond, values := workflowRenewalFence(t, timeToN(nowUTC().Add(d)))
+		_, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:                 aws.String(b.table("wf_tasks")),
+			Key:                       map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(t.InstanceID))},
+			UpdateExpression:          aws.String("SET visible_at = :v"),
+			ConditionExpression:       aws.String(cond),
+			ExpressionAttributeValues: values,
+		})
+		if conditional(err) {
+			return backend.ErrNotFound
+		}
+		return err
+	}
+	return b.updateActivityLease(ctx, t, d)
 }
 
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
-	values := map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(lease)))}
+func (b *Backend) activityRenewalFence(t backend.Task, visible int64) (string, map[string]types.AttributeValue) {
+	return "kind = :kind AND worker_id = :w AND attempt = :a", map[string]types.AttributeValue{
+		":v": avN(visible), ":kind": avS(t.Kind), ":w": avS(t.WorkerID), ":a": avN(int64(t.Attempt)),
+	}
+}
+
+func (b *Backend) updateActivityLease(ctx context.Context, t backend.Task, d time.Duration) error {
+	cond, values := b.activityRenewalFence(t, timeToN(nowUTC().Add(d)))
+	return b.updateTask(ctx, t.ID, "SET visible_at = :v", values, cond)
+}
+
+func workflowRenewalFence(t backend.Task, visible int64) (string, map[string]types.AttributeValue) {
+	return "attribute_exists(task_pk) AND id = :id AND worker_id = :w AND attempt = :a", map[string]types.AttributeValue{
+		":v": avN(visible), ":id": avN(t.ID), ":w": avS(t.WorkerID), ":a": avN(int64(t.Attempt)),
+	}
+}
+
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
+	cond, values := b.activityRenewalFence(task, timeToN(nowUTC().Add(lease)))
 	update := "SET visible_at = :v"
 	if details != nil {
 		update += ", heartbeat = :h"
 		values[":h"] = avJSON(details)
 	}
-	return b.updateTask(ctx, taskID, update, values, "")
+	return b.updateTask(ctx, task.ID, update, values, cond)
 }
 func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
@@ -982,9 +1014,16 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 		// follow-up is then part of the same atomic transaction, so no
 		// crash gap can stall the remaining replayed commands (recovery
 		// cannot detect them: they leave no inbox behind).
-		items = append(items, b.refreshWorkflowTask(adv.InstanceID, adv.TaskID, inst.Queue, now))
+		items = append(items, b.refreshWorkflowTask(adv, inst.Queue, now))
 	} else {
-		items = append(items, delWithValues(b.table("wf_tasks"), map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))}, "id = :taskid AND kind = :workflow", map[string]types.AttributeValue{":taskid": avN(adv.TaskID), ":workflow": avS("workflow")}))
+		cond := "id = :taskid AND kind = :workflow"
+		vals := map[string]types.AttributeValue{":taskid": avN(adv.TaskID), ":workflow": avS("workflow")}
+		if adv.WorkerID != "" {
+			cond += " AND worker_id = :wid AND attempt = :attempt"
+			vals[":wid"] = avS(adv.WorkerID)
+			vals[":attempt"] = avN(int64(adv.Attempt))
+		}
+		items = append(items, delWithValues(b.table("wf_tasks"), map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))}, cond, vals))
 	}
 	return items, parentID, nil
 }
@@ -993,16 +1032,23 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 // truncated advancement: one Update on the same key instead of Delete +
 // post-commit Put. The fence (id/kind condition) is preserved so a zombie
 // task that lost its lease still fails the transaction.
-func (b *Backend) refreshWorkflowTask(instanceID string, taskID int64, queue string, now time.Time) types.TransactWriteItem {
+func (b *Backend) refreshWorkflowTask(adv backend.Advancement, queue string, now time.Time) types.TransactWriteItem {
+	cond := "id = :taskid AND kind = :workflow"
+	vals := map[string]types.AttributeValue{
+		":newid": avN(newID()), ":v": avN(timeToN(now)), ":zero": avN(0), ":now": avN(timeToN(now)),
+		":taskid": avN(adv.TaskID), ":workflow": avS("workflow"),
+	}
+	if adv.WorkerID != "" {
+		cond += " AND worker_id = :wid AND attempt = :attempt"
+		vals[":wid"] = avS(adv.WorkerID)
+		vals[":attempt"] = avN(int64(adv.Attempt))
+	}
 	return types.TransactWriteItem{Update: &types.Update{
-		TableName:           aws.String(b.table("wf_tasks")),
-		Key:                 map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(instanceID))},
-		UpdateExpression:    aws.String("SET id = :newid, visible_at = :v, attempt = :zero, created_at = :now REMOVE worker_id"),
-		ConditionExpression: aws.String("id = :taskid AND kind = :workflow"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":newid": avN(newID()), ":v": avN(timeToN(now)), ":zero": avN(0), ":now": avN(timeToN(now)),
-			":taskid": avN(taskID), ":workflow": avS("workflow"),
-		},
+		TableName:                 aws.String(b.table("wf_tasks")),
+		Key:                       map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))},
+		UpdateExpression:          aws.String("SET id = :newid, visible_at = :v, attempt = :zero, created_at = :now REMOVE worker_id"),
+		ConditionExpression:       aws.String(cond),
+		ExpressionAttributeValues: vals,
 	}}
 }
 

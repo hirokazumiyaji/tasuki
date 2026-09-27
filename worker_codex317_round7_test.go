@@ -45,9 +45,9 @@ type sleepExtendBackend struct {
 	delay time.Duration
 }
 
-func (b *sleepExtendBackend) ExtendLease(ctx context.Context, taskID int64, d time.Duration) error {
+func (b *sleepExtendBackend) ExtendLease(ctx context.Context, task backend.Task, d time.Duration) error {
 	time.Sleep(b.delay)
-	return b.Backend.ExtendLease(ctx, taskID, d)
+	return b.Backend.ExtendLease(ctx, task, d)
 }
 
 // TestWorker_CommitEntryOrdersRenewalBeforeRelease is a regression test
@@ -105,7 +105,7 @@ func TestWorker_CommitEntryOrdersRenewalBeforeRelease(t *testing.T) {
 		errBlocked: make(chan struct{}),
 		errRelease: make(chan struct{}),
 	}
-	tok := w.track(task.ID)
+	tok := w.trackTaskAt(task, time.Now())
 	defer w.untrack(task.ID, tok)
 	herrCh := make(chan error, 1)
 	go func() { herrCh <- w.handleActivity(hook, task, tok) }()
@@ -223,7 +223,7 @@ func TestWorker_DetachedEntryHoldsSingleCriticalSection(t *testing.T) {
 		tok := w.track(id)
 		committing.Store(false)
 		phase.Store(1)
-		if !w.beginDetachedCommit(id, tok, &committing) {
+		if !w.beginDetachedCommit(id, tok, &committing, context.Background()) {
 			close(stop)
 			wg.Wait()
 			t.Fatalf("iter %d: beginDetachedCommit failed on an owned entry", i)
@@ -371,9 +371,9 @@ func TestWorker_RenewRefreshesConservativeExpiry(t *testing.T) {
 	})
 	// A real backend row so ExtendLease succeeds and the refresh path
 	// actually runs ("ghost" stays unregistered; the task itself is only
-	// used for its ID and lease row).
+	// used for its claim and lease row).
 	task := setupClaimableActivityTask(t, ctx, store, mem, w, "conservative-renew-1", "ghost")
-	tok := w.track(task.ID)
+	tok := w.trackTaskAt(task, time.Now())
 	defer w.untrack(task.ID, tok)
 	before := time.Now()
 	w.renewOnceDetached(ctx, task.ID, tok)
