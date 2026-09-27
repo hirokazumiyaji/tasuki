@@ -129,7 +129,7 @@ func main() {
 
 `SetUpdateHandler` も同様に毎回同じ位置で登録する。
 ハンドラは `*workflow.Context` を受け取り、`Execute` / `Sleep` など通常のワークフロー API を使える。
-呼び出しは `worker.Update`（Worker 同一プロセス）。任意の `WithUpdateID` で再送冪等。
+呼び出しは `worker.Update`（Worker 同一プロセス）。任意の `worker.WithUpdateID` で再送冪等。
 進行中の Update があるあいだ、メインのワークフローは新しいコマンドを進めない（単一ゴルーチンの協調モデル）。
 
 `UpsertSearchAttributes` は決定的コマンドとしてジャーナルに残り、ペイロードは適用後のマップ全体である。
@@ -238,7 +238,7 @@ type RetryPolicy struct {
 一時障害で止まらないことを既定とし、打ち切りたい呼び出しには `MaxAttempts` や `WithStartToCloseTimeout` を与える。
 
 `WithStartToCloseTimeout(d)` は **1 試行**の開始から完了までの上限である（`d <= 0` は未指定＝上限なし）。
-超過するとその試行は `"activity start-to-close timeout"` で失敗し、通常の失敗と同じく `RetryPolicy` / `MaxAttempts` / `NonRetryable` の対象になる。
+超過するとその試行は `"activity start-to-close timeout"` で失敗し、通常の失敗と同じく `RetryPolicy` / `MaxAttempts` / `worker.NonRetryable` の対象になる。
 ワーカーはアクティビティに渡す `context.Context` を打ち切る（コンテキストを無視する処理は止められない）。
 
 リトライしても意味のないエラー（バリデーション失敗など）は、アクティビティが `worker.NonRetryable(err)` で包んで返す。
@@ -303,14 +303,14 @@ list, err := c.List(ctx, client.InstanceFilter{
 })
 ```
 
-`WithSearchAttributes` は Start 時に文字列キー／値の可視メタデータを付ける。
+`client.WithSearchAttributes` は Start 時に文字列キー／値の可視メタデータを付ける。
 `List` の `SearchAttributes` は各キーの完全一致を AND で絞り込む（未設定キーは不一致）。
 実行中の更新は `workflow.UpsertSearchAttributes`（マージ。空文字は削除）。
 
-`WithMemo` は表示用の文字列注釈を付ける（Get で見える。List フィルタには使わない）。
+`client.WithMemo` は表示用の文字列注釈を付ける（Get で見える。List フィルタには使わない）。
 実行中の更新は `workflow.UpsertMemo`（マージ。空文字は削除）。
 
-`Signal` に `WithDedupeID` を付けると、同じインスタンス内でその ID の再送は inbox に増えない（戻り値は `nil`）。
+`Signal` に `client.WithDedupeID` を付けると、同じインスタンス内でその ID の再送は inbox に増えない（戻り値は `nil`）。
 未指定または空文字のときは従来どおり、送信ごとの到着になる。
 dedupe キーはインスタンスが終端になると消える。
 
@@ -357,7 +357,7 @@ out, err := worker.Update[ReviseIn, ReviseOut](ctx, w, "order-123", "revise", in
 
 inbox に `update_requested` を入れ、ワークフロータスクで `SetUpdateHandler` を実行する。
 ハンドラは `Execute` などでサスペンドでき、完了は `update_completed` としてジャーナルに残る。
-同じ `WithUpdateID` の再送は、完了済みなら同じ結果を返す。
+同じ `worker.WithUpdateID` の再送は、完了済みなら同じ結果を返す。
 
 `Update` はリクエストの投入と完了待ちだけを行い、呼び出し元ゴルーチンでワークフロー／アクティビティタスクの取得・実行は一切行わない（無関係なアクティビティが呼び出し元で走ることはない）。
 進行は同一プロセスで起動済みの Worker ループ（`w.Start(ctx)`）が担うため、`Update` を完了させるには起動済み Worker が必要である。
@@ -479,13 +479,13 @@ DynamoDB、Firestore、Spanner は無視して FIFO 順に claim する（[08-fa
 
 ストアが未マイグレーション（必要なテーブルが無い）とき、Worker は起動しない。
 `Worker.StartWithError` は、バックエンドが `backend.SchemaValidator` を実装していれば起動前に検証し、失敗したらエラーを返してポーリングループを起動しない（従来の `Worker.Start` は同じエラーをログに出して停止したままになる）。
-`WorkerOptions.DisableSchemaValidation` を `true` にすると、この検証を無効化できる（自己管理でスキーマを用意する運用向け）。
+`worker.WorkerOptions.DisableSchemaValidation` を `true` にすると、この検証を無効化できる（自己管理でスキーマを用意する運用向け）。
 
 アプリケーション側で明示的に検証したいときは `worker.ValidateSchema(ctx, backend)` を使う。
 未対応バックエンドに対しては何もしない。
 
 `w.Start(ctx)` は非同期にポーラーを起動して即座に返る。
-`w.StartWithError(ctx)` も同様だが、起動失敗（スキーマ検証・二重起動 `ErrWorkerAlreadyRunning`）を呼び出し元に返す。
+`w.StartWithError(ctx)` も同様だが、起動失敗（スキーマ検証・二重起動 `worker.ErrWorkerAlreadyRunning`）を呼び出し元に返す。
 `w.Running()` はポーリングループが起動中かどうかを返す（ヘルスチェック用）。
 `w.Shutdown(ctx)` は新規獲得を止め、実行中タスクの完了を ctx の期限まで待ち、未完了タスクのリースを解放（`visible_at` を現在時刻へ戻す）してから返る。
 リース解放により、他のプロセスがリース期限を待たずに引き継げる。

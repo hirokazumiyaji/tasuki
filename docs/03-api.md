@@ -126,7 +126,7 @@ Functions provided by the `workflow` package:
 
 `SetQueryHandler` must be registered at a deterministic position during replay. Query handlers must never record new commands (no `Execute` or `Sleep`).
 
-`SetUpdateHandler` must similarly be registered at a deterministic position. Handlers receive `*workflow.Context` and may call standard workflow operations such as `Execute` and `Sleep`. Updates are triggered using `worker.Update` (within the same worker process) and support optional `WithUpdateID` for idempotent resends. While an update turn is processing, the main workflow routine does not advance.
+`SetUpdateHandler` must similarly be registered at a deterministic position. Handlers receive `*workflow.Context` and may call standard workflow operations such as `Execute` and `Sleep`. Updates are triggered using `worker.Update` (within the same worker process) and support optional `worker.WithUpdateID` for idempotent resends. While an update turn is processing, the main workflow routine does not advance.
 
 `UpsertSearchAttributes` is recorded as a command event in the journal, with the full merged attribute map as its payload. Calling it during query execution is rejected.
 
@@ -273,9 +273,9 @@ list, err := c.List(ctx, client.InstanceFilter{
 })
 ```
 
-- `WithSearchAttributes` attaches string metadata at start time. `List` filters search attributes using exact-match AND queries.
-- `WithMemo` attaches arbitrary display metadata visible in `Get` (not filtered in `List`).
-- `Signal` with `WithDedupeID` prevents duplicate delivery of the same signal identifier within an instance.
+- `client.WithSearchAttributes` attaches string metadata at start time. `List` filters search attributes using exact-match AND queries.
+- `client.WithMemo` attaches arbitrary display metadata visible in `Get` (not filtered in `List`).
+- `Signal` with `client.WithDedupeID` prevents duplicate delivery of the same signal identifier within an instance.
 - `SignalBatch` atomically delivers multiple signals to an instance.
 - `client.Start` is idempotent on instance ID: if an instance with the given ID already exists, it returns `client.ErrAlreadyStarted` along with a valid handle to the existing instance.
 
@@ -398,11 +398,11 @@ type WorkerOptions struct {
 
 Schema migrations are managed per backend. The PostgreSQL backend uses versioned migration files under `backend/postgres/migrations/` (see the [PostgreSQL Migrations README](../backend/postgres/migrations/README.md)).
 
-Workers verify database schemas at startup if the backend implements `backend.SchemaValidator`. If required tables are missing, `StartWithError` returns an error and the polling loop is not launched (the legacy `Start` wrapper logs the same error and leaves the worker stopped). This validation can be disabled using `WorkerOptions.DisableSchemaValidation`.
+Workers verify database schemas at startup if the backend implements `backend.SchemaValidator`. If required tables are missing, `StartWithError` returns an error and the polling loop is not launched (the legacy `Start` wrapper logs the same error and leaves the worker stopped). This validation can be disabled using `worker.WorkerOptions.DisableSchemaValidation`.
 
 Applications can explicitly trigger validation using `worker.ValidateSchema(ctx, backend)`.
 
 - `w.Start(ctx)` starts task polling loops asynchronously and returns immediately.
-- `w.StartWithError(ctx)` is the same but reports startup failures (schema validation, double start via `ErrWorkerAlreadyRunning`) to the caller instead of only logging.
+- `w.StartWithError(ctx)` is the same but reports startup failures (schema validation, double start via `worker.ErrWorkerAlreadyRunning`) to the caller instead of only logging.
 - `w.Running()` reports whether the background polling loop is started (useful for health checks).
 - `w.Shutdown(ctx)` gracefully halts new task acquisition, waits for in-flight tasks within the context deadline, and releases task leases so peer workers can claim them without waiting for expiration.
