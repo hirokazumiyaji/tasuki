@@ -7,45 +7,46 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
+	"github.com/hirokazumiyaji/tasuki/client"
+	"github.com/hirokazumiyaji/tasuki/worker"
 	"github.com/hirokazumiyaji/tasuki/workflow"
 )
 
 type Env struct {
-	t      *testing.T
+	t       *testing.T
 	backend *memory.Backend
-	worker *tasuki.Worker
-	client *tasuki.Client
+	worker  *worker.Worker
+	client  *client.Client
 }
 
-type Option = tasuki.RegisterOption
+type Option = worker.RegisterOption
 
-func WithName(name string) Option { return tasuki.WithName(name) }
+func WithName(name string) Option { return worker.WithName(name) }
 
 func New(t *testing.T) *Env {
 	t.Helper()
 	b := memory.New()
 	b.SetNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
-	w := tasuki.NewWorker(b, tasuki.WorkerOptions{PollInterval: time.Hour})
+	w := worker.NewWorker(b, worker.WorkerOptions{PollInterval: time.Hour})
 	return &Env{
 		t:       t,
 		backend: b,
 		worker:  w,
-		client:  tasuki.NewClient(b),
+		client:  client.NewClient(b),
 	}
 }
 
 func RegisterActivity[I, O any](env *Env, fn func(context.Context, I) (O, error), opts ...Option) {
-	tasuki.RegisterActivity(env.worker, fn, opts...)
+	worker.RegisterActivity(env.worker, fn, opts...)
 }
 
 func Run[I, O any](env *Env, fn func(*workflow.Context, I) (O, error), input I) (O, error) {
 	var zero O
 	const wfName = "__wftest_workflow__"
-	tasuki.RegisterWorkflow(env.worker, fn, tasuki.WithName(wfName))
+	worker.RegisterWorkflow(env.worker, fn, worker.WithName(wfName))
 
-	h, err := tasuki.Start(context.Background(), env.client, wfName, input, tasuki.WithID("wftest-"+env.t.Name()))
+	h, err := client.Start(context.Background(), env.client, wfName, input, client.WithID("wftest-"+env.t.Name()))
 	if err != nil {
 		return zero, err
 	}

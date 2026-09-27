@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
+	"github.com/hirokazumiyaji/tasuki/client"
 	"github.com/hirokazumiyaji/tasuki/contrib/ui"
 )
 
@@ -42,7 +42,7 @@ func countRows(body string) int {
 func TestHandler_ListPagination(t *testing.T) {
 	b := memory.New()
 	seedInstances(t, b, 201, "page")
-	h := ui.NewHandler(tasuki.NewClient(b))
+	h := ui.NewHandler(client.NewClient(b))
 
 	code, body, _ := getList(t, h, "/?limit=100")
 	if code != http.StatusOK {
@@ -90,7 +90,7 @@ func TestHandler_ListPagination(t *testing.T) {
 func TestHandler_ListPaginationExactMultiple(t *testing.T) {
 	b := memory.New()
 	seedInstances(t, b, 200, "exact")
-	h := ui.NewHandler(tasuki.NewClient(b))
+	h := ui.NewHandler(client.NewClient(b))
 
 	code, body, _ := getList(t, h, "/?limit=100")
 	if code != http.StatusOK {
@@ -126,7 +126,7 @@ func TestHandler_ListPaginationExactMultiple(t *testing.T) {
 func TestHandler_ListPaginationBounds(t *testing.T) {
 	b := memory.New()
 	seedInstances(t, b, 201, "bound")
-	h := ui.NewHandler(tasuki.NewClient(b))
+	h := ui.NewHandler(client.NewClient(b))
 
 	// Invalid limit falls back to default (100).
 	_, body, _ := getList(t, h, "/?limit=abc")

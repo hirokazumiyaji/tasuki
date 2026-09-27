@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
+	"github.com/hirokazumiyaji/tasuki/client"
+	"github.com/hirokazumiyaji/tasuki/worker"
 	"github.com/hirokazumiyaji/tasuki/workflow"
 )
 
@@ -30,16 +31,16 @@ func main() {
 	b := memory.New()
 	b.SetNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 
-	w := tasuki.NewWorker(b, tasuki.WorkerOptions{PollInterval: 10 * time.Millisecond})
-	tasuki.RegisterWorkflow(w, HelloWorkflow, tasuki.WithName("hello"))
-	tasuki.RegisterActivity(w, Greet, tasuki.WithName("greet"))
+	w := worker.NewWorker(b, worker.WorkerOptions{PollInterval: 10 * time.Millisecond})
+	worker.RegisterWorkflow(w, HelloWorkflow, worker.WithName("hello"))
+	worker.RegisterActivity(w, Greet, worker.WithName("greet"))
 	if err := w.StartWithError(ctx); err != nil {
 		panic(err)
 	}
 	defer w.Shutdown(ctx)
 
-	c := tasuki.NewClient(b)
-	_, err := tasuki.Start(ctx, c, "hello", "world", tasuki.WithID("demo-1"))
+	c := client.NewClient(b)
+	_, err := client.Start(ctx, c, "hello", "world", client.WithID("demo-1"))
 	if err != nil {
 		panic(err)
 	}

@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hirokazumiyaji/tasuki"
+	"github.com/hirokazumiyaji/tasuki/client"
 	"github.com/hirokazumiyaji/tasuki/contrib/ui"
 	"github.com/hirokazumiyaji/tasuki/internal/backendopen"
 )
@@ -74,7 +74,7 @@ func main() {
 	}
 	defer closer()
 
-	c := tasuki.NewClient(b)
+	c := client.NewClient(b)
 	var opts []ui.Option
 	auth := "off"
 	if token != "" {
