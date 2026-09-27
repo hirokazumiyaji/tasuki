@@ -75,7 +75,7 @@ Expected: no documentation example imports the module root as a Go package or re
 
 - [x] Run `go test ./...`.
 - [x] Run `go list ./...`; confirm the module root is absent and `client` and `worker` are listed.
-- [ ] Search Go and Markdown files for `worker_codex317`, old root imports, and stale root API paths; distinguish prose/module branding from API references.
+- [x] Search Go and Markdown files for `worker_codex317`, old root imports, and stale root API paths; distinguish prose/module branding from API references.
 - [x] Review the diff to confirm tests retain their assertions and runtime/persistence code has no unrelated edits.
 
 Expected: all tests pass, the root package is absent, both new packages are present, and scans find no stale API references.
