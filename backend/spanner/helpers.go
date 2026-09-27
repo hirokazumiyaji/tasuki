@@ -2,8 +2,12 @@ package spanner
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -22,6 +26,30 @@ func newID() int64 {
 		return 1
 	}
 	return id
+}
+
+// incarnationColumn is the wf_instances (and wf_purge_markers) column
+// carrying the per-incarnation identity token (see newIncarnation).
+const incarnationColumn = "incarnation"
+
+// newIncarnation mints the identity token for one instance incarnation
+// (Codex round-21 P1 on #296): 128 crypto-random bits, hex-encoded. Terminal
+// sweep and purge fences compare this token — not created_at — so a
+// recreated ID can never alias a prior incarnation through clock rollback,
+// VM restore, or timestamp precision truncation (all of which can reproduce
+// the same created_at). A 128-bit random collision is practically
+// impossible, unlike clock-derived equality. Legacy instance rows predate
+// the column and read NULL; fences fall back to created_at comparison for
+// them (see victimMatches) with that documented caveat.
+func newIncarnation() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return hex.EncodeToString(b[:])
+	}
+	// crypto/rand essentially never fails; the fallback keeps
+	// CreateInstance total (unique per call via nanotime plus process
+	// randomness) rather than failing instance creation.
+	return fmt.Sprintf("fallback-%d-%d", time.Now().UnixNano(), newID())
 }
 
 func isAlreadyExists(err error) bool {
@@ -76,10 +104,10 @@ func nullStr(s string) spanner.NullString {
 }
 
 type activityPayload struct {
-	Name                    string          `json:"name"`
-	Input                   json.RawMessage `json:"input"`
-	Retry                   retryJSON       `json:"retry"`
-	StartToCloseTimeoutMs   int64           `json:"start_to_close_timeout_ms,omitempty"`
+	Name                  string          `json:"name"`
+	Input                 json.RawMessage `json:"input"`
+	Retry                 retryJSON       `json:"retry"`
+	StartToCloseTimeoutMs int64           `json:"start_to_close_timeout_ms,omitempty"`
 }
 
 type retryJSON struct {
@@ -101,6 +129,345 @@ func inboxPayload(ev journal.Event) []byte {
 	b, _ := json.Marshal(inboxEnv{Name: ev.Name, Body: ev.Payload})
 	return b
 }
+
+// dedupeKeyLimit is the wf_signal_dedupe.dedupe_id STRING(255) budget.
+// Both backends share one encoding so keys behave identically and stay
+// portable (Codex round 8 on #327).
+const dedupeKeyLimit = 255
+
+const (
+	dedupeMarkerPrefix       = "__post_terminal__:"
+	dedupeHashedUserPrefix   = "__hash__:"
+	dedupeHashedMarkerPrefix = "__post_terminal__#h:"
+	// dedupeMarkerPrefixV1 / dedupeHashedMarkerPrefixV1 namespace the
+	// versioned (Codex round 9 on #327) post-terminal retry markers. The
+	// legacy prefixes above are ambiguous with pre-upgrade user rows:
+	// before the round-6 escape, a user DedupeID of "__post_terminal__:x"
+	// was stored verbatim as "__post_terminal__:x" — the very key the
+	// retry-marker probe for user ID "x" reads. The round-8 dual-read
+	// (probing legacy raw forms) therefore mistakes that legacy user row
+	// for a marker and swallows the first post-terminal send of "x" (lost
+	// signal). Versioned markers live under a disjoint prefix no legacy
+	// verbatim row uses, and marker probes check versioned forms only, so
+	// unversioned legacy rows never match a marker probe (safe direction:
+	// a duplicate event rather than a dropped send; pre-upgrade markers
+	// are likewise ignored and may duplicate one retry).
+	dedupeMarkerPrefixV1       = "__post_terminal__v1:"
+	dedupeHashedMarkerPrefixV1 = "__post_terminal__v1#h:"
+)
+
+func hashDedupeID(dedupeID string) string {
+	sum := sha256.Sum256([]byte(dedupeID))
+	return hex.EncodeToString(sum[:])
+}
+
+// postTerminalMarkersTable holds post-terminal retry markers OUTSIDE the
+// dedupe keyspace (Codex round 11 on #327). Markers used to live as rows of
+// wf_signal_dedupe under a "__post_terminal__..:" prefix, but prefixes are
+// insufficient: a legacy verbatim user row (old code stored DedupeIDs
+// verbatim, so a user ID of "__post_terminal__v1:x" occupies the very row
+// the v1 marker probe for "x" reads) collides with the marker in both probe
+// directions — the user probe drops a genuine send on a marker row, the
+// marker probe drops one on a legacy user row. A disjoint table ends the
+// ambiguity structurally: user-key probes never consult it, marker probes
+// never consult wf_signal_dedupe. Rows predating the move stay inert in
+// wf_signal_dedupe (never probed as markers; user probes skip marker-shaped
+// candidates) and drain via purge; the terminate sweep keeps preserving them
+// exactly as before.
+const postTerminalMarkersTable = "wf_post_terminal_markers"
+
+// postTerminalDedupeMarker derives the post-terminal send marker key for a
+// DedupeID. Since the round-11 move, markers are stored as rows of
+// postTerminalMarkersTable, not wf_signal_dedupe: the derivation below only
+// shapes the marker_key and the stored shape for operators, so no user key
+// — however crafted — can share a row with a marker. (History: terminal
+// sends always insert their event, but retries must still dedupe: the first
+// post-terminal send creates the marker alongside the event, and later
+// retries with the same DedupeID see the marker and skip. Only the marker
+// suppresses a terminal insert; the pre-terminal base key never does.)
+//
+// The marker carries the round-9 namespace version (not the legacy
+// "__post_terminal__:" prefix).
+//
+// Long IDs hash into a bounded marker form under the same transparency rule
+// as user keys (Codex round 8 on #327).
+func postTerminalDedupeMarker(dedupeID string) string {
+	if m := dedupeMarkerPrefixV1 + dedupeID; len(m) <= dedupeKeyLimit {
+		return m
+	}
+	return dedupeHashedMarkerPrefixV1 + hashDedupeID(dedupeID)
+}
+
+// escapeDedupeID encodes a user-supplied DedupeID for storage. IDs starting
+// with "__" gain one extra "__" prefix, so every stored user key is either
+// free of a "__" prefix (unescaped) or starts with "____" (escaped), and the
+// encoding is injective, so distinct user IDs still map to distinct keys.
+// (Pre-escape verbatim rows such as "__post_terminal__:x" predate this
+// namespacing; since the round-11 marker move, live markers never share the
+// dedupe keyspace — see isPostTerminalMarkerKey — and since round 12 running
+// probes honor the raw legacy candidate as the live guard for a
+// marker-shaped DedupeID.)
+//
+// Long IDs that would exceed the STRING(255) budget hash into a bounded
+// "__hash__:" form instead (Codex round 8 on #327); the mapping applies on
+// write and lookup alike, so it stays transparent.
+//
+// NOTE on framing (Codex round-16 on #296): unlike Firestore, which
+// concatenates instance and key into one document ID (length-prefixed since
+// the round-16 fix — see frameDedupeDocID there), Spanner keys are composite
+// (instance_id, dedupe_id), so (instance, key) pairs are structurally
+// unambiguous here; there is no concatenation to reframe. The key-level
+// encodings below are byte-identical to Firestore's, and lookups validate
+// the stored instance_id exactly like Firestore's docInstanceMatches (a
+// no-op by construction here — the key's instance component always equals
+// the stored column — kept as defense in depth so both backends enforce the
+// same ownership invariant).
+func escapeDedupeID(dedupeID string) string {
+	var esc string
+	if strings.HasPrefix(dedupeID, "__") {
+		esc = "__" + dedupeID
+	} else {
+		esc = dedupeID
+	}
+	if len(esc) <= dedupeKeyLimit {
+		return esc
+	}
+	return dedupeHashedUserPrefix + hashDedupeID(dedupeID)
+}
+
+// rawFallbackDedupeKey derives the fallback guard key for a DedupeID whose
+// canonical key is already occupied by a foreign legacy row (Codex round-16
+// on #296). Short IDs fall back to the raw key itself, exactly as before.
+// Over-budget IDs cannot: writing the raw long ID would exceed the
+// STRING(255) budget, the commit fails, and the event is never delivered —
+// so they hash into the __hash__: namespace with a domain-separated
+// second-level hash: deterministic, bounded (77 chars), byte-identical to
+// Firestore's, and structurally distinct from the occupied canonical hash
+// (no "raw:" infix). Residual caveat, duplicate-never-drop: a true double
+// collision (canonical AND fallback keys both foreign-occupied) inserts
+// unguarded. The hash-reuse confusion shape — a DISTINCT send reusing another
+// send's 77-char fallback hash as its own literal DedupeID — is closed by the
+// fallback_owner column (Codex round-17 on #296): v2 rows record their
+// owner's canonical form and probes match only on owner equality, exactly
+// like Firestore's stored canonical cross-check.
+func rawFallbackDedupeKey(dedupeID string) string {
+	if len(dedupeID) <= dedupeKeyLimit {
+		return dedupeID
+	}
+	sum := sha256.Sum256([]byte("tasuki/dedupe-raw-fallback/v1\x00" + dedupeID))
+	return dedupeHashedUserPrefix + "raw:" + hex.EncodeToString(sum[:])
+}
+
+// isPostTerminalMarkerKey reports whether a stored wf_signal_dedupe key is
+// shaped like a post-terminal retry marker (versioned or legacy form). Since
+// the round-11 move, live markers never live in wf_signal_dedupe; this
+// classifies only inert pre-upgrade rows. It serves two conservative
+// purposes: the terminate sweep preserves such rows (deleting a pre-upgrade
+// marker while its inbox event remains would duplicate its retry), and
+// terminal base-key probes skip marker-shaped candidates (such a row is an
+// inert marker or a legacy verbatim row — never the live guard for the
+// probed DedupeID; skipping duplicates at worst, never drops). Running
+// probes honor every candidate instead (Codex round 12 on #296): a running
+// instance cannot own a post-terminal marker, so a marker-shaped row there
+// is unambiguously a legacy user key. User keys written by current code —
+// verbatim, "__"-escaped ("____.."), or hashed ("__hash__:..") — never carry
+// these prefixes.
+func isPostTerminalMarkerKey(stored string) bool {
+	return strings.HasPrefix(stored, dedupeMarkerPrefix) ||
+		strings.HasPrefix(stored, dedupeHashedMarkerPrefix) ||
+		strings.HasPrefix(stored, dedupeMarkerPrefixV1) ||
+		strings.HasPrefix(stored, dedupeHashedMarkerPrefixV1)
+}
+
+// dedupeFormatVersion stamps new wf_signal_dedupe rows so reads can tell
+// canonical (escaped) rows from legacy verbatim rows (Codex round 13 on
+// #296). Pre-versioning code stored "__"-prefixed IDs verbatim, so a stored
+// key alone is ambiguous: the row at "____x" may be the verbatim guard for
+// user ID "____x" or the escaped guard for user ID "__x". Dual-read probes
+// over legacy candidates therefore mistake one ID's row for another's and
+// skip genuine sends (wrong owner). New writes carry format_version=1 with
+// the canonical escapeDedupeID form in both the key and the dedupe_id
+// column; rows with a NULL/absent version are legacy (v0) and match only by
+// exact raw-ID equality, never as an escaped form of another ID. Databases
+// created before the column existed gain it via Migrate (see
+// ensureDedupeFormatVersionColumn), with existing rows defaulting to
+// NULL = legacy.
+const dedupeFormatVersion = 1
+
+const dedupeFormatVersionColumn = "format_version"
+
+// dedupeFormatRawKeyVersion stamps fallback guard rows written at the raw
+// (unescaped) key instead of the canonical escaped key. The fallback is used
+// when the canonical key is already occupied by a foreign legacy row (which
+// cannot be overwritten and must not be mistaken for this ID's guard).
+//
+// Since Codex round-17 on #296, fallback rows additionally record their
+// owner's canonical form in the fallback_owner column (see
+// dedupeFallbackOwnerColumn): dedupe_id IS the primary key, so unlike
+// Firestore — whose dedupe_id field carries the canonical form even on
+// fallback rows — Spanner had no owner metadata and matched fallback rows on
+// the key alone. A DISTINCT send whose literal DedupeID equals another
+// send's 77-char hashed fallback key (short, so rawFallback(K)==K) then
+// claimed the existing guard and its genuine event was suppressed. Probes now
+// match a v2 row only when the stored owner equals the requested ID's
+// canonical form, closing the confusion structurally (a two-level hash would
+// still be literally expressible as a user ID; the owner column is airtight).
+// Rows predating the column read a NULL owner and keep the previous key-only
+// rule, so established guards keep deduping; only pre-existing rows carry the
+// old caveat, and they drain via the terminal sweep and purge.
+const dedupeFormatRawKeyVersion = 2
+
+// dedupeFallbackOwnerColumn names the nullable wf_signal_dedupe column that
+// records a v2 fallback guard row's owner as the canonical escapeDedupeID
+// form (always within the STRING(255) budget: escapeDedupeID hashes anything
+// that would exceed it). Databases created before the column existed gain it
+// via Migrate (see ensureDedupeFallbackOwnerColumn), with existing rows
+// defaulting to NULL.
+const dedupeFallbackOwnerColumn = "fallback_owner"
+
+// matchDedupeRow reports whether a stored dedupe row guards the requested
+// raw DedupeID. candidateKey is the probed stored-key form that located the
+// row; storedDedupeID is the row's dedupe_id column; owner is its
+// fallback_owner column (NULL for legacy rows and for fallback rows written
+// before the round-17 #296 owner column); version is its format_version
+// column (NULL for legacy rows).
+//
+//   - Versioned rows always store the canonical escapeDedupeID form, so they
+//     match iff the stored column equals the requested ID's canonical form —
+//     regardless of which candidate located them. A foreign-owner row (e.g.
+//     "__x"'s "____x" found via "____x"'s raw candidate) never matches.
+//   - Fallback rows (format_version >= 2) live at the rawFallbackDedupeKey
+//     instead of the canonical key. They match iff the candidate IS that
+//     fallback key for the requested ID AND the stored owner names the
+//     requested ID's canonical form — the same positive owner identification
+//     Firestore gets from its stored dedupe_id field. A NULL owner (a row
+//     written before the owner column existed) keeps the previous key-only
+//     rule so its guard keeps deduping; only such rows retain the hash-reuse
+//     caveat.
+//   - Legacy rows were stored verbatim, so they belong to the requested ID
+//     iff the row's STORED key IS the requested raw ID exactly (Codex
+//     round-19 on #296, same rule as Firestore). An escaped candidate
+//     hitting a legacy row is another ID's row and never matches (safe
+//     direction: the send inserts, possibly duplicating, but is never
+//     dropped). The stored comparison is load-bearing on Firestore, where a
+//     framing collision can land a probe on a foreign legacy row
+//     (frameDedupeDocID("3:3","x") is the legacy doc of ("3","3:3:x")); under
+//     Spanner's composite (instance_id, dedupe_id) keys such aliasing is
+//     structurally impossible — readDedupeRow reads by (instanceID, key), so
+//     the stored column always equals the probed key — and the stored form
+//     keeps both backends on the identical rule.
+//
+// Callers additionally gate every hit on the stored instance_id equaling the
+// probing instance (see readDedupeRow): a no-op by construction under
+// composite keys, kept identical to Firestore's docInstanceMatches as
+// defense in depth.
+func matchDedupeRow(requestedRaw, candidateKey, storedDedupeID string, owner spanner.NullString, version spanner.NullInt64) bool {
+	if version.Valid && version.Int64 >= dedupeFormatRawKeyVersion {
+		// Fallback guard: the key locates the row, the owner identifies it.
+		// Without the owner check, a DISTINCT short ID literally equal to
+		// another send's hashed fallback key would claim its guard and its
+		// genuine event would be suppressed (round-17 P2 on #296).
+		if candidateKey != rawFallbackDedupeKey(requestedRaw) {
+			return false
+		}
+		if !owner.Valid {
+			return true
+		}
+		return owner.StringVal == escapeDedupeID(requestedRaw)
+	}
+	if version.Valid && version.Int64 >= dedupeFormatVersion {
+		return storedDedupeID == escapeDedupeID(requestedRaw)
+	}
+	return storedDedupeID == requestedRaw
+}
+
+// dedupeKeyCandidates lists the stored user-key forms to probe on
+// dedupe-check reads, legacy raw first (Codex round 8 on #327). The fallback
+// guard key comes last: it is only consulted when the canonical key is
+// occupied. Terminal base-key probes skip marker-shaped candidates (see
+// isPostTerminalMarkerKey); running probes honor every candidate, since a
+// marker-shaped row on a running instance is unambiguously a legacy user
+// key (Codex round 12 on #296).
+func dedupeKeyCandidates(dedupeID string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(k string) {
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	add(dedupeID)
+	if strings.HasPrefix(dedupeID, "__") {
+		add("__" + dedupeID)
+	}
+	add(escapeDedupeID(dedupeID))
+	add(rawFallbackDedupeKey(dedupeID))
+	return out
+}
+
+func dedupeKey(dedupeID string) string       { return escapeDedupeID(dedupeID) }
+func dedupeMarkerKey(dedupeID string) string { return postTerminalDedupeMarker(dedupeID) }
+
+// soleAmbiguousGuardKey chooses the single guard row for an
+// ambiguously-encoded DedupeID (Codex round-28 P1 on #296): the requested ID
+// differs from its canonical escapeDedupeID form ("__"-prefixed short IDs and
+// every over-budget ID), so a canonical row would sit at another ID's
+// verbatim probe key. Pre-upgrade nodes match on key existence alone — they
+// cannot interpret format_version — so an old node handling the distinct
+// first send S = escapeDedupeID(X) would mistake X's canonical guard for its
+// own verbatim guard and silently drop S's event. The guard therefore lives
+// solely at the fallback key, which no other ID probes as anything but its
+// own raw/fallback candidate (see the candidate-disjointness argument at the
+// call sites): the raw ID itself for short IDs — a legacy verbatim shape
+// with no version columns, matched by current readers on exact raw equality
+// (the same legacy rule verbatim-era readers use) — or a versioned fallback
+// row carrying the owner's canonical form for over-budget IDs (the existing
+// foreign-collision shape). ok=false when the fallback key is occupied or
+// batch-reserved: the caller inserts unguarded (duplicate-never-drop) rather
+// than writing a canonical row old nodes would misread. Pure for unit tests.
+func soleAmbiguousGuardKey(requestedRaw, fallbackKey string, fallbackOccupied bool, reserved map[string]bool) (key string, version int64, ok bool) {
+	if fallbackOccupied || reserved[fallbackKey] {
+		return "", 0, false
+	}
+	if fallbackKey == requestedRaw {
+		return fallbackKey, 0, true
+	}
+	return fallbackKey, dedupeFormatRawKeyVersion, true
+}
+
+// pickSpannerDedupeInsert chooses the guard key for a DedupeID with no owned
+// guard found (Codex round-18 on #296 P2): the canonical key when free, else
+// the fallback key when free — the same preference the inline code had, with
+// the owner's canonical form recorded on fallback rows (see
+// dedupeFallbackOwnerColumn). Keys already reserved by earlier items of the
+// same batch count as occupied: the transaction's reads don't see buffered
+// mutations, so two items choosing one key (e.g. batch "____x" + "__x" with
+// "______x" foreign-occupied: the first falls back to "____x", the second's
+// canonical probe misses the buffered insert and chooses the same key) fail
+// the whole batch deterministically on every retry. insert=false when
+// nothing is free: the caller inserts unguarded (duplicate-never-drop)
+// instead of failing the batch.
+func pickSpannerDedupeInsert(canonicalKey, fallbackKey string, canonicalOccupied, fallbackOccupied bool, reserved map[string]bool) (key string, version int64, insert bool) {
+	if !canonicalOccupied && !reserved[canonicalKey] {
+		return canonicalKey, dedupeFormatVersion, true
+	}
+	if !fallbackOccupied && !reserved[fallbackKey] {
+		return fallbackKey, dedupeFormatRawKeyVersion, true
+	}
+	return "", 0, false
+}
+
+// Exported key-encoding accessors for the cross-backend parity test (see
+// backend/firestore/dedupe_parity_test.go): both backends must encode
+// DedupeIDs byte-identically even though they store them differently
+// (framed Firestore document IDs vs. Spanner composite keys).
+func EscapeDedupeID(dedupeID string) string { return escapeDedupeID(dedupeID) }
+func PostTerminalDedupeMarker(dedupeID string) string {
+	return postTerminalDedupeMarker(dedupeID)
+}
+func RawFallbackDedupeKey(dedupeID string) string  { return rawFallbackDedupeKey(dedupeID) }
+func DedupeKeyCandidates(dedupeID string) []string { return dedupeKeyCandidates(dedupeID) }
 
 func unwrapInboxPayload(payload []byte) (string, []byte) {
 	if len(payload) == 0 {

@@ -64,6 +64,23 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 	now := nowUTC()
 	taskID := newID()
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// Fence ID reuse while crash recovery is pending: a previous
+		// incarnation's purge wrote its marker atomically with the victim
+		// delete and has not finished its trailing sweep (the marker is
+		// cleared only after the second sweep/reap). Creating a replacement
+		// now would let it consume the old incarnation's leftover inbox
+		// rows long before its own purge. Fail fast so the caller retries;
+		// the next PurgeInstances resumes the crashed cleanup via the
+		// marker (sweep + clear) and unblocks the ID. The check rides in
+		// this same transaction: the victim-delete transaction is the
+		// serialization point, so a delete committing after this read
+		// aborts the create on the conflicting instance-row write, and a
+		// delete that committed first leaves its marker visible here.
+		if _, merr := txn.ReadRow(ctx, "wf_purge_markers", spanner.Key{inst.ID}, []string{"instance_id"}); merr == nil {
+			return backend.ErrAlreadyExists
+		} else if !isNotFound(merr) {
+			return merr
+		}
 		muts := []*spanner.Mutation{
 			spanner.InsertMap("wf_instances", map[string]any{
 				"id":                inst.ID,
@@ -78,6 +95,7 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 				"memo":              jsonVal(backend.MarshalSearchAttributes(inst.Memo)),
 				"created_at":        now,
 				"updated_at":        now,
+				incarnationColumn:   newIncarnation(),
 			}),
 			spanner.InsertMap("wf_journal", map[string]any{
 				"instance_id": inst.ID,
@@ -229,93 +247,56 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 
 func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	now := nowUTC()
+	// Status flips in one small transaction so the mutation count never scales
+	// with the instance's task/timer/dedupe rows (DynamoDB parity). Child rows
+	// are swept afterwards in paged transactions.
+	// Dedupe keys are snapshotted INSIDE the flip transaction (serializable
+	// read): a post-terminal SendToInbox committing after the flip is never in
+	// the snapshot and survives the sweep, while pre-termination keys are
+	// reaped (Codex round 8 on #327: an unqualified sweep deleted
+	// post-terminal retry markers while leaving their inbox events, so the
+	// next retry re-inserted a duplicate). Markers in the snapshot itself are
+	// filtered out as well; purge reaps leftovers.
+	var dedupeSnapshot []string
+	var victim purgeVictim
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{id}, []string{"id"})
+		v, err := queryInstanceVictimTx(ctx, txn, id)
 		if err != nil {
 			if isNotFound(err) {
 				return backend.ErrNotFound
 			}
 			return err
 		}
-		_ = row
-		var muts []*spanner.Mutation
-		muts = append(muts, spanner.UpdateMap("wf_instances", map[string]any{
-			"id":           id,
-			"status":       "terminated",
-			"updated_at":   now,
-			"completed_at": now,
-		}))
-		tIter := txn.Query(ctx, spanner.Statement{
-			SQL:    `SELECT id FROM wf_tasks WHERE instance_id = @id`,
-			Params: map[string]any{"id": id},
-		})
-		for {
-			r, err := tIter.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				tIter.Stop()
-				return err
-			}
-			var tid int64
-			if err := r.Columns(&tid); err != nil {
-				tIter.Stop()
-				return err
-			}
-			muts = append(muts, spanner.Delete("wf_tasks", spanner.Key{tid}))
-		}
-		tIter.Stop()
-		tmIter := txn.Query(ctx, spanner.Statement{
-			SQL:    `SELECT seq FROM wf_timers WHERE instance_id = @id`,
-			Params: map[string]any{"id": id},
-		})
-		for {
-			r, err := tmIter.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				tmIter.Stop()
-				return err
-			}
-			var seq int64
-			if err := r.Columns(&seq); err != nil {
-				tmIter.Stop()
-				return err
-			}
-			muts = append(muts, spanner.Delete("wf_timers", spanner.Key{id, seq}))
-		}
-		tmIter.Stop()
-		dMuts, err := deleteSignalDedupe(ctx, txn, id)
+		victim = v
+		ids, err := querySignalDedupeIDsTx(ctx, txn, id)
 		if err != nil {
 			return err
 		}
-		muts = append(muts, dMuts...)
-		iIter := txn.Query(ctx, spanner.Statement{
-			SQL:    `SELECT id FROM wf_inbox WHERE instance_id = @id`,
-			Params: map[string]any{"id": id},
+		dedupeSnapshot = ids
+		return txn.BufferWrite([]*spanner.Mutation{
+			spanner.UpdateMap("wf_instances", map[string]any{
+				"id":           id,
+				"status":       "terminated",
+				"updated_at":   now,
+				"completed_at": now,
+			}),
 		})
-		for {
-			r, err := iIter.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				iIter.Stop()
-				return err
-			}
-			var inboxID int64
-			if err := r.Columns(&inboxID); err != nil {
-				iIter.Stop()
-				return err
-			}
-			muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{inboxID}))
-		}
-		iIter.Stop()
-		return txn.BufferWrite(muts)
 	})
 	if err != nil {
+		return err
+	}
+	// Await the sweep before returning so previously seen DedupeIDs insert
+	// anew and claimed tasks observe no leftovers. Terminal instances are
+	// immutable, so the sweep cannot race with advancement commits — but it
+	// can race with a purge that deletes the instance and lets CreateInstance
+	// reuse the ID, which the incarnation fence aborts on (see
+	// sweepTerminateDocs); purge reaps anything left by a failed or fenced
+	// sweep.
+	// The status flip above already committed, so subscribers must wake even
+	// when the sweep fails: GetInstance permanently reports terminated while
+	// a skipped notifyTerminal would leave waiters asleep until a retry.
+	if err := b.sweepTerminateDocs(ctx, victim, dedupeSnapshot); err != nil {
+		b.notifyTerminal(id)
 		return err
 	}
 	b.notifyTerminal(id)
@@ -365,61 +346,130 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 	var out []backend.Task
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		out = nil
-		iter := txn.Query(ctx, spanner.Statement{
-			SQL: `SELECT id, visible_at FROM wf_tasks
-				WHERE kind = @kind AND visible_at <= @now AND queue IN UNNEST(@queues)
-				ORDER BY visible_at, id LIMIT @limit`,
-			Params: map[string]any{
-				"kind": req.Kind, "now": now, "queues": req.Queues, "limit": int64(req.Limit),
-			},
-		})
-		type cand struct {
-			id  int64
-			vis time.Time
-		}
-		var cands []cand
-		for {
-			row, err := iter.Next()
-			if err == iterator.Done {
+		// Terminal-instance tasks are deleted on sight (best-effort) and
+		// the select repeats while deletions free slots: without the
+		// delete a Limit:1 poll stuck behind one terminal task would
+		// return it on every call and starve the live tasks queued
+		// behind it. Each repeat deletes at least one row, so the loop
+		// terminates; lease races alone never trigger a repeat.
+		// The total deletes per claim are capped (see
+		// spannerClaimStaleDeleteCap): an unbounded terminal backlog must
+		// not buffer one DELETE per row in a single commit, or DML limits
+		// abort every claim and the live task stays unreachable. The cap
+		// drains across polls; Firestore needs no equivalent cap because
+		// its claim path commits one document per transaction (already
+		// bounded by the 500-write limit).
+		totalDeleted := 0
+		for len(out) < req.Limit {
+			if totalDeleted >= spannerClaimStaleDeleteCap {
 				break
 			}
-			if err != nil {
-				iter.Stop()
-				return err
-			}
-			var c cand
-			if err := row.Columns(&c.id, &c.vis); err != nil {
-				iter.Stop()
-				return err
-			}
-			cands = append(cands, c)
-		}
-		iter.Stop()
-
-		for _, c := range cands {
-			n, err := txn.Update(ctx, spanner.Statement{
-				SQL: `UPDATE wf_tasks SET visible_at = @vis, attempt = attempt + 1, worker_id = @wid
-					WHERE id = @id AND visible_at = @old`,
+			need := int64(req.Limit - len(out))
+			iter := txn.Query(ctx, spanner.Statement{
+				SQL: `SELECT id, visible_at, instance_id FROM wf_tasks
+					WHERE kind = @kind AND visible_at <= @now AND queue IN UNNEST(@queues)
+					ORDER BY visible_at, id LIMIT @limit`,
 				Params: map[string]any{
-					"vis": visAt, "wid": req.WorkerID, "id": c.id, "old": c.vis,
+					"kind": req.Kind, "now": now, "queues": req.Queues, "limit": need,
 				},
 			})
-			if err != nil {
-				return err
+			type cand struct {
+				id         int64
+				vis        time.Time
+				instanceID string
 			}
-			if n == 0 {
-				continue
+			var cands []cand
+			for {
+				row, err := iter.Next()
+				if err == iterator.Done {
+					break
+				}
+				if err != nil {
+					iter.Stop()
+					return err
+				}
+				var c cand
+				if err := row.Columns(&c.id, &c.vis, &c.instanceID); err != nil {
+					iter.Stop()
+					return err
+				}
+				cands = append(cands, c)
 			}
-			row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{c.id},
-				[]string{"id", "kind", "queue", "instance_id", "ref_seq", "payload", "attempt", "visible_at", "worker_id", "heartbeat"})
-			if err != nil {
-				return err
+			iter.Stop()
+			if len(cands) == 0 {
+				break
 			}
-			t, err := scanTask(row)
-			if err != nil {
-				return err
+			deleted := 0
+			for _, c := range cands {
+				if len(out) >= req.Limit {
+					break
+				}
+				if totalDeleted+deleted >= spannerClaimStaleDeleteCap {
+					break
+				}
+				// Fence against TerminateInstance: never lease a task whose
+				// instance already left running. Reading the instance row inside
+				// the claim transaction also conflicts with a concurrent status
+				// flip, restoring the exclusion the pre-chunk single-transaction
+				// terminate had (status + task deletes committed atomically).
+				// A stale terminal task is deleted here so later polls (and
+				// the repeat select above) reach live tasks.
+				irow, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{c.instanceID}, []string{"status"})
+				if err != nil {
+					if isNotFound(err) {
+						if _, err := txn.Update(ctx, spanner.Statement{
+							SQL:    `DELETE FROM wf_tasks WHERE id = @id`,
+							Params: map[string]any{"id": c.id},
+						}); err != nil {
+							return err
+						}
+						deleted++
+						continue
+					}
+					return err
+				}
+				var st string
+				if err := irow.Columns(&st); err != nil {
+					return err
+				}
+				if st != "running" {
+					if _, err := txn.Update(ctx, spanner.Statement{
+						SQL:    `DELETE FROM wf_tasks WHERE id = @id`,
+						Params: map[string]any{"id": c.id},
+					}); err != nil {
+						return err
+					}
+					deleted++
+					continue
+				}
+				n, err := txn.Update(ctx, spanner.Statement{
+					SQL: `UPDATE wf_tasks SET visible_at = @vis, attempt = attempt + 1, worker_id = @wid
+						WHERE id = @id AND visible_at = @old`,
+					Params: map[string]any{
+						"vis": visAt, "wid": req.WorkerID, "id": c.id, "old": c.vis,
+					},
+				})
+				if err != nil {
+					return err
+				}
+				if n == 0 {
+					continue
+				}
+				row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{c.id},
+					[]string{"id", "kind", "queue", "instance_id", "ref_seq", "payload", "attempt", "visible_at", "worker_id", "heartbeat"})
+				if err != nil {
+					return err
+				}
+				t, err := scanTask(row)
+				if err != nil {
+					return err
+				}
+				out = append(out, t)
 			}
-			out = append(out, t)
+			if deleted == 0 {
+				break
+			}
+			totalDeleted += deleted
 		}
 		return nil
 	})
@@ -637,8 +687,35 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if len(advs) == 0 {
 		return nil
 	}
+	// Dedupe keys for terminal advancements are snapshotted INSIDE the commit
+	// transaction (serializable read): a SendToInbox serializing before the
+	// terminal commit is included in the post-commit sweep instead of
+	// lingering until purge (where a later ID reuse would mistake it for a
+	// duplicate of a promised post-terminal event). Keys created after the
+	// snapshot read stay for purge. The sweep itself still runs after the
+	// commit so the mutation count never scales with accumulated keys.
+	// The pre-commit incarnation is captured alongside for the sweep fence
+	// (see terminalSweep): a purge plus ID reuse interleaved with the sweep
+	// aborts it instead of deleting the replacement's recreated guard.
+	var snapshots map[string]terminalSweep
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// Reset per attempt: the transaction function may run more than
+		// once, and only the committing attempt's reads classify the sweep.
+		snapshots = make(map[string]terminalSweep, len(advs))
 		for _, adv := range advs {
+			if adv.Terminal != nil {
+				if _, ok := snapshots[adv.InstanceID]; !ok {
+					ids, err := querySignalDedupeIDsTx(ctx, txn, adv.InstanceID)
+					if err != nil {
+						return err
+					}
+					victim, err := queryInstanceVictimTx(ctx, txn, adv.InstanceID)
+					if err != nil {
+						return err
+					}
+					snapshots[adv.InstanceID] = terminalSweep{createdAt: victim.createdAt, incarnation: victim.incarnation, dedupeIDs: ids}
+				}
+			}
 			if err := b.commitAdvancementTxn(ctx, txn, adv); err != nil {
 				return err
 			}
@@ -647,6 +724,17 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	})
 	if err != nil {
 		return err
+	}
+	// Wake terminal subscribers immediately after the successful commit,
+	// before the fallible ensureWorkflowTaskIfInbox loop below: the
+	// terminal status already committed, and a transient ensure error
+	// returns early while the advancement only retries on conflict.
+	// Notification must never be skipped because post-commit cleanup
+	// errored.
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			b.notifyTerminal(adv.InstanceID)
+		}
 	}
 	for _, adv := range advs {
 		if err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
@@ -658,7 +746,29 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	b.notifyTasks()
 	for _, adv := range advs {
 		if adv.Terminal != nil {
-			b.notifyTerminal(adv.InstanceID)
+			// Dedupe cleanup stays out of the advancement transaction so the
+			// mutation count never scales with accumulated dedupe keys.
+			// Best-effort (DynamoDB/Firestore parity); purge reaps leftovers.
+			// Only keys snapshotted before the commit are removed: a
+			// concurrent SendToInbox with a new DedupeID can land after
+			// notifyTerminal fired above, and sweeping its key while the
+			// inbox event remains would duplicate a later retry. Every page
+			// re-validates the pre-commit incarnation: a purge plus ID
+			// reuse interleaved with the sweep aborts it instead of
+			// deleting the replacement's recreated guard (see
+			// sweepSignalDedupeIDs); purge owns the leftovers. The sweep
+			// stays synchronous so a redelivered DedupeID inserts anew once
+			// this call returns, but runs under a bounded context so a
+			// stuck store delays only this cleanup, never the caller.
+			cctx, cancel := context.WithTimeout(context.Background(), signalDedupeSweepTimeout)
+			sw := snapshots[adv.InstanceID]
+			victim := purgeVictim{id: adv.InstanceID, createdAt: sw.createdAt, incarnation: sw.incarnation}
+			guard := func(ctx context.Context) error { return b.checkPurgeVictim(ctx, victim) }
+			guardTx := func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+				return b.checkPurgeVictimTx(ctx, txn, victim)
+			}
+			_ = b.sweepSignalDedupeIDs(cctx, adv.InstanceID, guard, guardTx, sw.dedupeIDs)
+			cancel()
 		}
 	}
 	return nil
@@ -685,6 +795,14 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	var parentSeq spanner.NullInt64
 	if err := row.Columns(&status, &nextSeq, &queue, &parentID, &parentSeq); err != nil {
 		return err
+	}
+	// Reject commits for instances that already left running (see firestore
+	// readAdvancementTx): a task leased before TerminateInstance still
+	// matches, and without this gate a terminal advancement would overwrite
+	// terminated → completed/failed while a suspended one appends
+	// journal/children post-termination.
+	if status != "running" {
+		return backend.ErrConflict
 	}
 	if nextSeq != adv.ExpectedSeq {
 		return backend.ErrConflict
@@ -803,14 +921,25 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 			"completed_at": now,
 		}
 		muts = append(muts, spanner.UpdateMap("wf_instances", m))
-		dMuts, err := deleteSignalDedupe(ctx, txn, adv.InstanceID)
-		if err != nil {
-			return err
-		}
-		muts = append(muts, dMuts...)
+		// Dedupe keys are swept after commit (see CommitAdvancements): buffering
+		// one mutation per accumulated key would blow the commit mutation limit.
 	}
 	for _, inboxID := range adv.DrainedInbox {
 		muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{inboxID}))
+	}
+	// Fence child creation on purge markers (Codex round 12 on #296): only
+	// direct CreateInstance checked the marker, so a child — or a
+	// Continue-As-New successor, which is also an adv.Children entry —
+	// reusing a purged ID recreated the instance while the old incarnation's
+	// rows were still pending, and the replacement consumed purged signals.
+	// A hit fails the advancement with ErrConflict so the worker retries
+	// after purge recovery clears the marker.
+	for _, ch := range adv.Children {
+		if _, merr := txn.ReadRow(ctx, "wf_purge_markers", spanner.Key{ch.ID}, []string{"instance_id"}); merr == nil {
+			return backend.ErrConflict
+		} else if !isNotFound(merr) {
+			return merr
+		}
 	}
 	for _, ch := range adv.Children {
 		q := ch.Queue
@@ -825,6 +954,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 				"search_attributes": jsonVal(backend.MarshalSearchAttributes(ch.SearchAttributes)),
 				"memo":              jsonVal(backend.MarshalSearchAttributes(ch.Memo)),
 				"created_at":        now, "updated_at": now,
+				incarnationColumn: newIncarnation(),
 			}),
 			spanner.InsertMap("wf_journal", map[string]any{
 				"instance_id": ch.ID, "seq": int64(1),
@@ -1092,6 +1222,30 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			if delN == 0 {
 				continue
 			}
+			n++
+			// Fence event creation on the instance still running (Codex
+			// round-23 P1 on #296, Firestore parity): a timer due after a
+			// status-only terminal commit but before the sweep deletes it
+			// must be discarded without recording. enqueueWorkflowTask
+			// below already gates task creation on running, but without
+			// this check the TimerFired inbox insert stands
+			// unconditionally, leaving a post-terminal event behind.
+			row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{d.instanceID}, []string{"status"})
+			if err != nil {
+				if isNotFound(err) {
+					// Instance purged: the timer is already deleted
+					// above; nothing to record.
+					continue
+				}
+				return err
+			}
+			var status string
+			if err := row.Columns(&status); err != nil {
+				return err
+			}
+			if status != "running" {
+				continue
+			}
 			seq, existed, err := readInboxSeq(ctx, txn, d.instanceID)
 			if err != nil {
 				return err
@@ -1108,7 +1262,6 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			if err := enqueueWorkflowTask(ctx, txn, d.instanceID, "", now); err != nil {
 				return err
 			}
-			n++
 		}
 		return nil
 	})
@@ -1125,6 +1278,31 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
 }
 
+// readDedupeRow reads a dedupe guard row with its format version and fallback
+// owner. ok=false when the row is absent. Rows predating the format_version
+// column read a NULL version, i.e. legacy (v0); rows predating the
+// fallback_owner column read a NULL owner (see matchDedupeRow). The stored
+// instance_id is validated against the probing instance (owned=false on
+// mismatch): under composite keys a mismatch is structurally impossible, but
+// the check mirrors Firestore's docInstanceMatches so both backends enforce
+// the same ownership invariant (Codex round-16 on #296). Callers must still
+// count an unowned row as occupying its key (a Create over it would collide)
+// while never treating it as a match.
+func readDedupeRow(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID, key string) (stored string, owner spanner.NullString, version spanner.NullInt64, owned, ok bool, err error) {
+	row, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, key}, []string{"instance_id", "dedupe_id", dedupeFallbackOwnerColumn, dedupeFormatVersionColumn})
+	if err != nil {
+		if isNotFound(err) {
+			return "", spanner.NullString{}, spanner.NullInt64{}, false, false, nil
+		}
+		return "", spanner.NullString{}, spanner.NullInt64{}, false, false, err
+	}
+	var instOwner string
+	if err := row.Columns(&instOwner, &stored, &owner, &version); err != nil {
+		return "", spanner.NullString{}, spanner.NullInt64{}, false, false, err
+	}
+	return stored, owner, version, instOwner == instanceID, true, nil
+}
+
 func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items []backend.InboxItem) error {
 	if len(items) == 0 {
 		return nil
@@ -1132,9 +1310,26 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	if len(items) > backend.InboxBatchLimit(b.Capabilities()) {
 		return backend.ErrBatchTooLarge
 	}
-	now := nowUTC()
+	// No terminal-specific cap here (cf. Firestore's
+	// firestoreTerminalInboxBatchLimit, Codex round-25 P2 on #296): a Spanner
+	// terminal first-send costs at most one marker row plus one base-guard
+	// row plus one inbox row (3 mutations) plus one inbox-seq mutation —
+	// 100*3+1=301 mutations, far below the 20,000-mutation commit limit, and
+	// composite (instance_id, dedupe_id) keys never alias across IDs, so no
+	// FRAMING dual-write is needed (cf. Firestore's framed/legacy doc IDs).
+	// Old-node visibility comes from the guards' keys themselves, not a
+	// second leg: ambiguously-encoded IDs guard solely at the fallback key
+	// (the raw verbatim key for short IDs — exactly what old nodes probe),
+	// and identity-encoded IDs store verbatim anyway (Codex round-28 P1 on
+	// #296, superseding the round-26/27 raw compat leg, which always
+	// duplicated the sole guard or exceeded the key budget).
 	var inserted int
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// Stamp inside the transaction (per attempt): a transaction that
+		// loses a race and retries must not commit with a created_at
+		// captured before the conflicting commit.
+		now := nowUTC()
+		inserted = 0
 		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"status", "queue"})
 		if err != nil {
 			if isNotFound(err) {
@@ -1154,24 +1349,290 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		var muts []*spanner.Mutation
 		// Track DedupeIDs reserved in this transaction: ReadRow only sees committed
 		// rows, so same-batch duplicates would otherwise emit colliding InsertMaps.
+		// The same holds for guard storage keys across DISTINCT IDs (Codex
+		// round-18 on #296 P2): one item's fallback key can be another's
+		// canonical key, and buffered inserts stay invisible to later probes,
+		// so every chosen guard key is reserved in reservedGuardKeys below
+		// and treated as occupied.
+		// Terminal sends must not be swallowed by pre-terminal dedupe keys:
+		// a SendToInbox racing a terminal transition (CommitAdvancements or
+		// TerminateInstance) can observe a key snapshotted for the post-commit
+		// sweep. The sweep deletes exactly the snapshotted keys, so a send
+		// that commits in the notify-to-sweep window must insert its own
+		// event immediately: suppressing it on the doomed pre-terminal row
+		// while stamping only a marker loses the signal permanently once the
+		// sweep removes the row — the marker then suppresses every retry
+		// (Codex round-15 on #296). Sends that commit while the instance is
+		// already terminal insert on the first post-terminal send; retries
+		// dedupe via a post-terminal marker (see postTerminalDedupeMarker):
+		// the first terminal send creates the marker alongside the event,
+		// later retries see it and skip. The base key is created when absent
+		// but an owned base key — legacy or versioned — never suppresses
+		// a terminal insert — only the marker does.
+		terminal := status != "running"
 		created := map[string]bool{}
+		reservedGuardKeys := map[string]bool{}
 		for _, it := range items {
 			if it.DedupeID != "" {
 				if created[it.DedupeID] {
 					continue
 				}
-				_, err := txn.ReadRow(ctx, "wf_signal_dedupe", spanner.Key{instanceID, it.DedupeID}, []string{"dedupe_id"})
-				if err == nil {
+				if terminal {
+					// Retry check first: marker present means this DedupeID
+					// already inserted post-terminal. Markers live in their
+					// own table (see postTerminalMarkersTable), never in
+					// the dedupe keyspace: no legacy verbatim user row —
+					// however marker-shaped — can match this probe, and
+					// pre-upgrade marker rows left behind in
+					// wf_signal_dedupe are inert (a pre-upgrade retry may
+					// duplicate once, never drop; purge reaps the rows).
+					// The stored instance_id is validated like every
+					// dedupe read (Codex round-16 on #296): a no-op under
+					// composite keys, kept identical to Firestore.
+					mowner, merr := txn.ReadRow(ctx, postTerminalMarkersTable, spanner.Key{instanceID, dedupeMarkerKey(it.DedupeID)}, []string{"instance_id"})
+					if merr == nil {
+						var mInstanceID string
+						if cerr := mowner.Columns(&mInstanceID); cerr != nil {
+							return cerr
+						}
+						if mInstanceID == instanceID {
+							created[it.DedupeID] = true
+							continue
+						}
+					} else if !isNotFound(merr) {
+						return merr
+					}
+					// First post-terminal send: stamp the marker; create
+					// the base key too when absent for sweep consistency.
+					// An owned base guard (versioned or legacy) never
+					// suppresses the insert: a pre-terminal key's event was
+					// swept, so a fresh post-terminal delivery is promised
+					// (reset semantics — see TestTerminalSendBypassesStaleDedupe)
+					// — and a key observed here may itself be snapshotted for
+					// a sweep that has not run yet (notify-to-sweep window,
+					// Codex round-15 on #296): suppressing on it while
+					// stamping only a marker loses the signal once the sweep
+					// removes the row, with the marker then suppressing every
+					// retry. Only the marker suppresses terminal retries.
+					// (A pre-upgrade legacy post-terminal retry guard therefore
+					// duplicates once on its first post-upgrade retry instead
+					// of suppressing — the safe direction: never drop. The
+					// marker mutation above still dedupes all later retries.)
+					// Marker-shaped candidates are never user keys:
+					// markers live in their own table now, so a row shaped
+					// like one is either an inert pre-upgrade marker or a
+					// legacy verbatim row no probe may mistake for this
+					// DedupeID's guard (skipping it duplicates at worst,
+					// never drops).
+					muts = append(muts, spanner.InsertMap(postTerminalMarkersTable, map[string]any{
+						"instance_id": instanceID, "marker_key": dedupeMarkerKey(it.DedupeID), "created_at": now,
+					}))
+					baseExists := false
+					canonicalOccupied := false
+					canonKey := escapeDedupeID(it.DedupeID)
+					fallbackKey := rawFallbackDedupeKey(it.DedupeID)
+					fallbackOccupied := false
+					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
+						if isPostTerminalMarkerKey(bk) {
+							continue
+						}
+						stored, owner, version, owned, ok, err := readDedupeRow(ctx, txn, instanceID, bk)
+						if err != nil {
+							return err
+						}
+						if !ok {
+							continue
+						}
+						if bk == canonKey {
+							canonicalOccupied = true
+						}
+						if bk == fallbackKey {
+							fallbackOccupied = true
+						}
+						if !owned {
+							continue
+						}
+						if matchDedupeRow(it.DedupeID, bk, stored, owner, version) {
+							baseExists = true
+							break
+						}
+					}
+					// Same-batch guard keys are invisible to the probes above
+					// (reads see committed rows only): a canonical key
+					// reserved by an earlier terminal item counts as occupied,
+					// so the second insert degrades to marker-only instead of
+					// failing the commit on a duplicate insert.
+					if reservedGuardKeys[canonKey] {
+						canonicalOccupied = true
+					}
+					if reservedGuardKeys[fallbackKey] {
+						fallbackOccupied = true
+					}
+					if canonKey != it.DedupeID {
+						// Ambiguously-encoded ID (Codex round-28 P1 on #296):
+						// the escaped base guard would sit at another ID's
+						// verbatim probe key, where a pre-upgrade node
+						// mistakes it for its own guard and silently drops
+						// that ID's first send. Guard solely at the fallback
+						// key instead (see soleAmbiguousGuardKey, same shape
+						// as the running path above); an occupied fallback
+						// degrades to marker-only like the occupied case
+						// below. No round-27 raw leg rides along — short: it
+						// would duplicate the primary; long: over budget.
+						if baseExists || fallbackOccupied {
+							created[it.DedupeID] = true
+						} else if key, ver, ok := soleAmbiguousGuardKey(it.DedupeID, fallbackKey, false, reservedGuardKeys); ok {
+							reservedGuardKeys[key] = true
+							m := map[string]any{
+								"instance_id": instanceID, "dedupe_id": key, "created_at": now,
+							}
+							if ver >= dedupeFormatRawKeyVersion {
+								m[dedupeFormatVersionColumn] = ver
+								m[dedupeFallbackOwnerColumn] = escapeDedupeID(it.DedupeID)
+							}
+							muts = append(muts, spanner.InsertMap("wf_signal_dedupe", m))
+							created[it.DedupeID] = true
+						} else {
+							created[it.DedupeID] = true
+						}
+					} else if baseExists || canonicalOccupied {
+						created[it.DedupeID] = true
+					} else {
+						reservedGuardKeys[canonKey] = true
+						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
+							"instance_id": instanceID, "dedupe_id": canonKey,
+							dedupeFormatVersionColumn: dedupeFormatVersion, "created_at": now,
+						}))
+						created[it.DedupeID] = true
+					}
+				} else {
+					// Probe every stored user-key form, legacy raw first (Codex
+					// round 8 on #327): pre-escape rows stored "__" IDs verbatim.
+					// Ownership is version-aware (Codex round 13 on #296, see
+					// matchDedupeRow): a hit counts only when the row guards
+					// THIS DedupeID.
+					// Marker-shaped candidates are honored here (Codex round 12
+					// on #296): live markers live in their own table, and a
+					// running instance cannot own a post-terminal marker, so a
+					// marker-shaped row on a running instance is unambiguously
+					// a legacy user key (e.g. DedupeID "__post_terminal__:x"
+					// stored raw pre-escape). Skipping it would miss the guard
+					// and duplicate the event. Terminal instances keep the
+					// marker-only rule (see the terminal base check above).
+					baseHit := false
+					canonicalOccupied := false
+					fallbackKey := rawFallbackDedupeKey(it.DedupeID)
+					fallbackOccupied := false
+					for _, bk := range dedupeKeyCandidates(it.DedupeID) {
+						stored, owner, version, owned, ok, err := readDedupeRow(ctx, txn, instanceID, bk)
+						if err != nil {
+							return err
+						}
+						if !ok {
+							continue
+						}
+						if bk == escapeDedupeID(it.DedupeID) {
+							canonicalOccupied = true
+						}
+						if bk == fallbackKey {
+							fallbackOccupied = true
+						}
+						if !owned {
+							continue
+						}
+						if matchDedupeRow(it.DedupeID, bk, stored, owner, version) {
+							baseHit = true
+							break
+						}
+					}
+					if baseHit {
+						created[it.DedupeID] = true
+						continue
+					}
+					// A foreign-owner row at this DedupeID's canonical key
+					// means the canonical guard cannot be created (it would
+					// collide), so the guard falls back to the
+					// rawFallbackDedupeKey with an explicit version
+					// (dedupeFormatRawKeyVersion) plus the owner's canonical
+					// form in fallback_owner (Codex round-17 on #296):
+					// delivery is preserved and retries keep deduping, and
+					// no other ID's probe can claim the guard. The fallback
+					// key stays within the STRING(255) budget even for
+					// over-budget IDs (bounded second-level hash — Codex
+					// round-16 on #296). Guard keys chosen earlier in this
+					// batch count as occupied (Codex round-18 on #296 P2,
+					// see pickSpannerDedupeInsert): without the reservation
+					// two items choosing one key fail the whole batch
+					// deterministically. Only when no key is free does the
+					// event insert unguarded (duplicate-never-drop).
+					canonKey := dedupeKey(it.DedupeID)
+					if canonKey != it.DedupeID {
+						// Ambiguously-encoded ID (Codex round-28 P1 on #296):
+						// a canonical row at escapeDedupeID(X) would sit at
+						// another ID's verbatim probe key, where a
+						// pre-upgrade node (existence-only probes, no
+						// version metadata) mistakes it for its own guard
+						// and silently drops that ID's first send. The sole
+						// guard lives at the fallback key instead (see
+						// soleAmbiguousGuardKey): no other ID probes that
+						// key as anything but X's own raw/fallback
+						// candidate, and when it matches it matches only X
+						// (legacy exact-raw rule for short IDs, owner-gated
+						// v2 rule for over-budget IDs). No canonical row and
+						// no round-26 raw leg ride along — short: the leg
+						// would duplicate the primary; long: the raw form is
+						// over budget. Fallback occupied/reserved degrades
+						// to an unguarded insert (duplicate-never-drop),
+						// same as pickSpannerDedupeInsert's ok=false below.
+						if key, ver, ok := soleAmbiguousGuardKey(it.DedupeID, fallbackKey, fallbackOccupied, reservedGuardKeys); ok {
+							reservedGuardKeys[key] = true
+							m := map[string]any{
+								"instance_id": instanceID, "dedupe_id": key, "created_at": now,
+							}
+							if ver >= dedupeFormatRawKeyVersion {
+								m[dedupeFormatVersionColumn] = ver
+								m[dedupeFallbackOwnerColumn] = escapeDedupeID(it.DedupeID)
+							}
+							muts = append(muts, spanner.InsertMap("wf_signal_dedupe", m))
+						} else if fallbackOccupied && !reservedGuardKeys[fallbackKey] && !canonicalOccupied && !reservedGuardKeys[canonKey] {
+							// Last resort (round-17 preservation): the fallback
+							// key is foreign-occupied by a committed row —
+							// reachable only for over-budget IDs (for short
+							// IDs every occupant matches its own key, so an
+							// unmatched occupant is impossible and short IDs
+							// never land here). Without a guard every retry
+							// of X would insert unguarded forever, so the
+							// canonical v1 row keeps a permanent guard for
+							// current readers (ownership rules stop foreign
+							// IDs from claiming it). Pre-upgrade nodes
+							// probing escape(X) verbatim may mistake it
+							// during the rollout window — the round-28
+							// residual, now confined to hash-shaped third
+							// IDs — while the "__x"/"____x" natural pair
+							// stays fully isolated (short IDs only ever
+							// write the sole guard above).
+							reservedGuardKeys[canonKey] = true
+							muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
+								"instance_id": instanceID, "dedupe_id": canonKey,
+								dedupeFormatVersionColumn: dedupeFormatVersion, "created_at": now,
+							}))
+						}
+						// else: batch-reserved or fully occupied — insert
+						// unguarded (duplicate-never-drop), same as
+						// pickSpannerDedupeInsert's ok=false below.
+					} else if key, ver, ok := pickSpannerDedupeInsert(canonKey, fallbackKey, canonicalOccupied, fallbackOccupied, reservedGuardKeys); ok {
+						reservedGuardKeys[key] = true
+						m := map[string]any{
+							"instance_id": instanceID, "dedupe_id": key,
+							dedupeFormatVersionColumn: ver, "created_at": now,
+						}
+						if ver >= dedupeFormatRawKeyVersion {
+							m[dedupeFallbackOwnerColumn] = escapeDedupeID(it.DedupeID)
+						}
+						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", m))
+					}
 					created[it.DedupeID] = true
-					continue
 				}
-				if !isNotFound(err) {
-					return err
-				}
-				muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-					"instance_id": instanceID, "dedupe_id": it.DedupeID, "created_at": now,
-				}))
-				created[it.DedupeID] = true
 			}
 			payload := inboxPayload(it.Event)
 			seq++
@@ -1207,28 +1668,4 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	}
 	b.notifyTasks()
 	return nil
-}
-
-func deleteSignalDedupe(ctx context.Context, txn *spanner.ReadWriteTransaction, instanceID string) ([]*spanner.Mutation, error) {
-	iter := txn.Query(ctx, spanner.Statement{
-		SQL:    `SELECT dedupe_id FROM wf_signal_dedupe WHERE instance_id = @id`,
-		Params: map[string]any{"id": instanceID},
-	})
-	defer iter.Stop()
-	var muts []*spanner.Mutation
-	for {
-		r, err := iter.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		var dedupeID string
-		if err := r.Columns(&dedupeID); err != nil {
-			return nil, err
-		}
-		muts = append(muts, spanner.Delete("wf_signal_dedupe", spanner.Key{instanceID, dedupeID}))
-	}
-	return muts, nil
 }

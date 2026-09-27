@@ -60,6 +60,12 @@ var collections = []string{
 	"wf_timers",
 	"wf_schedules",
 	"wf_notify",
+	// Purge markers are crash-recovery metadata (see purgeMarker); Reset
+	// must clear them so tests never observe a previous run's fence.
+	purgeMarkersCollection,
+	// Post-terminal retry markers live outside the dedupe keyspace (see
+	// postTerminalMarkersCollection).
+	postTerminalMarkersCollection,
 }
 
 // Reset deletes all documents in known collections (test helper).

@@ -26,6 +26,17 @@ Operation Count Calculation (DynamoDB equivalent):
 + (ParentNotify ? 1 : 0)
 ```
 
+Signal-dedupe rows (`wf_signal_dedupe`) are intentionally **not** counted above.
+
+## Signal Dedupe and Terminal Cleanup (Firestore / Spanner)
+
+`wf_signal_dedupe` accumulates one row per `DedupeID` for the life of the instance. Deleting one row per key inside the committing transaction would make terminal commits scale with history: an instance with 600 dedupe keys needs 600+ writes, breaching Firestore's 500-write transaction limit (budget 400) and stressing Spanner's commit mutation limit. The same applies to `TerminateInstance` sweeping `wf_tasks` / `wf_timers` / `wf_signal_dedupe` in one commit.
+
+- Terminal advancements commit only the bounded effects (instance status, journal puts, activity/timer puts, inbox deletes, children, parent notify, one task delete) inside the transaction. Dedupe keys are swept **after commit** in paged batches: Firestore deletes `wf_signal_dedupe` with 400-doc `Batch` commits in a `Limit` loop, Spanner deletes in 500-key paged read-write transactions, DynamoDB already paged post-commit. The sweep is best-effort; anything left by a crash is reaped by retention purge. Terminal instances are immutable, so the non-transactional sweep cannot race with advancement commits.
+- `TerminateInstance` flips `status` to `terminated` in one small transaction (one read + one update), then awaits a paged sweep of `wf_tasks` / `wf_timers` / `wf_signal_dedupe` before returning, so `SendToInbox` with a previously seen `DedupeID` correctly inserts anew and claimed tasks observe no leftovers. Inbox/journal rows (if any) are left for purge.
+- Spanner `PurgeInstances` works per instance in paged transactions: each child table (`wf_tasks`, `wf_timers`, `wf_signal_dedupe`, `wf_inbox`, `wf_journal`) is swept in 500-key `LIMIT` pages, the `wf_inbox_seq` + `wf_instances` rows go last, and a second child sweep reaps writers that committed between the first sweep and the instance delete.
+- Compliance: `backendtest` `TerminalLargeDedupe` seeds 600 dedupe rows (over the 500 cap) and asserts both `TerminateInstance` and a terminal `CommitAdvancement` succeed and clear dedupe keys.
+
 ## Fanout Advancement Strategy
 
 When a suspended workflow advancement exceeds the configured budget, the Worker commits only the prefix of new commands that fits within the budget, deferring the remainder to the next turn's replay. This ensures intermediate states remain strictly consistent between the journal and task tables.

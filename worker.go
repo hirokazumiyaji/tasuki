@@ -2487,6 +2487,11 @@ func (w *Worker) attachEffects(adv *backend.Advancement, queue string, cmds []jo
 // inbox deletes + 3 per child + parent inbox + 1 task delete.
 // It mirrors backend/dynamodb buildAdvancementItems counting so workers can
 // stay within backend.Capabilities.MaxAdvancementEffects atomically.
+//
+// Signal-dedupe cleanup is deliberately excluded: Firestore/Spanner/DynamoDB
+// sweep wf_signal_dedupe outside the committing transaction in paged
+// post-commit batches (purge reaps leftovers), so terminal commits never scale
+// with accumulated dedupe rows. See docs/09-limits.md.
 func advancementOps(adv *backend.Advancement) int {
 	n := 2 + len(adv.NewEvents) + len(adv.ActivityTasks) + len(adv.Timers) + len(adv.DrainedInbox) + 3*len(adv.Children)
 	if adv.ParentNotify != nil {
@@ -2586,6 +2591,9 @@ func (w *Worker) fitAdvancementToBudget(adv *backend.Advancement, commands []jou
 
 func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimToken) error {
 	w.bindTrackedTask(t, tok)
+	if proceed, err := w.checkActivityFence(ctx, t); err != nil || !proceed {
+		return err
+	}
 	// Result commits use a bounded detached context created immediately
 	// before each result operation. Shutdown cancels the poll loop ctx
 	// immediately and the execution ctx after its grace; committing with
@@ -2646,7 +2654,6 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		defer close(renewDone)
 		w.extendLeaseLoop(ctx, t.ID, tok, done, &committing, detachedEntered)
 	}()
-
 	act, err := w.reg.activity(t.Name)
 	if err != nil {
 		if errors.Is(err, ErrActivityNotRegistered) {
@@ -2694,6 +2701,11 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		return rerr
 	}
 
+	// Recheck as close as possible to invoking user code to limit the race
+	// with a concurrent termination.
+	if proceed, err := w.checkActivityFence(ctx, t); err != nil || !proceed {
+		return err
+	}
 	// Execution setup: renewal already runs (see above), so every commit
 	// path below stays covered.
 	attempt := t.Attempt
@@ -2911,6 +2923,32 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 	}
 	commitCancel()
 	return nil
+}
+
+// checkActivityFence enforces the pre-execution termination fence for one
+// activity task: it reports proceed=false (after best-effort cleanup) when
+// the owning instance already left "running", and proceed=true when user
+// code may run. A transient status-read error fails CLOSED (returned, so no
+// user code runs and the lease redelivers); only ErrNotFound — the instance
+// row reaped as terminal residue — is dropped silently. Callers invoke it
+// both at handler entry and immediately before invokeActivity to keep the
+// termination right fenced through invocation (see handleActivity).
+func (w *Worker) checkActivityFence(ctx context.Context, t backend.Task) (bool, error) {
+	inst, err := w.backend.GetInstance(ctx, t.InstanceID)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if inst.Status != "running" {
+		_ = w.backend.CompleteActivity(ctx, t, journal.Event{
+			Type:   journal.TypeActivityCompleted,
+			RefSeq: t.Seq,
+		})
+		return false, nil
+	}
+	return true, nil
 }
 
 // errLeaseLost marks a detached result commit skipped because its

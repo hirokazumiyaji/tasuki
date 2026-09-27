@@ -22,10 +22,36 @@ func (b *Backend) Capabilities() backend.Capabilities {
 func (b *Backend) col(name string) *gcf.CollectionRef  { return b.client.Collection(name) }
 func (b *Backend) ref(col, id string) *gcf.DocumentRef { return b.col(col).Doc(id) }
 
+// probeDedupeKey fetches one stored dedupe/marker key under both doc-ID
+// framings (see selectOwnedDedupeDoc): both existing rows plus per-framing
+// availability for guard creation. A row at either framing blocks creation
+// there (a Create over it would collide) but counts as a match only when
+// owned by this instance AND guarding the requested ID (see
+// matchOwnedDedupeRow).
+func (b *Backend) probeDedupeKey(tx *gcf.Transaction, col, instanceID, key string) (dedupeKeyProbe, error) {
+	var framed, legacy map[string]any
+	framedID := frameDedupeDocID(instanceID, key)
+	for _, docID := range dedupeDocIDs(instanceID, []string{key}) {
+		snap, err := tx.Get(b.ref(col, docID))
+		if err != nil && !isNotFound(err) {
+			return dedupeKeyProbe{}, err
+		}
+		if err == nil && snap.Exists() {
+			if docID == framedID {
+				framed = snap.Data()
+			} else {
+				legacy = snap.Data()
+			}
+		}
+	}
+	return dedupeKeyProbe{framedDoc: framed, legacyDoc: legacy, framedFree: framed == nil, legacyFree: legacy == nil}, nil
+}
+
 func instanceDoc(inst backend.NewInstance, queue string, now time.Time) map[string]any {
 	m := map[string]any{
 		"id": inst.ID, "name": inst.Name, "queue": queue, "status": "running",
 		"input": jsonString(inst.Input), "next_seq": int64(2), "created_at": now, "updated_at": now,
+		incarnationField:    newIncarnation(),
 		"search_attributes": searchAttrsDoc(inst.SearchAttributes),
 		"memo":              searchAttrsDoc(inst.Memo),
 	}
@@ -145,6 +171,25 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 		if err == nil && s.Exists() {
 			return backend.ErrAlreadyExists
 		}
+		// Fence ID reuse while crash recovery is pending: a previous
+		// incarnation's purge wrote its marker atomically with the victim
+		// delete and has not finished its trailing sweep (the marker is
+		// cleared only after the second sweep/reap). Creating a replacement
+		// now would let it consume the old incarnation's leftover inbox
+		// rows long before its own purge. Fail fast so the caller retries;
+		// the next PurgeInstances resumes the crashed cleanup via the
+		// marker (sweep + clear) and unblocks the ID. The check rides in
+		// this same transaction: the victim-delete transaction is the
+		// serialization point, so a delete committing after this read
+		// aborts the create on the conflicting instance-row write, and a
+		// delete that committed first leaves its marker visible here.
+		msnap, merr := tx.Get(b.ref(purgeMarkersCollection, inst.ID))
+		if merr != nil && !isNotFound(merr) {
+			return merr
+		}
+		if merr == nil && msnap.Exists() {
+			return backend.ErrAlreadyExists
+		}
 		if err := tx.Create(r, instanceDoc(inst, q, now)); err != nil {
 			return err
 		}
@@ -223,6 +268,23 @@ func (b *Backend) ListInstances(ctx context.Context, f backend.InstanceFilter) (
 }
 func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	now := nowUTC()
+	// Status flips inside a small transaction so the write count never scales
+	// with the instance's task/timer/dedupe rows. Child documents are swept
+	// afterwards in paged batches: a single transaction deleting them would
+	// breach the 500-write limit once dedupe keys accumulate (DynamoDB parity:
+	// status update first, paged deletes).
+	// Dedupe keys are snapshotted INSIDE the flip transaction (read phase,
+	// before the update): the snapshot is serializable, so a post-terminal
+	// SendToInbox committing after the flip — its marker plus inbox event —
+	// is never in the snapshot and survives the sweep, while pre-termination
+	// keys are reaped (Codex round 8 on #327: an unqualified sweep deleted
+	// post-terminal retry markers while leaving their inbox events, so the
+	// next retry re-inserted a duplicate). Markers in the snapshot itself are
+	// filtered out as well (a redundant TerminateInstance after terminal
+	// sends must not strip them); purge reaps all leftovers.
+	var dedupeSnapshot []string
+	var createdAt time.Time
+	var incarnation string
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		s, err := tx.Get(b.ref("wf_instances", id))
 		if isNotFound(err) {
@@ -234,33 +296,31 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		if !s.Exists() {
 			return backend.ErrNotFound
 		}
-		var refs []*gcf.DocumentRef
-		for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox"} {
-			it := tx.Documents(b.col(col).Where("instance_id", "==", id))
-			for {
-				d, e := it.Next()
-				if e == iterator.Done {
-					break
-				}
-				if e != nil {
-					it.Stop()
-					return e
-				}
-				refs = append(refs, d.Ref)
-			}
-			it.Stop()
-		}
-		if err = tx.Update(b.ref("wf_instances", id), []gcf.Update{{Path: "status", Value: "terminated"}, {Path: "updated_at", Value: now}, {Path: "completed_at", Value: now}}); err != nil {
+		// Pin the post-commit sweep to this instance incarnation.
+		createdAt = timestamp(s.Data(), "created_at")
+		incarnation = str(s.Data(), incarnationField)
+		ids, err := listSignalDedupeIDsTx(tx, b.col("wf_signal_dedupe"), id)
+		if err != nil {
 			return err
 		}
-		for _, r := range refs {
-			if e := tx.Delete(r); e != nil {
-				return e
-			}
-		}
-		return nil
+		dedupeSnapshot = ids
+		return tx.Update(b.ref("wf_instances", id), []gcf.Update{{Path: "status", Value: "terminated"}, {Path: "updated_at", Value: now}, {Path: "completed_at", Value: now}})
 	})
 	if err != nil {
+		return err
+	}
+	// Await the sweep before returning so SendToInbox with a previously seen
+	// DedupeID correctly inserts anew (conformance SignalDedupe) and claimed
+	// tasks observe no leftovers. Terminal instances are immutable, so the
+	// sweep cannot race with advancement commits — but it can race with a
+	// purge that deletes the instance and lets CreateInstance reuse the ID,
+	// which the incarnation fence aborts on (see sweepTerminateDocs); purge
+	// reaps anything left by a failed or fenced sweep.
+	// The status flip above already committed, so subscribers must wake even
+	// when the sweep fails: GetInstance permanently reports terminated while
+	// a skipped notifyTerminal would leave waiters asleep until a retry.
+	if err := b.sweepTerminateDocs(ctx, purgeVictim{id: id, createdAt: createdAt, incarnation: incarnation}, dedupeSnapshot); err != nil {
+		b.notifyTerminal(id)
 		return err
 	}
 	b.notifyTerminal(id)
@@ -381,7 +441,12 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 				skip[id] = struct{}{}
 				old := timestamp(m, "visible_at")
 				var claimed backend.Task
+				skipped := false
 				err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+					// The transaction function may run more than once; reset
+					// per-attempt outcome state on entry.
+					claimed = backend.Task{}
+					skipped = false
 					s, e := tx.Get(d.Ref)
 					if isNotFound(e) {
 						return backend.ErrConflict
@@ -393,25 +458,60 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 						return backend.ErrConflict
 					}
 					m := s.Data()
-					claimed = decodeTask(m)
-					claimed.Attempt++
-					claimed.VisibleAt = now.Add(req.Lease)
-					claimed.WorkerID = req.WorkerID
-					return tx.Update(d.Ref, []gcf.Update{{Path: "visible_at", Value: claimed.VisibleAt}, {Path: "worker_id", Value: req.WorkerID}, {Path: "attempt", Value: int64(claimed.Attempt)}})
+					// Fence against TerminateInstance: never lease a task whose
+					// instance already left running. Reading the instance doc
+					// inside the claim transaction also conflicts with a
+					// concurrent status flip, restoring the exclusion the
+					// pre-chunk single-transaction terminate had. A stale
+					// terminal task is removed in the same transaction so
+					// later polls (and the refill pass below) reach live
+					// tasks; a commit conflict drops the delete and the next
+					// poll retries.
+					instID := str(m, "instance_id")
+					isnap, e := tx.Get(b.ref("wf_instances", instID))
+					if e != nil && !isNotFound(e) {
+						return e
+					}
+					if e == nil && isnap.Exists() && str(isnap.Data(), "status") == "running" {
+						claimed = decodeTask(m)
+						claimed.Attempt++
+						claimed.VisibleAt = now.Add(req.Lease)
+						claimed.WorkerID = req.WorkerID
+						return tx.Update(d.Ref, []gcf.Update{{Path: "visible_at", Value: claimed.VisibleAt}, {Path: "worker_id", Value: req.WorkerID}, {Path: "attempt", Value: int64(claimed.Attempt)}})
+					}
+					skipped = true
+					return tx.Delete(d.Ref)
 				})
 				if err == backend.ErrConflict {
 					// Another worker leased this snapshot first: free its picker
 					// slot so Full below does not stop later candidates and
 					// queues from filling the batch, then re-query this queue
 					// for a replacement (the loop above) instead of moving on.
+					// The refill flag is set even without a picker (Codex round
+					// 8 on #327): a default nil-picker claim must also loop to
+					// fill Limit instead of returning undersized after one pass.
 					if picker != nil {
 						picker.Release(backend.FairTaskRef{ID: id, InstanceID: str(m, "instance_id")})
-						released = true
 					}
+					released = true
 					continue
 				}
 				if err != nil {
 					return nil, err
+				}
+				if skipped {
+					// Terminal residue deleted above; free its picker slot
+					// so Full does not stop later candidates and queues
+					// from filling the batch, then re-query this queue
+					// for a replacement (the loop above) instead of
+					// moving on. The refill flag is set even without a picker
+					// (Codex round 8 on #327): deleting a stale task must loop
+					// until Limit is filled or candidates are exhausted.
+					if picker != nil {
+						picker.Release(backend.FairTaskRef{ID: id, InstanceID: str(m, "instance_id")})
+					}
+					released = true
+					continue
 				}
 				out = append(out, claimed)
 				if len(out) >= req.Limit {
@@ -427,8 +527,9 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 }
 
 // listClaimCandidates returns FIFO-ordered task snapshots for one queue.
-// With a nil picker it returns the first remaining snapshots; otherwise it
-// pages through the (kind, queue, visible_at, __name__) composite index in
+// With a nil picker it pages the (kind, queue, visible_at, __name__)
+// composite index Limit-at-a-time, advancing with the caller's cursor across
+// refills; otherwise it pages the same index in
 // FairOverfetch windows feeding the shared picker, so a victim hidden behind
 // a flooding instance is still found beyond the first page. Pages advance
 // with a document cursor over (visible_at, __name__) ordering — each query
@@ -485,9 +586,13 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		return docs, nil
 	}
 	if picker == nil {
-		// Single-pass path: the caller never refills without a picker
-		// (refills follow a conflict Release), so cursor is always nil
-		// here; it is threaded only for signature symmetry.
+		// Nil-picker path pages with the same (visible_at, __name__) cursor
+		// the caller threads across refills (Codex round 8 on #327): without
+		// it a refill after deleting a terminal task would re-fetch the same
+		// head window on every pass (one poll per stale row with big
+		// backlogs) instead of advancing. The resume point is the last
+		// FETCHED document and exhaustion is a short page, mirroring the
+		// picker path.
 		q := base.Limit(remaining)
 		if cursor != nil {
 			q = q.StartAfter(cursor)
@@ -496,8 +601,13 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		if err != nil {
 			return nil, cursor, false, err
 		}
+		if len(docs) == 0 {
+			return nil, cursor, true, nil
+		}
+		next := docs[len(docs)-1]
+		exhausted := len(docs) < remaining
 		if len(skip) == 0 {
-			return docs, nil, false, nil
+			return docs, next, exhausted, nil
 		}
 		kept := docs[:0]
 		for _, d := range docs {
@@ -505,7 +615,7 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 				kept = append(kept, d)
 			}
 		}
-		return kept, nil, false, nil
+		return kept, next, exhausted, nil
 	}
 	pageSize := backend.FairOverfetch(remaining)
 	// byID retains snapshots only for picker-accepted candidates so
@@ -820,17 +930,47 @@ func (b *Backend) CommitAdvancement(ctx context.Context, adv backend.Advancement
 }
 
 type advancementPrep struct {
-	instRef    *gcf.DocumentRef
-	taskRef    *gcf.DocumentRef
-	inst       *backend.Instance
-	hasInbox   bool
-	dedupeRefs []*gcf.DocumentRef
+	instRef  *gcf.DocumentRef
+	taskRef  *gcf.DocumentRef
+	inst     *backend.Instance
+	hasInbox bool
+	// createdAt is the pre-commit incarnation captured inside the commit
+	// transaction (see readAdvancementTx). The post-commit dedupe sweep
+	// re-validates it on every page so a purge plus ID reuse interleaved
+	// with the sweep aborts instead of deleting the replacement's guard.
+	createdAt time.Time
+	// incarnation is the instance's unique per-incarnation token captured
+	// alongside createdAt (see newIncarnation). Fences compare it exactly;
+	// createdAt stays as the legacy fallback for rows predating the field.
+	incarnation string
+	// dedupeSnapshot holds the terminal advancement's dedupe keys as read
+	// inside the commit transaction (see readAdvancementTx). The post-commit
+	// sweep deletes exactly these IDs.
+	dedupeSnapshot []string
+}
+
+// terminalSweep carries one terminal advancement's post-commit sweep: the
+// pre-commit incarnation fencing it plus the exact dedupe keys to remove.
+type terminalSweep struct {
+	createdAt   time.Time
+	incarnation string
+	dedupeIDs   []string
 }
 
 func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
 	if len(advs) == 0 {
 		return nil
 	}
+	// Dedupe keys for terminal advancements are snapshotted INSIDE the commit
+	// transaction (see readAdvancementTx): the snapshot is a serializable
+	// read, so a SendToInbox serializing before the terminal commit is
+	// included in the post-commit sweep instead of lingering until purge
+	// (where a later ID reuse would mistake it for a duplicate of a
+	// promised post-terminal event). Keys created after the snapshot stay
+	// for purge. The sweep itself still runs after the commit: a terminal
+	// commit with hundreds of keys must not scale one transaction past the
+	// 500-write limit.
+	var snapshots map[string]terminalSweep
 	now := nowUTC()
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		// Firestore requires all reads before any writes in a transaction.
@@ -848,10 +988,33 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 				return err
 			}
 		}
+		// Capture the snapshots from this attempt only: the transaction
+		// function may run more than once, and only the committing
+		// attempt's reads classify the sweep.
+		snapshots = make(map[string]terminalSweep, len(advs))
+		for i, adv := range advs {
+			if adv.Terminal == nil {
+				continue
+			}
+			if _, ok := snapshots[adv.InstanceID]; ok {
+				continue
+			}
+			snapshots[adv.InstanceID] = terminalSweep{createdAt: preps[i].createdAt, incarnation: preps[i].incarnation, dedupeIDs: preps[i].dedupeSnapshot}
+		}
 		return b.flushInboxSeqs(tx, alloc)
 	})
 	if err != nil {
 		return err
+	}
+	// Wake terminal subscribers immediately after the successful commit,
+	// before the fallible ensureWorkflowTask loop below: the terminal
+	// status already committed, and a transient ensure error returns early
+	// while the advancement only retries on conflict. Notification must
+	// never be skipped because post-commit cleanup errored.
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			b.notifyTerminal(adv.InstanceID)
+		}
 	}
 	for _, adv := range advs {
 		if adv.ParentNotify != nil {
@@ -875,7 +1038,25 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	b.notifyTasks()
 	for _, adv := range advs {
 		if adv.Terminal != nil {
-			b.notifyTerminal(adv.InstanceID)
+			// Dedupe rows are deliberately cleaned outside the advancement
+			// transaction: a terminal commit with hundreds of dedupe keys
+			// would otherwise exceed the 500-write transaction limit.
+			// Best-effort (DynamoDB parity); leftovers are reaped by purge.
+			// Only keys snapshotted before the commit are removed: a
+			// concurrent SendToInbox with a new DedupeID can land after
+			// notifyTerminal fired above, and sweeping its key while the
+			// inbox event remains would duplicate a later retry.
+			// Every page re-validates the pre-commit incarnation: a purge
+			// plus ID reuse interleaved with the sweep aborts it instead
+			// of deleting the replacement's recreated guard (see
+			// sweepSignalDedupeIDs); purge owns the leftovers.
+			// The sweep stays synchronous so a redelivered DedupeID inserts
+			// anew once this call returns, but runs under a bounded context
+			// so a stuck store delays only this cleanup, never the caller.
+			cctx, cancel := context.WithTimeout(context.Background(), signalDedupeSweepTimeout)
+			sw := snapshots[adv.InstanceID]
+			_ = b.sweepSignalDedupeIDs(cctx, purgeFence{victim: purgeVictim{id: adv.InstanceID, createdAt: sw.createdAt, incarnation: sw.incarnation}}, sw.dedupeIDs)
+			cancel()
 		}
 	}
 	return nil
@@ -910,6 +1091,35 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 		}
 	}
 	inst := decodeInstance(instSnap.Data())
+	// Reject commits for instances that already left running: a task leased
+	// before TerminateInstance still carries a matching ExpectedSeq/TaskID,
+	// and the post-flip sweep no longer deletes the task inside the flip
+	// transaction, so without this gate a terminal advancement would
+	// overwrite terminated → completed/failed (and a suspended one would
+	// append journal/children post-termination). Reading the status in-txn
+	// also conflicts with a concurrent status flip, serializing the commit
+	// against termination.
+	if inst.Status != "running" {
+		return advancementPrep{}, backend.ErrConflict
+	}
+	// Fence child creation on purge markers (Codex round 12 on #296): only
+	// direct CreateInstance checked the marker, so a child — or a
+	// Continue-As-New successor, which is also an adv.Children entry —
+	// reusing a purged ID recreated the instance while the old incarnation's
+	// rows were still pending, and the replacement consumed purged signals.
+	// The check rides in the read phase (Firestore rejects reads after
+	// writes in a transaction) alongside the other advancement reads; a hit
+	// fails the advancement with ErrConflict so the worker retries after
+	// purge recovery clears the marker.
+	for _, ch := range adv.Children {
+		msnap, merr := tx.Get(b.ref(purgeMarkersCollection, ch.ID))
+		if merr != nil && !isNotFound(merr) {
+			return advancementPrep{}, merr
+		}
+		if merr == nil && msnap.Exists() {
+			return advancementPrep{}, backend.ErrConflict
+		}
+	}
 	if adv.ParentNotify != nil && inst.ParentID != "" {
 		if err := seedInboxSeqTx(b, tx, alloc, inst.ParentID); err != nil {
 			return advancementPrep{}, err
@@ -935,23 +1145,21 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 		}
 	}
 	inboxIter.Stop()
-	var dedupeRefs []*gcf.DocumentRef
+	prep := advancementPrep{instRef: instSnap.Ref, taskRef: taskRef, inst: inst, hasInbox: hasInbox}
+	prep.createdAt = timestamp(instSnap.Data(), "created_at")
+	prep.incarnation = str(instSnap.Data(), incarnationField)
 	if adv.Terminal != nil {
-		dIter := tx.Documents(b.col("wf_signal_dedupe").Where("instance_id", "==", adv.InstanceID))
-		for {
-			d, nextErr := dIter.Next()
-			if nextErr == iterator.Done {
-				break
-			}
-			if nextErr != nil {
-				dIter.Stop()
-				return advancementPrep{}, nextErr
-			}
-			dedupeRefs = append(dedupeRefs, d.Ref)
+		// Snapshot the dedupe keys inside the commit transaction (still the
+		// read phase: no writes have been buffered yet). A SendToInbox
+		// serializing before this commit is included in the post-commit
+		// sweep; anything landing after stays for purge.
+		ids, err := listSignalDedupeIDsTx(tx, b.col("wf_signal_dedupe"), adv.InstanceID)
+		if err != nil {
+			return advancementPrep{}, err
 		}
-		dIter.Stop()
+		prep.dedupeSnapshot = ids
 	}
-	return advancementPrep{instRef: instSnap.Ref, taskRef: taskRef, inst: inst, hasInbox: hasInbox, dedupeRefs: dedupeRefs}, nil
+	return prep, nil
 }
 
 func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancement, prep advancementPrep, now time.Time, alloc *inboxSeqAlloc) error {
@@ -980,13 +1188,6 @@ func (b *Backend) writeAdvancementTx(tx *gcf.Transaction, adv backend.Advancemen
 	}
 	if err := tx.Update(prep.instRef, updates); err != nil {
 		return err
-	}
-	if adv.Terminal != nil {
-		for _, ref := range prep.dedupeRefs {
-			if err := tx.Delete(ref); err != nil {
-				return err
-			}
-		}
 	}
 	for _, e := range adv.NewEvents {
 		if err := tx.Create(b.ref("wf_journal", journalID(adv.InstanceID, e.Seq)), journalDoc(adv.InstanceID, e.Seq, e, now)); err != nil {
@@ -1147,6 +1348,17 @@ func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal
 	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
 }
 
+// firestoreTerminalInboxBatchLimit caps terminal-instance signal batches
+// below the generic InboxBatchLimit (Codex round-25 P2 on #296): a terminal
+// first-send with a fresh DedupeID writes up to two marker docs (framed plus
+// rolling-upgrade dual), two base-guard docs (framed plus dual), and one
+// inbox doc — 5 writes per item — plus one flushInboxSeqs write. A 100-item
+// terminal batch therefore needs 100*5+1=501 writes, exceeding Firestore's
+// 500-write transaction limit even though InboxBatchLimit permits 100 items.
+// Running batches stay at the generic limit (worst case two guard docs plus
+// one inbox per item: 100*3+1=301 writes). 99*5+1=496 fits with headroom.
+const firestoreTerminalInboxBatchLimit = 99
+
 func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items []backend.InboxItem) error {
 	if len(items) == 0 {
 		return nil
@@ -1158,9 +1370,18 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	if err != nil {
 		return err
 	}
-	now := nowUTC()
+	// Fast path for the terminal write budget (see above): the in-transaction
+	// check below covers a running→terminal race between this read and the
+	// commit, but rejecting here avoids opening a doomed transaction.
+	if inst.Status != "running" && len(items) > firestoreTerminalInboxBatchLimit {
+		return backend.ErrBatchTooLarge
+	}
 	var inserted int
 	err = b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		// Stamp inside the transaction (per attempt): a transaction that
+		// loses a race and retries must not commit with a created_at
+		// captured before the conflicting commit.
+		now := nowUTC()
 		inserted = 0
 		// Read the parent inside the transaction: PurgeInstances deletes
 		// wf_instances after sweeping children, and Firestore aborts a
@@ -1183,9 +1404,45 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		if err := seedInboxSeqTx(b, tx, alloc, instanceID); err != nil {
 			return err
 		}
+		// Terminal sends must not be swallowed by pre-terminal dedupe keys:
+		// a SendToInbox racing a terminal transition (CommitAdvancements or
+		// TerminateInstance) can observe a key snapshotted for the
+		// post-commit sweep. The sweep deletes exactly the snapshotted keys,
+		// so a send that commits in the notify-to-sweep window must insert
+		// its own event immediately: suppressing it on the doomed
+		// pre-terminal row (legacy or versioned) while stamping only a
+		// marker loses the signal permanently once the sweep removes the
+		// row — the marker then suppresses every retry (Codex round-15 on
+		// #296). Sends that commit while the instance is already terminal
+		// always insert their event on the first post-terminal send;
+		// retries still dedupe via a post-terminal marker (see
+		// postTerminalDedupeMarker): the first terminal send with a DedupeID
+		// creates the marker alongside the event, and later retries see
+		// the marker and skip. The base key is created when absent (so
+		// sweeps/purge stay consistent) but an owned base key — legacy or
+		// versioned — never suppresses a terminal insert, only the marker
+		// does. (Same-batch duplicates still collapse to one insert
+		// so a batch never issues conflicting Creates.)
+		terminal := str(isnap.Data(), "status") != "running"
+		// Enforce the terminal write budget inside the transaction as well:
+		// the instance may have flipped to terminal after the pre-read above
+		// (running→terminal race), turning a 100-item running batch into a
+		// 501-write terminal commit. Fail fast with ErrBatchTooLarge instead
+		// of a deterministic Firestore limit error.
+		if terminal && len(items) > firestoreTerminalInboxBatchLimit {
+			return backend.ErrBatchTooLarge
+		}
 		// Firestore requires all reads before writes; also skip same-batch DedupeID dups.
 		skip := make([]bool, len(items))
+		createDoc := make([]string, len(items))
+		createDocDual := make([]string, len(items))
+		createVer := make([]int64, len(items))
+		markerDoc := make([]string, len(items))
+		markerDocDual := make([]string, len(items))
 		created := map[string]bool{}
+		// reserved tracks guard document IDs chosen earlier in this batch
+		// (round-18 P2): transaction reads don't see buffered Creates.
+		reserved := map[string]bool{}
 		for i, it := range items {
 			if it.DedupeID == "" {
 				continue
@@ -1194,28 +1451,265 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				skip[i] = true
 				continue
 			}
-			dref := b.ref("wf_signal_dedupe", signalDedupeID(instanceID, it.DedupeID))
-			snap, err := tx.Get(dref)
-			if err != nil && !isNotFound(err) {
-				return err
+			if terminal {
+				// Retry check first: a marker means this DedupeID already
+				// inserted post-terminal, so dedupe the retry. Markers
+				// live in their own collection (see
+				// postTerminalMarkersCollection), never in the dedupe
+				// keyspace: no legacy verbatim user row — however
+				// marker-shaped — can match this probe, and pre-upgrade
+				// marker rows left behind in wf_signal_dedupe are inert
+				// (a pre-upgrade retry may duplicate once, never drop;
+				// purge reaps the rows). Both doc-ID framings are probed
+				// (framed first, legacy for pre-framing markers), and the
+				// stored instance_id is validated: under legacy framing
+				// two (instance, marker) pairs could share one document,
+				// so a foreign row never suppresses this instance (Codex
+				// round-16 on #296, see docInstanceMatches).
+				markerExists := false
+				mpr, merr := b.probeDedupeKey(tx, postTerminalMarkersCollection, instanceID, postTerminalDedupeMarker(it.DedupeID))
+				if merr != nil {
+					return merr
+				}
+				if owned, _ := selectOwnedDedupeDoc(mpr.framedDoc, mpr.legacyDoc, instanceID); owned != nil {
+					markerExists = true
+				}
+				if markerExists {
+					created[it.DedupeID] = true
+					skip[i] = true
+					continue
+				}
+				// First post-terminal send: insert + stamp the marker.
+				// Create the base key too when absent for sweep/purge
+				// consistency. An owned base guard (versioned or legacy)
+				// never suppresses a terminal insert: a pre-terminal key's
+				// event was retired by the terminal sweep, so the reset
+				// semantics still promise a fresh post-terminal delivery
+				// (see TestTerminalSendBypassesStaleDedupe) — and a key
+				// observed here may itself be snapshotted for a sweep that
+				// has not run yet (notify-to-sweep window, Codex round-15
+				// on #296): suppressing on it while stamping only a marker
+				// loses the signal once the sweep removes the row, with
+				// the marker then suppressing every retry. Only the marker
+				// suppresses terminal retries. (A pre-upgrade legacy
+				// post-terminal retry guard therefore duplicates once on
+				// its first post-upgrade retry instead of suppressing —
+				// the safe direction: never drop. The marker stamped
+				// alongside still dedupes all later retries.)
+				// Marker-shaped candidates are never user keys: markers
+				// live in their own collection now, so a row shaped like
+				// one is either an inert pre-upgrade marker or a legacy
+				// verbatim row no probe may mistake for this DedupeID's
+				// guard (skipping it duplicates at worst, never drops).
+				// Ownership is version-aware (Codex round 13 on #296, see
+				// matchDedupeRow): a foreign-owner row at this DedupeID's
+				// canonical key already satisfies sweep consistency (the
+				// key is occupied), so only the marker is stamped —
+				// creating over it would fail and must not suppress the
+				// insert.
+				baseExists := false
+				canonicalOccupied := false
+				canonFramedFree := true
+				rawLegacyFree := true
+				canonicalKey := escapeDedupeID(it.DedupeID)
+				for _, bk := range dedupeKeyCandidates(it.DedupeID) {
+					if isPostTerminalMarkerKey(bk) {
+						continue
+					}
+					pr, err := b.probeDedupeKey(tx, "wf_signal_dedupe", instanceID, bk)
+					if err != nil {
+						return err
+					}
+					if bk == canonicalKey {
+						canonFramedFree = pr.framedFree
+					}
+					if bk == it.DedupeID {
+						rawLegacyFree = pr.legacyFree
+					}
+					if bk == escapeDedupeID(it.DedupeID) && (!pr.framedFree || !pr.legacyFree) {
+						// Either framing occupied — even by a foreign row
+						// under a colliding legacy doc ID (Codex round-16
+						// on #296, round-18 ownership-aware probing): never
+						// this DedupeID's guard, but the key still counts
+						// as occupied (the write would collide), so only
+						// the marker is stamped for it.
+						canonicalOccupied = true
+					}
+					if matchOwnedDedupeRow(it.DedupeID, bk, pr, instanceID) {
+						baseExists = true
+						break
+					}
+				}
+				created[it.DedupeID] = true
+				// Stamp the marker under rolling-upgrade dual-write (Codex
+				// round-24 P1 on #296): the framed doc plus its legacy
+				// counterpart when free, else the legacy doc alone when the
+				// framed leg is foreign-occupied, else no marker (the event
+				// still inserts; a retry may duplicate once rather than the
+				// send failing deterministically).
+				if md, ok := markerGuardTarget(instanceID, it.DedupeID, mpr.framedFree, mpr.legacyFree, reserved); ok {
+					reserved[md] = true
+					markerDoc[i] = md
+					if dual, ok := dualMarkerDoc(instanceID, it.DedupeID, mpr.legacyFree, reserved); ok && dual != md {
+						reserved[dual] = true
+						markerDocDual[i] = dual
+					}
+				}
+				if baseExists || canonicalOccupied {
+					continue
+				}
+				// New base guards dual-write both framings (same round-24
+				// P1, corrected round-26 P1 on #296): pre-framing nodes probe
+				// only the raw legacy concatenation and would otherwise miss
+				// the framed-only guard. canonicalOccupied is false here, so
+				// the framed leg is free; the raw legacy leg rides along when
+				// free (see dualDedupeGuardDoc).
+				target := dedupeGuardTarget{docID: signalDedupeID(instanceID, it.DedupeID), ver: int64(dedupeFormatVersion)}
+				if !canonFramedFree || reserved[target.docID] {
+					// Framed leg lost a same-batch race (reserved) or a
+					// concurrent commit: fall back to marker-only like the
+					// occupied case above (duplicate-never-drop) instead of
+					// failing the batch deterministically.
+					continue
+				}
+				reserved[target.docID] = true
+				createDoc[i] = target.docID
+				createVer[i] = target.ver
+				if dual, ok := dualDedupeGuardDoc(instanceID, target, it.DedupeID, canonicalKey, rawFallbackDedupeKey(it.DedupeID), rawLegacyFree, reserved); ok {
+					reserved[dual.docID] = true
+					createDocDual[i] = dual.docID
+				}
+				continue
 			}
-			if err == nil && snap.Exists() {
+			// Probe every stored user-key form, legacy raw first (Codex round 8
+			// on #327): pre-escape rows stored "__" IDs verbatim.
+			// Marker-shaped candidates are honored here (Codex round 12 on
+			// #296): live markers live outside the dedupe keyspace, and a
+			// running instance cannot own a post-terminal marker, so a
+			// marker-shaped row on a running instance is unambiguously a
+			// legacy user key (e.g. DedupeID "__post_terminal__:x" stored
+			// raw pre-escape). Skipping it would miss the guard, write a
+			// second escaped key, and duplicate the event. Terminal
+			// instances keep the marker-only rule (see the terminal base
+			// check above).
+			// Ownership is version-aware (Codex round 13 on #296, see
+			// matchDedupeRow) and instance-aware (Codex round-16 on #296,
+			// see docInstanceMatches): a hit counts only when the row guards
+			// THIS DedupeID of THIS instance — a legacy row on exact raw
+			// equality, a versioned row on canonical-form equality (v1) or
+			// fallback-key equality (v2). A foreign-owner row at this
+			// DedupeID's canonical key means the canonical guard cannot be
+			// created (it would collide), so the guard falls back to the
+			// rawFallbackDedupeKey with an explicit version
+			// (dedupeFormatRawKeyVersion): delivery is preserved and retries
+			// keep deduping. The fallback key is the raw ID for short IDs
+			// but a bounded second-level hash for over-budget IDs, so the
+			// write stays within the shared STRING(255) budget on Spanner
+			// (Codex round-16 on #296). Probing is ownership-aware (Codex
+			// round-18 on #296, see probeDedupeKey): a foreign row at the
+			// framed doc no longer hides the owned legacy candidate, and
+			// when both framed docs are foreign-occupied the guard is
+			// created at a free legacy framing (see pickDedupeGuardTarget)
+			// instead of inserting unguarded. Guard docs chosen earlier in
+			// this batch are reserved (round-18 P2): transaction reads
+			// don't see buffered Creates, so without the reservation two
+			// items choosing one doc fail the whole batch deterministically
+			// on every retry. Only when no slot is free does the event
+			// insert unguarded (duplicate-never-drop).
+			baseHit := false
+			canonicalKey := escapeDedupeID(it.DedupeID)
+			fallbackKey := rawFallbackDedupeKey(it.DedupeID)
+			canonProbe := dedupeKeyProbe{framedFree: true, legacyFree: true}
+			fbProbe := dedupeKeyProbe{framedFree: true, legacyFree: true}
+			rawProbe := dedupeKeyProbe{framedFree: true, legacyFree: true}
+			for _, bk := range dedupeKeyCandidates(it.DedupeID) {
+				pr, err := b.probeDedupeKey(tx, "wf_signal_dedupe", instanceID, bk)
+				if err != nil {
+					return err
+				}
+				if bk == canonicalKey {
+					canonProbe = pr
+				}
+				if bk == fallbackKey {
+					fbProbe = pr
+				}
+				if bk == it.DedupeID {
+					rawProbe = pr
+				}
+				if matchOwnedDedupeRow(it.DedupeID, bk, pr, instanceID) {
+					baseHit = true
+					break
+				}
+			}
+			if baseHit {
+				created[it.DedupeID] = true
 				skip[i] = true
 				continue
 			}
 			created[it.DedupeID] = true
+			if target, ok := pickDedupeGuardTarget(instanceID, it.DedupeID, canonicalKey, fallbackKey, canonProbe, fbProbe, reserved); ok {
+				reserved[target.docID] = true
+				createDoc[i] = target.docID
+				createVer[i] = target.ver
+				// Rolling-upgrade dual-write (Codex round-24 P1 on #296,
+				// corrected round-26 P1): a framed guard also lands under
+				// the RAW legacy-format doc ID so pre-framing nodes (which
+				// probe instanceID + ":" + raw DedupeID) see the guard.
+				// Legacy targets need no counterpart (old readers see them
+				// directly). Dual-write needs the PHYSICAL raw-legacy
+				// availability (a foreign-occupied raw leg still collides),
+				// not the effective availability pick used above.
+				if dual, ok := dualDedupeGuardDoc(instanceID, target, it.DedupeID, canonicalKey, fallbackKey, rawProbe.legacyFree, reserved); ok {
+					reserved[dual.docID] = true
+					createDocDual[i] = dual.docID
+				}
+			}
 		}
 		for i, it := range items {
 			if skip[i] {
+				// Suppressed same-batch duplicate (or a running-state
+				// dedupe hit): no inbox insert and no marker (markers are
+				// terminal-only; terminal marker hits return above without
+				// stamping). Kept as an explicit no-op branch so a future
+				// marker-on-skip never silently inserts an inbox row.
 				continue
 			}
-			if it.DedupeID != "" {
-				if err := tx.Create(b.ref("wf_signal_dedupe", signalDedupeID(instanceID, it.DedupeID)), map[string]any{
+			if it.DedupeID != "" && createDoc[i] != "" {
+				if err := tx.Create(b.ref("wf_signal_dedupe", createDoc[i]), map[string]any{
+					"instance_id":            instanceID,
+					"dedupe_id":              escapeDedupeID(it.DedupeID),
+					dedupeFormatVersionField: createVer[i],
+					"created_at":             now,
+				}); err != nil {
+					return err
+				}
+				if createDocDual[i] != "" {
+					if err := tx.Create(b.ref("wf_signal_dedupe", createDocDual[i]), map[string]any{
+						"instance_id":            instanceID,
+						"dedupe_id":              escapeDedupeID(it.DedupeID),
+						dedupeFormatVersionField: createVer[i],
+						"created_at":             now,
+					}); err != nil {
+						return err
+					}
+				}
+			}
+			if it.DedupeID != "" && markerDoc[i] != "" {
+				if err := tx.Create(b.ref(postTerminalMarkersCollection, markerDoc[i]), map[string]any{
 					"instance_id": instanceID,
-					"dedupe_id":   it.DedupeID,
+					"dedupe_id":   postTerminalDedupeMarker(it.DedupeID),
 					"created_at":  now,
 				}); err != nil {
 					return err
+				}
+				if markerDocDual[i] != "" {
+					if err := tx.Create(b.ref(postTerminalMarkersCollection, markerDocDual[i]), map[string]any{
+						"instance_id": instanceID,
+						"dedupe_id":   postTerminalDedupeMarker(it.DedupeID),
+						"created_at":  now,
+					}); err != nil {
+						return err
+					}
 				}
 			}
 			id := newID()

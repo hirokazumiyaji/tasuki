@@ -192,10 +192,18 @@ func (b *Backend) Migrate(ctx context.Context) error {
 CREATE TABLE wf_signal_dedupe (
   instance_id STRING(255) NOT NULL,
   dedupe_id STRING(255) NOT NULL,
-  created_at TIMESTAMP NOT NULL
+  created_at TIMESTAMP NOT NULL,
+  format_version INT64,
+  fallback_owner STRING(255)
 ) PRIMARY KEY (instance_id, dedupe_id)`}); err != nil {
 			return err
 		}
+	}
+	if err := b.ensureDedupeFormatVersionColumn(ctx); err != nil {
+		return err
+	}
+	if err := b.ensureDedupeFallbackOwnerColumn(ctx); err != nil {
+		return err
 	}
 	seqExists, err := b.tableExists(ctx, "wf_inbox_seq")
 	if err != nil {
@@ -210,7 +218,50 @@ CREATE TABLE wf_inbox_seq (
 			return err
 		}
 	}
+	// Purge markers backfill for databases created before the crash-fence
+	// (Codex round 10 on #296): without the row the victim-delete
+	// transaction fails, so its absence must behave like the other
+	// incremental tables above, not like a fatal schema error.
+	markerExists, err := b.tableExists(ctx, "wf_purge_markers")
+	if err != nil {
+		return err
+	}
+	if markerExists {
+		if err := b.ensureStringColumn(ctx, "wf_purge_markers", incarnationColumn); err != nil {
+			return err
+		}
+	} else {
+		if err := b.applyDDL(ctx, []string{`
+CREATE TABLE wf_purge_markers (
+  instance_id STRING(255) NOT NULL,
+  created_at TIMESTAMP NOT NULL,
+  purged_at TIMESTAMP NOT NULL,
+  incarnation STRING(32)
+) PRIMARY KEY (instance_id)`}); err != nil {
+			return err
+		}
+	}
+	// Post-terminal retry markers live in their own table since the
+	// round-11 marker move (Codex round 11 on #296): same incremental
+	// backfill pattern for pre-move databases.
+	postMarkerExists, err := b.tableExists(ctx, "wf_post_terminal_markers")
+	if err != nil {
+		return err
+	}
+	if !postMarkerExists {
+		if err := b.applyDDL(ctx, []string{`
+CREATE TABLE wf_post_terminal_markers (
+  instance_id STRING(255) NOT NULL,
+  marker_key STRING(255) NOT NULL,
+  created_at TIMESTAMP NOT NULL
+) PRIMARY KEY (instance_id, marker_key)`}); err != nil {
+			return err
+		}
+	}
 	if err := b.ensureSearchAttributesColumn(ctx); err != nil {
+		return err
+	}
+	if err := b.ensureIncarnationColumn(ctx); err != nil {
 		return err
 	}
 	return b.ensureInt64Column(ctx, "wf_inbox", "seq")
@@ -243,6 +294,53 @@ func (b *Backend) ensureInt64Column(ctx context.Context, table, column string) e
 		return nil
 	}
 	return b.applyDDL(ctx, []string{fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s INT64`, table, column)})
+}
+
+// ensureIncarnationColumn backfills the incarnation token column on
+// wf_instances for databases created before the round-21 (#296) identity
+// fix. The column is nullable: existing rows read NULL, i.e. legacy
+// (tokenless), and fences fall back to created_at comparison for them (see
+// victimMatches). No row rewrite is needed; new incarnations always record
+// a token at CreateInstance.
+func (b *Backend) ensureIncarnationColumn(ctx context.Context) error {
+	return b.ensureStringColumn(ctx, "wf_instances", incarnationColumn)
+}
+
+func (b *Backend) ensureStringColumn(ctx context.Context, table, column string) error {
+	exists, err := b.columnExists(ctx, table, column)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	return b.applyDDL(ctx, []string{fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s STRING(32)`, table, column)})
+}
+
+// ensureDedupeFormatVersionColumn backfills the format_version column on
+// wf_signal_dedupe for databases created before the round-13 (#296)
+// versioning. The column is nullable: existing rows read NULL, i.e. legacy
+// (v0), which probes match only by exact raw-ID equality (see
+// matchDedupeRow). No row rewrite is needed.
+func (b *Backend) ensureDedupeFormatVersionColumn(ctx context.Context) error {
+	return b.ensureInt64Column(ctx, "wf_signal_dedupe", dedupeFormatVersionColumn)
+}
+
+// ensureDedupeFallbackOwnerColumn backfills the fallback_owner column on
+// wf_signal_dedupe for databases created before the round-17 (#296) owner
+// fix. The column is nullable: existing v2 fallback rows read a NULL owner
+// and keep the previous key-only match rule (see matchDedupeRow), so their
+// guards keep deduping; new fallback writes always record the owner. No row
+// rewrite is needed.
+func (b *Backend) ensureDedupeFallbackOwnerColumn(ctx context.Context) error {
+	exists, err := b.columnExists(ctx, "wf_signal_dedupe", dedupeFallbackOwnerColumn)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	return b.applyDDL(ctx, []string{fmt.Sprintf(`ALTER TABLE wf_signal_dedupe ADD COLUMN %s STRING(255)`, dedupeFallbackOwnerColumn)})
 }
 
 func (b *Backend) columnExists(ctx context.Context, table, column string) (bool, error) {
@@ -320,7 +418,7 @@ func (b *Backend) Reset(ctx context.Context) error {
 	type keyQuery struct {
 		table string
 		sql   string
-		kind  string // "string" | "int64" | "pair"
+		kind  string // "string" | "int64" | "pair" | "strpair"
 	}
 	queries := []keyQuery{
 		{table: "wf_schedules", sql: `SELECT id FROM wf_schedules`, kind: "string"},
@@ -328,6 +426,9 @@ func (b *Backend) Reset(ctx context.Context) error {
 		{table: "wf_tasks", sql: `SELECT id FROM wf_tasks`, kind: "int64"},
 		{table: "wf_inbox", sql: `SELECT id FROM wf_inbox`, kind: "int64"},
 		{table: "wf_inbox_seq", sql: `SELECT instance_id FROM wf_inbox_seq`, kind: "string"},
+		{table: "wf_signal_dedupe", sql: `SELECT instance_id, dedupe_id FROM wf_signal_dedupe`, kind: "strpair"},
+		{table: "wf_post_terminal_markers", sql: `SELECT instance_id, marker_key FROM wf_post_terminal_markers`, kind: "strpair"},
+		{table: "wf_purge_markers", sql: `SELECT instance_id FROM wf_purge_markers`, kind: "string"},
 		{table: "wf_journal", sql: `SELECT instance_id, seq FROM wf_journal`, kind: "pair"},
 		{table: "wf_instances", sql: `SELECT id FROM wf_instances`, kind: "string"},
 	}
@@ -367,6 +468,13 @@ func (b *Backend) Reset(ctx context.Context) error {
 						return err
 					}
 					muts = append(muts, spanner.Delete(q.table, spanner.Key{instanceID, seq}))
+				case "strpair":
+					var instanceID, second string
+					if err := row.Columns(&instanceID, &second); err != nil {
+						iter.Stop()
+						return err
+					}
+					muts = append(muts, spanner.Delete(q.table, spanner.Key{instanceID, second}))
 				}
 			}
 			iter.Stop()
