@@ -9,8 +9,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend/mysql"
+	"github.com/hirokazumiyaji/tasuki/client"
+	"github.com/hirokazumiyaji/tasuki/worker"
 	"github.com/hirokazumiyaji/tasuki/workflow"
 )
 
@@ -44,18 +45,18 @@ func main() {
 		panic(err)
 	}
 
-	w := tasuki.NewWorker(b, tasuki.WorkerOptions{PollInterval: 50 * time.Millisecond})
-	tasuki.RegisterWorkflow(w, OrderWorkflow, tasuki.WithName("order"))
-	tasuki.RegisterActivity(w, Charge, tasuki.WithName("charge"))
+	w := worker.NewWorker(b, worker.WorkerOptions{PollInterval: 50 * time.Millisecond})
+	worker.RegisterWorkflow(w, OrderWorkflow, worker.WithName("order"))
+	worker.RegisterActivity(w, Charge, worker.WithName("charge"))
 	w.Start(ctx)
 	defer w.Shutdown(ctx)
 
-	c := tasuki.NewClient(b)
-	h, err := tasuki.Start(ctx, c, "order", "123", tasuki.WithID("order-mysql-123"))
-	if err != nil && !errors.Is(err, tasuki.ErrAlreadyStarted) {
+	c := client.NewClient(b)
+	h, err := client.Start(ctx, c, "order", "123", client.WithID("order-mysql-123"))
+	if err != nil && !errors.Is(err, client.ErrAlreadyStarted) {
 		panic(err)
 	}
-	res, err := tasuki.Result[string](ctx, h)
+	res, err := client.Result[string](ctx, h)
 	if err != nil {
 		panic(err)
 	}

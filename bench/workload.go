@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/hirokazumiyaji/tasuki"
+	"github.com/hirokazumiyaji/tasuki/worker"
 	"github.com/hirokazumiyaji/tasuki/workflow"
 )
 
@@ -16,17 +16,17 @@ const (
 )
 
 // Register attaches the bench-chain workflow and bench-step activity to w.
-func Register(w *tasuki.Worker) {
+func Register(w *worker.Worker) {
 	RegisterScenario(w, "chain")
 }
 
 // RegisterScenario registers workloads for a scenario (chain/long-history/mixed).
-func RegisterScenario(w *tasuki.Worker, scenario string) {
-	tasuki.RegisterActivity(w, step, tasuki.WithName(ActivityName))
-	tasuki.RegisterActivity(w, slowStep, tasuki.WithName("bench-slow"))
-	tasuki.RegisterWorkflow(w, chain, tasuki.WithName(WorkflowName))
-	tasuki.RegisterWorkflow(w, chain, tasuki.WithName(LongName))
-	tasuki.RegisterWorkflow(w, mixed, tasuki.WithName(MixedName))
+func RegisterScenario(w *worker.Worker, scenario string) {
+	worker.RegisterActivity(w, step, worker.WithName(ActivityName))
+	worker.RegisterActivity(w, slowStep, worker.WithName("bench-slow"))
+	worker.RegisterWorkflow(w, chain, worker.WithName(WorkflowName))
+	worker.RegisterWorkflow(w, chain, worker.WithName(LongName))
+	worker.RegisterWorkflow(w, mixed, worker.WithName(MixedName))
 }
 
 // WorkflowNameFor maps a scenario to its workflow name.

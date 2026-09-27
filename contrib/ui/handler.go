@@ -15,21 +15,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend"
+	"github.com/hirokazumiyaji/tasuki/client"
 )
 
 //go:embed templates/*
 var templateFS embed.FS
 
 type server struct {
-	client *tasuki.Client
+	client *client.Client
 	tmpl   *template.Template
 	secret []byte
 }
 
 // NewHandler returns an HTTP handler for instance list, journal detail, terminate, signal, and cancel.
-func NewHandler(c *tasuki.Client, opts ...Option) http.Handler {
+func NewHandler(c *client.Client, opts ...Option) http.Handler {
 	var o options
 	for _, opt := range opts {
 		opt(&o)
@@ -107,7 +107,7 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
 	limit, offset := parseListPagination(r)
 	page := listPage{Title: "tasuki", Status: status, Name: name, Limit: limit, Offset: offset}
-	list, err := s.client.List(r.Context(), tasuki.InstanceFilter{
+	list, err := s.client.List(r.Context(), client.InstanceFilter{
 		Status: status,
 		Name:   name,
 		Limit:  limit + 1,
@@ -367,7 +367,7 @@ func (s *server) buildDetail(r *http.Request, id, errMsg string) (detailPage, in
 	page.Queue = inst.Queue
 	page.Status = inst.Status
 	page.NextSeq = inst.NextSeq
-	if inst.Status == tasuki.StatusRunning {
+	if inst.Status == client.StatusRunning {
 		page.CanTerminate = true
 		page.CanSignal = true
 		page.CanCancel = true

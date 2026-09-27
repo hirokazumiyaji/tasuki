@@ -19,11 +19,13 @@ tasuki は逆の配置を取る。
 エンジンをライブラリとしてアプリケーションプロセスの中で動かし、永続化はアプリケーションがすでに持っているデータストアに相乗りする。
 追加で必要になるインフラはゼロである。
 
+Worker の生成と登録には `github.com/hirokazumiyaji/tasuki/worker` を import する。
+
 ```go
 // 追加インフラなしで動く最小構成のイメージ
-w := tasuki.NewWorker(postgres.NewBackend(pool), tasuki.WorkerOptions{})
-tasuki.RegisterWorkflow(w, OrderWorkflow)
-tasuki.RegisterActivity(w, ChargePayment)
+w := worker.NewWorker(postgres.NewBackend(pool), worker.WorkerOptions{})
+worker.RegisterWorkflow(w, OrderWorkflow)
+worker.RegisterActivity(w, ChargePayment)
 w.Start(ctx)
 ```
 

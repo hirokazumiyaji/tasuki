@@ -88,7 +88,7 @@ type AdvancementBatcher interface {
 
 // SchemaValidator is implemented by backends that can verify the store schema
 // is ready (tables present, version current). Workers call it through
-// tasuki.ValidateSchema at startup as a fail-safe for unmigrated databases.
+// worker.ValidateSchema at startup as a fail-safe for unmigrated databases.
 type SchemaValidator interface {
 	ValidateSchema(ctx context.Context) error
 }

@@ -3,7 +3,7 @@
 [English] | [日本語](ja/03-api.md)
 
 This document defines the public API of tasuki from the perspective of library consumers.  
-The module path is `github.com/hirokazumiyaji/tasuki`, and the root package name is `tasuki`.
+The module path is `github.com/hirokazumiyaji/tasuki`. Client operations live in `client`, and Worker operations live in `worker`.
 
 ## Design Principles
 
@@ -21,9 +21,10 @@ import (
     "context"
     "time"
 
-    "github.com/hirokazumiyaji/tasuki"
     "github.com/hirokazumiyaji/tasuki/activity"
     "github.com/hirokazumiyaji/tasuki/backend/postgres"
+    "github.com/hirokazumiyaji/tasuki/client"
+    "github.com/hirokazumiyaji/tasuki/worker"
     "github.com/hirokazumiyaji/tasuki/workflow"
     "github.com/jackc/pgx/v5/pgxpool"
 )
@@ -78,20 +79,20 @@ func main() {
     ctx := context.Background()
     pool, _ := pgxpool.New(ctx, "postgres://...")
 
-    w := tasuki.NewWorker(postgres.NewBackend(pool), tasuki.WorkerOptions{})
-    tasuki.RegisterWorkflow(w, OrderWorkflow)
-    tasuki.RegisterActivity(w, ChargePayment)
-    tasuki.RegisterActivity(w, ShipOrder)
-    tasuki.RegisterActivity(w, SendReceiptMail)
-    tasuki.RegisterActivity(w, SendFollowUpMail)
+    w := worker.NewWorker(postgres.NewBackend(pool), worker.WorkerOptions{})
+    worker.RegisterWorkflow(w, OrderWorkflow)
+    worker.RegisterActivity(w, ChargePayment)
+    worker.RegisterActivity(w, ShipOrder)
+    worker.RegisterActivity(w, SendReceiptMail)
+    worker.RegisterActivity(w, SendFollowUpMail)
     w.Start(ctx)
     defer w.Shutdown(ctx)
 
     // Starting workflows can be performed from any process (Clients do not require workers)
-    c := tasuki.NewClient(postgres.NewBackend(pool))
-    h, _ := tasuki.Start(ctx, c, OrderWorkflow, OrderInput{OrderID: "order-123"},
-        tasuki.WithID("order-123"))
-    res, _ := h.Result(ctx)
+    c := client.NewClient(postgres.NewBackend(pool))
+    h, _ := client.Start(ctx, c, "OrderWorkflow", OrderInput{OrderID: "order-123"},
+        client.WithID("order-123"))
+    res, _ := client.Result[OrderResult](ctx, h)
     _ = res
 }
 ```
@@ -125,7 +126,7 @@ Functions provided by the `workflow` package:
 
 `SetQueryHandler` must be registered at a deterministic position during replay. Query handlers must never record new commands (no `Execute` or `Sleep`).
 
-`SetUpdateHandler` must similarly be registered at a deterministic position. Handlers receive `*workflow.Context` and may call standard workflow operations such as `Execute` and `Sleep`. Updates are triggered using `tasuki.Update` (within the same worker process) and support optional `WithUpdateID` for idempotent resends. While an update turn is processing, the main workflow routine does not advance.
+`SetUpdateHandler` must similarly be registered at a deterministic position. Handlers receive `*workflow.Context` and may call standard workflow operations such as `Execute` and `Sleep`. Updates are triggered using `worker.Update` (within the same worker process) and support optional `worker.WithUpdateID` for idempotent resends. While an update turn is processing, the main workflow routine does not advance.
 
 `UpsertSearchAttributes` is recorded as a command event in the journal, with the full merged attribute map as its payload. Calling it during query execution is rejected.
 
@@ -217,7 +218,7 @@ By default, retries are unlimited (matching Temporal's convention) so that trans
 
 `WithStartToCloseTimeout(d)` sets a maximum execution duration for a **single attempt** (`d <= 0` disables the limit). If an attempt exceeds this duration, it fails with `"activity start-to-close timeout"`, triggering standard retry backoff according to the `RetryPolicy`. The worker cancels the `context.Context` passed to the activity.
 
-Non-retriable errors (such as invalid user input) should be wrapped with `tasuki.NonRetryable(err)`. The worker immediately halts retries and returns the error to the workflow.
+Non-retriable errors (such as invalid user input) should be wrapped with `worker.NonRetryable(err)`. The worker immediately halts retries and returns the error to the workflow.
 
 ## Activity Definition and Idempotency
 
@@ -246,18 +247,18 @@ Because activities follow an **at-least-once** execution contract, side effects 
 ## Client API
 
 ```go
-c := tasuki.NewClient(backend)
+c := client.NewClient(backend)
 
-h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID("order-123"))
-h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID("order-123"),
-    tasuki.WithSearchAttributes(map[string]string{"tenant": "acme", "order_id": "42"}))
-h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID("order-123"),
-    tasuki.WithMemo(map[string]string{"note": "vip"}))
+h, err := client.Start(ctx, c, "OrderWorkflow", in, client.WithID("order-123"))
+h, err := client.Start(ctx, c, "OrderWorkflow", in, client.WithID("order-123"),
+    client.WithSearchAttributes(map[string]string{"tenant": "acme", "order_id": "42"}))
+h, err := client.Start(ctx, c, "OrderWorkflow", in, client.WithID("order-123"),
+    client.WithMemo(map[string]string{"note": "vip"}))
 
-res, err := h.Result(ctx)                    // Awaits terminal completion
+res, err := client.Result[OrderResult](ctx, h) // Awaits terminal completion
 err = c.Signal(ctx, "order-123", "approve", payload)
-err = c.Signal(ctx, "order-123", "approve", payload, tasuki.WithDedupeID("pay-42"))
-err = c.SignalBatch(ctx, "order-123", []tasuki.SignalItem{
+err = c.Signal(ctx, "order-123", "approve", payload, client.WithDedupeID("pay-42"))
+err = c.SignalBatch(ctx, "order-123", []client.SignalItem{
     {Name: "approve", Payload: payload, DedupeID: "pay-42"},
     {Name: "note", Payload: note},
 })
@@ -265,36 +266,36 @@ err = c.Cancel(ctx, "order-123")             // Cooperative cancellation
 err = c.Terminate(ctx, "order-123")          // Immediate termination
 info, err := c.Get(ctx, "order-123")         // Status, result, failure, search attributes, memo
 events, err := c.GetJournal(ctx, "order-123") // Execution history
-list, err := c.List(ctx, tasuki.InstanceFilter{Status: tasuki.StatusStuck})
-list, err := c.List(ctx, tasuki.InstanceFilter{
-    Status: tasuki.StatusRunning,
+list, err := c.List(ctx, client.InstanceFilter{Status: client.StatusStuck})
+list, err := c.List(ctx, client.InstanceFilter{
+    Status: client.StatusRunning,
     SearchAttributes: map[string]string{"tenant": "acme"},
 })
 ```
 
-- `WithSearchAttributes` attaches string metadata at start time. `List` filters search attributes using exact-match AND queries.
-- `WithMemo` attaches arbitrary display metadata visible in `Get` (not filtered in `List`).
-- `Signal` with `WithDedupeID` prevents duplicate delivery of the same signal identifier within an instance.
+- `client.WithSearchAttributes` attaches string metadata at start time. `List` filters search attributes using exact-match AND queries.
+- `client.WithMemo` attaches arbitrary display metadata visible in `Get` (not filtered in `List`).
+- `Signal` with `client.WithDedupeID` prevents duplicate delivery of the same signal identifier within an instance.
 - `SignalBatch` atomically delivers multiple signals to an instance.
-- `Start` is idempotent on instance ID: if an instance with the given ID already exists, it returns `tasuki.ErrAlreadyStarted` along with a valid handle to the existing instance.
+- `client.Start` is idempotent on instance ID: if an instance with the given ID already exists, it returns `client.ErrAlreadyStarted` along with a valid handle to the existing instance.
 
 ### Query
 
-To inspect derived state from running or completed workflows without mutating history, use `tasuki.Query`:
+To inspect derived state from running or completed workflows without mutating history, use `worker.Query`:
 
 ```go
-out, err := tasuki.Query[struct{}, int](ctx, w, "order-123", "count", struct{}{})
+out, err := worker.Query[struct{}, int](ctx, w, "order-123", "count", struct{}{})
 ```
 
 Queries replay history in-memory up to the current point and invoke the registered query handler without claiming tasks or updating sequence numbers.
 
 ### Update
 
-To send synchronous request-response mutations to running instances, use `tasuki.Update`:
+To send synchronous request-response mutations to running instances, use `worker.Update`:
 
 ```go
-out, err := tasuki.Update[ReviseIn, ReviseOut](ctx, w, "order-123", "revise", in,
-    tasuki.WithUpdateID("rev-42"))
+out, err := worker.Update[ReviseIn, ReviseOut](ctx, w, "order-123", "revise", in,
+    worker.WithUpdateID("rev-42"))
 ```
 
 Updates enqueue an `update_requested` event to the inbox. The worker executes the registered `SetUpdateHandler`, which can invoke activities or sleep. Completed updates commit as `update_completed` events.
@@ -306,7 +307,7 @@ Updates enqueue an `update_requested` event to the inbox. The worker executes th
 Workflow and activity names are stored in the database and serve as matching keys during replay. By default, names are derived from function reflection (e.g., `OrderWorkflow`). In production, explicit names are recommended to safeguard against accidental refactoring breakages:
 
 ```go
-tasuki.RegisterWorkflow(w, OrderWorkflow, tasuki.WithName("order"))
+worker.RegisterWorkflow(w, OrderWorkflow, worker.WithName("order"))
 ```
 
 ## Serialization
@@ -333,8 +334,8 @@ keys, err := codec.StaticKeys("2026-07", map[string][]byte{
 })
 enc := codec.Encrypted(codec.JSON(), keys)
 
-w := tasuki.NewWorker(b, tasuki.WorkerOptions{Codec: enc})
-c := tasuki.NewClient(b, tasuki.WithCodec(enc))
+w := worker.NewWorker(b, worker.WorkerOptions{Codec: enc})
+c := client.NewClient(b, client.WithCodec(enc))
 ```
 
 Key rotation is supported by specifying a new primary key while retaining historical keys in the keyring. Unencrypted payloads lacking envelope markers fall back to plaintext reading, allowing encryption to be enabled on existing deployments without data migration.
@@ -397,11 +398,11 @@ type WorkerOptions struct {
 
 Schema migrations are managed per backend. The PostgreSQL backend uses versioned migration files under `backend/postgres/migrations/` (see the [PostgreSQL Migrations README](../backend/postgres/migrations/README.md)).
 
-Workers verify database schemas at startup if the backend implements `backend.SchemaValidator`. If required tables are missing, `StartWithError` returns an error and the polling loop is not launched (the legacy `Start` wrapper logs the same error and leaves the worker stopped). This validation can be disabled using `WorkerOptions.DisableSchemaValidation`.
+Workers verify database schemas at startup if the backend implements `backend.SchemaValidator`. If required tables are missing, `StartWithError` returns an error and the polling loop is not launched (the legacy `Start` wrapper logs the same error and leaves the worker stopped). This validation can be disabled using `worker.WorkerOptions.DisableSchemaValidation`.
 
-Applications can explicitly trigger validation using `tasuki.ValidateSchema(ctx, backend)`.
+Applications can explicitly trigger validation using `worker.ValidateSchema(ctx, backend)`.
 
 - `w.Start(ctx)` starts task polling loops asynchronously and returns immediately.
-- `w.StartWithError(ctx)` is the same but reports startup failures (schema validation, double start via `ErrWorkerAlreadyRunning`) to the caller instead of only logging.
+- `w.StartWithError(ctx)` is the same but reports startup failures (schema validation, double start via `worker.ErrWorkerAlreadyRunning`) to the caller instead of only logging.
 - `w.Running()` reports whether the background polling loop is started (useful for health checks).
 - `w.Shutdown(ctx)` gracefully halts new task acquisition, waits for in-flight tasks within the context deadline, and releases task leases so peer workers can claim them without waiting for expiration.

@@ -3,7 +3,7 @@
 [English](../03-api.md) | 日本語
 
 本書はライブラリ利用者から見た API を定める。
-モジュールパスは `github.com/hirokazumiyaji/tasuki`、ルートパッケージ名は `tasuki` とする。
+モジュールパスは `github.com/hirokazumiyaji/tasuki` とする。Client の操作は `client`、Worker の操作は `worker` パッケージに置く。
 
 ## 設計方針
 
@@ -21,9 +21,10 @@ import (
     "context"
     "time"
 
-    "github.com/hirokazumiyaji/tasuki"
     "github.com/hirokazumiyaji/tasuki/activity"
     "github.com/hirokazumiyaji/tasuki/backend/postgres"
+    "github.com/hirokazumiyaji/tasuki/client"
+    "github.com/hirokazumiyaji/tasuki/worker"
     "github.com/hirokazumiyaji/tasuki/workflow"
     "github.com/jackc/pgx/v5/pgxpool"
 )
@@ -78,20 +79,20 @@ func main() {
     ctx := context.Background()
     pool, _ := pgxpool.New(ctx, "postgres://...")
 
-    w := tasuki.NewWorker(postgres.NewBackend(pool), tasuki.WorkerOptions{})
-    tasuki.RegisterWorkflow(w, OrderWorkflow)
-    tasuki.RegisterActivity(w, ChargePayment)
-    tasuki.RegisterActivity(w, ShipOrder)
-    tasuki.RegisterActivity(w, SendReceiptMail)
-    tasuki.RegisterActivity(w, SendFollowUpMail)
+    w := worker.NewWorker(postgres.NewBackend(pool), worker.WorkerOptions{})
+    worker.RegisterWorkflow(w, OrderWorkflow)
+    worker.RegisterActivity(w, ChargePayment)
+    worker.RegisterActivity(w, ShipOrder)
+    worker.RegisterActivity(w, SendReceiptMail)
+    worker.RegisterActivity(w, SendFollowUpMail)
     w.Start(ctx)
     defer w.Shutdown(ctx)
 
     // 開始はどのプロセスからでもよい（Client はワーカーなしでも作れる）
-    c := tasuki.NewClient(postgres.NewBackend(pool))
-    h, _ := tasuki.Start(ctx, c, OrderWorkflow, OrderInput{OrderID: "order-123"},
-        tasuki.WithID("order-123"))
-    res, _ := h.Result(ctx)
+    c := client.NewClient(postgres.NewBackend(pool))
+    h, _ := client.Start(ctx, c, "OrderWorkflow", OrderInput{OrderID: "order-123"},
+        client.WithID("order-123"))
+    res, _ := client.Result[OrderResult](ctx, h)
     _ = res
 }
 ```
@@ -128,7 +129,7 @@ func main() {
 
 `SetUpdateHandler` も同様に毎回同じ位置で登録する。
 ハンドラは `*workflow.Context` を受け取り、`Execute` / `Sleep` など通常のワークフロー API を使える。
-呼び出しは `tasuki.Update`（Worker 同一プロセス）。任意の `WithUpdateID` で再送冪等。
+呼び出しは `worker.Update`（Worker 同一プロセス）。任意の `worker.WithUpdateID` で再送冪等。
 進行中の Update があるあいだ、メインのワークフローは新しいコマンドを進めない（単一ゴルーチンの協調モデル）。
 
 `UpsertSearchAttributes` は決定的コマンドとしてジャーナルに残り、ペイロードは適用後のマップ全体である。
@@ -237,10 +238,10 @@ type RetryPolicy struct {
 一時障害で止まらないことを既定とし、打ち切りたい呼び出しには `MaxAttempts` や `WithStartToCloseTimeout` を与える。
 
 `WithStartToCloseTimeout(d)` は **1 試行**の開始から完了までの上限である（`d <= 0` は未指定＝上限なし）。
-超過するとその試行は `"activity start-to-close timeout"` で失敗し、通常の失敗と同じく `RetryPolicy` / `MaxAttempts` / `NonRetryable` の対象になる。
+超過するとその試行は `"activity start-to-close timeout"` で失敗し、通常の失敗と同じく `RetryPolicy` / `MaxAttempts` / `worker.NonRetryable` の対象になる。
 ワーカーはアクティビティに渡す `context.Context` を打ち切る（コンテキストを無視する処理は止められない）。
 
-リトライしても意味のないエラー（バリデーション失敗など）は、アクティビティが `tasuki.NonRetryable(err)` で包んで返す。
+リトライしても意味のないエラー（バリデーション失敗など）は、アクティビティが `worker.NonRetryable(err)` で包んで返す。
 このエラーは即座に恒久的失敗となり、ワークフロー側へそのまま返る。
 `MaxAttempts` 到達時も同様にワークフロー側へエラーが返り、以後の対処（補償、別経路、失敗として終端）はワークフローコードが決める。
 
@@ -277,17 +278,17 @@ type Info struct {
 ## クライアント API
 
 ```go
-c := tasuki.NewClient(backend)
+c := client.NewClient(backend)
 
-h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID("order-123"))
-h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID("order-123"),
-    tasuki.WithSearchAttributes(map[string]string{"tenant": "acme", "order_id": "42"}))
-h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID("order-123"),
-    tasuki.WithMemo(map[string]string{"note": "vip"}))
-res, err := h.Result(ctx)                    // 終端までポーリングで待つ
+h, err := client.Start(ctx, c, "OrderWorkflow", in, client.WithID("order-123"))
+h, err := client.Start(ctx, c, "OrderWorkflow", in, client.WithID("order-123"),
+    client.WithSearchAttributes(map[string]string{"tenant": "acme", "order_id": "42"}))
+h, err := client.Start(ctx, c, "OrderWorkflow", in, client.WithID("order-123"),
+    client.WithMemo(map[string]string{"note": "vip"}))
+res, err := client.Result[OrderResult](ctx, h) // 終端まで待つ
 err = c.Signal(ctx, "order-123", "approve", payload)
-err = c.Signal(ctx, "order-123", "approve", payload, tasuki.WithDedupeID("pay-42"))
-err = c.SignalBatch(ctx, "order-123", []tasuki.SignalItem{
+err = c.Signal(ctx, "order-123", "approve", payload, client.WithDedupeID("pay-42"))
+err = c.SignalBatch(ctx, "order-123", []client.SignalItem{
     {Name: "approve", Payload: payload, DedupeID: "pay-42"},
     {Name: "note", Payload: note},
 })
@@ -295,21 +296,21 @@ err = c.Cancel(ctx, "order-123")             // 協調的キャンセル
 err = c.Terminate(ctx, "order-123")          // 即時終了
 info, err := c.Get(ctx, "order-123")         // 状態、結果、失敗理由、検索属性、メモ
 events, err := c.GetJournal(ctx, "order-123") // 実行履歴
-list, err := c.List(ctx, tasuki.InstanceFilter{Status: tasuki.StatusStuck})
-list, err := c.List(ctx, tasuki.InstanceFilter{
-    Status: tasuki.StatusRunning,
+list, err := c.List(ctx, client.InstanceFilter{Status: client.StatusStuck})
+list, err := c.List(ctx, client.InstanceFilter{
+    Status: client.StatusRunning,
     SearchAttributes: map[string]string{"tenant": "acme"},
 })
 ```
 
-`WithSearchAttributes` は Start 時に文字列キー／値の可視メタデータを付ける。
+`client.WithSearchAttributes` は Start 時に文字列キー／値の可視メタデータを付ける。
 `List` の `SearchAttributes` は各キーの完全一致を AND で絞り込む（未設定キーは不一致）。
 実行中の更新は `workflow.UpsertSearchAttributes`（マージ。空文字は削除）。
 
-`WithMemo` は表示用の文字列注釈を付ける（Get で見える。List フィルタには使わない）。
+`client.WithMemo` は表示用の文字列注釈を付ける（Get で見える。List フィルタには使わない）。
 実行中の更新は `workflow.UpsertMemo`（マージ。空文字は削除）。
 
-`Signal` に `WithDedupeID` を付けると、同じインスタンス内でその ID の再送は inbox に増えない（戻り値は `nil`）。
+`Signal` に `client.WithDedupeID` を付けると、同じインスタンス内でその ID の再送は inbox に増えない（戻り値は `nil`）。
 未指定または空文字のときは従来どおり、送信ごとの到着になる。
 dedupe キーはインスタンスが終端になると消える。
 
@@ -317,28 +318,28 @@ dedupe キーはインスタンスが終端になると消える。
 各 item の `DedupeID` は任意で、ヒットした件だけスキップ（全体は成功）。空スライスは no-op。
 ストアの書き込み上限を超えると `backend.ErrBatchTooLarge`（部分適用なし）。
 
-`Start` は ID で冪等である。
-同じ ID がすでに存在する場合は `tasuki.ErrAlreadyStarted` を返し、そのとき返るハンドルは既存インスタンスを指す。
+`client.Start` は ID で冪等である。
+同じ ID がすでに存在する場合は `client.ErrAlreadyStarted` を返し、そのとき返るハンドルは既存インスタンスを指す。
 API ハンドラのリトライで二重開始しない、という組み込み用途で重要な性質のため、エラーではなく正常系の一部として文書化する。
 
 ```go
-h, err := tasuki.Start(ctx, c, OrderWorkflow, in, tasuki.WithID(orderID))
-if err != nil && !errors.Is(err, tasuki.ErrAlreadyStarted) {
+h, err := client.Start(ctx, c, "OrderWorkflow", in, client.WithID(orderID))
+if err != nil && !errors.Is(err, client.ErrAlreadyStarted) {
     return err
 }
-res, err := h.Result(ctx) // 新規でも既存でも同じに扱える
+res, err := client.Result[OrderResult](ctx, h) // 新規でも既存でも同じに扱える
 ```
 
-`Handle[O].Result` はポーリング（既定 200ms 間隔）で待つ。
+`client.Result[O]` はポーリング（既定 200ms 間隔）で待つ。
 通知による即時化は各バックエンドの起床機構（PostgreSQL の `NOTIFY`、DynamoDB/Firestore のプロセス間起床、他ストアのプロセス内ハブ。詳細は [02-architecture.md](02-architecture.md)）と連携して行われる。
 
 ### クエリ
 
-実行中（または終端）のインスタンスから、シグナルなしで派生状態を読むには `tasuki.Query` を使う。
+実行中（または終端）のインスタンスから、シグナルなしで派生状態を読むには `worker.Query` を使う。
 ワークフローを登録した同一プロセスの Worker が必要である（レジストリでハンドラ定義を解決するため）。
 
 ```go
-out, err := tasuki.Query[struct{}, int](ctx, w, "order-123", "count", struct{}{})
+out, err := worker.Query[struct{}, int](ctx, w, "order-123", "count", struct{}{})
 ```
 
 内部では journal と可視な inbox を仮 seq で連結してリプレイし、名前付きハンドラを呼ぶ。
@@ -347,16 +348,16 @@ Claim や Commit は行わないため、`next_seq` とタスクは変わらな�
 
 ### Update
 
-実行中インスタンスへリクエスト／レスポンス型の更新を送るには `tasuki.Update` を使う（Worker 同一プロセス）。
+実行中インスタンスへリクエスト／レスポンス型の更新を送るには `worker.Update` を使う（Worker 同一プロセス）。
 
 ```go
-out, err := tasuki.Update[ReviseIn, ReviseOut](ctx, w, "order-123", "revise", in,
-    tasuki.WithUpdateID("rev-42"))
+out, err := worker.Update[ReviseIn, ReviseOut](ctx, w, "order-123", "revise", in,
+    worker.WithUpdateID("rev-42"))
 ```
 
 inbox に `update_requested` を入れ、ワークフロータスクで `SetUpdateHandler` を実行する。
 ハンドラは `Execute` などでサスペンドでき、完了は `update_completed` としてジャーナルに残る。
-同じ `WithUpdateID` の再送は、完了済みなら同じ結果を返す。
+同じ `worker.WithUpdateID` の再送は、完了済みなら同じ結果を返す。
 
 `Update` はリクエストの投入と完了待ちだけを行い、呼び出し元ゴルーチンでワークフロー／アクティビティタスクの取得・実行は一切行わない（無関係なアクティビティが呼び出し元で走ることはない）。
 進行は同一プロセスで起動済みの Worker ループ（`w.Start(ctx)`）が担うため、`Update` を完了させるには起動済み Worker が必要である。
@@ -369,7 +370,7 @@ inbox に `update_requested` を入れ、ワークフロータスクで `SetUpda
 実運用では明示的な名前を推奨する。
 
 ```go
-tasuki.RegisterWorkflow(w, OrderWorkflow, tasuki.WithName("order"))
+worker.RegisterWorkflow(w, OrderWorkflow, worker.WithName("order"))
 ```
 
 ## シリアライゼーション
@@ -401,8 +402,8 @@ keys, err := codec.StaticKeys("2026-07", map[string][]byte{
 })
 enc := codec.Encrypted(codec.JSON(), keys)
 
-w := tasuki.NewWorker(b, tasuki.WorkerOptions{Codec: enc})
-c := tasuki.NewClient(b, tasuki.WithCodec(enc))
+w := worker.NewWorker(b, worker.WorkerOptions{Codec: enc})
+c := client.NewClient(b, client.WithCodec(enc))
 ```
 
 運用規則を四つ定める。
@@ -478,13 +479,13 @@ DynamoDB、Firestore、Spanner は無視して FIFO 順に claim する（[08-fa
 
 ストアが未マイグレーション（必要なテーブルが無い）とき、Worker は起動しない。
 `Worker.StartWithError` は、バックエンドが `backend.SchemaValidator` を実装していれば起動前に検証し、失敗したらエラーを返してポーリングループを起動しない（従来の `Worker.Start` は同じエラーをログに出して停止したままになる）。
-`WorkerOptions.DisableSchemaValidation` を `true` にすると、この検証を無効化できる（自己管理でスキーマを用意する運用向け）。
+`worker.WorkerOptions.DisableSchemaValidation` を `true` にすると、この検証を無効化できる（自己管理でスキーマを用意する運用向け）。
 
-アプリケーション側で明示的に検証したいときは `tasuki.ValidateSchema(ctx, backend)` を使う。
+アプリケーション側で明示的に検証したいときは `worker.ValidateSchema(ctx, backend)` を使う。
 未対応バックエンドに対しては何もしない。
 
 `w.Start(ctx)` は非同期にポーラーを起動して即座に返る。
-`w.StartWithError(ctx)` も同様だが、起動失敗（スキーマ検証・二重起動 `ErrWorkerAlreadyRunning`）を呼び出し元に返す。
+`w.StartWithError(ctx)` も同様だが、起動失敗（スキーマ検証・二重起動 `worker.ErrWorkerAlreadyRunning`）を呼び出し元に返す。
 `w.Running()` はポーリングループが起動中かどうかを返す（ヘルスチェック用）。
 `w.Shutdown(ctx)` は新規獲得を止め、実行中タスクの完了を ctx の期限まで待ち、未完了タスクのリースを解放（`visible_at` を現在時刻へ戻す）してから返る。
 リース解放により、他のプロセスがリース期限を待たずに引き継げる。

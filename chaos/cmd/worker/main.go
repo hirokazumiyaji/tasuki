@@ -9,7 +9,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/backend/dynamodb"
 	"github.com/hirokazumiyaji/tasuki/backend/firestore"
@@ -17,6 +16,7 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend/postgres"
 	"github.com/hirokazumiyaji/tasuki/backend/spanner"
 	"github.com/hirokazumiyaji/tasuki/backend/sqlite"
+	"github.com/hirokazumiyaji/tasuki/worker"
 	"github.com/hirokazumiyaji/tasuki/workflow"
 )
 
@@ -27,13 +27,13 @@ func main() {
 	b, closer := openBackend(ctx)
 	defer closer()
 
-	w := tasuki.NewWorker(b, tasuki.WorkerOptions{
+	w := worker.NewWorker(b, worker.WorkerOptions{
 		PollInterval:  20 * time.Millisecond,
 		LeaseDuration: time.Second,
 		WorkerID:      os.Getenv("WORKER_ID"),
 	})
-	tasuki.RegisterActivity(w, step, tasuki.WithName("step"))
-	tasuki.RegisterWorkflow(w, chaosWF, tasuki.WithName("chaos"))
+	worker.RegisterActivity(w, step, worker.WithName("step"))
+	worker.RegisterWorkflow(w, chaosWF, worker.WithName("chaos"))
 	w.Start(ctx)
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

@@ -7,15 +7,15 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
+	"github.com/hirokazumiyaji/tasuki/client"
 	"github.com/hirokazumiyaji/tasuki/contrib/ui"
 )
 
 func TestHandler_Auth(t *testing.T) {
 	b := memory.New()
-	c := tasuki.NewClient(b)
+	c := client.NewClient(b)
 	if err := b.CreateInstance(context.Background(), backend.NewInstance{
 		ID: "auth-1", Name: "demo", Queue: "default", Input: []byte(`{}`),
 	}); err != nil {

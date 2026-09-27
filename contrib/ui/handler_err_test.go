@@ -9,14 +9,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
+	"github.com/hirokazumiyaji/tasuki/client"
 )
 
 func testServer(t *testing.T) (*server, http.Handler) {
 	t.Helper()
 	b := memory.New()
-	c := tasuki.NewClient(b)
+	c := client.NewClient(b)
 	tmpl := template.Must(template.New("").ParseFS(templateFS, "templates/*.html"))
 	secret := make([]byte, 32)
 	for i := range secret {

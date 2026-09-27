@@ -69,6 +69,6 @@ The table below outlines technical risks identified in durable workflow executio
 | **Database semantics variance** (e.g., lock waits vs CAS aborts) | Missed wakeups or lost exclusivity | Guarantees formulated as formal invariants (e.g., I1) and validated uniformly across all backends via the shared compliance suite. |
 | **Low transaction write caps** (DynamoDB, Firestore) | Exceeding transaction batch operation limits | Declared via `Capabilities.MaxAdvancementEffects`; the engine commits prefix commands within budget and defers remaining fan-outs to subsequent turns. |
 | **Lack of authoritative database clock** | Premature lease expirations or extra retries | Safety is decoupled from clock drift using CAS and atomic task deletion; drift margins are configurable. |
-| **Function rename incompatibilities** | Running instances fail replay | Explicit registration names via `tasuki.WithName` are supported and recommended in documentation. |
+| **Function rename incompatibilities** | Running instances fail replay | Explicit registration names via `worker.WithName` are supported and recommended in documentation. |
 | **Payload schema evolution** | Deserialization failures on old journal events | Additive-only schema evolution rules documented; pluggable codecs support custom versioning and encryption. |
 | **Duplicate activity execution** | External side-effect inconsistency | Activity contracts mandate at-least-once execution; stable `IdempotencyKey` is provided to ensure deduplication at external endpoints. |

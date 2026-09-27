@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
+	"github.com/hirokazumiyaji/tasuki/client"
 	"github.com/hirokazumiyaji/tasuki/contrib/ui"
 )
 
@@ -37,7 +37,7 @@ func (f *failGetBackend) GetInstance(_ context.Context, _ string) (*backend.Inst
 func TestHandler_ListErrorSanitized(t *testing.T) {
 	sensitive := errors.New("postgres dial SECRET-TOKEN-123")
 	b := &failListBackend{Backend: memory.New(), err: sensitive}
-	h := ui.NewHandler(tasuki.NewClient(b))
+	h := ui.NewHandler(client.NewClient(b))
 
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
@@ -60,7 +60,7 @@ func TestHandler_ListErrorSanitized(t *testing.T) {
 func TestHandler_DetailErrorSanitized(t *testing.T) {
 	sensitive := errors.New("journal read SECRET-TOKEN-456")
 	b := &failGetBackend{Backend: memory.New(), err: sensitive}
-	h := ui.NewHandler(tasuki.NewClient(b))
+	h := ui.NewHandler(client.NewClient(b))
 
 	r := httptest.NewRequest(http.MethodGet, "/instances/anything", nil)
 	w := httptest.NewRecorder()
@@ -82,7 +82,7 @@ func TestHandler_DetailErrorSanitized(t *testing.T) {
 
 func TestHandler_DetailNotFoundMessage(t *testing.T) {
 	b := memory.New()
-	h := ui.NewHandler(tasuki.NewClient(b))
+	h := ui.NewHandler(client.NewClient(b))
 
 	r := httptest.NewRequest(http.MethodGet, "/instances/nope", nil)
 	w := httptest.NewRecorder()
@@ -100,7 +100,7 @@ func TestHandler_DetailNotFoundMessage(t *testing.T) {
 
 func TestHandler_ListRequestIDPassthrough(t *testing.T) {
 	b := memory.New()
-	h := ui.NewHandler(tasuki.NewClient(b))
+	h := ui.NewHandler(client.NewClient(b))
 
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	r.Header.Set("X-Request-ID", "test-req-1")
@@ -114,7 +114,7 @@ func TestHandler_ListRequestIDPassthrough(t *testing.T) {
 func TestHandler_MiddlewareRequestIDPropagated(t *testing.T) {
 	sensitive := errors.New("detail read SECRET-TOKEN-789")
 	b := &failGetBackend{Backend: memory.New(), err: sensitive}
-	inner := ui.NewHandler(tasuki.NewClient(b))
+	inner := ui.NewHandler(client.NewClient(b))
 	// Outer middleware sets the ID on the response before delegating.
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Request-ID", "mw-id-1")

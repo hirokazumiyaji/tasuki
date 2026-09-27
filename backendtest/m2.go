@@ -9,9 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend"
+	"github.com/hirokazumiyaji/tasuki/client"
 	"github.com/hirokazumiyaji/tasuki/journal"
+	"github.com/hirokazumiyaji/tasuki/worker"
 	"github.com/hirokazumiyaji/tasuki/workflow"
 )
 
@@ -151,12 +152,12 @@ func testCancelCompensation(t *testing.T, newBackend Factory) {
 	setNow(b, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 
 	comp := false
-	w := tasuki.NewWorker(b, tasuki.WorkerOptions{PollInterval: time.Millisecond, LeaseDuration: time.Minute})
-	tasuki.RegisterActivity(w, func(ctx context.Context, _ struct{}) (string, error) {
+	w := worker.NewWorker(b, worker.WorkerOptions{PollInterval: time.Millisecond, LeaseDuration: time.Minute})
+	worker.RegisterActivity(w, func(ctx context.Context, _ struct{}) (string, error) {
 		comp = true
 		return "refunded", nil
-	}, tasuki.WithName("refund"))
-	tasuki.RegisterWorkflow(w, func(wctx *workflow.Context, _ struct{}) (string, error) {
+	}, worker.WithName("refund"))
+	worker.RegisterWorkflow(w, func(wctx *workflow.Context, _ struct{}) (string, error) {
 		err := workflow.Sleep(wctx, time.Hour)
 		if errors.Is(err, workflow.ErrCanceled) {
 			if _, err := workflow.Execute[struct{}, string](wctx, "refund", struct{}{}); err != nil {
@@ -165,13 +166,13 @@ func testCancelCompensation(t *testing.T, newBackend Factory) {
 			return "", workflow.ErrCanceled
 		}
 		return "done", err
-	}, tasuki.WithName("cancelWF"))
+	}, worker.WithName("cancelWF"))
 	w.Start(ctx)
 	defer w.Shutdown(ctx)
 
-	c := tasuki.NewClient(b)
+	c := client.NewClient(b)
 	id := "cancel-comp-1"
-	if _, err := tasuki.Start(ctx, c, "cancelWF", struct{}{}, tasuki.WithID(id)); err != nil {
+	if _, err := client.Start(ctx, c, "cancelWF", struct{}{}, client.WithID(id)); err != nil {
 		t.Fatal(err)
 	}
 

@@ -10,16 +10,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend"
 	"github.com/hirokazumiyaji/tasuki/backend/memory"
+	"github.com/hirokazumiyaji/tasuki/client"
 	"github.com/hirokazumiyaji/tasuki/contrib/ui"
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
 func TestHandler_ListAndDetail(t *testing.T) {
 	b := memory.New()
-	c := tasuki.NewClient(b)
+	c := client.NewClient(b)
 	ctx := context.Background()
 	if err := b.CreateInstance(ctx, backend.NewInstance{
 		ID: "ui-1", Name: "demo", Queue: "default", Input: []byte(`{}`),
@@ -60,7 +60,7 @@ func TestHandler_ListAndDetail(t *testing.T) {
 
 func TestHandler_Terminate(t *testing.T) {
 	b := memory.New()
-	c := tasuki.NewClient(b)
+	c := client.NewClient(b)
 	ctx := context.Background()
 	if err := b.CreateInstance(ctx, backend.NewInstance{
 		ID: "term-ui", Name: "demo", Queue: "default", Input: []byte(`{}`),
@@ -97,7 +97,7 @@ func TestHandler_Terminate(t *testing.T) {
 	}
 
 	inst, err := c.Get(ctx, "term-ui")
-	if err != nil || inst.Status != tasuki.StatusRunning {
+	if err != nil || inst.Status != client.StatusRunning {
 		t.Fatalf("still running want; status=%v err=%v", inst, err)
 	}
 
@@ -112,7 +112,7 @@ func TestHandler_Terminate(t *testing.T) {
 		t.Fatalf("Location=%q", loc)
 	}
 	inst, err = c.Get(ctx, "term-ui")
-	if err != nil || inst.Status != tasuki.StatusTerminated {
+	if err != nil || inst.Status != client.StatusTerminated {
 		t.Fatalf("status=%v err=%v", inst, err)
 	}
 
@@ -125,7 +125,7 @@ func TestHandler_Terminate(t *testing.T) {
 
 func TestHandler_Signal(t *testing.T) {
 	b := memory.New()
-	c := tasuki.NewClient(b)
+	c := client.NewClient(b)
 	ctx := context.Background()
 	if err := b.CreateInstance(ctx, backend.NewInstance{
 		ID: "sig-ui", Name: "demo", Queue: "default", Input: []byte(`{}`),
@@ -187,7 +187,7 @@ func TestHandler_Signal(t *testing.T) {
 
 func TestHandler_Cancel(t *testing.T) {
 	b := memory.New()
-	c := tasuki.NewClient(b)
+	c := client.NewClient(b)
 	ctx := context.Background()
 	if err := b.CreateInstance(ctx, backend.NewInstance{
 		ID: "cancel-ui", Name: "demo", Queue: "default", Input: []byte(`{}`),
@@ -239,14 +239,14 @@ func TestHandler_Cancel(t *testing.T) {
 		t.Fatalf("inbox missing cancel: %+v", head.Inbox)
 	}
 	inst, err := c.Get(ctx, "cancel-ui")
-	if err != nil || inst.Status != tasuki.StatusRunning {
+	if err != nil || inst.Status != client.StatusRunning {
 		t.Fatalf("still running want; status=%v err=%v", inst, err)
 	}
 }
 
 func TestHandler_DetailTruncatesLongPayload(t *testing.T) {
 	b := memory.New()
-	c := tasuki.NewClient(b)
+	c := client.NewClient(b)
 	ctx := context.Background()
 	if err := b.CreateInstance(ctx, backend.NewInstance{
 		ID: "long-ui", Name: "demo", Queue: "default", Input: []byte(`{}`),

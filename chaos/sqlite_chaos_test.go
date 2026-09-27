@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend/sqlite"
+	"github.com/hirokazumiyaji/tasuki/client"
 )
 
 func TestChaos_KillWorkers_SQLite(t *testing.T) {
@@ -35,10 +35,10 @@ func TestChaos_KillWorkers_SQLite(t *testing.T) {
 	}
 
 	const nInst = 20
-	c := tasuki.NewClient(b)
+	c := client.NewClient(b)
 	for i := 0; i < nInst; i++ {
 		id := fmt.Sprintf("chaos-sqlite-%d", i)
-		if _, err := tasuki.Start(ctx, c, "chaos", 0, tasuki.WithID(id)); err != nil {
+		if _, err := client.Start(ctx, c, "chaos", 0, client.WithID(id)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -127,11 +127,11 @@ func TestChaos_KillWorkers_SQLite(t *testing.T) {
 		if info.Status != "completed" {
 			t.Fatalf("%s status=%s", id, info.Status)
 		}
-		h, err := tasuki.Start(ctx, c, "chaos", 0, tasuki.WithID(id))
-		if err != nil && !errors.Is(err, tasuki.ErrAlreadyStarted) {
+		h, err := client.Start(ctx, c, "chaos", 0, client.WithID(id))
+		if err != nil && !errors.Is(err, client.ErrAlreadyStarted) {
 			t.Fatal(err)
 		}
-		result, err := tasuki.Result[int](ctx, h)
+		result, err := client.Result[int](ctx, h)
 		if err != nil {
 			t.Fatal(err)
 		}

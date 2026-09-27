@@ -11,8 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hirokazumiyaji/tasuki"
 	"github.com/hirokazumiyaji/tasuki/backend"
+	"github.com/hirokazumiyaji/tasuki/client"
+	"github.com/hirokazumiyaji/tasuki/worker"
 )
 
 // Config controls a benchmark run. Zero values use defaults.
@@ -111,9 +112,9 @@ func (c Config) effectiveSettings() map[string]any {
 // Per-instance latencies yield p50/p95/p99 in Result.
 func Run(ctx context.Context, b backend.Backend, backendName string, cfg Config) (Result, error) {
 	cfg = cfg.withDefaults()
-	workers := make([]*tasuki.Worker, 0, cfg.Workers)
+	workers := make([]*worker.Worker, 0, cfg.Workers)
 	for i := 0; i < cfg.Workers; i++ {
-		w := tasuki.NewWorker(b, tasuki.WorkerOptions{
+		w := worker.NewWorker(b, worker.WorkerOptions{
 			PollInterval:        cfg.Poll,
 			LeaseDuration:       cfg.Lease,
 			ClaimLimit:          cfg.resolvedClaimLimit(),
@@ -134,7 +135,7 @@ func Run(ctx context.Context, b backend.Backend, backendName string, cfg Config)
 		}
 	}()
 
-	client := tasuki.NewClient(b)
+	cl := client.NewClient(b)
 	// waitCtx bounds the whole run including submission when Duration caps it.
 	waitCtx := ctx
 	var cancel context.CancelFunc = func() {}
@@ -154,7 +155,7 @@ func Run(ctx context.Context, b backend.Backend, backendName string, cfg Config)
 	for i := 0; i < cfg.Instances; i++ {
 		id := fmt.Sprintf("%s-%d", cfg.RunID, i)
 		t0 := time.Now()
-		h, err := tasuki.Start(ctx, client, WorkflowNameFor(cfg.Scenario), scenarioSteps(cfg), tasuki.WithID(id))
+		h, err := client.Start(ctx, cl, WorkflowNameFor(cfg.Scenario), scenarioSteps(cfg), client.WithID(id))
 		if err != nil {
 			return Result{}, fmt.Errorf("start %s: %w", id, err)
 		}
@@ -162,9 +163,9 @@ func Run(ctx context.Context, b backend.Backend, backendName string, cfg Config)
 		// waiters launched after the whole batch would inflate early
 		// completions by the remaining submission delay.
 		wg.Add(1)
-		go func(h *tasuki.Handle, t0 time.Time, idx int) {
+		go func(h *client.Handle, t0 time.Time, idx int) {
 			defer wg.Done()
-			_, err := tasuki.Result[int](waitCtx, h)
+			_, err := client.Result[int](waitCtx, h)
 			if err != nil {
 				// Duration cut-off / cancel: incomplete, not failed.
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || waitCtx.Err() != nil {

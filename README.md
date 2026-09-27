@@ -10,6 +10,8 @@ The engine runs as an in-process library within your application, and persistenc
 
 Pluggable backend storage interface with PostgreSQL as the reference implementation, and support for MySQL / MariaDB, SQLite, Spanner, TiDB, DynamoDB, and Firestore.
 
+Import Client APIs from `github.com/hirokazumiyaji/tasuki/client` and Worker APIs from `github.com/hirokazumiyaji/tasuki/worker`.
+
 ## Status
 
 - **M4 (Backend Expansion)** complete. PostgreSQL, SQLite, MySQL / MariaDB / TiDB, Spanner, DynamoDB, and Firestore are verified against compliance and chaos test suites.
@@ -17,21 +19,21 @@ Pluggable backend storage interface with PostgreSQL as the reference implementat
 - **Quality Sprint** completed (split CI matrix, test coverage reporting, test suite fill, and documentation freshness). See [docs/04-testing.md](docs/04-testing.md).
 - **Benchmark Foundation**: `go run ./cmd/bench` (memory / postgres / sqlite).
 - **Wakeup & Notification**: PostgreSQL Worker wakes on `LISTEN`/`NOTIFY` (channel `tasuki_tasks`), keeping `PollInterval` as fallback and cadence for timers/schedules. memory, sqlite, mysql, and spanner share in-process wakeups within the same `Backend` (`backend/hub`). DynamoDB uses `wf_wake` (Streams enabled) + wake item polling, and Firestore uses `wf_notify` document snapshots for cross-process wakeups (all notifications are hints; correctness is guaranteed by Claim / GetInstance).
-- **Terminal Result Notification**: Client `Result` wakes up on workflow termination via postgres (`tasuki_terminal`), hub, or cross-process channels.
+- **Terminal Result Notification**: `client.Result` wakes up on workflow termination via postgres (`tasuki_terminal`), hub, or cross-process channels.
 - **Sticky Journal Cache**: Worker uses an in-memory sticky journal cache per instance (matching `next_seq`, diff reads via `GetJournal`) to eliminate full history re-reads on replay.
 - **Durable Actor Model**: tasuki models each workflow instance as a durable actor while retaining the deterministic journal replay execution model.
 - **Journal Growth Warning**: Worker emits a Warn log and metric when journal event count reaches or exceeds `JournalWarnThreshold` (default 10,000; negative disables). Long-running workflows should reset history using `workflow.ContinueAsNew` ([docs/02-architecture.md](docs/02-architecture.md), [docs/03-api.md](docs/03-api.md)).
 - **Activity Heartbeats**: Long-running activities can record progress and extend leases via `activity.RecordHeartbeat`, retrieved on retry with `GetHeartbeatDetails`.
 - **Start-To-Close Timeout**: Activity single-attempt execution time limit is set via `workflow.WithStartToCloseTimeout` (exceeding it is treated as a regular failure eligible for retry).
-- **Workflow Query**: Read-only queries to workflows are handled with `workflow.SetQueryHandler` and `tasuki.Query` (same Worker process).
-- **Workflow Update**: Synchronous request-response updates to running workflows use `workflow.SetUpdateHandler` and `tasuki.Update` (supports optional `WithUpdateID` for idempotency).
-- **Signal Deduplication**: `Client.Signal` supports `WithDedupeID` for instance-scoped idempotent resends.
-- **Signal Batching**: Atomic bulk signals to a single instance via `Client.SignalBatch` (with optional per-item dedupe ID).
+- **Workflow Query**: Read-only queries to workflows are handled with `workflow.SetQueryHandler` and `worker.Query` (same Worker process).
+- **Workflow Update**: Synchronous request-response updates to running workflows use `workflow.SetUpdateHandler` and `worker.Update` (supports optional `worker.WithUpdateID` for idempotency).
+- **Signal Deduplication**: `client.Client.Signal` supports `client.WithDedupeID` for instance-scoped idempotent resends.
+- **Signal Batching**: Atomic bulk signals to a single instance via `client.Client.SignalBatch` (with optional per-item dedupe ID).
 - **Incompatible Worker Nack**: During rolling deployments, if an older worker encounters an unrecognized journal event or unregistered workflow/activity, it Nacks the task so a newer worker can pick it up (`IncompatibleRetryDelay`).
-- **Search Attributes**: String attributes attached via `WithSearchAttributes` (Start) and `workflow.UpsertSearchAttributes` (runtime) allow exact-match filtering in `Client.List`.
-- **Memos**: Annotations attached via `WithMemo` / `workflow.UpsertMemo` provide visible metadata in `Get` (not filtered in `List`).
+- **Search Attributes**: String attributes attached via `client.WithSearchAttributes` (`client.Start`) and `workflow.UpsertSearchAttributes` (runtime) allow exact-match filtering in `client.Client.List`.
+- **Memos**: Annotations attached via `client.WithMemo` / `workflow.UpsertMemo` provide visible metadata in `Get` (not filtered in `List`).
 - **Local Activity**: Synchronous execution within the same Worker process via `workflow.ExecuteLocal` (no task queue, no retry; results recorded in journal).
-- **Payload Encryption**: At-rest payload encryption via `codec.Encrypted` (AES-256-GCM with key rotation; configured on Worker `Codec` and Client `WithCodec`).
+- **Payload Encryption**: At-rest payload encryption via `codec.Encrypted` (AES-256-GCM with key rotation; configured on `worker.WorkerOptions.Codec` and `client.WithCodec`).
 
 ## Quickstart
 
