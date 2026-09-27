@@ -32,14 +32,14 @@ func (b *countResultBackend) ExtendLease(ctx context.Context, task backend.Task,
 	return err
 }
 
-func (b *countResultBackend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
+func (b *countResultBackend) RetryActivity(ctx context.Context, task backend.Task, delay time.Duration) error {
 	b.retryCalls.Add(1)
-	return b.Backend.RetryActivity(ctx, taskID, delay)
+	return b.Backend.RetryActivity(ctx, task, delay)
 }
 
-func (b *countResultBackend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *countResultBackend) CompleteActivity(ctx context.Context, task backend.Task, ev journal.Event) error {
 	b.completeCalls.Add(1)
-	return b.Backend.CompleteActivity(ctx, taskID, ev)
+	return b.Backend.CompleteActivity(ctx, task, ev)
 }
 
 // storeErrorTotal sums tasuki.worker.store_errors, optionally filtered by op

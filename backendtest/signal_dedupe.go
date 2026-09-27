@@ -44,12 +44,9 @@ func testSignalDedupe(t *testing.T, newBackend Factory) {
 	if err := b.TerminateInstance(ctx, id); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.SendToInbox(ctx, id, ev, "pay-1"); err != nil {
-		t.Fatal(err)
-	}
 	st, _ = b.LoadWorkflow(ctx, id)
-	if len(st.Inbox) != 4 {
-		t.Fatalf("inbox=%d want 4 after terminate clears dedupe", len(st.Inbox))
+	if len(st.Inbox) != 0 {
+		t.Fatalf("inbox=%d want 0 after terminate", len(st.Inbox))
 	}
 }
 

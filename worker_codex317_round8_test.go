@@ -128,9 +128,9 @@ func (b *failExtendBackend) ExtendLease(ctx context.Context, task backend.Task, 
 	return errors.New("transient store timeout")
 }
 
-func (b *failExtendBackend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *failExtendBackend) CompleteActivity(ctx context.Context, task backend.Task, ev journal.Event) error {
 	b.completes.Add(1)
-	return b.Backend.CompleteActivity(ctx, taskID, ev)
+	return b.Backend.CompleteActivity(ctx, task, ev)
 }
 
 // TestWorker_Round8_DetachedRenewalFailureAbortsCommit is a regression test

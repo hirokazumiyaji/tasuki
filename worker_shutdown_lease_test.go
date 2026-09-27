@@ -239,12 +239,12 @@ type slowCommitBackend struct {
 	commitOK atomic.Int32
 }
 
-func (b *slowCommitBackend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *slowCommitBackend) CompleteActivity(ctx context.Context, task backend.Task, ev journal.Event) error {
 	time.Sleep(200 * time.Millisecond) // ordinary store latency
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if err := b.Backend.CompleteActivity(ctx, taskID, ev); err != nil {
+	if err := b.Backend.CompleteActivity(ctx, task, ev); err != nil {
 		return err
 	}
 	b.commitOK.Add(1)

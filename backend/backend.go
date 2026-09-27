@@ -59,9 +59,11 @@ type Backend interface {
 	// LoadWorkflowHead returns instance metadata, inbox, next_seq, and store Now without journal.
 	LoadWorkflowHead(ctx context.Context, instanceID string) (*WorkflowState, error)
 	CommitAdvancement(ctx context.Context, adv Advancement) error
-	CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error
+	CompleteActivity(ctx context.Context, task Task, ev journal.Event) error
 	// RetryActivity clears the lease and defers activity visibility by delay (store clock).
-	RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error
+	// It is conditional on the claimed worker and attempt so stale workers cannot
+	// clear a successor's lease.
+	RetryActivity(ctx context.Context, task Task, delay time.Duration) error
 	FireDueTimers(ctx context.Context, limit int) (int, error)
 
 	UpsertSchedule(ctx context.Context, s NewSchedule) error

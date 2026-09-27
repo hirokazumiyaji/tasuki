@@ -308,7 +308,7 @@ type cancelAwareCommitBackend struct {
 	commitRelease chan struct{}
 }
 
-func (b *cancelAwareCommitBackend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *cancelAwareCommitBackend) CompleteActivity(ctx context.Context, task backend.Task, ev journal.Event) error {
 	if b.armCommit.Load() {
 		if b.commitOnce.CompareAndSwap(false, true) {
 			close(b.commitEntered)
@@ -322,7 +322,7 @@ func (b *cancelAwareCommitBackend) CompleteActivity(ctx context.Context, taskID 
 			return ctx.Err()
 		}
 	}
-	return b.Backend.CompleteActivity(ctx, taskID, ev)
+	return b.Backend.CompleteActivity(ctx, task, ev)
 }
 
 // armableExtendBackend passes ExtendLease through until armed, then fails

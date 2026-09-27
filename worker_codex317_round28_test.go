@@ -36,9 +36,9 @@ func (b *round28StallExtendBackend) ExtendLease(_ context.Context, _ backend.Tas
 	return errors.New("round28 released")
 }
 
-func (b *round28StallExtendBackend) RetryActivity(ctx context.Context, id int64, delay time.Duration) error {
+func (b *round28StallExtendBackend) RetryActivity(ctx context.Context, task backend.Task, delay time.Duration) error {
 	b.retries.Add(1)
-	return b.Backend.RetryActivity(ctx, id, delay)
+	return b.Backend.RetryActivity(ctx, task, delay)
 }
 
 func (b *round28StallExtendBackend) ReleaseLease(ctx context.Context, t backend.Task) error {

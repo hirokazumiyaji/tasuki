@@ -185,6 +185,9 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	if _, err = conn.ExecContext(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = ?`, id); err != nil {
 		return err
 	}
+	if _, err = conn.ExecContext(ctx, `DELETE FROM wf_inbox WHERE instance_id = ?`, id); err != nil {
+		return err
+	}
 	if err := commitConn(ctx, conn); err != nil {
 		return err
 	}
@@ -796,7 +799,7 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 	return nil
 }
 
-func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
 	conn, err := beginImmediate(ctx, b.db)
 	if err != nil {
 		return err
@@ -804,7 +807,7 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	defer rollbackConn(ctx, conn)
 
 	row := conn.QueryRowContext(ctx, `
-		SELECT instance_id, COALESCE(ref_seq, 0), kind FROM wf_tasks WHERE id = ?`, taskID)
+		SELECT instance_id, COALESCE(ref_seq, 0), kind FROM wf_tasks WHERE id = ?`, claim.ID)
 	var instanceID string
 	var refSeq int64
 	var kind string
@@ -818,7 +821,7 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	if kind != "activity" {
 		return backend.ErrSuperseded
 	}
-	res, err := conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE id = ? AND kind = 'activity'`, taskID)
+	res, err := conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE id = ? AND kind = 'activity' AND worker_id = ? AND attempt = ?`, claim.ID, claim.WorkerID, claim.Attempt)
 	if err != nil {
 		return err
 	}
@@ -858,10 +861,10 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	return nil
 }
 
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
 	res, err := b.db.ExecContext(ctx, `
 		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL
-		WHERE id = ? AND kind = 'activity'`, formatTime(nowUTC().Add(delay)), taskID)
+		WHERE id = ? AND kind = 'activity' AND worker_id = ? AND attempt = ?`, formatTime(nowUTC().Add(delay)), claim.ID, claim.WorkerID, claim.Attempt)
 	if err != nil {
 		return err
 	}
@@ -870,7 +873,7 @@ func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Du
 		return err
 	}
 	if n == 0 {
-		return backend.ErrNotFound
+		return backend.ErrSuperseded
 	}
 	return nil
 }

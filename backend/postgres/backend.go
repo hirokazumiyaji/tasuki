@@ -171,6 +171,10 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	_, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE instance_id = $1`, id)
+	if err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
@@ -756,7 +760,7 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 	return nil
 }
 
-func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -766,8 +770,8 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	var instanceID string
 	var refSeq int64
 	err = tx.QueryRow(ctx, `
-		DELETE FROM wf_tasks WHERE id = $1 AND kind = 'activity'
-		RETURNING instance_id, COALESCE(ref_seq, 0)`, taskID).Scan(&instanceID, &refSeq)
+		DELETE FROM wf_tasks WHERE id = $1 AND kind = 'activity' AND worker_id = $2 AND attempt = $3
+		RETURNING instance_id, COALESCE(ref_seq, 0)`, claim.ID, claim.WorkerID, claim.Attempt).Scan(&instanceID, &refSeq)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return backend.ErrSuperseded
@@ -805,16 +809,16 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	return nil
 }
 
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
 	tag, err := b.pool.Exec(ctx, `
 		UPDATE wf_tasks SET visible_at = now() + $2::interval, worker_id = NULL
-		WHERE id = $1 AND kind = 'activity'`,
-		taskID, interval(delay))
+		WHERE id = $1 AND kind = 'activity' AND worker_id = $3 AND attempt = $4`,
+		claim.ID, interval(delay), claim.WorkerID, claim.Attempt)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return backend.ErrNotFound
+		return backend.ErrSuperseded
 	}
 	return nil
 }

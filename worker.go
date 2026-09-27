@@ -1902,8 +1902,7 @@ func (w *Worker) tickWorkflows(ctx context.Context) {
 		go func(t backend.Task, tok claimToken, stopRenewal func()) {
 			defer wg.Done()
 			defer func() { <-w.wfSem }()
-			actor := w.actorFor(t.InstanceID)
-			if !actor.dispatchContext(turnCtx, func() {
+			if !w.dispatchWorkflow(turnCtx, t.InstanceID, func() {
 				w.opts.Metrics.AddWorkflowTask(ctx, 1)
 				w.opts.Logger.Debug("workflow task", "instance_id", t.InstanceID, "task_id", t.ID)
 				p, herr := w.handleWorkflow(turnCtx, t, stopRenewal)
@@ -2846,7 +2845,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 		// RetryActivity rewrites visible_at in place: serialize against
 		// cover renewals (round-11 P1b).
 		if rerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, true, func() error {
-			return w.backend.RetryActivity(commitCtx, t.ID, delay)
+			return w.backend.RetryActivity(commitCtx, t, delay)
 		}); rerr != nil {
 			if errors.Is(rerr, errLeaseLost) {
 				// Fencing rejection, not a backend failure: the
@@ -2889,7 +2888,7 @@ func (w *Worker) handleActivity(ctx context.Context, t backend.Task, tok claimTo
 	defer joinCommitStop(stopCommitRenewal, closeDone, renewDone)()
 	// CompleteActivity deletes the task row: shared commit (see above).
 	if cerr := w.guardedDetachedCommit(t.ID, tok, commitCtx, commitCancel, false, func() error {
-		return w.backend.CompleteActivity(commitCtx, t.ID, journal.Event{
+		return w.backend.CompleteActivity(commitCtx, t, journal.Event{
 			Type:    journal.TypeActivityCompleted,
 			RefSeq:  t.Seq,
 			Payload: out,
@@ -3162,7 +3161,7 @@ func (w *Worker) invokeActivity(ctx context.Context, fn func(context.Context, []
 func (w *Worker) failActivity(ctx context.Context, t backend.Task, err error) error {
 	w.opts.Logger.Warn("activity failed", "instance_id", t.InstanceID, "activity", t.Name, "error", err)
 	payload, _ := json.Marshal(err.Error())
-	if cerr := w.backend.CompleteActivity(ctx, t.ID, journal.Event{
+	if cerr := w.backend.CompleteActivity(ctx, t, journal.Event{
 		Type:    journal.TypeActivityFailed,
 		RefSeq:  t.Seq,
 		Payload: payload,

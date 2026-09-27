@@ -292,6 +292,27 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 			return err
 		}
 		muts = append(muts, dMuts...)
+		iIter := txn.Query(ctx, spanner.Statement{
+			SQL:    `SELECT id FROM wf_inbox WHERE instance_id = @id`,
+			Params: map[string]any{"id": id},
+		})
+		for {
+			r, err := iIter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				iIter.Stop()
+				return err
+			}
+			var inboxID int64
+			if err := r.Columns(&inboxID); err != nil {
+				iIter.Stop()
+				return err
+			}
+			muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{inboxID}))
+		}
+		iIter.Stop()
 		return txn.BufferWrite(muts)
 	})
 	if err != nil {
@@ -942,12 +963,12 @@ func ensureWorkflowTaskIfInbox(ctx context.Context, txn *spanner.ReadWriteTransa
 	return enqueueWorkflowTask(ctx, txn, instanceID, queue, nowUTC())
 }
 
-func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
 	now := nowUTC()
 	var wake bool
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{taskID},
-			[]string{"instance_id", "ref_seq", "kind"})
+		row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{claim.ID},
+			[]string{"instance_id", "ref_seq", "kind", "worker_id", "attempt"})
 		if err != nil {
 			if isNotFound(err) {
 				return backend.ErrSuperseded
@@ -955,15 +976,17 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 			return err
 		}
 		var instanceID, kind string
+		var workerID spanner.NullString
 		var refSeq spanner.NullInt64
-		if err := row.Columns(&instanceID, &refSeq, &kind); err != nil {
+		var attempt int64
+		if err := row.Columns(&instanceID, &refSeq, &kind, &workerID, &attempt); err != nil {
 			return err
 		}
-		if kind != "activity" {
+		if kind != "activity" || !workerID.Valid || workerID.StringVal != claim.WorkerID || attempt != int64(claim.Attempt) {
 			return backend.ErrSuperseded
 		}
 		if err := txn.BufferWrite([]*spanner.Mutation{
-			spanner.Delete("wf_tasks", spanner.Key{taskID}),
+			spanner.Delete("wf_tasks", spanner.Key{claim.ID}),
 		}); err != nil {
 			return err
 		}
@@ -1005,18 +1028,18 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	return nil
 }
 
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
 			SQL: `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL
-				WHERE id = @id AND kind = 'activity'`,
-			Params: map[string]any{"v": nowUTC().Add(delay), "id": taskID},
+				WHERE id = @id AND kind = 'activity' AND worker_id = @wid AND attempt = @attempt`,
+			Params: map[string]any{"v": nowUTC().Add(delay), "id": claim.ID, "wid": claim.WorkerID, "attempt": int64(claim.Attempt)},
 		})
 		if err != nil {
 			return err
 		}
 		if n == 0 {
-			return backend.ErrNotFound
+			return backend.ErrSuperseded
 		}
 		return nil
 	})

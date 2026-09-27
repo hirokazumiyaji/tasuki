@@ -77,7 +77,7 @@ func TestSQLite_LeaseHeartbeatReleaseRetry(t *testing.T) {
 	if err != nil || len(acts2) != 1 {
 		t.Fatalf("reclaim: %v %#v", err, acts2)
 	}
-	if err := b.RetryActivity(ctx, acts2[0].ID, time.Second); err != nil {
+	if err := b.RetryActivity(ctx, acts2[0], time.Second); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -176,18 +176,18 @@ func TestSQLite_CompleteActivity(t *testing.T) {
 	if err != nil || len(acts) != 1 {
 		t.Fatalf("act claim: %v %#v", err, acts)
 	}
-	if err := b.CompleteActivity(ctx, acts[0].ID, journal.Event{
+	if err := b.CompleteActivity(ctx, acts[0], journal.Event{
 		Type: journal.TypeActivityCompleted, Name: "act", Payload: []byte(`{"ok":true}`),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.CompleteActivity(ctx, acts[0].ID, journal.Event{Type: journal.TypeActivityCompleted}); err != backend.ErrSuperseded {
+	if err := b.CompleteActivity(ctx, acts[0], journal.Event{Type: journal.TypeActivityCompleted}); err != backend.ErrSuperseded {
 		t.Fatalf("want superseded, got %v", err)
 	}
-	if err := b.CompleteActivity(ctx, 99999, journal.Event{Type: journal.TypeActivityCompleted}); err != backend.ErrSuperseded {
+	if err := b.CompleteActivity(ctx, backend.Task{ID: 99999, Kind: "activity", WorkerID: "w1", Attempt: 1}, journal.Event{Type: journal.TypeActivityCompleted}); err != backend.ErrSuperseded {
 		t.Fatalf("missing want superseded, got %v", err)
 	}
-	if err := b.RetryActivity(ctx, 99999, 0); err != backend.ErrNotFound {
+	if err := b.RetryActivity(ctx, backend.Task{ID: 99999, Kind: "activity", WorkerID: "w1", Attempt: 1}, 0); err != backend.ErrSuperseded {
 		t.Fatalf("retry missing: %v", err)
 	}
 }

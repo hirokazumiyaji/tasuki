@@ -22,7 +22,7 @@ type commitGateBackend struct {
 	releases  atomic.Int32
 }
 
-func (b *commitGateBackend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *commitGateBackend) CompleteActivity(ctx context.Context, task backend.Task, ev journal.Event) error {
 	if b.enterOnce.CompareAndSwap(false, true) {
 		close(b.entered)
 	}
@@ -30,7 +30,7 @@ func (b *commitGateBackend) CompleteActivity(ctx context.Context, taskID int64, 
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	return b.Backend.CompleteActivity(ctx, taskID, ev)
+	return b.Backend.CompleteActivity(ctx, task, ev)
 }
 
 func (b *commitGateBackend) ReleaseLease(ctx context.Context, t backend.Task) error {

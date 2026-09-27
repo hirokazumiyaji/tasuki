@@ -228,7 +228,7 @@ func (b *gateRetryBackend) ExtendLease(ctx context.Context, task backend.Task, d
 	return b.Backend.ExtendLease(ctx, task, d)
 }
 
-func (b *gateRetryBackend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
+func (b *gateRetryBackend) RetryActivity(ctx context.Context, task backend.Task, delay time.Duration) error {
 	if b.retryOnce.CompareAndSwap(false, true) {
 		close(b.retryEntered)
 	}
@@ -239,7 +239,7 @@ func (b *gateRetryBackend) RetryActivity(ctx context.Context, taskID int64, dela
 	b.mu.Lock()
 	b.retryCalls++
 	b.mu.Unlock()
-	return b.Backend.RetryActivity(ctx, taskID, delay)
+	return b.Backend.RetryActivity(ctx, task, delay)
 }
 
 func (b *gateRetryBackend) counts() (extend, retry int) {

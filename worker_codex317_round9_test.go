@@ -27,9 +27,9 @@ func (b *countExtendBackend) ExtendLease(ctx context.Context, task backend.Task,
 	return b.Backend.ExtendLease(ctx, task, d)
 }
 
-func (b *countExtendBackend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *countExtendBackend) CompleteActivity(ctx context.Context, task backend.Task, ev journal.Event) error {
 	b.completes.Add(1)
-	return b.Backend.CompleteActivity(ctx, taskID, ev)
+	return b.Backend.CompleteActivity(ctx, task, ev)
 }
 
 // TestWorker_Round9_ShutdownJoinsInFlightRenewal is a regression test for

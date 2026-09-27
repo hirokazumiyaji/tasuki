@@ -20,6 +20,16 @@ func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{MaxAdvancementEffects: 80, FairDispatch: true}
 }
 
+const dynamoTxnItemLimit = 100
+
+func advancementItemCount(adv backend.Advancement, hasParent bool) int {
+	n := 2 + len(adv.NewEvents) + len(adv.ActivityTasks) + len(adv.Timers) + len(adv.DrainedInbox) + 3*len(adv.Children)
+	if adv.ParentNotify != nil && hasParent {
+		n++
+	}
+	return n
+}
+
 func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) error {
 	queue := inst.Queue
 	if queue == "" {
@@ -197,6 +207,9 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 		return err
 	}
 	if err := b.deleteSignalDedupeForInstance(ctx, id); err != nil {
+		return err
+	}
+	if err := b.deleteInboxForInstance(ctx, id); err != nil {
 		return err
 	}
 	b.notifyTerminal(id)
@@ -741,8 +754,15 @@ func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Durat
 	b.notifyTasks()
 	return nil
 }
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
-	return b.updateTask(ctx, taskID, "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(delay)))}, "kind = :kind")
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
+	values := map[string]types.AttributeValue{
+		":v": avN(timeToN(nowUTC().Add(delay))), ":wid": avS(claim.WorkerID), ":attempt": avN(int64(claim.Attempt)),
+	}
+	err := b.updateTask(ctx, claim.ID, "SET visible_at = :v REMOVE worker_id", values, "kind = :kind AND worker_id = :wid AND attempt = :attempt")
+	if errors.Is(err, backend.ErrNotFound) {
+		return backend.ErrSuperseded
+	}
+	return err
 }
 func (b *Backend) updateTask(ctx context.Context, id int64, update string, values map[string]types.AttributeValue, condition string) error {
 	if condition != "" {
@@ -849,12 +869,30 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if len(advs) == 0 {
 		return nil
 	}
+	seen := make(map[string]struct{}, len(advs))
+	for _, adv := range advs {
+		if _, dup := seen[adv.InstanceID]; dup {
+			return backend.ErrConflict
+		}
+		seen[adv.InstanceID] = struct{}{}
+	}
 	if len(advs) == 1 {
 		if err := b.commitAdvancementOnce(ctx, advs[0]); err != nil {
 			return err
 		}
 		b.notifyAfterAdvancements(advs)
 		return nil
+	}
+	total := 0
+	for _, adv := range advs {
+		inst, err := b.GetInstance(ctx, adv.InstanceID)
+		if err != nil {
+			return backend.ErrConflict
+		}
+		total += advancementItemCount(adv, inst.ParentID != "")
+		if total > dynamoTxnItemLimit {
+			return fmt.Errorf("dynamodb: combined batch produces %d transaction operations (limit %d; split the batch or reduce fanout; see docs/09-limits.md)", total, dynamoTxnItemLimit)
+		}
 	}
 	var all []types.TransactWriteItem
 	var ensures []string
@@ -868,14 +906,8 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		if err != nil {
 			return err
 		}
-		if len(all)+len(items) > 100 {
-			for _, a := range advs {
-				if err := b.commitAdvancementOnce(ctx, a); err != nil {
-					return err
-				}
-			}
-			b.notifyAfterAdvancements(advs)
-			return nil
+		if len(all)+len(items) > dynamoTxnItemLimit {
+			return fmt.Errorf("dynamodb: combined batch produces %d transaction operations (limit %d; split the batch or reduce fanout; see docs/09-limits.md)", len(all)+len(items), dynamoTxnItemLimit)
 		}
 		all = append(all, items...)
 		ensures = append(ensures, adv.InstanceID)
@@ -930,7 +962,7 @@ func (b *Backend) commitAdvancementOnce(ctx context.Context, adv backend.Advance
 	if err != nil {
 		return err
 	}
-	if len(items) > 100 {
+	if len(items) > dynamoTxnItemLimit {
 		return fmt.Errorf("dynamodb: advancement produces %d transaction operations (budget %d; see docs/09-limits.md)", len(items), b.Capabilities().MaxAdvancementEffects)
 	}
 	_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
@@ -1114,8 +1146,8 @@ func (b *Backend) ensureWorkflowTask(ctx context.Context, instanceID string) err
 	return err
 }
 
-func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
-	key := map[string]types.AttributeValue{"task_pk": avS(actTaskPK(taskID))}
+func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
+	key := map[string]types.AttributeValue{"task_pk": avS(actTaskPK(claim.ID))}
 	task, err := b.client.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(b.table("wf_tasks")), Key: key, ConsistentRead: aws.Bool(true)})
 	if err != nil || len(task.Item) == 0 || fromS(task.Item["kind"]) != "activity" {
 		return backend.ErrSuperseded
@@ -1128,7 +1160,9 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 		ev.RefSeq = fromN(task.Item["ref_seq"])
 	}
 	now := nowUTC()
-	items := []types.TransactWriteItem{del(b.table("wf_tasks"), key, "attribute_exists(task_pk)")}
+	items := []types.TransactWriteItem{delWithValues(b.table("wf_tasks"), key, "kind = :kind AND worker_id = :wid AND attempt = :attempt", map[string]types.AttributeValue{
+		":kind": avS("activity"), ":wid": avS(claim.WorkerID), ":attempt": avN(int64(claim.Attempt)),
+	})}
 	if inst.Status == "running" {
 		seq, err := b.allocInboxSeqs(ctx, inst.ID, 1)
 		if err != nil {

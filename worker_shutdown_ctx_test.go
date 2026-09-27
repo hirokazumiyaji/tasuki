@@ -21,20 +21,20 @@ type ctxCheckingBackend struct {
 	canceledRetries atomic.Int32
 }
 
-func (b *ctxCheckingBackend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *ctxCheckingBackend) CompleteActivity(ctx context.Context, task backend.Task, ev journal.Event) error {
 	if ctx.Err() != nil {
 		b.canceledCommits.Add(1)
 		return ctx.Err()
 	}
-	return b.Backend.CompleteActivity(ctx, taskID, ev)
+	return b.Backend.CompleteActivity(ctx, task, ev)
 }
 
-func (b *ctxCheckingBackend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
+func (b *ctxCheckingBackend) RetryActivity(ctx context.Context, task backend.Task, delay time.Duration) error {
 	if ctx.Err() != nil {
 		b.canceledRetries.Add(1)
 		return ctx.Err()
 	}
-	return b.Backend.RetryActivity(ctx, taskID, delay)
+	return b.Backend.RetryActivity(ctx, task, delay)
 }
 
 // TestWorker_ShutdownCommitsActivityWithLiveContext is the regression test for

@@ -48,7 +48,7 @@ type gateCommitBackend struct {
 	commitRelease chan struct{}
 }
 
-func (b *gateCommitBackend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *gateCommitBackend) CompleteActivity(ctx context.Context, task backend.Task, ev journal.Event) error {
 	if b.armCommit.Load() {
 		if b.commitOnce.CompareAndSwap(false, true) {
 			close(b.commitEntered)
@@ -58,7 +58,7 @@ func (b *gateCommitBackend) CompleteActivity(ctx context.Context, taskID int64, 
 			return ctx.Err()
 		}
 	}
-	return b.Backend.CompleteActivity(ctx, taskID, ev)
+	return b.Backend.CompleteActivity(ctx, task, ev)
 }
 
 // gateNackBackend pins NackTask on a test-controlled gate once armed, so

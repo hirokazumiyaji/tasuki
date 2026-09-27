@@ -20,9 +20,9 @@ type commitOrderBackend struct {
 	completes atomic.Int32
 }
 
-func (b *commitOrderBackend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *commitOrderBackend) CompleteActivity(ctx context.Context, task backend.Task, ev journal.Event) error {
 	b.completes.Add(1)
-	return b.joinOrderBackend.Backend.CompleteActivity(ctx, taskID, ev)
+	return b.joinOrderBackend.Backend.CompleteActivity(ctx, task, ev)
 }
 
 // slowClaimBackend delays every ClaimTasks call by a fixed latency so the

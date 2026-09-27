@@ -24,7 +24,7 @@ type gatedCommitBackend struct {
 	release   chan struct{}
 }
 
-func (b *gatedCommitBackend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *gatedCommitBackend) CompleteActivity(ctx context.Context, task backend.Task, ev journal.Event) error {
 	if b.enterOnce.CompareAndSwap(false, true) {
 		close(b.entered)
 	}
@@ -36,7 +36,7 @@ func (b *gatedCommitBackend) CompleteActivity(ctx context.Context, taskID int64,
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	return b.Backend.CompleteActivity(ctx, taskID, ev)
+	return b.Backend.CompleteActivity(ctx, task, ev)
 }
 
 // TestWorker_ParentCancelKeepsRenewalAliveThroughCommit covers the

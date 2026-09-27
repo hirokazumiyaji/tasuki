@@ -112,7 +112,7 @@ func TestRetryActivity_VisibleAtRelativeToDBNow(t *testing.T) {
 	}
 
 	delay := 30 * time.Second
-	if err := b.RetryActivity(ctx, acts[0].ID, delay); err != nil {
+	if err := b.RetryActivity(ctx, acts[0], delay); err != nil {
 		t.Fatal(err)
 	}
 

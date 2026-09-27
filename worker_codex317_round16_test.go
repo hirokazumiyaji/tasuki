@@ -98,7 +98,7 @@ func TestWorker_Round16_OrdinaryRenewalJoinedBeforeExclusiveCommit(t *testing.T)
 	go func() {
 		commitCh <- w.guardedDetachedCommit(task.ID, tok, commitCtx, commitCancel, true, func() error {
 			opDone.Store(true)
-			return mem.RetryActivity(commitCtx, task.ID, 5*time.Second)
+			return mem.RetryActivity(commitCtx, task, 5*time.Second)
 		})
 	}()
 

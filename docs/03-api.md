@@ -131,7 +131,7 @@ Functions provided by the `workflow` package:
 
 `UpsertMemo` is similarly recorded as a command event, but memo fields are intended for display metadata and are not indexed for `List` filtering.
 
-`ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay. The workflow task turn performs no lease extension: the lease clock starts when `ClaimTasks` returns, so replay, every `ExecuteLocal` call, and the commit must together fit well within the remaining `LeaseDuration` with margin — it is not enough for each activity alone to be shorter than the lease. For example, with a 30s lease, 15s of replay followed by a 20s `ExecuteLocal` crosses expiry, letting a peer reclaim the task and repeat the local side effect before the first worker commits. Use `Execute` for anything longer than a small fraction of the lease, and keep local activities side-effect-free or idempotent where possible.
+`ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay. Tasuki renews workflow task leases periodically while a turn is running, including during local activity execution. `LocalActivityTimeout` cancels the activity context and discards its result after the configured duration; activity code that ignores cancellation may continue running in its goroutine. Local activities should be side-effect-free or idempotent because a worker can lose its lease while blocked in external code.
 
 For long-running or looping workflows, calling `ContinueAsNew` when event counts reach thousands is strongly recommended to bound history size.
 
@@ -381,6 +381,7 @@ type WorkerOptions struct {
     ActivitySlots          int           // Default: 100 concurrent activities
     PollInterval           time.Duration // Default: 1s
     LeaseDuration          time.Duration // Default: 30s
+    LocalActivityTimeout   time.Duration // Default: 0 (disabled); cancel and discard after this duration
     WorkerID               string        // Default: hostname + random suffix
     Codec                  Codec         // Default: JSON
     Logger                 *slog.Logger  // Default: slog.Default()

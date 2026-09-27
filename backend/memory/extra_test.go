@@ -64,7 +64,7 @@ func TestMemory_TerminateIgnoresLateComplete(t *testing.T) {
 		t.Fatalf("activity tasks should be removed on terminate, got %d", len(atasks))
 	}
 	// Late complete on a stale id
-	err := b.CompleteActivity(ctx, 9999, journal.Event{Type: journal.TypeActivityCompleted, Payload: []byte(`"y"`)})
+	err := b.CompleteActivity(ctx, backend.Task{ID: 9999, Kind: "activity", WorkerID: "missing", Attempt: 1}, journal.Event{Type: journal.TypeActivityCompleted, Payload: []byte(`"y"`)})
 	if !errors.Is(err, backend.ErrSuperseded) {
 		t.Fatalf("want ErrSuperseded, got %v", err)
 	}
@@ -110,7 +110,7 @@ func TestMemory_ExtendLeaseAndRetryActivity(t *testing.T) {
 		t.Fatal("should still be leased")
 	}
 	const backoff = time.Minute
-	if err := b.RetryActivity(ctx, atasks[0].ID, backoff); err != nil {
+	if err := b.RetryActivity(ctx, atasks[0], backoff); err != nil {
 		t.Fatal(err)
 	}
 	// visible_at = store now (now+5s) + backoff
