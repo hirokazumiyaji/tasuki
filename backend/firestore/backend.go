@@ -3,6 +3,7 @@ package firestore
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"sort"
 	"time"
 
@@ -234,9 +235,6 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 			return backend.ErrNotFound
 		}
 		var refs []*gcf.DocumentRef
-		// NOTE: instances with more than ~500 child documents exceed the
-		// Firestore transaction write cap here; chunked deletes are a
-		// follow-up to #299 (backendtest BulkTerminatePurge skips until then).
 		for _, col := range []string{"wf_tasks", "wf_timers", "wf_signal_dedupe", "wf_inbox"} {
 			it := tx.Documents(b.col(col).Where("instance_id", "==", id))
 			for {
@@ -281,20 +279,35 @@ func (b *Backend) CountClaimableTasks(ctx context.Context, kind string, queues [
 			Where("queue", "==", q).
 			Where("visible_at", "<=", now)
 		res, err := query.NewAggregationQuery().WithCount("n").Get(ctx)
-		if err != nil {
+		if err == nil {
+			var n int64
+			if v, ok := res["n"]; ok {
+				if count, ok := v.(*firestorepb.Value); ok {
+					n = count.GetIntegerValue()
+				}
+			}
+			if n > 0 {
+				out[q] = n
+			}
+			continue
+		}
+		if os.Getenv("FIRESTORE_EMULATOR_HOST") == "" {
 			return nil, err
 		}
-		// The aggregation value arrives as a *firestorepb.Value, not an
-		// int64. A missing or unexpected result counts as zero.
+		it := query.Documents(ctx)
 		var n int64
-		if v, ok := res["n"]; ok {
-			switch t := v.(type) {
-			case *firestorepb.Value:
-				n = t.GetIntegerValue()
-			case int64:
-				n = t
+		for {
+			_, err := it.Next()
+			if err == iterator.Done {
+				break
 			}
+			if err != nil {
+				it.Stop()
+				return nil, err
+			}
+			n++
 		}
+		it.Stop()
 		if n > 0 {
 			out[q] = n
 		}
@@ -579,46 +592,34 @@ func (b *Backend) updateTask(ctx context.Context, id int64, activity bool, field
 	})
 }
 func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
-	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
-	// kind like NackTask does. Renewing a workflow task by numeric ID would
-	// address a missing ACT# key and return ErrNotFound, letting long
-	// replays lose their lease to a peer (duplicate execution).
+	// Workflow tasks live under WF#<instanceID>, not ACT#<id>.
 	if t.Kind == "workflow" && t.InstanceID != "" {
 		ref := b.ref("wf_tasks", wfTaskID(t.InstanceID))
 		return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
-			s, e := tx.Get(ref)
-			if isNotFound(e) {
+			s, err := tx.Get(ref)
+			if isNotFound(err) {
 				return backend.ErrNotFound
 			}
-			if e != nil {
-				return e
+			if err != nil {
+				return err
 			}
 			if !s.Exists() {
 				return backend.ErrNotFound
 			}
-			// Fence the renewal to the claimed task generation: the
-			// singleton WF# key is reused across turns, so an
-			// EnsureWorkflowTask replacement (or a peer reclaim) must not
-			// be extended by a stale holder.
 			if err := checkWorkflowRenewalDoc(s.Data(), t); err != nil {
 				return err
 			}
 			return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
 		})
 	}
-	// Fence the activity renewal to the claimed generation (worker +
-	// attempt, round-28 P2b): a delayed renewal from a stale holder that
-	// lands after a peer reclaimed and retried the activity must not
-	// replace the peer's retry delay with a full lease. Mirrors the
-	// relational/memory fencing from round-20; ErrNotFound on mismatch.
-	r := b.ref("wf_tasks", actTaskID(t.ID))
+	ref := b.ref("wf_tasks", actTaskID(t.ID))
 	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
-		s, e := tx.Get(r)
-		if isNotFound(e) {
+		s, err := tx.Get(ref)
+		if isNotFound(err) {
 			return backend.ErrNotFound
 		}
-		if e != nil {
-			return e
+		if err != nil {
+			return err
 		}
 		if !s.Exists() {
 			return backend.ErrNotFound
@@ -626,29 +627,20 @@ func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Durati
 		if err := checkActivityRenewalDoc(s.Data(), t); err != nil {
 			return err
 		}
-		return tx.Update(r, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
+		return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(d)}})
 	})
 }
 
-// checkActivityRenewalDoc reports whether the activity task document still
-// carries the claimed generation (claim ownership). A mismatch means a
-// peer reclaim moved the lease on, and the stale renewal must not extend
-// it. An empty WorkerID skips the ownership check so legacy callers that
-// pass only an ID still renew (mirroring checkReleaseDoc).
 func checkActivityRenewalDoc(data map[string]any, t backend.Task) error {
 	if data == nil {
 		return backend.ErrNotFound
 	}
-	if t.WorkerID != "" && (str(data, "worker_id") != t.WorkerID || i64(data, "attempt") != int64(t.Attempt)) {
+	if str(data, "worker_id") != t.WorkerID || i64(data, "attempt") != int64(t.Attempt) {
 		return backend.ErrNotFound
 	}
 	return nil
 }
 
-// checkWorkflowRenewalDoc reports whether the workflow task document still
-// carries the claimed task generation (numeric id + claim ownership). A
-// mismatch means an EnsureWorkflowTask replacement or a peer reclaim moved
-// the key on, and the stale renewal must not extend it.
 func checkWorkflowRenewalDoc(data map[string]any, t backend.Task) error {
 	if data == nil || i64(data, "id") != t.ID || str(data, "worker_id") != t.WorkerID || i64(data, "attempt") != int64(t.Attempt) {
 		return backend.ErrNotFound
@@ -656,53 +648,38 @@ func checkWorkflowRenewalDoc(data map[string]any, t backend.Task) error {
 	return nil
 }
 
-// releaseTaskDocID routes a lease release to the task's document: workflow
-// tasks live under WF#<instanceID>, activities under ACT#<id> (see NackTask).
-func releaseTaskDocID(t backend.Task) string {
-	if t.Kind == "workflow" && t.InstanceID != "" {
-		return wfTaskID(t.InstanceID)
-	}
-	return actTaskID(t.ID)
-}
-
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
 	fields := []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(lease)}}
 	if details != nil {
 		fields = append(fields, gcf.Update{Path: "heartbeat", Value: string(details)})
 	}
-	return b.updateTask(ctx, taskID, false, fields)
-}
-// checkReleaseDoc reports whether the task document still carries the
-// claimed task generation (numeric id on WF keys + claim ownership). A
-// mismatch means a peer reclaim (or an EnsureWorkflowTask replacement)
-// moved the lease on, and the stale release must not clear the successor's
-// lease. Empty token fields are skipped so legacy callers fall back to
-// routing-only release; a missing document never matches.
-func checkReleaseDoc(data map[string]any, t backend.Task) error {
-	if data == nil {
-		return backend.ErrNotFound
-	}
-	if t.Kind == "workflow" && t.InstanceID != "" {
-		if t.ID != 0 && i64(data, "id") != t.ID {
+	ref := b.ref("wf_tasks", actTaskID(task.ID))
+	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		s, err := tx.Get(ref)
+		if isNotFound(err) || (err == nil && !s.Exists()) {
 			return backend.ErrNotFound
 		}
-	}
-	if t.WorkerID != "" && (str(data, "worker_id") != t.WorkerID || int(i64(data, "attempt")) != t.Attempt) {
-		return backend.ErrNotFound
-	}
-	return nil
+		if err != nil {
+			return err
+		}
+		if err := checkActivityRenewalDoc(s.Data(), task); err != nil {
+			return err
+		}
+		return tx.Update(ref, fields)
+	})
 }
-
 func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
-	// kind like NackTask does (see releaseTaskDocID). The release is fenced
-	// on the claim ownership token: a stale worker whose task was reclaimed
-	// or atomically refreshed sees a mismatch and reports ErrNotFound
-	// instead of clearing the fresh lease. Empty token fields fall back to
-	// routing-only so legacy callers still release.
-	r := b.ref("wf_tasks", releaseTaskDocID(t))
+	// kind like NackTask does. The release is fenced on the claim ownership
+	// token: a stale worker whose task was reclaimed or atomically refreshed
+	// sees a mismatch and reports ErrNotFound instead of clearing the fresh
+	// lease.
+	ref := b.ref("wf_tasks", actTaskID(t.ID))
+	if t.Kind == "workflow" && t.InstanceID != "" {
+		ref = b.ref("wf_tasks", wfTaskID(t.InstanceID))
+	}
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
-		s, e := tx.Get(r)
+		s, e := tx.Get(ref)
 		if isNotFound(e) {
 			return backend.ErrNotFound
 		}
@@ -713,10 +690,15 @@ func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
 			return backend.ErrNotFound
 		}
 		m := s.Data()
-		if err := checkReleaseDoc(m, t); err != nil {
-			return err
+		if t.Kind == "workflow" && t.InstanceID != "" {
+			if t.ID != 0 && i64(m, "id") != t.ID {
+				return backend.ErrNotFound
+			}
 		}
-		return tx.Update(r, []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}})
+		if t.WorkerID != "" && (str(m, "worker_id") != t.WorkerID || int(i64(m, "attempt")) != t.Attempt) {
+			return backend.ErrNotFound
+		}
+		return tx.Update(ref, []gcf.Update{{Path: "visible_at", Value: nowUTC()}, {Path: "worker_id", Value: gcf.Delete}})
 	})
 	if err != nil {
 		return err
@@ -761,8 +743,31 @@ func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Durat
 	b.notifyTasks()
 	return nil
 }
-func (b *Backend) RetryActivity(ctx context.Context, id int64, delay time.Duration) error {
-	return b.updateTask(ctx, id, true, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(delay)}, {Path: "worker_id", Value: gcf.Delete}})
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
+	r := b.ref("wf_tasks", actTaskID(claim.ID))
+	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		task, err := tx.Get(r)
+		if isNotFound(err) {
+			return backend.ErrSuperseded
+		}
+		if err != nil {
+			return err
+		}
+		if !task.Exists() {
+			return backend.ErrSuperseded
+		}
+		m := task.Data()
+		workerID, hasWorkerID := m["worker_id"].(string)
+		if str(m, "kind") != "activity" || !hasWorkerID || workerID != claim.WorkerID || int(i64(m, "attempt")) != claim.Attempt {
+			return backend.ErrSuperseded
+		}
+		return tx.Update(r, []gcf.Update{{Path: "visible_at", Value: nowUTC().Add(delay)}, {Path: "worker_id", Value: gcf.Delete}})
+	})
+	if err != nil {
+		return err
+	}
+	b.notifyTasks()
+	return nil
 }
 func (b *Backend) LoadWorkflowHead(ctx context.Context, id string) (*backend.WorkflowState, error) {
 	inst, err := b.GetInstance(ctx, id)
@@ -825,19 +830,6 @@ type advancementPrep struct {
 func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advancement) error {
 	if len(advs) == 0 {
 		return nil
-	}
-	// Reject duplicate instances up front: all reads run before any write
-	// in one transaction, so two advancements for the same instance would
-	// both pass the ExpectedSeq check and then collide creating the same
-	// journal document (AlreadyExists, not ErrConflict). Preflight keeps
-	// the batch all-or-nothing with a conflict error (see backendtest
-	// CommitAdvancementsAtomic).
-	seen := make(map[string]struct{}, len(advs))
-	for _, adv := range advs {
-		if _, dup := seen[adv.InstanceID]; dup {
-			return backend.ErrConflict
-		}
-		seen[adv.InstanceID] = struct{}{}
 	}
 	now := nowUTC()
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
@@ -911,10 +903,6 @@ func (b *Backend) readAdvancementTx(tx *gcf.Transaction, adv backend.Advancement
 	if !taskSnap.Exists() || i64(taskSnap.Data(), "id") != adv.TaskID {
 		return advancementPrep{}, backend.ErrConflict
 	}
-	// Fence the commit to the claimed generation (worker_id + attempt),
-	// like the release/nack fences: a stale commit after a release + peer
-	// reclaim must not delete the peer's active task. Zero WorkerID stays
-	// unfenced for legacy callers.
 	if adv.WorkerID != "" {
 		m := taskSnap.Data()
 		if str(m, "worker_id") != adv.WorkerID || int(i64(m, "attempt")) != adv.Attempt {
@@ -1093,12 +1081,12 @@ func (b *Backend) ensureWorkflowTaskWithForce(ctx context.Context, instanceID st
 	return err
 }
 
-func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
 	now := nowUTC()
 	var instanceID string
 	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
 		alloc := newInboxSeqAlloc()
-		r := b.ref("wf_tasks", actTaskID(taskID))
+		r := b.ref("wf_tasks", actTaskID(claim.ID))
 		task, err := tx.Get(r)
 		if isNotFound(err) {
 			return backend.ErrSuperseded
@@ -1106,10 +1094,14 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 		if err != nil {
 			return err
 		}
-		if !task.Exists() || str(task.Data(), "kind") != "activity" {
+		if !task.Exists() {
 			return backend.ErrSuperseded
 		}
 		m := task.Data()
+		workerID, hasWorkerID := m["worker_id"].(string)
+		if str(m, "kind") != "activity" || !hasWorkerID || workerID != claim.WorkerID || int(i64(m, "attempt")) != claim.Attempt {
+			return backend.ErrSuperseded
+		}
 		instanceID = str(m, "instance_id")
 		inst, err := tx.Get(b.ref("wf_instances", instanceID))
 		if isNotFound(err) {
@@ -1238,15 +1230,17 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 	if err != nil {
 		return err
 	}
-	// Even on pure dedupe hits, ensure a task when inbox remains: a prior
-	// crash between commit and ensure must not stall the instance forever.
+	if inserted == 0 {
+		// A retry after commit but before task creation must not strand inbox rows.
+		if inst.Status == "running" {
+			_ = b.ensureWorkflowTask(ctx, instanceID)
+		}
+		return nil
+	}
 	if inst.Status == "running" {
 		if err := b.ensureWorkflowTask(ctx, instanceID); err != nil {
 			return err
 		}
-	}
-	if inserted == 0 {
-		return nil
 	}
 	b.notifyTasks()
 	return nil

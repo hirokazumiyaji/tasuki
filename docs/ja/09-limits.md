@@ -38,7 +38,6 @@
 
 - terminal を含む advancement が予算を超える場合は切り詰めず診断エラーにする（例: `tasuki: terminal advancement needs 120 ops, budget 80`）。Worker は terminal turn（完了・失敗・ContinueAsNew・stuck）も事前に検証する。fanout を 1 tick あたりに収まる粒度に分割するか、子ワークフローに分割する。
 - `SendToInboxBatch` が予算超の場合は `ErrBatchTooLarge` を返す（`InboxBatchLimit` = `MaxAdvancementEffects/4`、無制限時は 100）。
-- 合計 DynamoDB 操作数が 100 件のトランザクション上限を超える `CommitAdvancements` まとめ打ちは、適用前にサイジングエラーで却下される（部分適用なし）。バッチを分割するか advancement ごとの fanout を減らすこと。Firestore/Spanner は単一トランザクションで原子的に失敗し、逐次フォールバックは持たない。
 
 ## Scan コストの限界（DynamoDB）
 

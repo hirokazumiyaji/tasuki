@@ -138,7 +138,7 @@ func main() {
 
 `ExecuteLocal` は `RegisterActivity` した関数をワークフロータスク内で同期実行する。
 通常の `Execute` と違いアクティビティタスクは作らず、リトライも行わない。短い・信頼できる処理向け。結果（またはエラー）は `local_activity` コマンドとしてジャーナルに残り、リプレイではランナーを呼ばない。
-ワーカーはターン実行中、リース半減期ごとに `ExtendLease` でワークフロータスクのリースを延長するため、リプレイ・すべての `ExecuteLocal` 呼び出し・バッチのコミット完了までが対象となり、実行中に他ワーカーに奪われて二重実行になることはない。更新が止まるのはターンを放棄する場合のみである。`Shutdown` はターンの `context.Context` をキャンセルし、実行中のローカル Activity はキャンセルを観測して中断する。キャンセルされたターンはワークフロー失敗として確定せず、リースを解放して他ワーカーに譲る。開始前にコンテキストが既にキャンセルされているターンも同様に放棄され、コミットされることはない。1 回の `ExecuteLocal` を期限で区切りたい場合は `WorkerOptions.LocalActivityTimeout` を設定する（呼び出しの外側で強制されるため、コンテキストを無視する処理でも期限切れエラーが期限どおりに返る。遅れて返った結果は破棄される）。長い処理には `Execute` を使い、ローカル処理は副作用を持たせないか冪等にできる形が望ましい。
+Tasuki はワークフロータスクの処理中、ローカルアクティビティの実行中も含めて定期的にリースを延長する。`LocalActivityTimeout` を設定すると、その時間の経過後にアクティビティの context をキャンセルし、結果を破棄する。ただし、キャンセルを無視するアクティビティコードは goroutine 内で動き続けることがある。外部処理の途中でワーカーがリースを失う可能性はあるため、ローカルアクティビティは副作用を持たせないか、冪等にできる形が望ましい。
 
 長寿命・ループするワークフローは、イベント数が数千〜1万付近になったら `ContinueAsNew` で履歴を打ち切ることを推奨する（既定の警告しきい値と揃える）。警告自体は実行を止めない。
 
@@ -456,12 +456,12 @@ type WorkerOptions struct {
     ActivitySlots        int           // 既定 100。同時に実行するアクティビティ数
     PollInterval         time.Duration // 既定 1s
     LeaseDuration        time.Duration // 既定 30s
+    LocalActivityTimeout time.Duration // 既定 0（無効）。経過後に context をキャンセルして結果を破棄
     WorkerID             string        // 既定 ホスト名 + ランダムサフィックス
     Codec                Codec         // 既定 JSON
     Logger               *slog.Logger  // 既定 slog.Default()
     JournalWarnThreshold int           // 0 → 既定 10000。負数で無効。超過時は Warn + メトリクスのみ
     IncompatibleRetryDelay time.Duration // 0 → 既定 5s。負数で即時再可視。非互換 Nack 後の hidden 時間
-    LocalActivityTimeout time.Duration // 既定 0（無制限）。1 回の ExecuteLocal を期限で区切る
     MaxPerInstance         int           // 既定 0（無効）。1 回の claim で同一インスタンスから取るタスク数の上限
 }
 ```

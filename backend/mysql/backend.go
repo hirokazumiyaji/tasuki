@@ -13,11 +13,7 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{
-		FairDispatch:        true,
-		CleansTerminalState: true,
-		SupportsBulkCleanup: true,
-	}
+	return backend.Capabilities{FairDispatch: true}
 }
 
 var _ backend.SchemaValidator = (*Backend)(nil)
@@ -400,11 +396,6 @@ func selectClaimCandidates(ctx context.Context, conn *sql.Conn, req backend.Clai
 }
 
 func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
-	// Fenced to the claimed generation (worker_id + attempt): a renewal
-	// delayed past the lease (or racing a peer reclaim after a nack)
-	// must not overwrite the successor's visible_at. Zero rows means the
-	// lease moved on; report ErrNotFound so the worker treats the renewal
-	// as stale.
 	res, err := b.db.ExecContext(ctx, `
 		UPDATE wf_tasks SET visible_at = ? WHERE id = ? AND worker_id = ? AND attempt = ?`, nowUTC().Add(d), t.ID, t.WorkerID, t.Attempt)
 	if err != nil {
@@ -420,10 +411,10 @@ func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Durati
 	return nil
 }
 
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
 	res, err := b.db.ExecContext(ctx, `
-		UPDATE wf_tasks SET visible_at = ?, heartbeat = ? WHERE id = ?`,
-		nowUTC().Add(lease), details, taskID)
+		UPDATE wf_tasks SET visible_at = ?, heartbeat = ? WHERE id = ? AND worker_id = ? AND attempt = ?`,
+		nowUTC().Add(lease), details, task.ID, task.WorkerID, task.Attempt)
 	if err != nil {
 		return err
 	}
@@ -438,12 +429,6 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 }
 
 func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
-	// Fenced to the claimed generation (worker_id + attempt): a renewal
-	// delayed past the lease (or a shutdown release racing a peer
-	// reclaim) must not clear a successor's lease. Zero rows means the
-	// lease moved on; report ErrNotFound so the worker treats it as
-	// already-released. A zero WorkerID falls back to unconditional
-	// release for legacy callers.
 	var res sql.Result
 	var err error
 	if t.WorkerID != "" {
@@ -725,22 +710,8 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = ?`, adv.InstanceID); err != nil {
 			return err
 		}
-		// Terminal transitions retire pending work: activity tasks must no
-		// longer be claimable and timers must never fire into the inbox.
-		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE instance_id = ?`, adv.InstanceID); err != nil {
-			return err
-		}
-		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_timers WHERE instance_id = ?`, adv.InstanceID); err != nil {
-			return err
-		}
-		// Purge the whole inbox, not just DrainedInbox: a signal committed
-		// after the worker loaded its state but before this terminal commit
-		// is never drained, and must not survive (like TerminateInstance).
-		if _, err = conn.ExecContext(ctx, `DELETE FROM wf_inbox WHERE instance_id = ?`, adv.InstanceID); err != nil {
-			return err
-		}
 	}
-	if adv.Terminal == nil && len(adv.DrainedInbox) > 0 {
+	if len(adv.DrainedInbox) > 0 {
 		for _, inboxID := range adv.DrainedInbox {
 			_, err = conn.ExecContext(ctx, `DELETE FROM wf_inbox WHERE id = ?`, inboxID)
 			if err != nil {
@@ -819,10 +790,7 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 	if err != nil {
 		return err
 	}
-	// A terminal advancement bulk-deletes every task of the instance above
-	// (including its own) after the generation preflight passed; only
-	// non-terminal commits require a deleted row here.
-	if n, derr := delRes.RowsAffected(); derr == nil && n == 0 && adv.WorkerID != "" && adv.Terminal == nil {
+	if n, derr := delRes.RowsAffected(); derr == nil && n == 0 && adv.WorkerID != "" {
 		return backend.ErrConflict
 	}
 	if err := ensureWorkflowTaskIfInbox(ctx, conn, adv.InstanceID); err != nil {
@@ -836,7 +804,7 @@ func (b *Backend) commitAdvancementConn(ctx context.Context, conn *sql.Conn, adv
 	return nil
 }
 
-func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
 	conn, err := beginTx(ctx, b.db)
 	if err != nil {
 		return err
@@ -844,7 +812,7 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	defer rollbackConn(ctx, conn)
 
 	row := conn.QueryRowContext(ctx, `
-		SELECT instance_id, COALESCE(ref_seq, 0), kind FROM wf_tasks WHERE id = ?`, taskID)
+		SELECT instance_id, COALESCE(ref_seq, 0), kind FROM wf_tasks WHERE id = ?`, claim.ID)
 	var instanceID string
 	var refSeq int64
 	var kind string
@@ -858,7 +826,7 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	if kind != "activity" {
 		return backend.ErrSuperseded
 	}
-	res, err := conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE id = ? AND kind = 'activity'`, taskID)
+	res, err := conn.ExecContext(ctx, `DELETE FROM wf_tasks WHERE id = ? AND kind = 'activity' AND worker_id = ? AND attempt = ?`, claim.ID, claim.WorkerID, claim.Attempt)
 	if err != nil {
 		return err
 	}
@@ -899,10 +867,10 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	return nil
 }
 
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
 	res, err := b.db.ExecContext(ctx, `
 		UPDATE wf_tasks SET visible_at = ?, worker_id = NULL
-		WHERE id = ? AND kind = 'activity'`, nowUTC().Add(delay), taskID)
+		WHERE id = ? AND kind = 'activity' AND worker_id = ? AND attempt = ?`, nowUTC().Add(delay), claim.ID, claim.WorkerID, claim.Attempt)
 	if err != nil {
 		return err
 	}
@@ -911,7 +879,7 @@ func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Du
 		return err
 	}
 	if n == 0 {
-		return backend.ErrNotFound
+		return backend.ErrSuperseded
 	}
 	return nil
 }
@@ -1026,20 +994,6 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			return 0, err
 		}
 		if aff == 0 {
-			continue
-		}
-		var status string
-		if err := conn.QueryRowContext(ctx, `SELECT status FROM wf_instances WHERE id = ?`, d.instanceID).
-			Scan(&status); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				continue // orphaned timer of a purged instance
-			}
-			return 0, err
-		}
-		if status != "running" {
-			// Terminal instances consume timers silently: no inbox row,
-			// no workflow task wakeup.
-			n++
 			continue
 		}
 		_, err = conn.ExecContext(ctx, `

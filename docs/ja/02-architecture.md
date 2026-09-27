@@ -491,11 +491,11 @@ type Backend interface {
 
     // Worker 系
     ClaimTasks(ctx context.Context, req ClaimRequest) ([]Task, error)
-    ExtendLease(ctx context.Context, t Task, d time.Duration) error
+    ExtendLease(ctx context.Context, task Task, d time.Duration) error
     LoadWorkflow(ctx context.Context, instanceID string) (*WorkflowState, error) // ジャーナル + inbox + next_seq + 現在時刻
     CommitAdvancement(ctx context.Context, adv Advancement) error               // 状態遷移Tx。競合時 ErrConflict
-    CompleteActivity(ctx context.Context, taskID int64, ev Event) error         // 完了Tx。タスク消失時 ErrSuperseded
-    RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error
+    CompleteActivity(ctx context.Context, task Task, ev Event) error            // 完了Tx。claim が失効済みなら ErrSuperseded
+    RetryActivity(ctx context.Context, task Task, delay time.Duration) error
     NackTask(ctx context.Context, t Task, delay time.Duration) error
     FireDueTimers(ctx context.Context, limit int) (int, error)
     ClaimDueSchedules(ctx context.Context, limit int) ([]Schedule, error)

@@ -20,19 +20,8 @@ func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{MaxAdvancementEffects: 80, FairDispatch: true}
 }
 
-// dynamoTxnItemLimit is the DynamoDB TransactWriteItems item cap. A combined
-// CommitAdvancements batch must fit in a single transaction to stay atomic;
-// anything larger is rejected before applying (see CommitAdvancements).
 const dynamoTxnItemLimit = 100
 
-// advancementItemCount predicts the TransactWriteItems operations
-// buildAdvancementItems will emit for adv: 1 instance CAS + journal/activity/
-// timer puts + inbox deletes + 3 per child + 1 parent inbox when the instance
-// has a parent + 1 task delete/refresh. It must stay in lockstep with
-// buildAdvancementItems — the combined-batch preflight in CommitAdvancements
-// relies on the count being exact (a drift that undercounts would push the
-// overflow into the defensive in-loop guard; a drift that overcounts only
-// rejects a batch that would have fit).
 func advancementItemCount(adv backend.Advancement, hasParent bool) int {
 	n := 2 + len(adv.NewEvents) + len(adv.ActivityTasks) + len(adv.Timers) + len(adv.DrainedInbox) + 3*len(adv.Children)
 	if adv.ParentNotify != nil && hasParent {
@@ -648,10 +637,7 @@ func decodeTask(m map[string]types.AttributeValue) backend.Task {
 }
 
 func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
-	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
-	// kind like NackTask does. Renewing a workflow task by numeric ID would
-	// address a missing ACT# key and return ErrNotFound, letting long
-	// replays lose their lease to a peer (duplicate execution).
+	// Workflow tasks live under WF#<instanceID>, while activities live under ACT#<id>.
 	if t.Kind == "workflow" && t.InstanceID != "" {
 		cond, values := workflowRenewalFence(t, timeToN(nowUTC().Add(d)))
 		_, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
@@ -666,85 +652,46 @@ func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Durati
 		}
 		return err
 	}
-	// Fence the activity renewal to the claimed generation (worker +
-	// attempt, round-28 P2b): a delayed renewal from a stale holder that
-	// lands after a peer reclaimed and retried the activity must not
-	// replace the peer's retry delay with a full lease, hiding the task.
-	// The update applies only while the item still carries the claimed
-	// ownership; otherwise the lease moved on and the renewal reports
-	// ErrNotFound so the worker treats it as stale. An empty WorkerID
-	// falls back to the legacy routing-only update so older/test call
-	// sites that pass only an ID still renew.
 	return b.updateActivityLease(ctx, t, d)
 }
 
-// activityRenewalFence fences an activity renewal to the claimed task
-// generation (worker + attempt), mirroring the relational/memory fencing
-// from round-20. A delayed renewal that lands after a peer reclaim+retry
-// must not overwrite the successor's visible_at. An empty WorkerID yields
-// an empty condition so legacy callers fall back to routing-only update.
-func activityRenewalFence(t backend.Task, visible int64) (string, map[string]types.AttributeValue) {
-	values := map[string]types.AttributeValue{":v": avN(visible)}
-	if t.WorkerID == "" {
-		return "", values
+func (b *Backend) activityRenewalFence(t backend.Task, visible int64) (string, map[string]types.AttributeValue) {
+	return "kind = :kind AND worker_id = :w AND attempt = :a", map[string]types.AttributeValue{
+		":v": avN(visible), ":kind": avS(t.Kind), ":w": avS(t.WorkerID), ":a": avN(int64(t.Attempt)),
 	}
-	return "kind = :kind AND worker_id = :w AND attempt = :a",
-		map[string]types.AttributeValue{
-			":v": avN(visible),
-			":w": avS(t.WorkerID), ":a": avN(int64(t.Attempt)),
-		}
 }
 
-// updateActivityLease renews one activity task's visibility fenced on the
-// claimed generation (see ExtendLease). It mirrors the relational/memory
-// fencing from round-20: worker_id + attempt predicate, ErrNotFound on
-// mismatch.
 func (b *Backend) updateActivityLease(ctx context.Context, t backend.Task, d time.Duration) error {
-	cond, values := activityRenewalFence(t, timeToN(nowUTC().Add(d)))
+	cond, values := b.activityRenewalFence(t, timeToN(nowUTC().Add(d)))
 	return b.updateTask(ctx, t.ID, "SET visible_at = :v", values, cond)
 }
 
-// workflowRenewalFence fences a workflow renewal to the claimed task
-// generation: the singleton WF#<instanceID> key is reused across turns, so
-// an EnsureWorkflowTask replacement (or a peer reclaim) must not be
-// extended by a stale holder. The update applies only when the item still
-// carries the claimed numeric id and claim ownership (worker + attempt).
 func workflowRenewalFence(t backend.Task, visible int64) (string, map[string]types.AttributeValue) {
-	return "attribute_exists(task_pk) AND id = :id AND worker_id = :w AND attempt = :a",
-		map[string]types.AttributeValue{
-			":v": avN(visible),
-			":id": avN(t.ID), ":w": avS(t.WorkerID), ":a": avN(int64(t.Attempt)),
-		}
-}
-
-// releaseTaskPK routes a lease release to the task's key: workflow tasks
-// live under WF#<instanceID>, activities under ACT#<id> (see NackTask).
-func releaseTaskPK(t backend.Task) string {
-	if t.Kind == "workflow" && t.InstanceID != "" {
-		return wfTaskPK(t.InstanceID)
+	return "attribute_exists(task_pk) AND id = :id AND worker_id = :w AND attempt = :a", map[string]types.AttributeValue{
+		":v": avN(visible), ":id": avN(t.ID), ":w": avS(t.WorkerID), ":a": avN(int64(t.Attempt)),
 	}
-	return actTaskPK(t.ID)
 }
 
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
-	values := map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(lease)))}
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
+	cond, values := b.activityRenewalFence(task, timeToN(nowUTC().Add(lease)))
 	update := "SET visible_at = :v"
 	if details != nil {
 		update += ", heartbeat = :h"
 		values[":h"] = avJSON(details)
 	}
-	return b.updateTask(ctx, taskID, update, values, "")
+	return b.updateTask(ctx, task.ID, update, values, cond)
 }
-// releaseCondition builds the conditional-release predicate for the claimed
-// task generation: a renewal delayed past the lease (or a shutdown release
-// racing a peer reclaim) must not clear a successor's lease. The update
-// applies only while the item still carries the claimed numeric id
-// (on WF keys) and claim ownership (worker + attempt); otherwise the lease
-// moved on and the release reports ErrNotFound so the worker treats it as
-// already-released. Empty token fields are left out of the predicate so
-// legacy callers fall back to routing-only release.
-func releaseCondition(t backend.Task, visible int64) (string, map[string]types.AttributeValue) {
-	values := map[string]types.AttributeValue{":v": avN(visible)}
+func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
+	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
+	// kind like NackTask does. The release is fenced on the claim ownership
+	// token (numeric id + worker + attempt): a stale worker whose task was
+	// reclaimed or atomically refreshed matches nothing and reports
+	// ErrNotFound instead of clearing the fresh lease.
+	pk := actTaskPK(t.ID)
+	if t.Kind == "workflow" && t.InstanceID != "" {
+		pk = wfTaskPK(t.InstanceID)
+	}
+	values := map[string]types.AttributeValue{":v": avN(timeToN(nowUTC()))}
 	cond := "attribute_exists(task_pk)"
 	if t.Kind == "workflow" && t.InstanceID != "" && t.ID != 0 {
 		cond += " AND id = :taskid"
@@ -755,21 +702,9 @@ func releaseCondition(t backend.Task, visible int64) (string, map[string]types.A
 		values[":wid"] = avS(t.WorkerID)
 		values[":attempt"] = avN(int64(t.Attempt))
 	}
-	return cond, values
-}
-
-func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
-	// Workflow tasks live under WF#<instanceID> (not ACT#<id>), so route by
-	// kind like NackTask does (see releaseTaskPK). The release is fenced
-	// on the claim ownership token (numeric id + worker + attempt): a
-	// stale worker whose task was reclaimed or atomically refreshed
-	// matches nothing and reports ErrNotFound instead of clearing the
-	// fresh lease. Empty token fields fall back to routing-only so legacy
-	// callers still release.
-	cond, values := releaseCondition(t, timeToN(nowUTC()))
 	_, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(b.table("wf_tasks")),
-		Key:                       map[string]types.AttributeValue{"task_pk": avS(releaseTaskPK(t))},
+		Key:                       map[string]types.AttributeValue{"task_pk": avS(pk)},
 		UpdateExpression:          aws.String("SET visible_at = :v REMOVE worker_id"),
 		ConditionExpression:       aws.String(cond),
 		ExpressionAttributeValues: values,
@@ -819,18 +754,21 @@ func (b *Backend) NackTask(ctx context.Context, t backend.Task, delay time.Durat
 	b.notifyTasks()
 	return nil
 }
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
-	return b.updateTask(ctx, taskID, "SET visible_at = :v REMOVE worker_id", map[string]types.AttributeValue{":v": avN(timeToN(nowUTC().Add(delay)))}, "kind = :kind")
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
+	values := map[string]types.AttributeValue{
+		":v": avN(timeToN(nowUTC().Add(delay))), ":wid": avS(claim.WorkerID), ":attempt": avN(int64(claim.Attempt)),
+	}
+	err := b.updateTask(ctx, claim.ID, "SET visible_at = :v REMOVE worker_id", values, "kind = :kind AND worker_id = :wid AND attempt = :attempt")
+	if errors.Is(err, backend.ErrNotFound) {
+		return backend.ErrSuperseded
+	}
+	return err
 }
 func (b *Backend) updateTask(ctx context.Context, id int64, update string, values map[string]types.AttributeValue, condition string) error {
-	return b.updateTaskPK(ctx, actTaskPK(id), update, values, condition)
-}
-
-func (b *Backend) updateTaskPK(ctx context.Context, pk string, update string, values map[string]types.AttributeValue, condition string) error {
 	if condition != "" {
 		values[":kind"] = avS("activity")
 	}
-	_, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": avS(pk)}, UpdateExpression: aws.String(update), ConditionExpression: aws.String("attribute_exists(task_pk)" + condSuffix(condition)), ExpressionAttributeValues: values})
+	_, err := b.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(b.table("wf_tasks")), Key: map[string]types.AttributeValue{"task_pk": avS(actTaskPK(id))}, UpdateExpression: aws.String(update), ConditionExpression: aws.String("attribute_exists(task_pk)" + condSuffix(condition)), ExpressionAttributeValues: values})
 	if conditional(err) {
 		return backend.ErrNotFound
 	}
@@ -931,12 +869,6 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if len(advs) == 0 {
 		return nil
 	}
-	// Reject duplicate instances up front: the batch below builds one
-	// TransactWriteItems with operations from every advancement, and
-	// DynamoDB rejects multiple operations on the same item with a
-	// ValidationException (not mapped to ErrConflict by conditional).
-	// Preflight keeps the batch all-or-nothing with a conflict error
-	// (see backendtest CommitAdvancementsAtomic).
 	seen := make(map[string]struct{}, len(advs))
 	for _, adv := range advs {
 		if _, dup := seen[adv.InstanceID]; dup {
@@ -951,16 +883,6 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		b.notifyAfterAdvancements(advs)
 		return nil
 	}
-	// Size the combined transaction BEFORE building anything: the batch
-	// below commits as one TransactWriteItems (limit 100 items), and falling
-	// back to sequential per-advancement commits when it overflows would
-	// break atomicity — earlier advancements would stay committed while a
-	// later stale ExpectedSeq returns ErrConflict (see backendtest
-	// CommitAdvancementsAtomic case C). Oversized combined batches are
-	// rejected with a sizing error while every instance is still untouched.
-	// The preflight is read-only (instance reads for the parent-notify term)
-	// so a rejection mutates nothing, not even inbox sequence counters
-	// (which buildAdvancementItems would bump as a side effect).
 	total := 0
 	for _, adv := range advs {
 		inst, err := b.GetInstance(ctx, adv.InstanceID)
@@ -985,10 +907,6 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			return err
 		}
 		if len(all)+len(items) > dynamoTxnItemLimit {
-			// Unreachable when the preflight above mirrors
-			// buildAdvancementItems exactly: fail closed with a sizing
-			// error rather than falling back to sequential commits that
-			// would apply the batch partially.
 			return fmt.Errorf("dynamodb: combined batch produces %d transaction operations (limit %d; split the batch or reduce fanout; see docs/09-limits.md)", len(all)+len(items), dynamoTxnItemLimit)
 		}
 		all = append(all, items...)
@@ -1144,9 +1062,8 @@ func (b *Backend) buildAdvancementItems(ctx context.Context, adv backend.Advance
 
 // refreshWorkflowTask atomically carries the singleton workflow task past a
 // truncated advancement: one Update on the same key instead of Delete +
-// post-commit Put. The fence (id/kind condition, plus worker_id/attempt
-// when the advancement carries the claimed generation) is preserved so a
-// zombie task that lost its lease still fails the transaction.
+// post-commit Put. The fence (id/kind condition) is preserved so a zombie
+// task that lost its lease still fails the transaction.
 func (b *Backend) refreshWorkflowTask(adv backend.Advancement, queue string, now time.Time) types.TransactWriteItem {
 	cond := "id = :taskid AND kind = :workflow"
 	vals := map[string]types.AttributeValue{
@@ -1159,10 +1076,10 @@ func (b *Backend) refreshWorkflowTask(adv backend.Advancement, queue string, now
 		vals[":attempt"] = avN(int64(adv.Attempt))
 	}
 	return types.TransactWriteItem{Update: &types.Update{
-		TableName:           aws.String(b.table("wf_tasks")),
-		Key:                 map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))},
-		UpdateExpression:    aws.String("SET id = :newid, visible_at = :v, attempt = :zero, created_at = :now REMOVE worker_id"),
-		ConditionExpression: aws.String(cond),
+		TableName:                 aws.String(b.table("wf_tasks")),
+		Key:                       map[string]types.AttributeValue{"task_pk": avS(wfTaskPK(adv.InstanceID))},
+		UpdateExpression:          aws.String("SET id = :newid, visible_at = :v, attempt = :zero, created_at = :now REMOVE worker_id"),
+		ConditionExpression:       aws.String(cond),
 		ExpressionAttributeValues: vals,
 	}}
 }
@@ -1229,8 +1146,8 @@ func (b *Backend) ensureWorkflowTask(ctx context.Context, instanceID string) err
 	return err
 }
 
-func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
-	key := map[string]types.AttributeValue{"task_pk": avS(actTaskPK(taskID))}
+func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
+	key := map[string]types.AttributeValue{"task_pk": avS(actTaskPK(claim.ID))}
 	task, err := b.client.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(b.table("wf_tasks")), Key: key, ConsistentRead: aws.Bool(true)})
 	if err != nil || len(task.Item) == 0 || fromS(task.Item["kind"]) != "activity" {
 		return backend.ErrSuperseded
@@ -1243,7 +1160,9 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 		ev.RefSeq = fromN(task.Item["ref_seq"])
 	}
 	now := nowUTC()
-	items := []types.TransactWriteItem{del(b.table("wf_tasks"), key, "attribute_exists(task_pk)")}
+	items := []types.TransactWriteItem{delWithValues(b.table("wf_tasks"), key, "kind = :kind AND worker_id = :wid AND attempt = :attempt", map[string]types.AttributeValue{
+		":kind": avS("activity"), ":wid": avS(claim.WorkerID), ":attempt": avN(int64(claim.Attempt)),
+	})}
 	if inst.Status == "running" {
 		seq, err := b.allocInboxSeqs(ctx, inst.ID, 1)
 		if err != nil {
@@ -1362,7 +1281,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 				"attribute_not_exists(instance_id) AND attribute_not_exists(id)"))
 			metas = append(metas, meta{pi, false})
 		}
-		if len(twi) > dynamoTxnItemLimit {
+		if len(twi) > 100 {
 			return backend.ErrBatchTooLarge
 		}
 		_, err = b.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: twi})

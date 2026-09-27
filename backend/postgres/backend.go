@@ -14,11 +14,7 @@ import (
 )
 
 func (b *Backend) Capabilities() backend.Capabilities {
-	return backend.Capabilities{
-		FairDispatch:        true,
-		CleansTerminalState: true,
-		SupportsBulkCleanup: true,
-	}
+	return backend.Capabilities{FairDispatch: true}
 }
 
 // Reset truncates all workflow tables (test helper).
@@ -373,12 +369,6 @@ func decodeActivityTask(t *backend.Task, payload []byte) {
 }
 
 func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
-	// Fenced to the claimed generation (worker_id + attempt): a renewal
-	// delayed past the lease (or racing a peer reclaim after a nack)
-	// must not overwrite the successor's visible_at, or the peer's retry
-	// stays hidden and a third worker executes concurrently with it.
-	// Zero rows means the lease moved on; report ErrNotFound so the
-	// worker treats the renewal as stale.
 	tag, err := b.pool.Exec(ctx, `
 		UPDATE wf_tasks SET visible_at = now() + $2::interval WHERE id = $1 AND worker_id = $3 AND attempt = $4`, t.ID, interval(d), t.WorkerID, t.Attempt)
 	if err != nil {
@@ -390,10 +380,10 @@ func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Durati
 	return nil
 }
 
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
 	tag, err := b.pool.Exec(ctx, `
-		UPDATE wf_tasks SET visible_at = now() + $2::interval, heartbeat = $3 WHERE id = $1`,
-		taskID, interval(lease), details)
+		UPDATE wf_tasks SET visible_at = now() + $2::interval, heartbeat = $3 WHERE id = $1 AND worker_id = $4 AND attempt = $5`,
+		task.ID, interval(lease), details, task.WorkerID, task.Attempt)
 	if err != nil {
 		return err
 	}
@@ -404,12 +394,6 @@ func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.
 }
 
 func (b *Backend) ReleaseLease(ctx context.Context, t backend.Task) error {
-	// Fenced to the claimed generation (worker_id + attempt): a renewal
-	// delayed past the lease (or a shutdown release racing a peer
-	// reclaim) must not clear a successor's lease. Zero rows means the
-	// lease moved on; report ErrNotFound so the worker treats it as
-	// already-released. A zero WorkerID falls back to unconditional
-	// release for legacy callers.
 	var tag pgconn.CommandTag
 	var err error
 	if t.WorkerID != "" {
@@ -573,9 +557,7 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 		return backend.ErrConflict
 	}
 
-	// Verify own task exists, fenced to the claimed generation when
-	// present (see Advancement): a stale commit after a release + peer
-	// reclaim must not delete the peer's active task.
+	// Verify own task exists and still belongs to the claimed generation.
 	var kind string
 	var workerID *string
 	var attempt int
@@ -667,22 +649,8 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 		if _, err = tx.Exec(ctx, `DELETE FROM wf_signal_dedupe WHERE instance_id = $1`, adv.InstanceID); err != nil {
 			return err
 		}
-		// Terminal transitions retire pending work: activity tasks must no
-		// longer be claimable and timers must never fire into the inbox.
-		if _, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE instance_id = $1`, adv.InstanceID); err != nil {
-			return err
-		}
-		if _, err = tx.Exec(ctx, `DELETE FROM wf_timers WHERE instance_id = $1`, adv.InstanceID); err != nil {
-			return err
-		}
-		// Purge the whole inbox, not just DrainedInbox: a signal committed
-		// after the worker loaded its state but before this terminal commit
-		// is never drained, and must not survive (like TerminateInstance).
-		if _, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE instance_id = $1`, adv.InstanceID); err != nil {
-			return err
-		}
 	}
-	if adv.Terminal == nil && len(adv.DrainedInbox) > 0 {
+	if len(adv.DrainedInbox) > 0 {
 		_, err = tx.Exec(ctx, `DELETE FROM wf_inbox WHERE id = ANY($1)`, adv.DrainedInbox)
 		if err != nil {
 			return err
@@ -754,7 +722,7 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 			}
 		}
 	}
-	var delTag pgx.CommandTag
+	var delTag pgconn.CommandTag
 	if adv.WorkerID != "" {
 		delTag, err = tx.Exec(ctx, `DELETE FROM wf_tasks WHERE id = $1 AND worker_id = $2 AND attempt = $3`, adv.TaskID, adv.WorkerID, adv.Attempt)
 	} else {
@@ -763,10 +731,7 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 	if err != nil {
 		return err
 	}
-	// A terminal advancement bulk-deletes every task of the instance above
-	// (including its own) after the generation preflight passed; only
-	// non-terminal commits require a deleted row here.
-	if adv.WorkerID != "" && adv.Terminal == nil && delTag.RowsAffected() == 0 {
+	if adv.WorkerID != "" && delTag.RowsAffected() == 0 {
 		return backend.ErrConflict
 	}
 	_, err = tx.Exec(ctx, `
@@ -795,7 +760,7 @@ func (b *Backend) applyAdvancement(ctx context.Context, tx pgx.Tx, adv backend.A
 	return nil
 }
 
-func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -805,8 +770,8 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	var instanceID string
 	var refSeq int64
 	err = tx.QueryRow(ctx, `
-		DELETE FROM wf_tasks WHERE id = $1 AND kind = 'activity'
-		RETURNING instance_id, COALESCE(ref_seq, 0)`, taskID).Scan(&instanceID, &refSeq)
+		DELETE FROM wf_tasks WHERE id = $1 AND kind = 'activity' AND worker_id = $2 AND attempt = $3
+		RETURNING instance_id, COALESCE(ref_seq, 0)`, claim.ID, claim.WorkerID, claim.Attempt).Scan(&instanceID, &refSeq)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return backend.ErrSuperseded
@@ -844,16 +809,16 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	return nil
 }
 
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
 	tag, err := b.pool.Exec(ctx, `
 		UPDATE wf_tasks SET visible_at = now() + $2::interval, worker_id = NULL
-		WHERE id = $1 AND kind = 'activity'`,
-		taskID, interval(delay))
+		WHERE id = $1 AND kind = 'activity' AND worker_id = $3 AND attempt = $4`,
+		claim.ID, interval(delay), claim.WorkerID, claim.Attempt)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return backend.ErrNotFound
+		return backend.ErrSuperseded
 	}
 	return nil
 }
@@ -945,20 +910,6 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 		if tag.RowsAffected() == 0 {
 			continue
 		}
-		var status string
-		if err := tx.QueryRow(ctx, `SELECT status FROM wf_instances WHERE id = $1`, d.instanceID).
-			Scan(&status); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				continue // orphaned timer of a purged instance
-			}
-			return 0, err
-		}
-		if status != "running" {
-			// Terminal instances consume timers silently: no inbox row,
-			// no workflow task wakeup.
-			n++
-			continue
-		}
 		_, err = tx.Exec(ctx, `
 			INSERT INTO wf_inbox (instance_id, type, ref_seq) VALUES ($1, $2, $3)`,
 			d.instanceID, string(journal.TypeTimerFired), d.seq)
@@ -982,7 +933,6 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 	}
 	return n, nil
 }
-
 
 func (b *Backend) SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error {
 	return b.SendToInboxBatch(ctx, instanceID, []backend.InboxItem{{Event: ev, DedupeID: dedupeID}})
@@ -1050,10 +1000,10 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 }
 
 type activityPayload struct {
-	Name                    string          `json:"name"`
-	Input                   json.RawMessage `json:"input"`
-	Retry                   retryJSON       `json:"retry"`
-	StartToCloseTimeoutMs   int64           `json:"start_to_close_timeout_ms,omitempty"`
+	Name                  string          `json:"name"`
+	Input                 json.RawMessage `json:"input"`
+	Retry                 retryJSON       `json:"retry"`
+	StartToCloseTimeoutMs int64           `json:"start_to_close_timeout_ms,omitempty"`
 }
 
 type retryJSON struct {
@@ -1062,7 +1012,6 @@ type retryJSON struct {
 	MaxIntervalMs      int64   `json:"max_interval_ms"`
 	MaxAttempts        int     `json:"max_attempts"`
 }
-
 
 type inboxEnv struct {
 	Name string          `json:"_name,omitempty"`

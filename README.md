@@ -99,19 +99,6 @@ Determinism Static Analysis:
 go run ./analyzers/determinism/cmd/determinism -- ./...
 ```
 
-Flags non-deterministic calls inside workflow functions (`*workflow.Context` receivers:
-`go` statements; `time.Now/Since/Until/Sleep/After/AfterFunc/NewTimer/NewTicker/Tick`
-(use `workflow.Now` for timestamps, `workflow.Sleep` for timers); `math/rand`,
-`math/rand/v2`, `crypto/rand` (use `workflow.SideEffect` or `workflow.NewUUID`);
-`os.Getenv/LookupEnv/Environ/Hostname/Getpid/Getppid/Getwd/Executable` and `os.Args`
-(pass values via inputs or activities); `sync`, `sync/atomic`, `runtime`;
-`net`, `net/http`, `os/exec` (do I/O in activities); channel operations (`select`,
-send/receive, `make(chan ...)`, `range` over channels, use `workflow.Execute`/`ExecuteAsync` and `workflow.Await`)
-and `range` over maps (iteration order is random). Closures passed to
-`workflow.SideEffect`/`NewUUID`/`SetQueryHandler` are excluded (update handlers
-registered with `workflow.SetUpdateHandler` are scanned).
-Helpers called from workflows are not analyzed; keep them deterministic.
-
 ## Web UI (contrib)
 
 Instance list and journal viewer. The details page allows running instances to be Canceled, Terminated, or Signaled (Cancel and Terminate require confirmation checkboxes; Signal accepts name + JSON payload; all are CSRF-protected. Cancel is cooperative cancellation, Terminate is immediate termination).

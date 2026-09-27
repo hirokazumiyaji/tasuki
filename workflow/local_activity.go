@@ -36,6 +36,9 @@ func ExecuteLocal[I, O any](ctx *Context, activityName string, in I) (O, error) 
 		}
 		return out, nil
 	}
+	if ctx.queryMode {
+		ctx.suspend()
+	}
 	if ctx.localRunner == nil {
 		return zero, ErrLocalActivityRunnerMissing
 	}

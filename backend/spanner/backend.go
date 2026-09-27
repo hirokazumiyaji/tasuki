@@ -66,18 +66,18 @@ func (b *Backend) CreateInstance(ctx context.Context, inst backend.NewInstance) 
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		muts := []*spanner.Mutation{
 			spanner.InsertMap("wf_instances", map[string]any{
-				"id":         inst.ID,
-				"name":       inst.Name,
-				"queue":      queue,
-				"status":     "running",
-				"input":      jsonVal(inst.Input),
-				"next_seq":   int64(2),
-				"parent_id":  nullStr(inst.ParentID),
-				"parent_seq": nullInt(inst.ParentSeq),
+				"id":                inst.ID,
+				"name":              inst.Name,
+				"queue":             queue,
+				"status":            "running",
+				"input":             jsonVal(inst.Input),
+				"next_seq":          int64(2),
+				"parent_id":         nullStr(inst.ParentID),
+				"parent_seq":        nullInt(inst.ParentSeq),
 				"search_attributes": jsonVal(backend.MarshalSearchAttributes(inst.SearchAttributes)),
 				"memo":              jsonVal(backend.MarshalSearchAttributes(inst.Memo)),
-				"created_at": now,
-				"updated_at": now,
+				"created_at":        now,
+				"updated_at":        now,
 			}),
 			spanner.InsertMap("wf_journal", map[string]any{
 				"instance_id": inst.ID,
@@ -292,30 +292,27 @@ func (b *Backend) TerminateInstance(ctx context.Context, id string) error {
 			return err
 		}
 		muts = append(muts, dMuts...)
-		// NOTE: instances with more child rows than one commit allows hit
-		// Spanner mutation limits here; chunked deletes are a follow-up to
-		// #299 (backendtest BulkTerminatePurge skips until then).
-		inIter := txn.Query(ctx, spanner.Statement{
+		iIter := txn.Query(ctx, spanner.Statement{
 			SQL:    `SELECT id FROM wf_inbox WHERE instance_id = @id`,
 			Params: map[string]any{"id": id},
 		})
 		for {
-			r, err := inIter.Next()
+			r, err := iIter.Next()
 			if err == iterator.Done {
 				break
 			}
 			if err != nil {
-				inIter.Stop()
+				iIter.Stop()
 				return err
 			}
-			var iid int64
-			if err := r.Columns(&iid); err != nil {
-				inIter.Stop()
+			var inboxID int64
+			if err := r.Columns(&inboxID); err != nil {
+				iIter.Stop()
 				return err
 			}
-			muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{iid}))
+			muts = append(muts, spanner.Delete("wf_inbox", spanner.Key{inboxID}))
 		}
-		inIter.Stop()
+		iIter.Stop()
 		return txn.BufferWrite(muts)
 	})
 	if err != nil {
@@ -466,11 +463,6 @@ func scanTask(row *spanner.Row) (backend.Task, error) {
 }
 
 func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
-	// Fenced to the claimed generation (worker_id + attempt): a renewal
-	// delayed past the lease (or racing a peer reclaim after a nack)
-	// must not overwrite the successor's visible_at. Zero rows means the
-	// lease moved on; report ErrNotFound so the worker treats the renewal
-	// as stale.
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, extendLeaseStatement(nowUTC().Add(d), t))
 		if err != nil {
@@ -484,11 +476,6 @@ func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Durati
 	return err
 }
 
-// extendLeaseStatement builds the conditional renewal DML for the claimed
-// task generation. Like fencedReleaseStatement, the attempt bind must be
-// INT64 (Go int64): the Spanner client rejects a native Go int for an
-// INT64 column, which would fail the renewal and leave the task to
-// expire instead of being renewed.
 func extendLeaseStatement(v time.Time, t backend.Task) spanner.Statement {
 	return spanner.Statement{
 		SQL:    `UPDATE wf_tasks SET visible_at = @v WHERE id = @id AND worker_id = @w AND attempt = @a`,
@@ -496,11 +483,11 @@ func extendLeaseStatement(v time.Time, t backend.Task) spanner.Statement {
 	}
 }
 
-func (b *Backend) RecordHeartbeat(ctx context.Context, taskID int64, lease time.Duration, details []byte) error {
+func (b *Backend) RecordHeartbeat(ctx context.Context, task backend.Task, lease time.Duration, details []byte) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
-			SQL: `UPDATE wf_tasks SET visible_at = @v, heartbeat = @h WHERE id = @id`,
-			Params: map[string]any{"v": nowUTC().Add(lease), "h": details, "id": taskID},
+			SQL:    `UPDATE wf_tasks SET visible_at = @v, heartbeat = @h WHERE id = @id AND worker_id = @w AND attempt = @a`,
+			Params: map[string]any{"v": nowUTC().Add(lease), "h": details, "id": task.ID, "w": task.WorkerID, "a": int64(task.Attempt)},
 		})
 		if err != nil {
 			return err
@@ -650,20 +637,6 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 	if len(advs) == 0 {
 		return nil
 	}
-	// Reject duplicate instances up front: the loop below applies every
-	// advancement in one read-write transaction with the same pre-mutation
-	// reads, so two advancements for the same instance both pass the
-	// ExpectedSeq check and then collide on the second journal insert
-	// (a native AlreadyExists commit error, not ErrConflict). Preflight
-	// keeps the batch all-or-nothing with a conflict error (see backendtest
-	// CommitAdvancementsAtomic).
-	seen := make(map[string]struct{}, len(advs))
-	for _, adv := range advs {
-		if _, dup := seen[adv.InstanceID]; dup {
-			return backend.ErrConflict
-		}
-		seen[adv.InstanceID] = struct{}{}
-	}
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		for _, adv := range advs {
 			if err := b.commitAdvancementTxn(ctx, txn, adv); err != nil {
@@ -740,8 +713,6 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	if kind != "workflow" || taskInst != adv.InstanceID {
 		return backend.ErrConflict
 	}
-	// Fence to the claimed generation (see Advancement): stale commits
-	// after a release + peer reclaim must fail without touching the peer.
 	if adv.WorkerID != "" {
 		got := ""
 		if worker.Valid {
@@ -853,7 +824,7 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 				"parent_id": ch.ParentID, "parent_seq": ch.ParentSeq,
 				"search_attributes": jsonVal(backend.MarshalSearchAttributes(ch.SearchAttributes)),
 				"memo":              jsonVal(backend.MarshalSearchAttributes(ch.Memo)),
-				"created_at": now, "updated_at": now,
+				"created_at":        now, "updated_at": now,
 			}),
 			spanner.InsertMap("wf_journal", map[string]any{
 				"instance_id": ch.ID, "seq": int64(1),
@@ -992,17 +963,12 @@ func ensureWorkflowTaskIfInbox(ctx context.Context, txn *spanner.ReadWriteTransa
 	return enqueueWorkflowTask(ctx, txn, instanceID, queue, nowUTC())
 }
 
-func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal.Event) error {
+func (b *Backend) CompleteActivity(ctx context.Context, claim backend.Task, ev journal.Event) error {
 	now := nowUTC()
 	var wake bool
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		// Reset per attempt: ReadWriteTransaction may retry this closure,
-		// and a stale wake (or a mutated ev.RefSeq) from an aborted attempt
-		// must not leak into the retry.
-		wake = false
-		ev := ev
-		row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{taskID},
-			[]string{"instance_id", "ref_seq", "kind"})
+		row, err := txn.ReadRow(ctx, "wf_tasks", spanner.Key{claim.ID},
+			[]string{"instance_id", "ref_seq", "kind", "worker_id", "attempt"})
 		if err != nil {
 			if isNotFound(err) {
 				return backend.ErrSuperseded
@@ -1010,15 +976,17 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 			return err
 		}
 		var instanceID, kind string
+		var workerID spanner.NullString
 		var refSeq spanner.NullInt64
-		if err := row.Columns(&instanceID, &refSeq, &kind); err != nil {
+		var attempt int64
+		if err := row.Columns(&instanceID, &refSeq, &kind, &workerID, &attempt); err != nil {
 			return err
 		}
-		if kind != "activity" {
+		if kind != "activity" || !workerID.Valid || workerID.StringVal != claim.WorkerID || attempt != int64(claim.Attempt) {
 			return backend.ErrSuperseded
 		}
 		if err := txn.BufferWrite([]*spanner.Mutation{
-			spanner.Delete("wf_tasks", spanner.Key{taskID}),
+			spanner.Delete("wf_tasks", spanner.Key{claim.ID}),
 		}); err != nil {
 			return err
 		}
@@ -1060,18 +1028,18 @@ func (b *Backend) CompleteActivity(ctx context.Context, taskID int64, ev journal
 	return nil
 }
 
-func (b *Backend) RetryActivity(ctx context.Context, taskID int64, delay time.Duration) error {
+func (b *Backend) RetryActivity(ctx context.Context, claim backend.Task, delay time.Duration) error {
 	_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		n, err := txn.Update(ctx, spanner.Statement{
 			SQL: `UPDATE wf_tasks SET visible_at = @v, worker_id = NULL
-				WHERE id = @id AND kind = 'activity'`,
-			Params: map[string]any{"v": nowUTC().Add(delay), "id": taskID},
+				WHERE id = @id AND kind = 'activity' AND worker_id = @wid AND attempt = @attempt`,
+			Params: map[string]any{"v": nowUTC().Add(delay), "id": claim.ID, "wid": claim.WorkerID, "attempt": int64(claim.Attempt)},
 		})
 		if err != nil {
 			return err
 		}
 		if n == 0 {
-			return backend.ErrNotFound
+			return backend.ErrSuperseded
 		}
 		return nil
 	})

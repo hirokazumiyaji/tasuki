@@ -178,3 +178,34 @@ func TestWorker_QueryNotFound(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+func TestWorker_QueryDoesNotRunUnrecordedLocalActivity(t *testing.T) {
+	ctx := context.Background()
+	b := memory.New()
+	w := tasuki.NewWorker(b, tasuki.WorkerOptions{})
+	activityCalls := 0
+	tasuki.RegisterActivity(w, func(context.Context, struct{}) (struct{}, error) {
+		activityCalls++
+		return struct{}{}, nil
+	}, tasuki.WithName("sideEffect"))
+	tasuki.RegisterWorkflow(w, func(wctx *workflow.Context, _ struct{}) (struct{}, error) {
+		workflow.SetQueryHandler(wctx, "calls", func(struct{}) (int, error) {
+			return activityCalls, nil
+		})
+		_, err := workflow.ExecuteLocal[struct{}, struct{}](wctx, "sideEffect", struct{}{})
+		return struct{}{}, err
+	}, tasuki.WithName("queryLocalActivity"))
+
+	client := tasuki.NewClient(b)
+	if _, err := tasuki.Start(ctx, client, "queryLocalActivity", struct{}{}, tasuki.WithID("query-local-activity")); err != nil {
+		t.Fatal(err)
+	}
+
+	calls, err := tasuki.Query[struct{}, int](ctx, w, "query-local-activity", "calls", struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 || activityCalls != 0 {
+		t.Fatalf("query ran local activity: query calls=%d activity calls=%d", calls, activityCalls)
+	}
+}

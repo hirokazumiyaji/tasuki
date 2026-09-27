@@ -131,7 +131,7 @@ Functions provided by the `workflow` package:
 
 `UpsertMemo` is similarly recorded as a command event, but memo fields are intended for display metadata and are not indexed for `List` filtering.
 
-`ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay. The worker extends the workflow task lease (`ExtendLease` at half the `LeaseDuration`) while the turn runs, so replay, every `ExecuteLocal` call, and the batch commit are covered through commit completion — the turn is not reclaimed by a peer mid-execution. Renewal stops only when the turn is abandoned: `Shutdown` cancels the turn's `context.Context`, a running local activity observes the cancellation, and the canceled turn releases its lease for a peer instead of committing (as a failure or otherwise). A turn whose context is already canceled before it starts is likewise abandoned, never committed. Set `WorkerOptions.LocalActivityTimeout` to bound a single `ExecuteLocal` invocation: the timeout is enforced outside the call, so even an activity that ignores cancellation returns a deadline error on time (its late result is discarded). Use `Execute` for anything longer than a small fraction of the lease, and keep local activities side-effect-free or idempotent where possible.
+`ExecuteLocal` runs registered activities synchronously within the workflow task turn. Unlike regular activities, it does not enqueue an activity task and does not perform retries. It is ideal for short, highly reliable operations. The result or error is recorded directly as a `local_activity` event, and the runner function is skipped during replay. Tasuki renews workflow task leases periodically while a turn is running, including during local activity execution. `LocalActivityTimeout` cancels the activity context and discards its result after the configured duration; activity code that ignores cancellation may continue running in its goroutine. Local activities should be side-effect-free or idempotent because a worker can lose its lease while blocked in external code.
 
 For long-running or looping workflows, calling `ContinueAsNew` when event counts reach thousands is strongly recommended to bound history size.
 
@@ -381,12 +381,12 @@ type WorkerOptions struct {
     ActivitySlots          int           // Default: 100 concurrent activities
     PollInterval           time.Duration // Default: 1s
     LeaseDuration          time.Duration // Default: 30s
+    LocalActivityTimeout   time.Duration // Default: 0 (disabled); cancel and discard after this duration
     WorkerID               string        // Default: hostname + random suffix
     Codec                  Codec         // Default: JSON
     Logger                 *slog.Logger  // Default: slog.Default()
     JournalWarnThreshold   int           // Default: 10000; negative disables
     IncompatibleRetryDelay time.Duration // Default: 5s; negative redisplays immediately
-    LocalActivityTimeout   time.Duration // Default: 0 (no limit); bounds one ExecuteLocal call
     MaxPerInstance         int           // Default: 0 (disabled); caps tasks claimed per instance per batch
 }
 ```
