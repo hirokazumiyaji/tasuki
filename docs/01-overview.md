@@ -16,11 +16,13 @@ While Temporal is powerful, running it requires operating multiple separate serv
 
 tasuki takes the inverted approach: the engine runs as an in-process library within the application, and persistence co-locates directly on the application's existing database. Zero additional infrastructure is required.
 
+Import `github.com/hirokazumiyaji/tasuki/worker` for Worker construction and registration:
+
 ```go
 // Minimal setup running with zero additional infrastructure
-w := tasuki.NewWorker(postgres.NewBackend(pool), tasuki.WorkerOptions{})
-tasuki.RegisterWorkflow(w, OrderWorkflow)
-tasuki.RegisterActivity(w, ChargePayment)
+w := worker.NewWorker(postgres.NewBackend(pool), worker.WorkerOptions{})
+worker.RegisterWorkflow(w, OrderWorkflow)
+worker.RegisterActivity(w, ChargePayment)
 w.Start(ctx)
 ```
 

@@ -25,10 +25,10 @@ Limit=3, MaxPerInstance=1 → flood-1, victim-1           # victim は最初の�
 
 ## 使い方
 
-ワーカー単位で設定する。
+`github.com/hirokazumiyaji/tasuki/worker` を import し、ワーカー単位で設定する。
 
 ```go
-w := tasuki.NewWorker(b, tasuki.WorkerOptions{
+w := worker.NewWorker(b, worker.WorkerOptions{
     Queues:         []string{"default"},
     MaxPerInstance: 1,
 })
@@ -55,13 +55,15 @@ w := tasuki.NewWorker(b, tasuki.WorkerOptions{
 
 公平ディスパッチは飢餓を防ぐが、隔離の第一選択はキュー分割である。重いワークフローを専用キューに振り向ければ、設定を一切変更せずに他のワークフローへの影響を zero にできる。
 
+`github.com/hirokazumiyaji/tasuki/client` と `github.com/hirokazumiyaji/tasuki/worker` を import する。
+
 ```go
 // 重いバッチ処理だけ bulk キューへ
-tasuki.Start(ctx, c, BulkWorkflow, in, tasuki.WithQueue("bulk"))
+client.Start(ctx, c, "BulkWorkflow", in, client.WithQueue("bulk"))
 
 // 通常ワーカーと bulk ワーカーでワーカー自体を分離
-tasuki.NewWorker(b, tasuki.WorkerOptions{Queues: []string{"default"}})
-tasuki.NewWorker(b, tasuki.WorkerOptions{Queues: []string{"bulk"}, ClaimLimit: 50})
+worker.NewWorker(b, worker.WorkerOptions{Queues: []string{"default"}})
+worker.NewWorker(b, worker.WorkerOptions{Queues: []string{"bulk"}, ClaimLimit: 50})
 ```
 
 キューごとの滞留は `tasuki.tasks.backlog` メトリクス（[05-observability.md](05-observability.md)）と `CountClaimableTasks` で監視でき、bulk ワーカーのオートスケール判定にそのまま使える。

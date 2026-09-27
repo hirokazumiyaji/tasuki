@@ -24,10 +24,10 @@ To find runnable tasks when high-volume tasks block the queue head, candidates a
 
 ## Usage
 
-Configure on a per-worker basis:
+Configure on a per-worker basis using `github.com/hirokazumiyaji/tasuki/worker`:
 
 ```go
-w := tasuki.NewWorker(b, tasuki.WorkerOptions{
+w := worker.NewWorker(b, worker.WorkerOptions{
     Queues:         []string{"default"},
     MaxPerInstance: 1,
 })
@@ -54,13 +54,15 @@ Configure `MaxPerInstance > 0` against such a backend and the worker logs a star
 
 While fair dispatch mitigates starvation, the primary tool for workload isolation is queue partitioning. Directing resource-intensive workflows to a dedicated queue isolates their impact entirely:
 
+Import `github.com/hirokazumiyaji/tasuki/client` and `github.com/hirokazumiyaji/tasuki/worker` for these operations:
+
 ```go
 // Direct heavy batch workloads to the dedicated "bulk" queue
-tasuki.Start(ctx, c, BulkWorkflow, in, tasuki.WithQueue("bulk"))
+client.Start(ctx, c, "BulkWorkflow", in, client.WithQueue("bulk"))
 
 // Run separate worker pools for standard and bulk queues
-tasuki.NewWorker(b, tasuki.WorkerOptions{Queues: []string{"default"}})
-tasuki.NewWorker(b, tasuki.WorkerOptions{Queues: []string{"bulk"}, ClaimLimit: 50})
+worker.NewWorker(b, worker.WorkerOptions{Queues: []string{"default"}})
+worker.NewWorker(b, worker.WorkerOptions{Queues: []string{"bulk"}, ClaimLimit: 50})
 ```
 
 Queue backlog can be tracked per queue using the `tasuki.tasks.backlog` metric ([05-observability.md](05-observability.md)) and `CountClaimableTasks`, making it easy to drive autoscaling for bulk workers.

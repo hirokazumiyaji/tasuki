@@ -9,6 +9,8 @@ Temporal のような「リトライ、タイマー、状態永続化を自分�
 エンジンはライブラリとしてアプリケーションプロセス内で動き、永続化はアプリケーションが持つデータストアに相乗りする。
 バックエンドはインターフェースで差し替え可能で、参照実装は PostgreSQL、対応対象に MySQL / MariaDB、SQLite、Spanner、TiDB、DynamoDB、Firestore を含む。
 
+Client API は `github.com/hirokazumiyaji/tasuki/client`、Worker API は `github.com/hirokazumiyaji/tasuki/worker` から import する。
+
 ## ステータス
 
 M4（バックエンド拡充）完了。PostgreSQL / SQLite / MySQL・MariaDB・TiDB / Spanner / DynamoDB / Firestore が適合・カオス可能な状態。
@@ -16,21 +18,21 @@ M5（性能と拡張）と M6（Query / Signal dedupe / Nack / SearchAttributes 
 品質スプリント（CI マトリクス・カバレッジ計測・ドキュメント整備）完了。詳細は [docs/ja/04-testing.md](docs/ja/04-testing.md)。
 M5 のベンチマーク基盤: `go run ./cmd/bench`（memory / postgres / sqlite）。
 PostgreSQL Worker は `LISTEN`/`NOTIFY`（チャネル `tasuki_tasks`）で起床し、`PollInterval` はフォールバックおよびタイマー／スケジュール用。memory / sqlite / mysql / spanner は同一 `Backend` 内のプロセス内 wakeup（`backend/hub`）。DynamoDB は `wf_wake`（Streams 有効）＋ wake アイテムポーリング、Firestore は `wf_notify` の Snapshot で**プロセスをまたいだ**起床もできる（いずれも hint。正しさは Claim / GetInstance）。
-Client の `Result` は postgres（`tasuki_terminal`）および他ストア（hub / 上記 cross-process 経路）で終端時に起床できる。
+`client.Result` は postgres（`tasuki_terminal`）および他ストア（hub / 上記 cross-process 経路）で終端時に起床できる。
 Worker はインスタンスごとの sticky ジャーナルキャッシュ（`next_seq` 照合、差分は `GetJournal`）でフル履歴の再読を減らす。
 tasuki は各 workflow instance を durable actor として扱い、journal replay モデルを維持する。
 ジャーナル件数が `JournalWarnThreshold`（既定 10000、負数で無効）以上のとき Worker は Warn ログとメトリクスを出す。長寿命ワークフローは `workflow.ContinueAsNew` で履歴を打ち切る（[docs/ja/02-architecture.md](docs/ja/02-architecture.md)、[docs/ja/03-api.md](docs/ja/03-api.md)）。
 長時間アクティビティは `activity.RecordHeartbeat` でリース延長と進捗記録ができ、リトライ時に `GetHeartbeatDetails` で取り出せる。
 アクティビティの 1 試行上限は `workflow.WithStartToCloseTimeout`（超過は通常失敗としてリトライ対象）。
-ワークフローの読み取り専用問い合わせは `workflow.SetQueryHandler` と `tasuki.Query`（Worker 同一プロセス）で行う。
-実行中ワークフローへの同期 Update は `workflow.SetUpdateHandler` と `tasuki.Update`（任意 `WithUpdateID`）。
-`Client.Signal` は `WithDedupeID` でインスタンス単位の再送冪等にできる。
-同一インスタンスへの一括送信は `Client.SignalBatch`（原子的。item ごとの任意 dedupe）。
+ワークフローの読み取り専用問い合わせは `workflow.SetQueryHandler` と `worker.Query`（Worker 同一プロセス）で行う。
+実行中ワークフローへの同期 Update は `workflow.SetUpdateHandler` と `worker.Update`（任意 `worker.WithUpdateID`）。
+`client.Client.Signal` は `client.WithDedupeID` でインスタンス単位の再送冪等にできる。
+同一インスタンスへの一括送信は `client.Client.SignalBatch`（原子的。item ごとの任意 dedupe）。
 ローリング中に旧 Worker が新履歴を扱えない場合はタスクを Nack し、新 Worker が拾えるようにする（`IncompatibleRetryDelay`）。
-検索属性は `WithSearchAttributes`（Start）と `workflow.UpsertSearchAttributes` で付け、`Client.List` の完全一致フィルタで絞り込める。
-メモは `WithMemo` / `workflow.UpsertMemo` で付け、Get で見える表示用注釈（List フィルタには使わない）。
+検索属性は `client.WithSearchAttributes`（`client.Start`）と `workflow.UpsertSearchAttributes` で付け、`client.Client.List` の完全一致フィルタで絞り込める。
+メモは `client.WithMemo` / `workflow.UpsertMemo` で付け、Get で見える表示用注釈（List フィルタには使わない）。
 短い同一 Worker 実行は `workflow.ExecuteLocal`（アクティビティタスクキューなし・リトライなし。結果はジャーナルに記録）。
-ペイロードの at-rest 暗号化は `codec.Encrypted`（AES-256-GCM、鍵ローテーション対応。Worker の `Codec` と Client の `WithCodec` に設定）。
+ペイロードの at-rest 暗号化は `codec.Encrypted`（AES-256-GCM、鍵ローテーション対応。`worker.WorkerOptions.Codec` と `client.WithCodec` に設定）。
 
 ## クイックスタート
 
