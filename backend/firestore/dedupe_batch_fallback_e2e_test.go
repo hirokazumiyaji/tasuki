@@ -25,17 +25,17 @@ func inboxCount(t *testing.T, b *Backend, ctx context.Context, instanceID string
 	return n
 }
 
-func r18signal(id string) backend.InboxItem {
+func dedupeSignal(id string) backend.InboxItem {
 	return backend.InboxItem{
 		Event:    journal.Event{Type: journal.TypeSignalReceived, Name: "sig"},
 		DedupeID: id,
 	}
 }
 
-// r18cleanup removes every row the round-18 e2e tests own (scoped by
+// batchFallbackCleanup removes every row these tests own (scoped by
 // instance ID — never a full Reset, so concurrent suites sharing the
 // emulator are undisturbed) so the tests are re-runnable.
-func r18cleanup(t *testing.T, b *Backend, ctx context.Context, instanceID string, keys []string) {
+func batchFallbackCleanup(t *testing.T, b *Backend, ctx context.Context, instanceID string, keys []string) {
 	t.Helper()
 	del := func(col, id string) {
 		_, _ = b.ref(col, id).Delete(ctx)
@@ -73,13 +73,10 @@ func r18cleanup(t *testing.T, b *Backend, ctx context.Context, instanceID string
 	del(purgeMarkersCollection, instanceID)
 }
 
-// TestRound18ForeignFramedHitDedupes is the end-to-end round-18 P1 case: an
-// upgraded DB holds another instance's legacy guard exactly at this
-// instance's framed doc (frameDedupeDocID("r18a","x") ==
-// legacyDedupeDocID("4:r18a","x") == "4:r18a:x"). The first send must still
-// guard (at the free legacy framing) and the retry must dedupe — previously
-// both sends inserted unguarded and every retry appended.
-func TestRound18ForeignFramedHitDedupes(t *testing.T) {
+// TestForeignFramedHitStillDedupes checks that a foreign legacy guard at the
+// framed doc ID does not suppress the first send. The framed ID for
+// "framed-a" and legacy ID for "8:framed-a" are both "8:framed-a:x".
+func TestForeignFramedHitStillDedupes(t *testing.T) {
 	guardTestEmulator(t)
 	ctx := context.Background()
 	b, err := New(ctx, os.Getenv("TASUKI_FIRESTORE_PROJECT"))
@@ -90,24 +87,24 @@ func TestRound18ForeignFramedHitDedupes(t *testing.T) {
 	if err := b.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if f, l := frameDedupeDocID("r18a", "x"), legacyDedupeDocID("4:r18a", "x"); f != l {
+	if f, l := frameDedupeDocID("framed-a", "x"), legacyDedupeDocID("8:framed-a", "x"); f != l {
 		t.Fatalf("test setup: framings must alias, got %q vs %q", f, l)
 	}
-	const inst = "r18a"
-	r18cleanup(t, b, ctx, inst, []string{"x"})
+	const inst = "framed-a"
+	batchFallbackCleanup(t, b, ctx, inst, []string{"x"})
 	if err := b.CreateInstance(ctx, backend.NewInstance{ID: inst, Name: "WF", Queue: "default"}); err != nil {
 		t.Fatal(err)
 	}
-	// Seed the foreign legacy row directly: doc "4:r18a:x" owned by "4:r18a".
-	// Only the dedupe doc is probed; no "4:r18a" instance is needed.
-	if _, err := b.ref("wf_signal_dedupe", legacyDedupeDocID("4:r18a", "x")).Create(ctx, map[string]any{
-		"instance_id": "4:r18a",
+	// Seed the foreign legacy row directly. Only the dedupe doc is probed;
+	// the foreign instance does not need to exist.
+	if _, err := b.ref("wf_signal_dedupe", legacyDedupeDocID("8:framed-a", "x")).Create(ctx, map[string]any{
+		"instance_id": "8:framed-a",
 		"dedupe_id":   "x",
 		"created_at":  nowUTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.SendToInboxBatch(ctx, inst, []backend.InboxItem{r18signal("x")}); err != nil {
+	if err := b.SendToInboxBatch(ctx, inst, []backend.InboxItem{dedupeSignal("x")}); err != nil {
 		t.Fatal(err)
 	}
 	if n := inboxCount(t, b, ctx, inst); n != 1 {
@@ -122,7 +119,7 @@ func TestRound18ForeignFramedHitDedupes(t *testing.T) {
 		t.Fatalf("legacy guard = %v, want canonical v1 form", g)
 	}
 	// Retry must dedupe via that guard.
-	if err := b.SendToInboxBatch(ctx, inst, []backend.InboxItem{r18signal("x")}); err != nil {
+	if err := b.SendToInboxBatch(ctx, inst, []backend.InboxItem{dedupeSignal("x")}); err != nil {
 		t.Fatal(err)
 	}
 	if n := inboxCount(t, b, ctx, inst); n != 1 {
@@ -130,12 +127,12 @@ func TestRound18ForeignFramedHitDedupes(t *testing.T) {
 	}
 }
 
-// TestRound18BatchFallbackKeysDistinct is the end-to-end round-18 P2 case:
+// TestBatchFallbackKeysDistinct checks batch fallback key selection end to end:
 // batch IDs "____x" + "__x" with foreign-occupied "______x". The first item
 // falls back to "____x" — the second item's canonical probe cannot see the
 // buffered Create, so without the batch reservation both choose the same
 // doc and the whole batch fails deterministically on every retry.
-func TestRound18BatchFallbackKeysDistinct(t *testing.T) {
+func TestBatchFallbackKeysDistinct(t *testing.T) {
 	guardTestEmulator(t)
 	ctx := context.Background()
 	b, err := New(ctx, os.Getenv("TASUKI_FIRESTORE_PROJECT"))
@@ -146,9 +143,9 @@ func TestRound18BatchFallbackKeysDistinct(t *testing.T) {
 	if err := b.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	const inst = "r18b"
+	const inst = "batch-fallback"
 	keys := []string{"____x", "__x", "______x"}
-	r18cleanup(t, b, ctx, inst, keys)
+	batchFallbackCleanup(t, b, ctx, inst, keys)
 	if err := b.CreateInstance(ctx, backend.NewInstance{ID: inst, Name: "WF", Queue: "default"}); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +157,7 @@ func TestRound18BatchFallbackKeysDistinct(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	batch := []backend.InboxItem{r18signal("____x"), r18signal("__x")}
+	batch := []backend.InboxItem{dedupeSignal("____x"), dedupeSignal("__x")}
 	if err := b.SendToInboxBatch(ctx, inst, batch); err != nil {
 		t.Fatalf("batch with colliding fallback keys must commit: %v", err)
 	}

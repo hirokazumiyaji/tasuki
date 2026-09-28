@@ -10,7 +10,7 @@ import (
 )
 
 // TestFramedLegacyStoredKeyCollision pins the aliasing behind issue #296
-// round-19 P1: the framed doc ID of ("3:3", "x") equals the legacy doc ID of
+// the framed doc ID of ("3:3", "x") equals the legacy doc ID of
 // ("3", "3:3:x"), so instance "3:3"'s probe for "x" lands exactly on
 // instance "3"'s old guard. Ownership validation succeeds for pre-field rows
 // (no instance_id to check), so only the stored key tells them apart.
@@ -22,7 +22,7 @@ func TestFramedLegacyStoredKeyCollision(t *testing.T) {
 	}
 }
 
-// TestMatchDedupeRowVerifiesLegacyStoredKey covers the round-19 P1 fix: the
+// TestMatchDedupeRowVerifiesLegacyStoredKey checks the legacy-key fix: the
 // legacy branch must compare the row's STORED key with the requested raw ID,
 // not the probe candidate (which equals the requested ID by construction and
 // therefore cannot tell a collision-landed foreign row apart).

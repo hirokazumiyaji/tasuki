@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-// TestPickSpannerDedupeInsert covers the round-18 P2 batch reservation: keys
+// TestPickSpannerDedupeInsert checks batch reservations: keys
 // chosen earlier in the batch count as occupied, so two items never emit
 // colliding inserts for one key (transaction reads don't see buffered
 // mutations — the whole batch would otherwise fail deterministically on

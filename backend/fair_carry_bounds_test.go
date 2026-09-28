@@ -7,11 +7,11 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend"
 )
 
-// TestTrimFairCarryBoundsLockedFlood covers issue #294 round-17 P2(a): a
+// TestTrimFairCarryBoundsLockedFlood covers issue #294: a
 // plain visibility probe cannot see locks, so probing the full retained carry
 // retains every locked row and the picker admits one per pass (~2000 lock
 // queries + quadratic re-offers). Trimming to the unfilled per-instance quota
-// plus the round-18 fallback margin bounds the probe set to O(limit+margin).
+// plus the fallback margin bounds the probe set to O(limit+margin).
 func TestTrimFairCarryBoundsLockedFlood(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	var carry []backend.FairTaskRef
@@ -21,7 +21,7 @@ func TestTrimFairCarryBoundsLockedFlood(t *testing.T) {
 	trimmed := backend.TrimFairCarry(carry, nil, 2, 1)
 	// Quota (1 row: per-instance cap) plus one bounded fallback window —
 	// never the full 2000-row carry. The window is what lets a later pass
-	// replace lock-skipped quota rows (round-18 P1) instead of stalling.
+	// replace lock-skipped quota rows instead of stalling.
 	// The cap is remaining+margin (O(limit+margin)).
 	if len(trimmed) != 2+backend.FairCarryMargin {
 		t.Fatalf("trimmed locked flood = %d rows, want remaining(2) + %d margin", len(trimmed), backend.FairCarryMargin)
@@ -39,7 +39,7 @@ func TestTrimFairCarryBoundsLockedFlood(t *testing.T) {
 	}
 
 	// Total bounded by the remaining limit plus the fallback margin, not by
-	// the sum of quotas (round-18 P1 keeps the next margin rows past the
+	// the sum of quotas; the next margin rows past the
 	// quota fill as lock-skip replacements).
 	trimmed = backend.TrimFairCarry(mixed, nil, 1, 1)
 	if len(trimmed) != 1+backend.FairCarryMargin {
@@ -57,7 +57,7 @@ func TestTrimFairCarryBoundsLockedFlood(t *testing.T) {
 	}
 }
 
-// TestNoteFairLossClearsOnRefill covers issue #294 round-17 P2(b): a
+// TestNoteFairLossClearsOnRefill covers issue #294: a
 // historical lostLock bool stays true after a refill replaces every lost
 // pick, causing a wasteful overflow rescan. Outstanding quota must clear once
 // the securing pass restores the instance to the cap.

@@ -7,7 +7,7 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend"
 )
 
-// TestTrimFairCarryDropsViableTail documents issue #294 round-19 P1 against
+// TestTrimFairCarryDropsViableTail documents issue #294 against
 // the fixed quota+margin window: Limit=2/MaxPerInstance=1 over A1..A68/B1
 // with A1..A67 locked. Pass 1 secures B1 and carries A2..A68; the plain trim
 // keeps A2..A66 (1 quota + 64 margin) and permanently forgets A67,A68 before
@@ -32,7 +32,7 @@ func TestTrimFairCarryDropsViableTail(t *testing.T) {
 	}
 }
 
-// TestTrimFairCarryWithResumeSpillsResumeCursor covers the round-19 P1 fix
+// TestTrimFairCarryWithResumeSpillsResumeCursor covers the fix
 // for the scenario above: the same trim must spill a resume cursor for the
 // dropped tail, with the FIFO-next dropped row riding along as the retained
 // boundary. Round-20 P1 corrected the cursor itself: it is the retained
