@@ -32,6 +32,11 @@ jobs:
           for m in backend/sqlite backend/postgres backend/mysql backend/spanner backend/dynamodb backend/firestore; do
             (cd "$m" && staticcheck ./...)
           done
+      - name: Run staticcheck (determinism analyzer)
+        working-directory: analyzers
+        env:
+          GOWORK: off
+        run: staticcheck ./...
 
   vuln:
     # Advisory: stdlib findings track the auto-selected toolchain versus the
@@ -457,6 +462,20 @@ jobs:
           git diff --exit-code go.mod go.sum
       - name: Minimal Go version with local toolchain
         run: GOTOOLCHAIN=local go build ./...
+      - name: Test and vet standalone determinism analyzer
+        working-directory: analyzers
+        env:
+          GOWORK: off
+        run: |
+          go test ./...
+          go vet ./...
+      - name: Verify analyzer module files are tidy
+        working-directory: analyzers
+        env:
+          GOWORK: off
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
       - name: Full workspace build with all backends
         run: go build -tags tasuki_all ./...
       - name: Test contrib and examples with all backends

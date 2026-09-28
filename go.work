@@ -8,4 +8,5 @@ use (
 	./backend/postgres
 	./backend/spanner
 	./backend/sqlite
+	./analyzers
 )

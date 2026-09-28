@@ -97,7 +97,7 @@ go run ./examples/m3-sqlite/
 決定性解析:
 
 ```bash
-go run ./analyzers/determinism/cmd/determinism -- ./...
+cd analyzers && go run ./determinism/cmd/determinism -- ../...
 ```
 
 ## 閲覧 UI（contrib）
