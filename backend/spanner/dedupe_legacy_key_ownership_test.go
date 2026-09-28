@@ -6,8 +6,8 @@ import (
 	"cloud.google.com/go/spanner"
 )
 
-// TestMatchDedupeRowVerifiesLegacyStoredKey covers the round-19 P1 fix on
-// the Spanner side: like Firestore, the legacy branch compares the row's
+// TestMatchDedupeRowVerifiesLegacyStoredKey checks that the legacy branch
+// compares the row's
 // STORED key with the requested raw ID. Under composite (instance_id,
 // dedupe_id) keys a framing collision cannot land a probe on a foreign row
 // (readDedupeRow reads by (instanceID, key), so stored always equals the

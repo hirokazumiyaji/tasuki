@@ -7,16 +7,16 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend"
 )
 
-// TestTrimFairCarryWithResumeRecoversA68 is the round-20 P1 regression test
+// TestTrimFairCarryWithResumeRecoversA68 is the regression test
 // for the resume-cursor fix: Limit=2/MaxPerInstance=1 over A1..A68/B1 with
-// A1..A67 locked. The round-19 helper returned the first DROPPED row (A68)
+// A1..A67 locked. The earlier helper returned the first DROPPED row (A68)
 // as the exclusive-requery cursor while retaining only through A67, so the
 // requery (`>` A68) skipped A68 forever and every poll came back short while
 // the head stayed locked. The fixed helper returns the last RETAINED row
 // (A67): resuming strictly after it re-fetches A68 onward. This test drives
 // the trim exactly as the postgres/mysql claim loops do — trim the carry,
 // then keyset-requery exclusively after the cursor — and requires A68 to
-// come back. Against the round-19 helper (cursor A68) the requery returns
+// come back. With the old cursor (A68), the requery returns
 // nothing and the test fails.
 func TestTrimFairCarryWithResumeRecoversA68(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)

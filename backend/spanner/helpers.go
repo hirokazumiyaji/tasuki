@@ -480,17 +480,6 @@ func pickSpannerDedupeInsert(canonicalKey, fallbackKey string, canonicalOccupied
 	return "", 0, false
 }
 
-// Exported key-encoding accessors for the cross-backend parity test (see
-// backend/firestore/dedupe_parity_test.go): both backends must encode
-// DedupeIDs byte-identically even though they store them differently
-// (framed Firestore document IDs vs. Spanner composite keys).
-func EscapeDedupeID(dedupeID string) string { return escapeDedupeID(dedupeID) }
-func PostTerminalDedupeMarker(dedupeID string) string {
-	return postTerminalDedupeMarker(dedupeID)
-}
-func RawFallbackDedupeKey(dedupeID string) string  { return rawFallbackDedupeKey(dedupeID) }
-func DedupeKeyCandidates(dedupeID string) []string { return dedupeKeyCandidates(dedupeID) }
-
 func unwrapInboxPayload(payload []byte) (string, []byte) {
 	if len(payload) == 0 {
 		return "", nil

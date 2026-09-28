@@ -1,4 +1,4 @@
-package postgres_test
+package mysql_test
 
 import (
 	"context"
@@ -6,33 +6,32 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/tasuki/backend"
-	"github.com/hirokazumiyaji/tasuki/backend/postgres"
+	"github.com/hirokazumiyaji/tasuki/backend/mysql"
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
-// TestFairClaimRequerySkipsAcceptedIDs covers issue #294 round-27 P2 (mysql
-// twin in backend/mysql/fair_round27_test.go): Limit=3/MaxPerInstance=2 over
-// FIFO A1..A70,B1,C1 with A1..A69 locked by a concurrent claimer. The
-// overflow requery from the A69 snapshot must skip the already-claimed B1
-// (see backend.SeedFairAttempted) instead of re-offering it. This backend
-// leases eagerly per pass, so a requery rescan normally never re-sees a
-// claimed row (visible_at moved to the future); the seed is parity hardening
-// for the same loop shape (e.g. a zero-lease claim re-exposes instantly).
-// The batch must come back FIFO [A70 B1 C1].
+// TestFairClaimRequerySkipsAcceptedIDs covers issue #294:
+// Limit=3/MaxPerInstance=2 over FIFO A1..A70,B1,C1 with A1..A69 locked by a
+// concurrent claimer. Pass 1 secures B1 while the trimmed carry arms an
+// overflow requery from the A69 snapshot; the requery must skip the
+// already-accepted B1 (see backend.SeedFairAttempted) instead of re-offering
+// it — a duplicate fills the picker and the claiming UPDATE rejects it,
+// starving C1. The batch must come back FIFO [A70 B1 C1].
 //
-// NOTE: as on mysql, the duplicate arm is unreachable in a deterministic
-// single-claimer run, so this test pins the SCENARIO end to end and passes
-// both before and after the round-27 seed. The fail-without-fix pin on the
-// seed itself lives in the backend package
+// NOTE: the duplicate arm is unreachable in a deterministic single-claimer
+// run (the forward scan secures every admittable fresh row before any
+// requery can arm with room to spare), so this test passes both before and
+// after the fix — it pins the SCENARIO end to end. The
+// fail-without-fix pin on the seed itself lives in the backend package
 // (TestSeedFairAttemptedSkipsAcceptedInRequery).
 func TestFairClaimRequerySkipsAcceptedIDs(t *testing.T) {
 	dsn := dsnOrSkip(t)
 	ctx := context.Background()
-	b, err := postgres.New(ctx, dsn)
+	b, err := mysql.New(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { b.Close() })
+	t.Cleanup(func() { _ = b.Close() })
 	if err := b.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -83,10 +82,10 @@ func TestFairClaimRequerySkipsAcceptedIDs(t *testing.T) {
 	spawn("r27-C", qc, 1)
 
 	queues := []string{qa, qb, qc}
-	rows, err := b.Pool().Query(ctx, `
+	rows, err := b.DB().QueryContext(ctx, `
 		SELECT id, instance_id FROM wf_tasks
-		WHERE kind = 'activity' AND queue = ANY($1)
-		ORDER BY visible_at, id`, queues)
+		WHERE kind = 'activity' AND queue IN (?, ?, ?)
+		ORDER BY visible_at, id`, qa, qb, qc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,14 +118,16 @@ func TestFairClaimRequerySkipsAcceptedIDs(t *testing.T) {
 		t.Fatalf("tail = %v, want [r27-B r27-C]", cands[70:])
 	}
 
-	// Blocker locks A1..A69 one by one with PK equality.
-	btx, err := b.Pool().Begin(ctx)
+	// Blocker locks A1..A69 one by one with PK equality: a multi-row IN
+	// degrades to a range scan under REPEATABLE READ and its next-key locks
+	// would spill onto A70, which must stay free.
+	btx, err := b.DB().BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer btx.Rollback(ctx)
+	defer btx.Rollback()
 	for i := 0; i < 69; i++ {
-		if _, err := btx.Exec(ctx, `SELECT id FROM wf_tasks WHERE id = $1 FOR UPDATE`, cands[i].id); err != nil {
+		if _, err := btx.ExecContext(ctx, `SELECT id FROM wf_tasks WHERE id = ? FOR UPDATE`, cands[i].id); err != nil {
 			t.Fatal(err)
 		}
 	}

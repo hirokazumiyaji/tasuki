@@ -12,7 +12,7 @@ import (
 	"github.com/hirokazumiyaji/tasuki/journal"
 )
 
-// TestRound18BatchFallbackKeysDistinct is the end-to-end round-18 P2 case:
+// TestBatchFallbackKeysDistinct checks batch fallback key selection end to end:
 // batch IDs "____x" + "__x" with foreign-occupied "______x" (a legacy
 // verbatim guard of user ID "______x" at the first item's canonical key —
 // owned by the same instance but never this ID's guard). The first item
@@ -20,7 +20,7 @@ import (
 // buffered mutation, so without the batch reservation both emit the same
 // insert. The batch must commit with distinct guards and the retry must
 // dedupe via them.
-func TestRound18BatchFallbackKeysDistinct(t *testing.T) {
+func TestBatchFallbackKeysDistinct(t *testing.T) {
 	dsn := dsnOrSkip(t)
 	ctx := context.Background()
 	b, err := backendspanner.New(ctx, dsn)
@@ -31,7 +31,7 @@ func TestRound18BatchFallbackKeysDistinct(t *testing.T) {
 	if err := b.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	const inst = "r18b-spanner"
+	const inst = "batch-fallback-spanner"
 	// Best-effort cleanup for re-runs against a non-wiped emulator.
 	_ = b.TerminateInstance(ctx, inst)
 	_, _ = b.PurgeInstances(ctx, 0, nil, 100)

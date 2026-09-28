@@ -8,8 +8,8 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend"
 )
 
-// TestFenceClaimedTasksBatchesDistinctInstances covers the round-27 P1
-// fence shape on #291: the post-claim fence must validate a whole batch
+// TestFenceClaimedTasksBatchesDistinctInstances checks that the post-claim
+// fence validates a whole batch
 // against one status snapshot — tasks of a still-running instance are kept
 // while a concurrently-terminated sibling's task is dropped and its residue
 // deleted, even though both rode in on the same claim. Fail-without-fix at

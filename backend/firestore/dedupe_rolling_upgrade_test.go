@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-// Rolling-upgrade dual-write (Codex round-24 P1 on #296, corrected round-26):
+// Rolling-upgrade dual-write keeps older readers able to find new guards:
 // new guards are written under the length-framed doc ID, but pre-framing
 // nodes probe only instanceID + ":" + raw DedupeID. A retry routed to an old
 // node misses the framed-only guard and duplicates the inbox event — even
@@ -38,7 +38,7 @@ func TestDualDedupeGuardDocCoversOldReader(t *testing.T) {
 		// (never the framed form, never the encoded key's legacy doc) and
 		// validates ownership + version. Both rows must match the
 		// requested ID identically. The framed row is simulated at the
-		// TARGET's key (round-28 P1 on #296: ambiguously-encoded IDs guard
+		// TARGET's key: ambiguously-encoded IDs guard
 		// at the framed fallback, not the canonical doc — the stored
 		// canonical form is unchanged, only the locating candidate moves).
 		framedRow := map[string]any{"instance_id": inst, "dedupe_id": canon, dedupeFormatVersionField: target.ver}
@@ -93,8 +93,8 @@ func TestDualDedupeGuardDocNoCounterpartWhenLegacy(t *testing.T) {
 	}
 }
 
-// TestDualDedupeGuardDocRawLegForEscapedID is the round-26 P1 regression
-// test on #296: the legacy counterpart of a framed canonical guard must be
+// TestDualDedupeGuardDocRawLegForEscapedID checks that the legacy counterpart
+// of a framed canonical guard is
 // the RAW DedupeID verbatim. The pre-fix code encoded "__x" to "____x" and
 // wrote "<inst>:____x"; an old node retrying "__x" probes "<inst>:__x" and
 // misses. Fail-without-fix: revert dualDedupeGuardDoc to legacy(canonical)

@@ -7,7 +7,7 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend"
 )
 
-// TestTrimFairCarryKeepsLockSkipFallbacks covers issue #294 round-18 P1: a
+// TestTrimFairCarryKeepsLockSkipFallbacks covers issue #294: a
 // quota-only trim discards the rows a lock-skip round needs as replacements.
 // Limit=2/MaxPerInstance=1 over A1,A2,A3,B1 with A1+A2 locked: pass 1 secures
 // B1 and carries A2,A3. The trim must keep A2 (quota) AND A3 (fallback), so
@@ -52,8 +52,8 @@ func TestTrimFairCarryKeepsLockSkipFallbacks(t *testing.T) {
 	}
 }
 
-// TestTrimFairCarryMarginBounded covers the round-17 quota bound under the
-// round-18 margin: the retained set stays O(limit+margin), never O(carry),
+// TestTrimFairCarryMarginBounded checks that the retained set stays
+// O(limit+margin), never O(carry),
 // and rows skipped as over-quota before the quota fill stay dropped (no
 // instance at the cap can admit them later in the claim).
 func TestTrimFairCarryMarginBounded(t *testing.T) {

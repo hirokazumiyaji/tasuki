@@ -4,8 +4,8 @@ import (
 	"testing"
 )
 
-// TestFramedLegacyDocCollision pins the aliasing behind issue #296 round-18
-// P1: the framed doc ID of one (instance, key) pair can equal the legacy doc
+// TestFramedLegacyDocCollision pins the aliasing behind issue #296: a framed
+// document ID of one (instance, key) pair can equal the legacy doc
 // ID of another pair, so a framed probe can land exactly on a foreign legacy
 // row. Probing must continue to the legacy candidate after an ownership
 // mismatch instead of returning the foreign row.
@@ -17,8 +17,8 @@ func TestFramedLegacyDocCollision(t *testing.T) {
 	}
 }
 
-// TestMatchOwnedDedupeRow covers the match-aware half of the round-18 P1
-// selection: ownership alone is not enough — an owned-but-not-matching
+// TestMatchOwnedDedupeRow checks that ownership alone is not enough: an
+// owned-but-not-matching
 // framed row must not hide an owned matching legacy row.
 func TestMatchOwnedDedupeRow(t *testing.T) {
 	ownMatch := map[string]any{"instance_id": "A", "dedupe_id": "x", dedupeFormatVersionField: int64(1)}
@@ -87,7 +87,7 @@ func TestSelectOwnedDedupeDoc(t *testing.T) {
 }
 
 // probeWith builds a dedupeKeyProbe from explicit framed/legacy rows for
-// pick-guard unit tests (round-25 P2): free flags derive from nil-ness, so
+// pick-guard unit tests: free flags derive from nil-ness, so
 // foreign vs owned occupancy is carried by the row maps themselves.
 func probeWith(framed, legacy map[string]any) dedupeKeyProbe {
 	return dedupeKeyProbe{framedDoc: framed, legacyDoc: legacy, framedFree: framed == nil, legacyFree: legacy == nil}
@@ -95,7 +95,7 @@ func probeWith(framed, legacy map[string]any) dedupeKeyProbe {
 
 func freeProbe() dedupeKeyProbe { return dedupeKeyProbe{framedFree: true, legacyFree: true} }
 
-// TestPickDedupeGuardTarget covers the round-18 guard placement: existing
+// TestPickDedupeGuardTarget covers guard placement: existing
 // preference order (framed canonical, framed fallback) is preserved, the
 // legacy framings serve as overflow for foreign-occupied framed docs (P1),
 // and batch-reserved docs count as unavailable (P2).
@@ -107,7 +107,7 @@ func TestPickDedupeGuardTarget(t *testing.T) {
 	}
 	// foreignRow marks a doc occupied by another key/instance: it collides
 	// physically but never matches the requested ID, so it blocks only the
-	// framing it occupies (round-25 P2: it must not veto the other framing).
+	// framing it occupies; it must not veto the other framing.
 	foreignRow := map[string]any{"instance_id": "other", "dedupe_id": "other"}
 	t.Run("all free prefers framed fallback for ambiguous IDs", func(t *testing.T) {
 		// Round-28 P1 on #296: "__x" is ambiguously encoded (canonical
@@ -131,7 +131,7 @@ func TestPickDedupeGuardTarget(t *testing.T) {
 	t.Run("owned legacy still blocks the framed canonical", func(t *testing.T) {
 		// The legacy leg holds this ID's own guard (owned + matching): the
 		// key is truly occupied, so the guard goes to the framed fallback
-		// (round-16/round-17 behavior preserved — see
+		// earlier behavior is preserved — see
 		// TestDedupeLongFallbackDelivers), never alongside it. In the live
 		// send path this state is a baseHit (no guard created at all); the
 		// pick-level preference matters only to avoid forking.
@@ -143,7 +143,7 @@ func TestPickDedupeGuardTarget(t *testing.T) {
 		}
 	})
 	t.Run("foreign legacy does not veto the framed fallback", func(t *testing.T) {
-		// Round-25 P2 regression, re-anchored round-28 P1 on #296: the
+		// Regression case: the
 		// legacy leg holds another key's row (same instance, different
 		// stored key), so the free framed slot remains usable — and since
 		// "__x" is ambiguously encoded, that usable slot is the framed
@@ -195,7 +195,7 @@ func TestPickDedupeGuardTarget(t *testing.T) {
 	})
 }
 
-// TestFramedGuardSurvivesLegacyCollision replays the round-25 P2 scenario:
+// TestFramedGuardSurvivesLegacyCollision reproduces a legacy-key collision:
 // instance "3:3" sends "x" (framed doc "3:3:3:x"), then first-sends "3:x"
 // whose legacy doc aliases that row while its own framed doc is free. Both
 // keys' whole-key availability is false under the old both-legs-free rule,
@@ -238,7 +238,7 @@ func TestFramedGuardSurvivesLegacyCollision(t *testing.T) {
 	}
 }
 
-// TestPickDedupeGuardTargetBatchCollision replays the round-18 P2 batch:
+// TestPickDedupeGuardTargetBatchCollision reproduces a batch collision:
 // IDs "____x" + "__x" with foreign-occupied "______x". The first item falls
 // back to "____x"; the second item's canonical probe cannot see the buffered
 // Create, so without the reservation both would choose the same doc and the

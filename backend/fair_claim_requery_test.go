@@ -7,7 +7,7 @@ import (
 	"github.com/hirokazumiyaji/tasuki/backend"
 )
 
-// TestSeedFairAttemptedSkipsAcceptedInRequery is the round-27 P2 regression
+// TestSeedFairAttemptedSkipsAcceptedInRequery is the regression
 // test on #294: Limit=3/MaxPerInstance=2 over FIFO A1..A70,B1,C1 with
 // A1..A69 locked. Pass 1 secures B1 WITHOUT overflowing, so B1 never enters
 // the attempt log (picks are recorded only on overflow/requery passes); the
@@ -55,7 +55,7 @@ func TestSeedFairAttemptedSkipsAcceptedInRequery(t *testing.T) {
 		t.Fatalf("unseeded requery picks %v, want [70 71] (the hole: B1 re-offered)", ids(got))
 	}
 
-	// With the round-27 seed every accepted ID is skipped: [A70,C1].
+	// Every accepted ID is skipped: [A70,C1].
 	seeded := backend.SeedFairAttempted(attempted, accepted)
 	if got := offer(seeded); len(got) != 2 || got[0].ID != 70 || got[1].ID != 72 {
 		t.Fatalf("seeded requery picks %v, want [70 72] (B1 skipped, C1 reached)", ids(got))
