@@ -98,7 +98,7 @@ go run ./examples/m3-sqlite/
 Determinism Static Analysis:
 
 ```bash
-go run ./analyzers/determinism/cmd/determinism -- ./...
+cd analyzers && go run ./determinism/cmd/determinism -- ../...
 ```
 
 ## Web UI (contrib)
