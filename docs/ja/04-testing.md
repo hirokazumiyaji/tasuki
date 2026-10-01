@@ -54,7 +54,7 @@ CI（`.github/workflows/ci.yml`）はプルリクエストと `main` への push
 | `gowork-check` | `GOWORK=off` の独立性、workspace の `tasuki_all` ビルド、`go test -tags tasuki_all ./contrib/... ./examples/...` |
 | `fuzz-nightly` | nightly のみ。各 codec/engine ファズ対象に `-fuzz -fuzztime` 60 秒 |
 
-CI の Go は全ジョブで `1.24.x` を使用する（`docs/ja/10-modules.md` 参照）。
+CI の Go は全ジョブで `1.27.x` を使用する（`docs/ja/10-modules.md` 参照）。
 
 ## リスクと対策
 

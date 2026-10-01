@@ -896,6 +896,13 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 			}
 		}
 	}
+	// Wake terminal subscribers before the fallible ensure loop below: the
+	// terminal status already committed, and an ensure error returns early.
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			b.notifyTerminal(adv.InstanceID)
+		}
+	}
 	for _, adv := range advs {
 		if adv.Terminal != nil {
 			// Terminal instances take no follow-up task:
@@ -1125,6 +1132,15 @@ func (b *Backend) commitAdvancementTxn(ctx context.Context, txn *spanner.ReadWri
 	}
 	if kind != "workflow" || taskInst != adv.InstanceID {
 		return backend.ErrConflict
+	}
+	if adv.WorkerID != "" {
+		got := ""
+		if worker.Valid {
+			got = worker.StringVal
+		}
+		if got != adv.WorkerID || int(attempt) != adv.Attempt {
+			return backend.ErrConflict
+		}
 	}
 	// Read-your-writes: Spanner buffers mutations client-side until commit,
 	// so queries below do not see them. The owned workflow task is deleted
@@ -1665,6 +1681,7 @@ func (b *Backend) FireDueTimers(ctx context.Context, limit int) (int, error) {
 			if delN == 0 {
 				continue
 			}
+			n++
 			instRow, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{d.instanceID}, []string{"status"})
 			if err != nil {
 				if isNotFound(err) {
@@ -1765,6 +1782,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 		// matter how skewed this worker's clock is. now is still refreshed
 		// per attempt for visible_at below.
 		now := nowUTC()
+		inserted = 0
 		row, err := txn.ReadRow(ctx, "wf_instances", spanner.Key{instanceID}, []string{"status", "queue"})
 		if err != nil {
 			if isNotFound(err) {
@@ -1919,7 +1937,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						} else if key, ver, ok := soleAmbiguousGuardKey(it.DedupeID, fallbackKey, false, reservedGuardKeys); ok {
 							reservedGuardKeys[key] = true
 							m := map[string]any{
-								"instance_id": instanceID, "dedupe_id": key, "created_at": now,
+								"instance_id": instanceID, "dedupe_id": key, "created_at": commitTimestamp(),
 							}
 							if ver >= dedupeFormatRawKeyVersion {
 								m[dedupeFormatVersionColumn] = ver
@@ -1936,7 +1954,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						reservedGuardKeys[canonKey] = true
 						muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
 							"instance_id": instanceID, "dedupe_id": canonKey,
-							dedupeFormatVersionColumn: dedupeFormatVersion, "created_at": now,
+							dedupeFormatVersionColumn: dedupeFormatVersion, "created_at": commitTimestamp(),
 						}))
 						created[it.DedupeID] = true
 					}
@@ -2022,7 +2040,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						if key, ver, ok := soleAmbiguousGuardKey(it.DedupeID, fallbackKey, fallbackOccupied, reservedGuardKeys); ok {
 							reservedGuardKeys[key] = true
 							m := map[string]any{
-								"instance_id": instanceID, "dedupe_id": key, "created_at": now,
+								"instance_id": instanceID, "dedupe_id": key, "created_at": commitTimestamp(),
 							}
 							if ver >= dedupeFormatRawKeyVersion {
 								m[dedupeFormatVersionColumn] = ver
@@ -2049,7 +2067,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 							reservedGuardKeys[canonKey] = true
 							muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
 								"instance_id": instanceID, "dedupe_id": canonKey,
-								dedupeFormatVersionColumn: dedupeFormatVersion, "created_at": now,
+								dedupeFormatVersionColumn: dedupeFormatVersion, "created_at": commitTimestamp(),
 							}))
 						}
 						// else: batch-reserved or fully occupied — insert
@@ -2059,7 +2077,7 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 						reservedGuardKeys[key] = true
 						m := map[string]any{
 							"instance_id": instanceID, "dedupe_id": key,
-							dedupeFormatVersionColumn: ver, "created_at": now,
+							dedupeFormatVersionColumn: ver, "created_at": commitTimestamp(),
 						}
 						if ver >= dedupeFormatRawKeyVersion {
 							m[dedupeFallbackOwnerColumn] = escapeDedupeID(it.DedupeID)
@@ -2068,13 +2086,6 @@ func (b *Backend) SendToInboxBatch(ctx context.Context, instanceID string, items
 					}
 					created[it.DedupeID] = true
 				}
-				if !isNotFound(err) {
-					return err
-				}
-				muts = append(muts, spanner.InsertMap("wf_signal_dedupe", map[string]any{
-					"instance_id": instanceID, "dedupe_id": it.DedupeID, "created_at": commitTimestamp(),
-				}))
-				created[it.DedupeID] = true
 			}
 			payload := inboxPayload(it.Event)
 			seq++

@@ -20,8 +20,8 @@ root は既定ビルドで backend サブモジュールに依存しない。`in
 
 ## 最小 Go バージョン
 
-- 宣言: root `go 1.24`、backend 各モジュール `go 1.24`、`go.work` も `go 1.24`（CI `1.24.x` と一致）。
-- 検証: `GOTOOLCHAIN=local go build ./...`（workspace 外の Go 1.24 環境で確認）。
+- 宣言: root `go 1.27`、backend 各モジュール `go 1.27`、`go.work` も `go 1.27`（CI `1.27.x` と一致）。
+- 検証: `GOTOOLCHAIN=local go build ./...`（workspace 外の Go 1.27 環境で確認）。
 
 ## 依存バージョン
 

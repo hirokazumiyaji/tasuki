@@ -1,6 +1,6 @@
 module github.com/hirokazumiyaji/tasuki/backend/mysql
 
-go 1.24
+go 1.27
 
 require (
 	github.com/go-sql-driver/mysql v1.9.2

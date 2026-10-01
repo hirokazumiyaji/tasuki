@@ -313,7 +313,7 @@ func (b *Backend) pollWakeItem(ctx context.Context, pk string, onBump func(id st
 				Key:            map[string]types.AttributeValue{"pk": avS(pk)},
 				ConsistentRead: aws.Bool(true),
 			})
-			if err != nil || out.Item == nil {
+			if err != nil {
 				interval = nextPollInterval(interval)
 				timer.Reset(interval)
 				continue

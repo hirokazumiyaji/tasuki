@@ -1,6 +1,6 @@
 module github.com/hirokazumiyaji/tasuki/backend/sqlite
 
-go 1.24
+go 1.27
 
 require (
 	github.com/hirokazumiyaji/tasuki v0.0.0

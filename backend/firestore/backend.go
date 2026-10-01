@@ -506,8 +506,8 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 					// moving on.
 					if picker != nil {
 						picker.Release(backend.FairTaskRef{ID: id, InstanceID: str(m, "instance_id")})
-						released = true
 					}
+					released = true
 					continue
 				}
 				out = append(out, claimed)
@@ -681,22 +681,6 @@ func (b *Backend) listClaimCandidates(ctx context.Context, kind, queue string, n
 		}
 	}
 	return docs, startAfter, exhausted, nil
-}
-func (b *Backend) updateTask(ctx context.Context, id int64, activity bool, fields []gcf.Update) error {
-	r := b.ref("wf_tasks", actTaskID(id))
-	return b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
-		s, e := tx.Get(r)
-		if isNotFound(e) {
-			return backend.ErrNotFound
-		}
-		if e != nil {
-			return e
-		}
-		if !s.Exists() || (activity && str(s.Data(), "kind") != "activity") {
-			return backend.ErrNotFound
-		}
-		return tx.Update(r, fields)
-	})
 }
 func (b *Backend) ExtendLease(ctx context.Context, t backend.Task, d time.Duration) error {
 	// Workflow tasks live under WF#<instanceID>, not ACT#<id>.
@@ -1059,6 +1043,11 @@ func (b *Backend) CommitAdvancements(ctx context.Context, advs []backend.Advance
 		}
 	}
 	b.notifyTasks()
+	for _, adv := range advs {
+		if adv.Terminal != nil {
+			b.notifyTerminal(adv.InstanceID)
+		}
+	}
 	for _, adv := range advs {
 		if adv.Terminal != nil {
 			// Dedupe rows are deliberately cleaned outside the advancement
@@ -1452,11 +1441,15 @@ func (b *Backend) deleteTerminalColDocs(ctx context.Context, col, id string, cut
 		}
 		it.Stop()
 		if len(refs) > 0 {
-			batch := b.client.Batch()
-			for _, r := range refs {
-				batch.Delete(r)
-			}
-			if _, err := batch.Commit(ctx); err != nil {
+			err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+				for _, r := range refs {
+					if err := tx.Delete(r); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if err != nil {
 				return err
 			}
 		}

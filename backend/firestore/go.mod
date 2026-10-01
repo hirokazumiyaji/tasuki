@@ -1,12 +1,12 @@
 module github.com/hirokazumiyaji/tasuki/backend/firestore
 
-go 1.24
+go 1.27
 
 require (
 	cloud.google.com/go/firestore v1.24.0
 	github.com/hirokazumiyaji/tasuki v0.0.0
 	google.golang.org/api v0.290.0
-	google.golang.org/grpc v1.82.0
+	google.golang.org/grpc v1.83.1
 )
 
 require (

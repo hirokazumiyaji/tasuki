@@ -1,6 +1,6 @@
 module github.com/hirokazumiyaji/tasuki/backend/dynamodb
 
-go 1.24
+go 1.27
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.43.0

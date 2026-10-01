@@ -104,8 +104,9 @@ func TestTerminalSweepSameCreatedAtReplacementAborts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshot) != 1 {
-		t.Fatalf("dedupe snapshot holds %d keys, want the single guard K", len(snapshot))
+	// Guard K is dual-written: framed doc plus raw legacy leg (round-26).
+	if len(snapshot) != 2 {
+		t.Fatalf("dedupe snapshot holds %d keys, want guard K's framed and legacy docs", len(snapshot))
 	}
 
 	// Simulate purge-delete plus clock-rollback recreate: the replacement
@@ -138,6 +139,7 @@ func TestTerminalSweepSameCreatedAtReplacementAborts(t *testing.T) {
 	_, _ = b.ref("wf_tasks", wfTaskID(id)).Delete(ctx)
 	_, _ = b.ref("wf_timers", journalID(id, 7)).Delete(ctx)
 	_, _ = b.ref("wf_signal_dedupe", signalDedupeID(id, "K")).Delete(ctx)
+	_, _ = b.ref("wf_signal_dedupe", legacyDedupeDocID(id, "K")).Delete(ctx)
 	it := b.col("wf_inbox").Where("instance_id", "==", id).Documents(ctx)
 	for {
 		d, err := it.Next()

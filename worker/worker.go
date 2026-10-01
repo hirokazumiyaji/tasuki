@@ -1017,15 +1017,6 @@ func (w *Worker) leaseDuration() time.Duration {
 	return 30 * time.Second
 }
 
-// refreshLease pushes a task's local lease expiry forward after a successful
-// renewal (ExtendLease/RecordHeartbeat). Unknown IDs — and entries stamped
-// by another invocation — are ignored: the task already transferred to a
-// commit, was released, or was reclaimed and re-tracked by a new
-// generation, whose own renewal maintains its expiry.
-func (w *Worker) refreshLease(taskID int64, tok claimToken) {
-	w.refreshLeaseAt(taskID, tok, time.Now())
-}
-
 // refreshLeaseAt pushes a task's local lease expiry forward after a
 // successful renewal (ExtendLease/RecordHeartbeat), measuring from at, the
 // instant BEFORE the renewal store call. Like trackAt, this keeps the

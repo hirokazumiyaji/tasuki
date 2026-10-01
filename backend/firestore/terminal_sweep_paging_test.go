@@ -103,12 +103,16 @@ func TestDeleteTerminalColDocs_PagesPastRetainedDocs(t *testing.T) {
 	// sharing the flip's timestamp would (correctly) sweep, which would
 	// fail the test for timing reasons rather than logic.
 	time.Sleep(1100 * time.Millisecond)
-	batch := b.client.Batch()
-	for i := 0; i < terminalCleanupBatchSize+1; i++ {
-		docID := fmt.Sprintf("%s:a%03d", id, i)
-		batch.Set(b.ref("wf_inbox", docID), inboxDoc(id, int64(2000+i), int64(2000+i), journal.Event{Type: journal.TypeSignalReceived, Name: "s"}, nowUTC()))
-	}
-	if _, err := batch.Commit(ctx); err != nil {
+	err := b.client.RunTransaction(ctx, func(ctx context.Context, tx *gcf.Transaction) error {
+		for i := 0; i < terminalCleanupBatchSize+1; i++ {
+			docID := fmt.Sprintf("%s:a%03d", id, i)
+			if err := tx.Set(b.ref("wf_inbox", docID), inboxDoc(id, int64(2000+i), int64(2000+i), journal.Event{Type: journal.TypeSignalReceived, Name: "s"}, nowUTC())); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 

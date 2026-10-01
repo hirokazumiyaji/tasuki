@@ -28,11 +28,6 @@ func seedFenceTimer(t *testing.T, b *Backend, ctx context.Context, id string, se
 	}
 }
 
-func instanceCreatedAtTx(t *testing.T, b *Backend, ctx context.Context, id string) time.Time {
-	t.Helper()
-	return instanceVictimTx(t, b, ctx, id).createdAt
-}
-
 // instanceVictimTx captures the fence identity the terminal commit observes:
 // the pre-commit incarnation (created_at plus the unique token) for the
 // post-commit sweep fence.

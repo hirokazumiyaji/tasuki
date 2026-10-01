@@ -75,11 +75,14 @@ func claimOneWorkflow(t *testing.T, b *Backend, ctx context.Context, worker stri
 func flipStatusWithoutSweep(t *testing.T, b *Backend, ctx context.Context, id string) {
 	t.Helper()
 	err := b.withRW(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		_, err := txn.Update(ctx, spanner.Statement{
-			SQL:    `UPDATE wf_instances SET status = 'terminated' WHERE id = @id`,
-			Params: map[string]any{"id": id},
+		return txn.BufferWrite([]*spanner.Mutation{
+			spanner.UpdateMap("wf_instances", map[string]any{
+				"id":           id,
+				"status":       "terminated",
+				"updated_at":   nowUTC(),
+				"completed_at": nowUTC(),
+			}),
 		})
-		return err
 	})
 	if err != nil {
 		t.Fatal(err)

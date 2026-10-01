@@ -1,10 +1,9 @@
 module github.com/hirokazumiyaji/tasuki
 
-go 1.24
-
-require github.com/robfig/cron/v3 v3.0.1
+go 1.27
 
 require (
+	github.com/robfig/cron/v3 v3.0.1
 	go.opentelemetry.io/otel v1.35.0
 	go.opentelemetry.io/otel/metric v1.35.0
 	go.opentelemetry.io/otel/sdk/metric v1.35.0

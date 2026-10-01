@@ -54,7 +54,7 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and push to `main`, p
 | `gowork-check` | `GOWORK=off` independence, the workspace `tasuki_all` build, and `go test -tags tasuki_all ./contrib/... ./examples/...` |
 | `fuzz-nightly` | Nightly only: 60s of `-fuzz -fuzztime` per codec/engine fuzz target |
 
-CI uses Go `1.24.x` across all jobs (see `docs/10-modules.md`).
+CI uses Go `1.27.x` across all jobs (see `docs/10-modules.md`).
 
 ## Risks and Mitigations
 
