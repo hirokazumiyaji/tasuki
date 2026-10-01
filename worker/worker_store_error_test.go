@@ -3,6 +3,7 @@ package worker_test
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,17 +17,17 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
-// errBackend fails ClaimTasks once, then delegates.
+// flakyBackend fails the next workflow ClaimTasks once, then delegates.
+// The worker loop and the test both touch failNext and calls, so they are atomic.
 type flakyBackend struct {
 	*memory.Backend
-	failNext bool
-	calls    int
+	failNext atomic.Bool
+	calls    atomic.Int32
 }
 
 func (f *flakyBackend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]backend.Task, error) {
-	f.calls++
-	if f.failNext && req.Kind == "workflow" {
-		f.failNext = false
+	f.calls.Add(1)
+	if req.Kind == "workflow" && f.failNext.CompareAndSwap(true, false) {
 		return nil, errors.New("injected store failure")
 	}
 	return f.Backend.ClaimTasks(ctx, req)
@@ -42,7 +43,8 @@ func TestWorker_StoreErrorCountedAndRecovers(t *testing.T) {
 	}
 	mem := memory.New()
 	mem.SetNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
-	fb := &flakyBackend{Backend: mem, failNext: true}
+	fb := &flakyBackend{Backend: mem}
+	fb.failNext.Store(true)
 	w := worker.NewWorker(fb, worker.WorkerOptions{
 		PollInterval: time.Millisecond,
 		Metrics:      m,
@@ -66,7 +68,7 @@ func TestWorker_StoreErrorCountedAndRecovers(t *testing.T) {
 	if out != 7 {
 		t.Fatalf("got %d", out)
 	}
-	if fb.calls < 2 {
+	if fb.calls.Load() < 2 {
 		t.Fatal("expected retry after failure")
 	}
 	// If we have a manual reader, verify the op-labeled counter.
