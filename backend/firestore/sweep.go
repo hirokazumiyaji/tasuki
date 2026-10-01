@@ -95,7 +95,20 @@ func (b *Backend) sweepTerminateDocs(ctx context.Context, victim purgeVictim, de
 			return err
 		}
 	}
-	return b.sweepSignalDedupeIDs(ctx, fence, filterTerminateDedupeDocs(dedupeSnapshot, id))
+	if err := b.sweepSignalDedupeIDs(ctx, fence, filterTerminateDedupeDocs(dedupeSnapshot, id)); err != nil {
+		return err
+	}
+	// Inbox rows predating the flip are swept by server commit order (see
+	// cleanupTerminalDocs): a post-terminal send's event survives with its
+	// marker. A replacement incarnation trips the fence and owns its rows.
+	snap, err := b.ref("wf_instances", id).Get(ctx)
+	if isNotFound(err) || (err == nil && (!snap.Exists() || !victimMatches(victim, timestamp(snap.Data(), "created_at"), str(snap.Data(), incarnationField)))) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return b.deleteTerminalColDocs(ctx, "wf_inbox", id, snap.UpdateTime)
 }
 
 // filterTerminateDedupeDocs keeps only the pre-termination non-marker keys of

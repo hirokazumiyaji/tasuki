@@ -53,12 +53,6 @@ func (b *stallExtendCountingBackend) ReleaseLease(ctx context.Context, t backend
 	return b.Backend.ReleaseLease(ctx, t)
 }
 
-func (b *stallExtendCountingBackend) extendCalls() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.calls
-}
-
 func (b *stallExtendCountingBackend) landedCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()

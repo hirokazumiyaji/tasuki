@@ -24,7 +24,7 @@ jobs:
         with:
           go-version: "1.27.x"
       - name: Install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+        run: go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
       - name: Run staticcheck (root module)
         run: staticcheck ./...
       - name: Run staticcheck (backend modules)
@@ -174,6 +174,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
+      # Trigger-based fault-injection tests need this under binary logging.
+      - name: Allow trigger creation
+        run: mysql -h 127.0.0.1 -uroot -proot -e 'SET GLOBAL log_bin_trust_function_creators = 1'
       - name: Test mysql
         working-directory: backend/mysql
         run: go test ./... -race -count=1 -timeout 180s
@@ -257,7 +260,8 @@ jobs:
           exit 1
       - name: Test firestore
         working-directory: backend/firestore
-        run: go test ./... -race -count=1 -timeout 180s
+        # Contention conformance rounds pay the emulator's ~1s abort backoff.
+        run: go test ./... -race -count=1 -timeout 300s
 
   chaos-postgres:
     runs-on: ubuntu-latest
@@ -458,6 +462,7 @@ jobs:
           # -e tolerates tasuki_all-gated workspace-only imports (backend/*),
           # which are intentionally unresolvable outside the workspace.
           # GOPROXY=off keeps them out instead of fetching pseudo-versions.
+          GOWORK=off go mod download all
           GOWORK=off GOPROXY=off go mod tidy -e
           git diff --exit-code go.mod go.sum
       - name: Minimal Go version with local toolchain

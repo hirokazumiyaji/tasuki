@@ -23,15 +23,6 @@ func seedFenceTimer(t *testing.T, b *Backend, ctx context.Context, id string, se
 	}
 }
 
-func instanceCreatedAt(t *testing.T, b *Backend, ctx context.Context, id string) time.Time {
-	t.Helper()
-	snap, err := b.ref("wf_instances", id).Get(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return timestamp(snap.Data(), "created_at")
-}
-
 // instanceVictim captures the fence identity the terminal commit observes:
 // the pre-commit incarnation (created_at plus the unique token) for the
 // post-commit sweep fence.
@@ -106,8 +97,9 @@ func TestTerminalSweepStaleFenceKeepsReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshot) != 1 {
-		t.Fatalf("dedupe snapshot holds %d keys, want the single guard K", len(snapshot))
+	// Guard K is dual-written: framed doc plus raw legacy leg (round-26).
+	if len(snapshot) != 2 {
+		t.Fatalf("dedupe snapshot holds %d keys, want guard K's framed and legacy docs", len(snapshot))
 	}
 
 	// Terminal status commits while the sweep is paused; the purge then

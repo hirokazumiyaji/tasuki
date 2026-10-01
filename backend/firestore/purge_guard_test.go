@@ -76,8 +76,13 @@ func TestPurgeVictimGuards(t *testing.T) {
 	if done, residual, _, err := b.deletePurgedInstanceDoc(ctx, victim); err != nil || !done {
 		t.Fatalf("own delete: done=%v err=%v", done, err)
 	} else {
-		if residual == nil || len(residual.dedupe) != 1 || residual.dedupe[0].ref.ID != signalDedupeID(id, "guard-key") {
-			t.Fatalf("own delete must snapshot the straggler dedupe row in-txn, got %+v", residual)
+		// The guard is dual-written: framed doc plus raw legacy leg (round-26).
+		if residual == nil || len(residual.dedupe) != 2 {
+			t.Fatalf("own delete must snapshot the straggler dedupe rows in-txn, got %+v", residual)
+		}
+		got := map[string]bool{residual.dedupe[0].ref.ID: true, residual.dedupe[1].ref.ID: true}
+		if !got[signalDedupeID(id, "guard-key")] || !got[legacyDedupeDocID(id, "guard-key")] {
+			t.Fatalf("own delete must snapshot both guard docs, got %+v", residual)
 		}
 		if len(residual.inbox) != 1 {
 			t.Fatalf("own delete must snapshot the straggler inbox row in-txn, got %+v", residual)

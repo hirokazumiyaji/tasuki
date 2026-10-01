@@ -233,6 +233,20 @@ CREATE TABLE wf_inbox (
   ref_seq INT64,
   payload JSON,
   created_at TIMESTAMP NOT NULL
+) PRIMARY KEY (id)`, `
+CREATE TABLE wf_tasks (
+  id INT64 NOT NULL,
+  kind STRING(32) NOT NULL,
+  queue STRING(255) NOT NULL DEFAULT ('default'),
+  instance_id STRING(255) NOT NULL,
+  ref_seq INT64,
+  payload JSON,
+  attempt INT64 NOT NULL DEFAULT (0),
+  max_attempts INT64,
+  visible_at TIMESTAMP NOT NULL,
+  worker_id STRING(255),
+  heartbeat BYTES(MAX),
+  created_at TIMESTAMP NOT NULL
 ) PRIMARY KEY (id)`}); err != nil {
 		t.Fatal(err)
 	}

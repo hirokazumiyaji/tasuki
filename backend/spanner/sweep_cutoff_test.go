@@ -36,7 +36,7 @@ func TestSweepSignalDedupeSnapshotPreservesPostCommitKeys(t *testing.T) {
 	if err := b.CreateInstance(ctx, backend.NewInstance{ID: id, Name: "WF", Queue: "default"}); err != nil {
 		t.Fatal(err)
 	}
-	put := func(dedupeID string, createdAt time.Time) {
+	put := func(dedupeID string, createdAt any) {
 		t.Helper()
 		_, err := b.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 			return txn.BufferWrite([]*spanner.Mutation{
@@ -65,7 +65,7 @@ func TestSweepSignalDedupeSnapshotPreservesPostCommitKeys(t *testing.T) {
 	// pre-commit client timestamp after losing a transaction race — must be
 	// preserved: its key was never in the committed set.
 	put("post-commit", time.Now().UTC().Add(-time.Second))
-	put("post-commit-fresh", time.Now().UTC().Add(time.Second))
+	put("post-commit-fresh", commitTimestamp())
 
 	// The fenced sweep (Codex round 20 on #296) still removes exactly the
 	// snapshot while the instance carries its pre-commit incarnation.

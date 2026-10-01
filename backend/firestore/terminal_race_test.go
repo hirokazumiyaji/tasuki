@@ -449,8 +449,9 @@ func TestPurgePreservesRecreatedDedupeKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(residual.dedupe) != 2 {
-		t.Fatalf("residual dedupe snapshot holds %d keys, want 2", len(residual.dedupe))
+	// Each key is dual-written: framed doc plus raw legacy leg (round-26).
+	if len(residual.dedupe) != 4 {
+		t.Fatalf("residual dedupe snapshot holds %d keys, want 4", len(residual.dedupe))
 	}
 	// Simulate a concurrent sweep deleting the straggler row after the
 	// snapshot, then the purge victim delete and an ID-reusing
@@ -458,6 +459,9 @@ func TestPurgePreservesRecreatedDedupeKey(t *testing.T) {
 	// it creates a FRESH document (new server update time) with its inbox
 	// event — the reap must recognize the version change and skip it.
 	if _, err := b.ref("wf_signal_dedupe", signalDedupeID(id, "old-key")).Delete(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ref("wf_signal_dedupe", legacyDedupeDocID(id, "old-key")).Delete(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := b.ref("wf_instances", id).Delete(ctx); err != nil {
