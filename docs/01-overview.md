@@ -79,7 +79,7 @@ Priorities are designated as **must** (essential for initial release), **should*
 | NFR-5 | Graceful shutdown (waiting for in-flight tasks and releasing leases early) |
 | NFR-6 | Write unit tests without databases (in-memory backend) with virtual clock timer fast-forwarding |
 | NFR-7 | Metrics hooks (OpenTelemetry) and structured logging (slog) |
-| NFR-8 | Support Go 1.24+ with minimal dependencies. Separate database drivers/SDKs into dedicated backend Go modules |
+| NFR-8 | Support Go 1.27+ with minimal dependencies. Separate database drivers/SDKs into dedicated backend Go modules |
 | NFR-9 | Pluggable persistence via a backend interface, targeting RDBMS (PostgreSQL, MySQL, MariaDB, SQLite), NewSQL (Spanner, TiDB), and Document stores (DynamoDB, Firestore) |
 
 ## Non-Goals

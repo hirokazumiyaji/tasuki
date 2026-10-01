@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Install staticcheck
         run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
       - name: Run staticcheck (root module)
@@ -50,7 +50,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
       - name: Run govulncheck (root module)
@@ -108,7 +108,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Test root
         run: go test ./... -race -count=1 -timeout 10m
 
@@ -118,7 +118,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Test sqlite
         working-directory: backend/sqlite
         run: go test ./... -race -count=1 -timeout 120s
@@ -145,7 +145,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Test postgres
         working-directory: backend/postgres
         run: go test ./... -race -count=1 -timeout 120s
@@ -173,7 +173,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Test mysql
         working-directory: backend/mysql
         run: go test ./... -race -count=1 -timeout 180s
@@ -193,7 +193,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Wait for Spanner emulator
         run: |
           for i in $(seq 1 60); do
@@ -217,7 +217,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Start DynamoDB Local
         run: |
           docker run -d --name dynamodb -p 8000:8000 amazon/dynamodb-local:2.5.2 \
@@ -243,7 +243,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Start Firestore emulator
         run: |
           docker run -d --name firestore -p 8086:8086 \
@@ -281,7 +281,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Chaos postgres
         run: go test -tags tasuki_all ./chaos/ -run 'TestChaos_KillWorkers$' -race -count=1 -timeout 5m
   chaos-mysql:
@@ -307,7 +307,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Chaos mysql
         run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_MySQL -race -count=1 -timeout 5m
   chaos-spanner:
@@ -325,7 +325,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Wait for Spanner emulator
         run: |
           for i in $(seq 1 60); do
@@ -346,7 +346,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Start DynamoDB Local
         run: |
           docker run -d --name dynamodb -p 8000:8000 amazon/dynamodb-local:2.5.2 \
@@ -368,7 +368,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Start Firestore emulator
         run: |
           docker run -d --name firestore -p 8086:8086 \
@@ -389,7 +389,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Chaos sqlite
         run: go test -tags tasuki_all ./chaos/ -run TestChaos_KillWorkers_SQLite -race -count=1 -timeout 5m
 
@@ -415,7 +415,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Cover root
         run: go test ./... -coverprofile=cover.out -count=1 -timeout 10m
       - name: Summary
@@ -446,7 +446,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Independent build without workspace (no hidden deps)
         run: |
           GOWORK=off go build ./...
@@ -490,7 +490,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.27.x"
       - name: Fuzz codec JSON round-trip (60s)
         run: go test -fuzz=FuzzJSONRoundTrip -fuzztime 60s ./codec/
       - name: Fuzz codec encrypted round-trip (60s)

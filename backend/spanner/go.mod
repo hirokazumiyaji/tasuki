@@ -1,6 +1,6 @@
 module github.com/hirokazumiyaji/tasuki/backend/spanner
 
-go 1.24
+go 1.27
 
 require (
 	cloud.google.com/go/spanner v1.93.0

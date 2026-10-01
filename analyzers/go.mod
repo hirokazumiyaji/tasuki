@@ -1,6 +1,6 @@
 module github.com/hirokazumiyaji/tasuki/analyzers
 
-go 1.24
+go 1.27
 
 require golang.org/x/tools v0.31.0
 

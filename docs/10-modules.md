@@ -20,8 +20,8 @@ The root module does not depend on database drivers or cloud SDKs by default. `i
 
 ## Minimum Go Version
 
-- **Declaration**: Root `go 1.24`, backend modules `go 1.24`, `go.work` declares `go 1.24` (aligned with CI `1.24.x`).
-- **Validation**: `GOTOOLCHAIN=local go build ./...` (verified outside workspace in a Go 1.24 environment).
+- **Declaration**: Root `go 1.27`, backend modules `go 1.27`, `go.work` declares `go 1.27` (aligned with CI `1.27.x`).
+- **Validation**: `GOTOOLCHAIN=local go build ./...` (verified outside workspace in a Go 1.27 environment).
 
 ## Dependency Versioning
 
