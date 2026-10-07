@@ -105,6 +105,8 @@ tasuki は各 workflow instance を durable actor として扱うが、常駐す
 | update_completed | コマンド（即値） | name, id, result / error |
 | now_recorded | コマンド（即値） | value |
 | version_marker | コマンド（即値） | change_id, version |
+| search_attributes_updated | コマンド（即値） | attributes |
+| memo_updated | コマンド（即値） | memo |
 | activity_completed | 完了 | ref_seq, result |
 | activity_failed | 完了 | ref_seq, error |
 | timer_fired | 完了 | ref_seq |
@@ -123,10 +125,11 @@ Temporal のような厳密な順序一致方式に比べて照合が単純に�
 ### リプレイと決定性違反の検出
 
 リプレイでは、ワークフロー関数が生成する i 番目のコマンドを、ジャーナルの i 番目のコマンドイベントと突き合わせる。
-type と名前（アクティビティ名など）が一致すればそのイベントの結果を返し、一致しなければ **決定性違反** としてインスタンスを stuck 状態に隔離する。
+type と名前（アクティビティ名など）が一致すればそのイベントの結果を返し、一致しなければ **決定性違反**（`journal.ErrDeterminismViolation`）として検知する。ワーカーはタスクを Nack し（`IncompatibleRetryDelay` 経過後に再獲得可能にする）、ローリングデプロイ中の別バージョンのワーカーによる引き継ぎを許容する。
 入力ペイロードは既定では比較しない。
 シリアライズ表現の揺れによる誤検出が多いためで、この緩い照合でも呼び出し順序の変化（コードの非互換な変更や非決定的な分岐）は捉えられる。
 
+ワークフロー実行中に未捕捉の panic や回復不能なエラーが発生した場合は、インスタンスを stuck 状態に隔離する。
 stuck は終端ではない。
 原因となったコードを修正してデプロイした後、運用操作（リトライ API）で running に戻せる。
 
@@ -407,11 +410,14 @@ CREATE TABLE wf_instances (
     completed_at timestamptz
 );
 CREATE INDEX wf_instances_visibility_idx ON wf_instances (status, name, created_at);
+CREATE INDEX wf_instances_completed_at_idx ON wf_instances (completed_at, id) WHERE completed_at IS NOT NULL;
+CREATE INDEX wf_instances_search_attributes_gin_idx ON wf_instances USING gin (search_attributes jsonb_path_ops);
 
 CREATE TABLE wf_journal (
     instance_id text   NOT NULL,
     seq         bigint NOT NULL,
     type        text   NOT NULL,
+    name        text   NOT NULL DEFAULT '',
     ref_seq     bigint,           -- 完了イベントから対応するコマンドイベントへの相関
     payload     jsonb,
     recorded_at timestamptz NOT NULL DEFAULT now(),
@@ -428,6 +434,13 @@ CREATE TABLE wf_inbox (
 );
 CREATE INDEX wf_inbox_instance_idx ON wf_inbox (instance_id, id);
 
+CREATE TABLE wf_signal_dedupe (
+    instance_id text NOT NULL,
+    dedupe_id   text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (instance_id, dedupe_id)
+);
+
 CREATE TABLE wf_tasks (
     id           bigserial PRIMARY KEY,
     kind         text NOT NULL,   -- workflow | activity
@@ -439,9 +452,11 @@ CREATE TABLE wf_tasks (
     max_attempts int,
     visible_at   timestamptz NOT NULL DEFAULT now(),  -- リースとリトライ待ちを兼ねる
     worker_id    text,
+    heartbeat    bytea,
     created_at   timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX wf_tasks_claim_idx ON wf_tasks (kind, queue, visible_at);
+CREATE INDEX wf_tasks_instance_idx ON wf_tasks (instance_id);
 CREATE UNIQUE INDEX wf_tasks_wf_singleton ON wf_tasks (instance_id) WHERE kind = 'workflow';
 
 CREATE TABLE wf_timers (
@@ -463,6 +478,7 @@ CREATE TABLE wf_schedules (
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
+CREATE INDEX wf_schedules_due_idx ON wf_schedules (next_run_at) WHERE NOT paused;
 ```
 
 スケジュール実行（cron）は次の性質で exactly-once にする。
@@ -483,41 +499,71 @@ type Backend interface {
 
     // Client 系
     CreateInstance(ctx context.Context, inst NewInstance) error // ID 重複時 ErrAlreadyExists
-    SendToInbox(ctx context.Context, instanceID string, ev Event) error // シグナル / キャンセル要求
+    SendToInbox(ctx context.Context, instanceID string, ev journal.Event, dedupeID string) error // シグナル / キャンセル要求（dedupeID で冪等化）
+    SendToInboxBatch(ctx context.Context, instanceID string, items []InboxItem) error // 複数イベントの一括投入
     GetInstance(ctx context.Context, id string) (*Instance, error)
-    GetJournal(ctx context.Context, id string, afterSeq int64) ([]Event, error)
+    GetJournal(ctx context.Context, id string, afterSeq int64) ([]journal.Event, error)
     ListInstances(ctx context.Context, f InstanceFilter) ([]Instance, error)
     TerminateInstance(ctx context.Context, id string) error
 
     // Worker 系
     ClaimTasks(ctx context.Context, req ClaimRequest) ([]Task, error)
+    CountClaimableTasks(ctx context.Context, kind string, queues []string) (map[string]int64, error)
     ExtendLease(ctx context.Context, task Task, d time.Duration) error
-    LoadWorkflow(ctx context.Context, instanceID string) (*WorkflowState, error) // ジャーナル + inbox + next_seq + 現在時刻
-    CommitAdvancement(ctx context.Context, adv Advancement) error               // 状態遷移Tx。競合時 ErrConflict
-    CompleteActivity(ctx context.Context, task Task, ev Event) error            // 完了Tx。claim が失効済みなら ErrSuperseded
-    RetryActivity(ctx context.Context, task Task, delay time.Duration) error
+    RecordHeartbeat(ctx context.Context, task Task, lease time.Duration, details []byte) error
+    ReleaseLease(ctx context.Context, t Task) error
     NackTask(ctx context.Context, t Task, delay time.Duration) error
+    LoadWorkflow(ctx context.Context, instanceID string) (*WorkflowState, error) // ジャーナル + inbox + next_seq + 現在時刻
+    LoadWorkflowHead(ctx context.Context, instanceID string) (*WorkflowState, error) // ジャーナルなしで先頭状態を取得
+    CommitAdvancement(ctx context.Context, adv Advancement) error               // 状態遷移Tx。競合時 ErrConflict
+    CompleteActivity(ctx context.Context, task Task, ev journal.Event) error    // 完了Tx。claim が失効済みなら ErrSuperseded
+    RetryActivity(ctx context.Context, task Task, delay time.Duration) error
     FireDueTimers(ctx context.Context, limit int) (int, error)
-    ClaimDueSchedules(ctx context.Context, limit int) ([]Schedule, error)
+
+    // スケジュール系
+    UpsertSchedule(ctx context.Context, s NewSchedule) error
+    GetSchedule(ctx context.Context, id string) (*Schedule, error)
+    PauseSchedule(ctx context.Context, id string, paused bool) error
+    ClaimDueSchedules(ctx context.Context, limit int) ([]DueSchedule, error)
+
+    // 保持期限パージ
+    PurgeInstances(ctx context.Context, olderThan time.Duration, statuses []string, limit int) (int, error)
+}
+
+// AdvancementBatcher は複数ワークフローの前進を 1 トランザクションでバッチコミットする拡張インターフェース。
+type AdvancementBatcher interface {
+    CommitAdvancements(ctx context.Context, advs []Advancement) error
+}
+
+// SchemaValidator は起動時にスキーマが準備できているかを検証するインターフェース。
+type SchemaValidator interface {
+    ValidateSchema(ctx context.Context) error
 }
 
 // Advancement は状態遷移トランザクションの入力一式。
 type Advancement struct {
-    InstanceID    string
-    TaskID        int64
-    ExpectedSeq   int64      // next_seq の楽観ロック値
-    DrainedInbox  []int64    // 取り込んだ inbox 行の ID
-    NewEvents     []Event    // seq 採番済みの追記イベント列
-    ActivityTasks []NewTask
-    Timers        []NewTimer
-    Children      []NewInstance
-    ParentNotify  *Event     // 自身が子として終端した場合の親への完了イベント
-    Terminal      *TerminalUpdate // status / result / failure
+    InstanceID         string
+    TaskID             int64
+    ExpectedSeq        int64      // next_seq の楽観ロック値
+    DrainedInbox       []int64    // 取り込んだ inbox 行の ID
+    NewEvents          []journal.Event // seq 採番済みの追記イベント列
+    ActivityTasks      []NewTask
+    Timers             []NewTimer
+    Children           []NewInstance
+    ParentNotify       *journal.Event  // 自身が子として終端した場合の親への完了イベント
+    Terminal           *TerminalUpdate // status / result / failure
+    EnsureWorkflowTask bool
+    WorkerID           string
+    Attempt            int
 }
 
-// Capabilities はストア固有の制約の宣言。エンジンは inbox の取り込み量などをこれに合わせる。
+// Capabilities はストア固有の制約と機能サポートの宣言。
 type Capabilities struct {
     MaxAdvancementEffects int // 一度の CommitAdvancement で原子的に書ける行数・項目数の上限。0 は無制限
+    FairDispatch          bool
+    CleansTerminalState   bool
+    SupportsBulkCleanup   bool
+    SweepsTerminalInbox   bool
 }
 ```
 
