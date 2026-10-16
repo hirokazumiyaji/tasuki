@@ -19,6 +19,7 @@ import (
 
 func nowUTC() time.Time         { return time.Now().UTC() }
 func isNotFound(err error) bool { return status.Code(err) == codes.NotFound }
+func isAborted(err error) bool  { return status.Code(err) == codes.Aborted }
 
 func newID() int64 {
 	var b [8]byte
