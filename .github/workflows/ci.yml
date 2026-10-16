@@ -24,7 +24,9 @@ jobs:
         with:
           go-version: "1.27.x"
       - name: Install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
+        # v0.8.2 is required for Go 1.27.2's unified export data V5
+        # (v0.8.1 only decodes up to V4 and fails with "export data version 5").
+        run: go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
       - name: Run staticcheck (root module)
         run: staticcheck ./...
       - name: Run staticcheck (backend modules)

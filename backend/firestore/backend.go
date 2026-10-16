@@ -481,11 +481,15 @@ func (b *Backend) ClaimTasks(ctx context.Context, req backend.ClaimRequest) ([]b
 					skipped = true
 					return tx.Delete(d.Ref)
 				})
-				if err == backend.ErrConflict {
-					// Another worker leased this snapshot first: free its picker
-					// slot so Full below does not stop later candidates and
-					// queues from filling the batch, then re-query this queue
-					// for a replacement (the loop above) instead of moving on.
+				if err == backend.ErrConflict || isAborted(err) {
+					// ErrConflict: another worker leased this snapshot first.
+					// Aborted (e.g. "Transaction lock timeout" under emulator
+					// contention): the client exhausted its internal retries;
+					// treat like a lost race and refill rather than failing the
+					// whole ClaimTasks call. Free the picker slot so Full below
+					// does not stop later candidates and queues from filling
+					// the batch, then re-query this queue for a replacement
+					// (the loop above) instead of moving on.
 					// The refill flag is set even without a picker (Codex round
 					// 8 on #327): a default nil-picker claim must also loop to
 					// fill Limit instead of returning undersized after one pass.
